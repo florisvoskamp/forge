@@ -23,6 +23,17 @@ impl GenAiProvider {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Construct with a caller-supplied `genai::Client`. Used by the HTTP contract tests to
+    /// point genai at a local mock server; otherwise identical to [`GenAiProvider::new`].
+    pub fn with_client(client: Client) -> Self {
+        Self { client }
+    }
+}
+
+/// Config uses `"provider::model"`; genai infers the adapter from the bare model name.
+fn bare_model(model: &str) -> &str {
+    model.rsplit("::").next().unwrap_or(model)
 }
 
 fn to_genai_messages(messages: &[Message]) -> Vec<ChatMessage> {
@@ -73,8 +84,7 @@ impl Provider for GenAiProvider {
         tools: &[ToolSpec],
         on_text: &mut TextSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
-        // Config uses "provider::model"; genai infers the adapter from the bare model name.
-        let model_name = model.rsplit("::").next().unwrap_or(model);
+        let model_name = bare_model(model);
 
         let mut req = ChatRequest::new(to_genai_messages(messages));
         if !tools.is_empty() {
@@ -139,5 +149,69 @@ impl Provider for GenAiProvider {
             tool_calls,
             usage,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn bare_model_strips_provider_prefix() {
+        assert_eq!(bare_model("ollama::llama3.2"), "llama3.2");
+        assert_eq!(bare_model("openai::gpt-4o"), "gpt-4o");
+        assert_eq!(bare_model("claude-3-5-sonnet"), "claude-3-5-sonnet");
+        assert_eq!(bare_model("a::b::c"), "c");
+        assert_eq!(bare_model(""), "");
+    }
+
+    #[test]
+    fn maps_all_roles_and_round_trips_tool_call_ids() {
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("hi"),
+            Message::assistant_tool_calls(
+                "thinking",
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    args: json!({"path": "x"}),
+                }],
+            ),
+            Message::tool_result("call_1", "file contents"),
+        ];
+        let out = to_genai_messages(&msgs);
+        // system, user, assistant-text, assistant-tool-call, tool-response = 5
+        assert_eq!(out.len(), 5, "every role maps to a genai message");
+    }
+
+    #[test]
+    fn empty_assistant_content_emits_no_stray_text_message() {
+        // assistant with empty content but a tool call -> only the tool-call message.
+        let msgs = vec![Message::assistant_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "c".into(),
+                name: "t".into(),
+                args: json!({}),
+            }],
+        )];
+        let out = to_genai_messages(&msgs);
+        assert_eq!(out.len(), 1, "no empty assistant text message");
+    }
+
+    #[test]
+    fn tool_spec_maps_name_description_and_schema() {
+        let schema = json!({"type":"object","properties":{"path":{"type":"string"}}});
+        let spec = ToolSpec {
+            name: "read_file".into(),
+            description: "read a file".into(),
+            schema: schema.clone(),
+        };
+        let tool = to_genai_tool(&spec);
+        assert_eq!(tool.name.as_str(), "read_file");
+        assert_eq!(tool.description.as_deref(), Some("read a file"));
+        assert_eq!(tool.schema.as_ref(), Some(&schema));
     }
 }

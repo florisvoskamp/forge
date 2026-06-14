@@ -17,3 +17,4 @@ futures.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
+httpmock = "0.7"
