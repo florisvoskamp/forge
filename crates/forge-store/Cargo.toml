@@ -11,3 +11,4 @@ repository.workspace = true
 forge-types.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true

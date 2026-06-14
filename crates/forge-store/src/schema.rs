@@ -13,13 +13,15 @@ CREATE TABLE IF NOT EXISTS session (
 );
 
 CREATE TABLE IF NOT EXISTS message (
-    id          TEXT PRIMARY KEY,
-    session_id  TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-    seq         INTEGER NOT NULL,
-    role        TEXT NOT NULL,
-    content     TEXT NOT NULL,
-    model       TEXT,
-    created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    id              TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    seq             INTEGER NOT NULL,
+    role            TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    model           TEXT,
+    tool_calls_json TEXT,
+    tool_call_id    TEXT,
+    created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id, seq);
 

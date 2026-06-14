@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use forge_types::{Role, TaskTier, Usage};
+use forge_types::{Role, TaskTier, ToolCall, Usage};
 use rusqlite::Connection;
 
 mod schema;
@@ -40,6 +40,14 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(schema::SCHEMA)?;
+        // Best-effort migrations for databases created before these columns existed
+        // (errors on already-present columns are expected and ignored).
+        for stmt in [
+            "ALTER TABLE message ADD COLUMN tool_calls_json TEXT",
+            "ALTER TABLE message ADD COLUMN tool_call_id TEXT",
+        ] {
+            let _ = conn.execute(stmt, []);
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -68,11 +76,32 @@ impl Store {
         content: &str,
         model: Option<&str>,
     ) -> Result<String> {
+        self.add_message_full(session_id, seq, role, content, model, &[], None)
+    }
+
+    /// Append a message, including any tool-call linkage (assistant tool calls / tool
+    /// result ids), so the transcript round-trips faithfully on resume.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_message_full(
+        &self,
+        session_id: &str,
+        seq: i64,
+        role: Role,
+        content: &str,
+        model: Option<&str>,
+        tool_calls: &[ToolCall],
+        tool_call_id: Option<&str>,
+    ) -> Result<String> {
         let id = forge_types::new_id();
+        let tool_calls_json = if tool_calls.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(tool_calls).unwrap_or_default())
+        };
         self.lock()?.execute(
-            "INSERT INTO message (id, session_id, seq, role, content, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            (&id, session_id, seq, role.as_str(), content, model),
+            "INSERT INTO message (id, session_id, seq, role, content, model, tool_calls_json, tool_call_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (&id, session_id, seq, role.as_str(), content, model, tool_calls_json, tool_call_id),
         )?;
         Ok(id)
     }
@@ -205,14 +234,21 @@ impl Store {
     pub fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT role, content, model FROM message WHERE session_id = ?1 ORDER BY seq",
+            "SELECT role, content, model, tool_calls_json, tool_call_id
+             FROM message WHERE session_id = ?1 ORDER BY seq",
         )?;
         let rows = stmt.query_map([session_id], |row| {
             let role: String = row.get(0)?;
+            let tool_calls_json: Option<String> = row.get(3)?;
+            let tool_calls = tool_calls_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
             Ok(StoredMessage {
                 role: Role::parse(&role).unwrap_or(Role::User),
                 content: row.get(1)?,
                 model: row.get(2)?,
+                tool_calls,
+                tool_call_id: row.get(4)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -226,6 +262,8 @@ pub struct StoredMessage {
     pub role: Role,
     pub content: String,
     pub model: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub tool_call_id: Option<String>,
 }
 
 /// A one-line summary of a past session, for `forge sessions`.
@@ -278,6 +316,28 @@ mod tests {
 
         assert_eq!(store.message_count(&sid).unwrap(), 1);
         assert!((store.session_cost(&sid).unwrap() - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tool_linkage_round_trips() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("/tmp", "default").unwrap();
+        let calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            args: serde_json::json!({ "path": "x" }),
+        }];
+        store
+            .add_message_full(&sid, 0, Role::Assistant, "calling", Some("m"), &calls, None)
+            .unwrap();
+        store
+            .add_message_full(&sid, 1, Role::Tool, "result", None, &[], Some("c1"))
+            .unwrap();
+
+        let msgs = store.load_messages(&sid).unwrap();
+        assert_eq!(msgs[0].tool_calls.len(), 1);
+        assert_eq!(msgs[0].tool_calls[0].name, "read_file");
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("c1"));
     }
 
     #[test]

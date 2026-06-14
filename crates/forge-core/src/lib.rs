@@ -87,7 +87,12 @@ impl Session {
         let seq = stored.len() as i64;
         let transcript = stored
             .into_iter()
-            .map(|m| Message::new(m.role, m.content))
+            .map(|m| Message {
+                role: m.role,
+                content: m.content,
+                tool_calls: m.tool_calls,
+                tool_call_id: m.tool_call_id,
+            })
             .collect();
         Ok(Self::build(
             session_id.to_string(),
@@ -233,12 +238,14 @@ impl Session {
             ));
 
             let seq = self.next_seq();
-            let msg_id = self.store.add_message(
+            let msg_id = self.store.add_message_full(
                 &self.id,
                 seq,
                 Role::Assistant,
                 &resp.content,
                 Some(&decision.model),
+                &resp.tool_calls,
+                None,
             )?;
             if step == 0 {
                 self.store.record_routing(
@@ -259,8 +266,15 @@ impl Session {
             for call in &resp.tool_calls {
                 let result = self.invoke_tool(&msg_id, call).await?;
                 let seq = self.next_seq();
-                self.store
-                    .add_message(&self.id, seq, Role::Tool, &result, None)?;
+                self.store.add_message_full(
+                    &self.id,
+                    seq,
+                    Role::Tool,
+                    &result,
+                    None,
+                    &[],
+                    Some(&call.id),
+                )?;
                 self.transcript.push(Message::tool_result(&call.id, result));
             }
         }
