@@ -1,20 +1,20 @@
-//! `TuiPresenter`: the interactive ratatui+crossterm renderer. It owns the terminal,
-//! folds each [`PresenterEvent`] into [`app::App`], and repaints — so the UI updates live
-//! as a turn progresses. `confirm` shows a permission prompt and blocks on a key. All the
-//! rendering logic lives in `app` (pure, TestBackend-tested); this module is the I/O shell.
+//! `TuiPresenter`: the synchronous ratatui+crossterm renderer for `forge run --tui`. It
+//! owns an *inline* terminal viewport (no alternate screen), folds each [`PresenterEvent`]
+//! into [`app::App`], flushes finalized lines into the terminal's native scrollback, and
+//! redraws the small pinned live region. `confirm` shows a permission prompt and blocks on
+//! a key. All rendering lives in `app` (pure, TestBackend-tested); this is the I/O shell.
 
 use std::io::{self, Stdout};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use forge_types::SideEffect;
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::text::Line as TextLine;
+use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
-use crate::app::{self, handle_key, App, InputOutcome, KeyKind, Line};
+use crate::app::{self, banner_lines, handle_key, App, InputOutcome, KeyKind, LIVE_H};
 use crate::{Presenter, PresenterEvent};
 
 pub struct TuiPresenter {
@@ -23,36 +23,60 @@ pub struct TuiPresenter {
 }
 
 impl TuiPresenter {
-    /// Enter raw mode + the alternate screen and take over the terminal.
+    /// Enter raw mode + an inline viewport and take over the bottom of the terminal.
     pub fn new() -> io::Result<Self> {
         enable_raw_mode()?;
         // From here on, any failure must undo raw mode — Drop won't run because the
         // struct isn't constructed yet, which would otherwise leave the shell broken.
         Self::enter().inspect_err(|_| {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
         })
     }
 
     fn enter() -> io::Result<Self> {
-        let mut out = io::stdout();
-        execute!(out, EnterAlternateScreen)?;
-        let terminal = Terminal::new(CrosstermBackend::new(out))?;
-        Ok(Self {
+        let backend = CrosstermBackend::new(io::stdout());
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(LIVE_H),
+            },
+        )?;
+        let width = terminal.size().map(|s| s.width).unwrap_or(80);
+        let banner = banner_lines(width);
+        let mut me = Self {
             terminal,
             app: App::default(),
-        })
+        };
+        me.insert_lines(banner);
+        Ok(me)
+    }
+
+    fn insert_lines(&mut self, lines: Vec<TextLine<'static>>) {
+        if lines.is_empty() {
+            return;
+        }
+        let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
+        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let height = (para.line_count(width) as u16).max(1);
+        let _ = self.terminal.insert_before(height, |buf| {
+            para.render(buf.area, buf);
+        });
+    }
+
+    fn flush(&mut self) {
+        let lines = self.app.drain_flush();
+        self.insert_lines(lines);
     }
 
     fn draw(&mut self) {
         let app = &self.app;
-        let _ = self.terminal.draw(|f| app::render(f, app));
+        let _ = self.terminal.draw(|f| app::render_live(f, app));
     }
 
     fn restore(&mut self) -> io::Result<()> {
         disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
         self.terminal.show_cursor()?;
+        println!();
         Ok(())
     }
 }
@@ -66,6 +90,7 @@ impl Drop for TuiPresenter {
 impl Presenter for TuiPresenter {
     fn emit(&mut self, event: PresenterEvent) {
         self.app.apply(event);
+        self.flush();
         self.draw();
     }
 
@@ -110,8 +135,9 @@ impl Presenter for TuiPresenter {
                     match handle_key(&mut self.app.input, key) {
                         InputOutcome::Editing => self.draw(),
                         InputOutcome::Submit(line) => {
-                            // Echo the user's message into the transcript.
-                            self.app.lines.push(Line::User(line.clone()));
+                            // Echo the user's message into scrollback.
+                            self.app.submit_user(&line);
+                            self.flush();
                             self.draw();
                             return Some(line);
                         }

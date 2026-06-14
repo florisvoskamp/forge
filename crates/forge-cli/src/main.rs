@@ -295,8 +295,10 @@ async fn chat(mock: bool, mode: Option<Mode>, resume: Option<String>, plain: boo
 /// Animated TUI chat loop: renders at ~16fps, runs each turn on a task so a spinner
 /// ticks (and streamed tokens flow) while the model works.
 async fn run_chat_tui(mock: bool, mode: Option<Mode>, resume: Option<String>) -> Result<()> {
-    use forge_tui::{handle_key, App, ChannelPresenter, InputOutcome, KeyKind, Line, Tui, UiMsg};
-    use std::time::Duration;
+    use forge_tui::{
+        banner_lines, handle_key, App, ChannelPresenter, InputOutcome, KeyKind, Tui, UiMsg,
+    };
+    use std::time::{Duration, Instant};
 
     let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -304,15 +306,30 @@ async fn run_chat_tui(mock: bool, mode: Option<Mode>, resume: Option<String>) ->
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
 
     let mut tui = Tui::new().context("initializing TUI")?;
+    // The welcome banner is a one-time print into scrollback (not a render branch).
+    tui.insert_lines(banner_lines(tui.width()));
     let mut app = App::default();
     let mut busy = false;
     let mut pending: Option<std::sync::mpsc::Sender<bool>> = None;
+    // Baseline for the spinner: deriving the tick from elapsed time keeps the animation
+    // speed independent of the loop frequency (one frame per 60ms, exactly as before).
+    let mut busy_since = Instant::now();
+    // Only redraw when state actually changed: idle frames cost nothing and the whole
+    // conversation isn't rebuilt 16×/sec for no reason.
+    let mut dirty = true;
+    let mut quit = false;
 
-    loop {
-        app.busy = busy;
-        tui.draw(&app);
+    while !quit {
+        if dirty {
+            app.busy = busy;
+            tui.draw(&app);
+            dirty = false;
+        }
 
-        if let Some(key) = tui.poll_key().context("reading input")? {
+        // Drain *all* buffered keystrokes this iteration. Reading one per frame throttled
+        // fast typing to the frame rate (~16 keys/sec) — the source of the input lag.
+        while let Some(key) = tui.poll_key().context("reading input")? {
+            dirty = true;
             if let Some(reply) = pending.take() {
                 // Answering a permission prompt.
                 let yes = matches!(
@@ -323,15 +340,17 @@ async fn run_chat_tui(mock: bool, mode: Option<Mode>, resume: Option<String>) ->
                 app.prompt = None;
             } else if busy {
                 if matches!(key, KeyKind::Esc) {
+                    quit = true;
                     break;
                 }
             } else {
                 match handle_key(&mut app.input, key) {
                     InputOutcome::Submit(line) => {
-                        app.lines.push(Line::User(line.clone()));
+                        app.submit_user(&line);
                         app.done = false;
                         app.tick = 0;
                         busy = true;
+                        busy_since = Instant::now();
                         let s = session.clone();
                         let dt = done_tx.clone();
                         tokio::spawn(async move {
@@ -339,13 +358,20 @@ async fn run_chat_tui(mock: bool, mode: Option<Mode>, resume: Option<String>) ->
                             let _ = dt.send(());
                         });
                     }
-                    InputOutcome::Quit => break,
+                    InputOutcome::Quit => {
+                        quit = true;
+                        break;
+                    }
                     InputOutcome::Editing => {}
                 }
             }
         }
+        if quit {
+            break;
+        }
 
         while let Ok(msg) = rx.try_recv() {
+            dirty = true;
             match msg {
                 UiMsg::Event(e) => app.apply(e),
                 UiMsg::Permission {
@@ -361,11 +387,23 @@ async fn run_chat_tui(mock: bool, mode: Option<Mode>, resume: Option<String>) ->
 
         if busy && done_rx.try_recv().is_ok() {
             busy = false;
+            dirty = true;
         }
         if busy {
-            app.tick = app.tick.wrapping_add(1);
+            let t = (busy_since.elapsed().as_millis() / 60) as usize;
+            if t != app.tick {
+                app.tick = t;
+                dirty = true;
+            }
         }
-        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Push any finalized lines into native scrollback (above the pinned live region).
+        let flushed = app.drain_flush();
+        if !flushed.is_empty() {
+            tui.insert_lines(flushed);
+            dirty = true;
+        }
+        tokio::time::sleep(Duration::from_millis(16)).await;
     }
     Ok(())
 }

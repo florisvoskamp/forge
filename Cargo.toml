@@ -36,7 +36,9 @@ clap = { version = "4.6", features = ["derive"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 genai = "0.6"
-ratatui = "0.30"
+# unstable-rendered-line-info: Paragraph::line_count, used to size insert_before so
+# scrollback lines never clip or overlap the inline viewport. Compiles on stable.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 
 [profile.release]

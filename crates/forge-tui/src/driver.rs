@@ -8,15 +8,14 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use forge_types::SideEffect;
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::text::Line as TextLine;
+use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
-use crate::app::{self, App, KeyKind};
+use crate::app::{self, App, KeyKind, LIVE_H};
 use crate::{Presenter, PresenterEvent};
 
 /// A message from a running turn to the render loop.
@@ -66,7 +65,9 @@ impl Presenter for ChannelPresenter {
     }
 }
 
-/// Owns the terminal for the render loop (raw mode + alternate screen).
+/// Owns the terminal for the render loop. Uses an *inline* viewport (no alternate screen):
+/// finalized lines flow into the terminal's native scrollback via [`Tui::insert_lines`],
+/// and only the small pinned live region is redrawn each frame.
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -74,15 +75,36 @@ pub struct Tui {
 impl Tui {
     pub fn new() -> io::Result<Self> {
         enable_raw_mode()?;
-        let mut out = io::stdout();
-        execute!(out, EnterAlternateScreen)?;
-        Ok(Self {
-            terminal: Terminal::new(CrosstermBackend::new(out))?,
-        })
+        let backend = CrosstermBackend::new(io::stdout());
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(LIVE_H),
+            },
+        )?;
+        Ok(Self { terminal })
+    }
+
+    /// Current terminal width (for building width-dependent scrollback like the banner).
+    pub fn width(&self) -> u16 {
+        self.terminal.size().map(|s| s.width).unwrap_or(80)
+    }
+
+    /// Push finalized lines into the terminal's native scrollback, above the live region.
+    pub fn insert_lines(&mut self, lines: Vec<TextLine<'static>>) {
+        if lines.is_empty() {
+            return;
+        }
+        let width = self.width();
+        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let height = (para.line_count(width) as u16).max(1);
+        let _ = self.terminal.insert_before(height, |buf| {
+            para.render(buf.area, buf);
+        });
     }
 
     pub fn draw(&mut self, app: &App) {
-        let _ = self.terminal.draw(|f| app::render(f, app));
+        let _ = self.terminal.draw(|f| app::render_live(f, app));
     }
 
     /// Non-blocking: returns a keystroke if one is pending, else `None`.
@@ -112,7 +134,8 @@ impl Tui {
 impl Drop for Tui {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
+        // No alternate screen to leave: the conversation stays in the user's scrollback.
+        println!();
     }
 }
