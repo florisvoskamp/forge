@@ -156,6 +156,89 @@ impl Store {
             |row| row.get(0),
         )?)
     }
+
+    /// Past sessions, newest first (by insertion order, then creation time).
+    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.cwd, s.permission_mode, s.created_at, s.total_cost_usd,
+                    (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id),
+                    (SELECT content FROM message m WHERE m.session_id = s.id
+                       AND m.role = 'user' ORDER BY m.seq LIMIT 1)
+             FROM session s ORDER BY s.created_at DESC, s.rowid DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                cwd: row.get(1)?,
+                permission_mode: row.get(2)?,
+                created_at: row.get(3)?,
+                total_cost_usd: row.get(4)?,
+                message_count: row.get(5)?,
+                preview: row.get(6)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Full session ids whose id starts with `prefix` (git-style abbreviation).
+    pub fn matching_session_ids(&self, prefix: &str) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT id FROM session WHERE id LIKE ?1 || '%'")?;
+        let rows = stmt.query_map([prefix], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Whether a session with this id exists.
+    pub fn session_exists(&self, session_id: &str) -> Result<bool> {
+        let n: i64 = self.lock()?.query_row(
+            "SELECT COUNT(*) FROM session WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// All messages of a session, in turn order (by seq).
+    pub fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT role, content, model FROM message WHERE session_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            let role: String = row.get(0)?;
+            Ok(StoredMessage {
+                role: Role::parse(&role).unwrap_or(Role::User),
+                content: row.get(1)?,
+                model: row.get(2)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+}
+
+/// A persisted message, as read back from the store.
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    pub role: Role,
+    pub content: String,
+    pub model: Option<String>,
+}
+
+/// A one-line summary of a past session, for `forge sessions`.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: String,
+    pub cwd: String,
+    pub permission_mode: String,
+    pub created_at: i64,
+    pub total_cost_usd: f64,
+    pub message_count: i64,
+    /// First user message, if any.
+    pub preview: Option<String>,
 }
 
 #[cfg(test)]
@@ -195,5 +278,73 @@ mod tests {
 
         assert_eq!(store.message_count(&sid).unwrap(), 1);
         assert!((store.session_cost(&sid).unwrap() - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn load_messages_returns_seq_order() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("/tmp", "default").unwrap();
+        // Insert out of order; load must sort by seq.
+        store
+            .add_message(&sid, 2, Role::Tool, "tool result", None)
+            .unwrap();
+        store
+            .add_message(&sid, 0, Role::User, "do the thing", None)
+            .unwrap();
+        store
+            .add_message(&sid, 1, Role::Assistant, "on it", Some("opus"))
+            .unwrap();
+
+        let msgs = store.load_messages(&sid).unwrap();
+        let roles: Vec<_> = msgs.iter().map(|m| m.role).collect();
+        assert_eq!(roles, vec![Role::User, Role::Assistant, Role::Tool]);
+        assert_eq!(msgs[0].content, "do the thing");
+        assert_eq!(msgs[1].model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn list_sessions_newest_first_with_preview_and_count() {
+        let store = Store::open_in_memory().unwrap();
+
+        let a = store.create_session("/a", "default").unwrap();
+        store
+            .add_message(&a, 0, Role::User, "first task", None)
+            .unwrap();
+
+        let b = store.create_session("/b", "plan").unwrap();
+        store
+            .add_message(&b, 0, Role::User, "second task", None)
+            .unwrap();
+        store
+            .add_message(&b, 1, Role::Assistant, "working", Some("opus"))
+            .unwrap();
+
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+        // Newest (b) first.
+        assert_eq!(sessions[0].id, b);
+        assert_eq!(sessions[0].preview.as_deref(), Some("second task"));
+        assert_eq!(sessions[0].message_count, 2);
+        assert_eq!(sessions[1].id, a);
+        assert_eq!(sessions[1].message_count, 1);
+    }
+
+    #[test]
+    fn session_exists_reports_presence() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_session("/x", "default").unwrap();
+        assert!(store.session_exists(&id).unwrap());
+        assert!(!store.session_exists("nope").unwrap());
+    }
+
+    #[test]
+    fn matching_session_ids_resolves_a_prefix() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_session("/x", "default").unwrap();
+        let prefix: String = id.chars().take(8).collect();
+
+        let matches = store.matching_session_ids(&prefix).unwrap();
+        assert_eq!(matches, vec![id]);
+        assert!(store.matching_session_ids("zzzzzzzz").unwrap().is_empty());
     }
 }

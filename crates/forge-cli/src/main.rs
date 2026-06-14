@@ -40,7 +40,12 @@ enum Command {
         /// Render the interactive ratatui TUI instead of plain line output.
         #[arg(long)]
         tui: bool,
+        /// Resume an existing session by id instead of starting a new one.
+        #[arg(long)]
+        resume: Option<String>,
     },
+    /// List past sessions (newest first).
+    Sessions,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -76,11 +81,55 @@ async fn main() -> Result<()> {
             mock,
             mode,
             tui,
-        } => run(prompt.join(" "), mock, mode, tui).await,
+            resume,
+        } => run(prompt.join(" "), mock, mode, tui, resume).await,
+        Command::Sessions => sessions(),
     }
 }
 
-async fn run(prompt: String, mock: bool, mode: Option<Mode>, tui: bool) -> Result<()> {
+fn open_store() -> Result<Store> {
+    std::fs::create_dir_all(".forge").context("creating .forge directory")?;
+    Store::open(Path::new(".forge/forge.db")).context("opening session store")
+}
+
+/// Resolve a (possibly abbreviated) session id to a single full id, git-style.
+fn resolve_session(store: &Store, prefix: &str) -> Result<String> {
+    let mut matches = store
+        .matching_session_ids(prefix)
+        .context("looking up session")?;
+    match matches.len() {
+        0 => anyhow::bail!("no session matching '{prefix}' — see `forge sessions`"),
+        1 => Ok(matches.remove(0)),
+        n => anyhow::bail!("'{prefix}' is ambiguous ({n} sessions match) — use more characters"),
+    }
+}
+
+fn sessions() -> Result<()> {
+    let store = open_store()?;
+    let list = store.list_sessions().context("listing sessions")?;
+    if list.is_empty() {
+        println!("no sessions yet — run `forge run \"<task>\"` to start one");
+        return Ok(());
+    }
+    for s in list {
+        let id: String = s.id.chars().take(8).collect();
+        let preview = s.preview.unwrap_or_default();
+        let preview: String = preview.chars().take(50).collect();
+        println!(
+            "{id}  ${:>8.4}  {:>3} msgs  {}",
+            s.total_cost_usd, s.message_count, preview
+        );
+    }
+    Ok(())
+}
+
+async fn run(
+    prompt: String,
+    mock: bool,
+    mode: Option<Mode>,
+    tui: bool,
+    resume: Option<String>,
+) -> Result<()> {
     if prompt.trim().is_empty() {
         anyhow::bail!("empty prompt — usage: forge run \"<your task>\"");
     }
@@ -90,9 +139,7 @@ async fn run(prompt: String, mock: bool, mode: Option<Mode>, tui: bool) -> Resul
         config.permission_mode = m.into();
     }
 
-    // Per-project local state under ./.forge (gitignored).
-    std::fs::create_dir_all(".forge").context("creating .forge directory")?;
-    let store = Store::open(Path::new(".forge/forge.db")).context("opening session store")?;
+    let store = open_store()?;
 
     let provider: Box<dyn Provider> = if mock {
         Box::new(MockProvider)
@@ -110,9 +157,18 @@ async fn run(prompt: String, mock: bool, mode: Option<Mode>, tui: bool) -> Resul
         Box::new(HeadlessPresenter::default())
     };
 
-    let cwd = std::env::current_dir()?.display().to_string();
-    let mut session = Session::start(store, provider, router, tools, presenter, config, &cwd)
-        .context("starting session")?;
+    let mut session = match resume {
+        Some(prefix) => {
+            let full = resolve_session(&store, &prefix)?;
+            Session::resume(store, provider, router, tools, presenter, config, &full)
+                .with_context(|| format!("resuming session {full}"))?
+        }
+        None => {
+            let cwd = std::env::current_dir()?.display().to_string();
+            Session::start(store, provider, router, tools, presenter, config, &cwd)
+                .context("starting session")?
+        }
+    };
 
     session
         .run_turn(&prompt)
