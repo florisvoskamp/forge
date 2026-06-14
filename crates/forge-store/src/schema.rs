@@ -56,4 +56,5 @@ CREATE TABLE IF NOT EXISTS usage (
     cost_usd      REAL NOT NULL,
     created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
+CREATE INDEX IF NOT EXISTS idx_usage_created_at ON usage(created_at);
 "#;

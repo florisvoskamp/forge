@@ -8,15 +8,33 @@ use forge_types::TaskTier;
 
 pub mod pricing;
 
-/// Live budget context the router considers when choosing a tier.
-#[derive(Debug, Clone, Copy, Default)]
+/// Live budget context the router considers when choosing a tier. Carries both the daily
+/// and monthly axes (FR-5); the stricter of the two governs.
+#[derive(Debug, Clone, Copy)]
 pub struct BudgetState {
     pub spent_today_usd: f64,
-    pub daily_budget_usd: Option<f64>,
+    pub daily_cap_usd: Option<f64>,
+    pub spent_month_usd: f64,
+    pub monthly_cap_usd: Option<f64>,
+    /// Fraction of a cap at which to warn (e.g. 0.8 = 80%).
+    pub warn_fraction: f64,
 }
 
-/// Where spending sits relative to the configured daily cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Default for BudgetState {
+    fn default() -> Self {
+        Self {
+            spent_today_usd: 0.0,
+            daily_cap_usd: None,
+            spent_month_usd: 0.0,
+            monthly_cap_usd: None,
+            warn_fraction: DEFAULT_WARN_FRACTION,
+        }
+    }
+}
+
+/// Where spending sits relative to a cap. Ordered `Ok < Warning < Exhausted` so the stricter
+/// of two axes can be taken with `.max()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BudgetStatus {
     /// No cap, or comfortably under it.
     Ok,
@@ -26,17 +44,25 @@ pub enum BudgetStatus {
     Exhausted,
 }
 
-/// Fraction of the cap at which to warn the user.
-const WARN_FRACTION: f64 = 0.8;
+/// Default fraction of the cap at which to warn the user.
+pub const DEFAULT_WARN_FRACTION: f64 = 0.8;
 
 impl BudgetState {
-    /// Classify current spending against the cap.
-    pub fn status(&self) -> BudgetStatus {
-        match self.daily_budget_usd {
-            Some(cap) if self.spent_today_usd >= cap => BudgetStatus::Exhausted,
-            Some(cap) if self.spent_today_usd >= cap * WARN_FRACTION => BudgetStatus::Warning,
+    fn axis(spent: f64, cap: Option<f64>, warn: f64) -> BudgetStatus {
+        match cap {
+            Some(c) if spent >= c => BudgetStatus::Exhausted,
+            Some(c) if spent >= c * warn => BudgetStatus::Warning,
             _ => BudgetStatus::Ok,
         }
+    }
+
+    /// Classify current spending: the stricter of the daily and monthly axes wins.
+    pub fn status(&self) -> BudgetStatus {
+        Self::axis(self.spent_today_usd, self.daily_cap_usd, self.warn_fraction).max(Self::axis(
+            self.spent_month_usd,
+            self.monthly_cap_usd,
+            self.warn_fraction,
+        ))
     }
 }
 
@@ -130,7 +156,8 @@ mod tests {
     fn budget_status_thresholds() {
         let mk = |spent| BudgetState {
             spent_today_usd: spent,
-            daily_budget_usd: Some(10.0),
+            daily_cap_usd: Some(10.0),
+            ..Default::default()
         };
         assert_eq!(mk(0.0).status(), BudgetStatus::Ok);
         assert_eq!(mk(7.99).status(), BudgetStatus::Ok);
@@ -144,9 +171,22 @@ mod tests {
     fn no_cap_is_always_ok() {
         let b = BudgetState {
             spent_today_usd: 1000.0,
-            daily_budget_usd: None,
+            ..Default::default()
         };
         assert_eq!(b.status(), BudgetStatus::Ok);
+    }
+
+    #[test]
+    fn stricter_axis_wins() {
+        // day Ok, month Exhausted -> Exhausted (AC-8).
+        let b = BudgetState {
+            spent_today_usd: 1.0,
+            daily_cap_usd: Some(100.0),
+            spent_month_usd: 80.0,
+            monthly_cap_usd: Some(80.0),
+            warn_fraction: DEFAULT_WARN_FRACTION,
+        };
+        assert_eq!(b.status(), BudgetStatus::Exhausted);
     }
 
     #[test]
@@ -166,7 +206,8 @@ mod tests {
     fn exhausted_budget_downshifts() {
         let budget = BudgetState {
             spent_today_usd: 5.0,
-            daily_budget_usd: Some(5.0),
+            daily_cap_usd: Some(5.0),
+            ..Default::default()
         };
         let d = router().route("refactor the whole architecture", budget);
         assert_eq!(d.tier, TaskTier::Trivial);

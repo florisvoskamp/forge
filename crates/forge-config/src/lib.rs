@@ -163,12 +163,47 @@ pub fn builtin_deny_rules() -> Vec<PermissionRule> {
 pub struct MeshConfig {
     /// Tier -> model id. The heuristic router maps a classified task to one of these.
     pub models: HashMap<String, String>,
-    /// Optional daily budget cap in USD; the router downshifts/blocks as it is approached.
+    /// Daily spend cap in USD across all sessions (FR-5). `daily_cap_usd` is the preferred
+    /// key; `daily_budget_usd` is kept as a backward-compatible alias.
+    #[serde(alias = "daily_cap_usd")]
     pub daily_budget_usd: Option<f64>,
+    /// Monthly spend cap in USD across all sessions. Absent = unlimited.
+    #[serde(default)]
+    pub monthly_cap_usd: Option<f64>,
+    /// Fraction of a cap that triggers a warning (default 0.8).
+    #[serde(default = "default_warn_threshold")]
+    pub warn_threshold: f64,
+    /// Enforcement behavior once a cap is reached.
+    #[serde(default)]
+    pub budget: BudgetBehavior,
     /// Per-model pricing overrides (USD per 1k tokens), applied on top of bundled
     /// defaults so a price change needs no release (A-7). Keyed by model id.
     #[serde(default)]
     pub pricing: HashMap<String, PriceOverride>,
+}
+
+fn default_warn_threshold() -> f64 {
+    0.8
+}
+
+/// What Forge does once a budget cap is reached (FR-5).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BudgetBehavior {
+    /// Refuse model calls once a cap is exceeded (overridable per-turn via
+    /// `FORGE_BUDGET_OVERRIDE=1`). Default true.
+    pub hard_stop: bool,
+    /// A cap downshifts/stops even an explicitly pinned model. Default true. (Model pinning
+    /// is not yet a feature; this is forward-compatible config.)
+    pub cap_overrides_pin: bool,
+}
+
+impl Default for BudgetBehavior {
+    fn default() -> Self {
+        Self {
+            hard_stop: true,
+            cap_overrides_pin: true,
+        }
+    }
 }
 
 /// A user-supplied price for one model (USD per 1,000 tokens).
@@ -195,6 +230,9 @@ impl Default for Config {
             mesh: MeshConfig {
                 models,
                 daily_budget_usd: None,
+                monthly_cap_usd: None,
+                warn_threshold: default_warn_threshold(),
+                budget: BudgetBehavior::default(),
                 pricing: HashMap::new(),
             },
             permissions: PermissionsConfig::default(),

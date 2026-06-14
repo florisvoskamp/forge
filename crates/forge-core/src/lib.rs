@@ -172,20 +172,50 @@ impl Session {
 
     /// Run one full turn: route -> (model -> tools)* -> final answer. Returns the answer.
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, CoreError> {
-        // 1. Route the task (deterministic, no model call) and record why.
+        // 1. Route the task (deterministic, no model call) and record why. The budget is
+        // aggregated across ALL sessions for the current local day + month (FR-5), not one
+        // session's running total.
         let budget = BudgetState {
-            spent_today_usd: self.store.session_cost(&self.id)?,
-            daily_budget_usd: self.config.mesh.daily_budget_usd,
+            spent_today_usd: self.store.spend_today_usd()?,
+            daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_month_usd: self.store.spend_this_month_usd()?,
+            monthly_cap_usd: self.config.mesh.monthly_cap_usd,
+            warn_fraction: self.config.mesh.warn_threshold,
         };
+        let status = budget.status();
+
+        // Hard stop: once a cap is exceeded, refuse the call before any provider request
+        // (the cap is never silently exceeded). Overridable per process via
+        // FORGE_BUDGET_OVERRIDE=1.
+        if status == BudgetStatus::Exhausted
+            && self.config.mesh.budget.hard_stop
+            && !budget_override_active()
+        {
+            let msg = over_budget_message(&budget);
+            self.presenter.emit(PresenterEvent::Warning(msg.clone()));
+            // Persist the prompt + a system note, make NO provider call, write NO usage row.
+            let seq = self.next_seq();
+            self.store
+                .add_message(&self.id, seq, Role::User, prompt, None)?;
+            self.transcript.push(Message::user(prompt));
+            let seq = self.next_seq();
+            self.store
+                .add_message(&self.id, seq, Role::System, &msg, None)?;
+            self.transcript.push(Message::system(&msg));
+            self.presenter.emit(PresenterEvent::Done {
+                final_text: msg.clone(),
+            });
+            return Ok(msg);
+        }
 
         // Surface budget pressure before routing (FR-5).
-        match budget.status() {
+        match status {
             BudgetStatus::Warning => self.presenter.emit(PresenterEvent::Warning(format!(
-                "approaching daily budget cap (spent ${:.4})",
-                budget.spent_today_usd
+                "approaching budget cap (today ${:.4}, month ${:.4})",
+                budget.spent_today_usd, budget.spent_month_usd
             ))),
             BudgetStatus::Exhausted => self.presenter.emit(PresenterEvent::Warning(format!(
-                "daily budget cap reached (spent ${:.4}) — routing to the cheapest tier",
+                "budget cap reached (today ${:.4}) — routing to the cheapest tier",
                 budget.spent_today_usd
             ))),
             BudgetStatus::Ok => {}
@@ -353,6 +383,26 @@ impl Session {
     }
 }
 
+/// True if the per-process budget override is set (lets one over-budget run proceed).
+fn budget_override_active() -> bool {
+    matches!(
+        std::env::var("FORGE_BUDGET_OVERRIDE").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+fn over_budget_message(b: &BudgetState) -> String {
+    let cap = |c: Option<f64>| c.map(|v| format!("${v:.2}")).unwrap_or_else(|| "∞".into());
+    format!(
+        "budget cap reached — today ${:.4}/{}, month ${:.4}/{}. Refusing further model calls. \
+         Set FORGE_BUDGET_OVERRIDE=1 to proceed.",
+        b.spent_today_usd,
+        cap(b.daily_cap_usd),
+        b.spent_month_usd,
+        cap(b.monthly_cap_usd)
+    )
+}
+
 fn summarize(s: &str) -> String {
     let first = s.lines().next().unwrap_or("").trim();
     if first.len() > 80 {
@@ -501,6 +551,74 @@ mod tests {
             ".",
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn hard_stop_refuses_once_over_cap() {
+        // AC-7: once the day total exceeds the cap, the next turn is refused before any
+        // provider call and records no further spend.
+        let mut config = Config::default();
+        config.mesh.daily_budget_usd = Some(0.05);
+        config.mesh.pricing.insert(
+            "anthropic::claude-opus-4-8".to_string(),
+            forge_config::PriceOverride {
+                input_per_1k: 1.0,
+                output_per_1k: 1.0,
+            },
+        );
+        let mut session = fresh_session(Store::open_in_memory().unwrap(), config);
+
+        // Turn 1 sees $0 spent -> proceeds, spends ~$0.102 (over the $0.05 cap).
+        session
+            .run_turn("refactor the architecture for concurrency")
+            .await
+            .unwrap();
+        let cost_after_1 = session.store.session_cost(session.id()).unwrap();
+        assert!(
+            cost_after_1 > 0.05,
+            "turn 1 should exceed the cap: {cost_after_1}"
+        );
+
+        // Turn 2 is over budget -> hard stop.
+        let answer = session
+            .run_turn("refactor the concurrency design again")
+            .await
+            .unwrap();
+        assert!(
+            answer.contains("budget cap reached"),
+            "turn 2 refused: {answer}"
+        );
+        let cost_after_2 = session.store.session_cost(session.id()).unwrap();
+        assert!(
+            (cost_after_2 - cost_after_1).abs() < 1e-9,
+            "no spend after a hard stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_spend_aggregates_across_sessions() {
+        // AC-1/AC-2: a second session sees the first session's spend in the day total.
+        let path = std::env::temp_dir().join(format!("forge-budget-{}.db", forge_types::new_id()));
+        let config = Config::default(); // no cap -> both proceed; complex tier is priced
+
+        let day_total_after_a = {
+            let mut a = fresh_session(Store::open(&path).unwrap(), config.clone());
+            a.run_turn("refactor the architecture for concurrency")
+                .await
+                .unwrap();
+            a.store.spend_today_usd().unwrap()
+        };
+        assert!(day_total_after_a > 0.0, "session A recorded spend today");
+
+        // A brand-new session on the same DB must see A's spend (the bug was a per-session reset).
+        let b = fresh_session(Store::open(&path).unwrap(), config.clone());
+        let seen_by_b = b.store.spend_today_usd().unwrap();
+        assert!(
+            (seen_by_b - day_total_after_a).abs() < 1e-9,
+            "B sees the cross-session day total: {seen_by_b} vs {day_total_after_a}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

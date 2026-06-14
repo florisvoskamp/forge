@@ -5,10 +5,49 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone};
 use forge_types::{Role, TaskTier, ToolCall, Usage};
 use rusqlite::Connection;
 
 mod schema;
+
+/// Half-open `[start, end)` epoch-second bounds of `now`'s **local** calendar day. Computed
+/// in Rust (not SQLite `strftime`) so the day rolls at the user's midnight and survives DST.
+pub fn day_bounds_local(now: DateTime<Local>) -> (i64, i64) {
+    let midnight = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("valid midnight");
+    let start = Local
+        .from_local_datetime(&midnight)
+        .earliest()
+        .unwrap_or(now);
+    let end = start + ChronoDuration::days(1);
+    (start.timestamp(), end.timestamp())
+}
+
+/// Half-open `[start, end)` epoch-second bounds of `now`'s **local** calendar month.
+pub fn month_bounds_local(now: DateTime<Local>) -> (i64, i64) {
+    let first = now
+        .date_naive()
+        .with_day(1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .expect("valid first-of-month");
+    let start = Local.from_local_datetime(&first).earliest().unwrap_or(now);
+    let next_first = if first.month() == 12 {
+        first
+            .with_year(first.year() + 1)
+            .and_then(|d| d.with_month(1))
+    } else {
+        first.with_month(first.month() + 1)
+    }
+    .expect("valid next month");
+    let end = Local
+        .from_local_datetime(&next_first)
+        .earliest()
+        .unwrap_or(now);
+    (start.timestamp(), end.timestamp())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -168,13 +207,37 @@ impl Store {
         Ok(())
     }
 
-    /// Current running cost of a session.
+    /// Current running cost of a session (the per-session meter — unchanged).
     pub fn session_cost(&self, session_id: &str) -> Result<f64> {
         Ok(self.lock()?.query_row(
             "SELECT total_cost_usd FROM session WHERE id = ?1",
             [session_id],
             |row| row.get(0),
         )?)
+    }
+
+    /// Total spend across ALL sessions whose `usage` rows fall in `[start, end)` epoch secs.
+    /// This is the authoritative budget figure (FR-5): it aggregates `usage.cost_usd` across
+    /// every session, not one session's running total.
+    pub fn spend_between(&self, start: i64, end: i64) -> Result<f64> {
+        Ok(self.lock()?.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage \
+             WHERE created_at >= ?1 AND created_at < ?2",
+            (start, end),
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Spend across all sessions in the current local calendar day.
+    pub fn spend_today_usd(&self) -> Result<f64> {
+        let (s, e) = day_bounds_local(chrono::Local::now());
+        self.spend_between(s, e)
+    }
+
+    /// Spend across all sessions in the current local calendar month.
+    pub fn spend_this_month_usd(&self) -> Result<f64> {
+        let (s, e) = month_bounds_local(chrono::Local::now());
+        self.spend_between(s, e)
     }
 
     /// Number of messages in a session.
@@ -316,6 +379,77 @@ mod tests {
 
         assert_eq!(store.message_count(&sid).unwrap(), 1);
         assert!((store.session_cost(&sid).unwrap() - 0.02).abs() < 1e-9);
+    }
+
+    fn record_cost(store: &Store, cost: f64) {
+        let sid = store.create_session("/tmp", "default").unwrap();
+        let mid = store.add_message(&sid, 0, Role::User, "x", None).unwrap();
+        store
+            .record_usage(
+                &sid,
+                &mid,
+                &Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cost_usd: cost,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn spend_today_sums_across_sessions() {
+        // AC-1: the day total aggregates usage across DIFFERENT sessions, not one session's
+        // running total.
+        let store = Store::open_in_memory().unwrap();
+        record_cost(&store, 0.06);
+        record_cost(&store, 0.05);
+        let today = store.spend_today_usd().unwrap();
+        assert!(
+            (today - 0.11).abs() < 1e-9,
+            "summed across sessions: {today}"
+        );
+    }
+
+    #[test]
+    fn spend_between_excludes_out_of_window_rows() {
+        let store = Store::open_in_memory().unwrap();
+        record_cost(&store, 0.03);
+        assert_eq!(
+            store.spend_between(0, 1).unwrap(),
+            0.0,
+            "a 1970 window excludes today's row"
+        );
+        let (s, e) = day_bounds_local(Local::now());
+        assert!(
+            store.spend_between(s, e).unwrap() > 0.0,
+            "today's window includes it"
+        );
+    }
+
+    #[test]
+    fn day_bounds_are_24h_and_exclude_prior_day() {
+        let now = Local.with_ymd_and_hms(2026, 6, 15, 13, 30, 0).unwrap();
+        let (s, e) = day_bounds_local(now);
+        assert_eq!(e - s, 86_400, "a day is 24h (no DST on this date)");
+        assert!(now.timestamp() >= s && now.timestamp() < e);
+        let prev = Local.with_ymd_and_hms(2026, 6, 14, 23, 0, 0).unwrap();
+        assert!(prev.timestamp() < s, "yesterday is excluded (AC-4)");
+    }
+
+    #[test]
+    fn month_bounds_exclude_prior_month() {
+        let now = Local.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        let (s, e) = month_bounds_local(now);
+        assert!(now.timestamp() >= s && now.timestamp() < e);
+        let jun1 = Local.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        assert_eq!(
+            s,
+            jun1.timestamp(),
+            "window starts at the first of the month"
+        );
+        let may = Local.with_ymd_and_hms(2026, 5, 31, 23, 0, 0).unwrap();
+        assert!(may.timestamp() < s, "May is excluded from June (AC-3)");
     }
 
     #[test]

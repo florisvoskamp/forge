@@ -43,6 +43,7 @@ crossterm = "0.29"
 globset = "0.4"
 shell-words = "1"
 libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [profile.release]
 lto = "thin"
