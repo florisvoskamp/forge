@@ -216,7 +216,10 @@ impl Session {
                 self.presenter
                     .emit(PresenterEvent::AssistantText(resp.content.clone()));
             }
-            self.transcript.push(Message::assistant(&resp.content));
+            self.transcript.push(Message::assistant_tool_calls(
+                &resp.content,
+                resp.tool_calls.clone(),
+            ));
 
             let seq = self.next_seq();
             let msg_id = self.store.add_message(
@@ -247,7 +250,7 @@ impl Session {
                 let seq = self.next_seq();
                 self.store
                     .add_message(&self.id, seq, Role::Tool, &result, None)?;
-                self.transcript.push(Message::new(Role::Tool, result));
+                self.transcript.push(Message::tool_result(&call.id, result));
             }
         }
 

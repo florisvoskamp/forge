@@ -43,6 +43,13 @@ impl Role {
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// Tool calls the assistant requested in this turn (empty otherwise). Carried so the
+    /// transcript can be replayed to a provider as a faithful tool-calling round-trip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// For a `Tool` message, the id of the call this result answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
@@ -50,6 +57,8 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
@@ -60,6 +69,24 @@ impl Message {
     }
     pub fn system(content: impl Into<String>) -> Self {
         Self::new(Role::System, content)
+    }
+    /// An assistant turn that requested tool calls.
+    pub fn assistant_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+    /// A tool result answering a specific call.
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.into()),
+        }
     }
 }
 
