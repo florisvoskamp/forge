@@ -40,6 +40,8 @@ genai = "0.6"
 # scrollback lines never clip or overlap the inline viewport. Compiles on stable.
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
+globset = "0.4"
+shell-words = "1"
 
 [profile.release]
 lto = "thin"

@@ -1,13 +1,13 @@
 //! Layered configuration (defaults -> user file -> project file -> `FORGE_*` env) and
 //! secret resolution. Secrets are never part of the config surface (ADR-0007): API keys
-//! come from environment variables (keyring storage is a planned enhancement).
+//! come from environment variables first, then the OS keyring (`forge auth`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
-use forge_types::{PermissionMode, TaskTier};
+use forge_types::{PermissionDecision, PermissionMode, PermissionRule, RuleSource, TaskTier};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +33,101 @@ pub struct Config {
     pub permission_mode: PermissionMode,
     /// Model Mesh settings (ADR-0006).
     pub mesh: MeshConfig,
+    /// Fine-grained allow/ask/deny rules layered on top of the mode (FR-10).
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
+}
+
+/// Fine-grained permission rules (FR-10). Resolution is by specificity/precedence, not file
+/// order; see `forge_core::permission`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PermissionsConfig {
+    #[serde(default)]
+    pub rules: Vec<RuleConfig>,
+}
+
+/// One TOML rule block: a tool plus exactly one of `allow`/`ask`/`deny` (string or list).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleConfig {
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<OneOrMany>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<OneOrMany>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<OneOrMany>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A TOML scalar-or-array of strings (so `allow = "git *"` and `allow = ["a","b"]` both work).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            OneOrMany::One(s) => vec![s],
+            OneOrMany::Many(v) => v,
+        }
+    }
+}
+
+impl RuleConfig {
+    /// Convert to a runtime rule. Deny is highest precedence if more than one is set.
+    fn to_rule(&self) -> Option<PermissionRule> {
+        let (decision, pats) = if let Some(d) = &self.deny {
+            (PermissionDecision::Deny, d.clone())
+        } else if let Some(a) = &self.ask {
+            (PermissionDecision::Ask, a.clone())
+        } else if let Some(a) = &self.allow {
+            (PermissionDecision::Allow, a.clone())
+        } else {
+            return None; // a block with no decision is ignored
+        };
+        Some(PermissionRule {
+            tool: self.tool.clone(),
+            patterns: pats.into_vec(),
+            decision,
+            source: RuleSource::Configured,
+            reason: self.reason.clone(),
+        })
+    }
+}
+
+/// Built-in safety deny rules — present even with zero config, unoverridable (`Builtin`),
+/// active in every mode including `bypass`.
+pub fn builtin_deny_rules() -> Vec<PermissionRule> {
+    let deny = |tool: &str, pats: &[&str]| PermissionRule {
+        tool: tool.to_string(),
+        patterns: pats.iter().map(|s| s.to_string()).collect(),
+        decision: PermissionDecision::Deny,
+        source: RuleSource::Builtin,
+        reason: Some("built-in safety rule".into()),
+    };
+    let secrets = [
+        "**/.env",
+        "**/*.pem",
+        "**/id_rsa",
+        "**/id_ed25519",
+        "**/.ssh/**",
+        "**/.aws/credentials",
+        "**/.git-credentials",
+    ];
+    vec![
+        deny(
+            "shell",
+            &["rm -rf /", "rm -rf ~", "rm -rf /*", ":(){ :|:& };:"],
+        ),
+        deny("read_file", &secrets),
+        deny("list_dir", &secrets),
+        deny("write_file", &["**/.ssh/**", "/etc/**"]),
+        deny("edit_file", &["**/.ssh/**", "/etc/**"]),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +168,7 @@ impl Default for Config {
                 daily_budget_usd: None,
                 pricing: HashMap::new(),
             },
+            permissions: PermissionsConfig::default(),
         }
     }
 }
@@ -85,6 +181,19 @@ impl Config {
             .get(tier.as_str())
             .or_else(|| self.mesh.models.get(TaskTier::Standard.as_str()))
             .map(String::as_str)
+    }
+
+    /// The full ordered rule set the broker resolves against: built-in safety denies first,
+    /// then configured rules. Precedence is decided in `forge_core::permission`, not order.
+    pub fn permission_rules(&self) -> Vec<PermissionRule> {
+        let mut rules = builtin_deny_rules();
+        rules.extend(
+            self.permissions
+                .rules
+                .iter()
+                .filter_map(RuleConfig::to_rule),
+        );
+        rules
     }
 }
 
@@ -196,5 +305,60 @@ mod tests {
             c.model_for(TaskTier::Trivial),
             c.model_for(TaskTier::Standard)
         );
+    }
+
+    #[test]
+    fn builtin_denies_present_with_empty_config() {
+        let rules = Config::default().permission_rules();
+        assert!(
+            rules.iter().any(|r| r.source == RuleSource::Builtin
+                && r.decision == PermissionDecision::Deny
+                && r.tool == "shell"
+                && r.patterns.iter().any(|p| p == "rm -rf /")),
+            "shell rm -rf / deny must ship by default"
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.tool == "read_file" && r.patterns.iter().any(|p| p == "**/.env")),
+            "secret-read deny must ship by default"
+        );
+    }
+
+    #[test]
+    fn rules_parse_from_toml_and_layer_over_builtins() {
+        let toml = r#"
+[[permissions.rules]]
+tool = "shell"
+allow = ["git *", "cargo *"]
+
+[[permissions.rules]]
+tool = "shell"
+deny = "sudo *"
+reason = "no privilege escalation"
+"#;
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert_eq!(cfg.permissions.rules.len(), 2);
+        let configured: Vec<_> = cfg
+            .permissions
+            .rules
+            .iter()
+            .filter_map(RuleConfig::to_rule)
+            .collect();
+        assert_eq!(configured[0].decision, PermissionDecision::Allow);
+        assert_eq!(configured[0].patterns, vec!["git *", "cargo *"]);
+        assert_eq!(configured[1].decision, PermissionDecision::Deny);
+        assert_eq!(
+            configured[1].reason.as_deref(),
+            Some("no privilege escalation")
+        );
+        // builtins still present in the full set
+        assert!(cfg
+            .permission_rules()
+            .iter()
+            .any(|r| r.source == RuleSource::Builtin));
     }
 }

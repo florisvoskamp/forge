@@ -10,7 +10,7 @@ use forge_provider::{Provider, ToolSpec};
 use forge_store::Store;
 use forge_tools::ToolRegistry;
 use forge_tui::{Presenter, PresenterEvent};
-use forge_types::{Message, PermissionDecision, PermissionMode, Role};
+use forge_types::{Message, PermissionDecision, PermissionMode, PermissionRule, Role};
 
 pub mod permission;
 
@@ -40,6 +40,8 @@ pub struct Session {
     config: Config,
     pricing: Pricing,
     mode: PermissionMode,
+    /// Resolved permission rules (built-in safety denies + configured), consulted per call.
+    rules: Vec<PermissionRule>,
     transcript: Vec<Message>,
     seq: i64,
 }
@@ -121,6 +123,7 @@ impl Session {
     ) -> Self {
         let mode = config.permission_mode;
         let pricing = Pricing::from_config(&config);
+        let rules = config.permission_rules();
         let mut s = Self {
             id,
             store,
@@ -131,6 +134,7 @@ impl Session {
             config,
             pricing,
             mode,
+            rules,
             transcript,
             seq,
         };
@@ -314,11 +318,12 @@ impl Session {
             args: args_json.clone(),
         });
 
-        let allowed = match permission::decide(self.mode, side_effect) {
-            PermissionDecision::Allow => true,
-            PermissionDecision::Deny => false,
-            PermissionDecision::Ask => self.presenter.confirm(&call.name, side_effect),
-        };
+        let allowed =
+            match permission::decide(self.mode, side_effect, &call.name, &call.args, &self.rules) {
+                PermissionDecision::Allow => true,
+                PermissionDecision::Deny => false,
+                PermissionDecision::Ask => self.presenter.confirm(&call.name, side_effect),
+            };
         let permission_label = if allowed { "allowed" } else { "denied" };
 
         let (result, ok) = if allowed {

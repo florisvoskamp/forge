@@ -167,6 +167,31 @@ pub enum PermissionDecision {
     Deny,
 }
 
+/// Where a permission rule came from. Drives precedence: a `Builtin` deny is a safety floor
+/// that no configured rule and no permission mode (not even `Bypass`) can override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleSource {
+    /// Shipped safety default (e.g. `rm -rf /`, secret reads) — unoverridable.
+    Builtin,
+    /// From a user or project `config.toml`.
+    Configured,
+}
+
+/// One fine-grained allow/ask/deny rule (FR-10), matching a tool call by name + argument
+/// pattern. The decision composes with the global [`PermissionMode`] in the broker.
+#[derive(Debug, Clone)]
+pub struct PermissionRule {
+    /// Tool name to match, or `"*"` for any tool.
+    pub tool: String,
+    /// Glob patterns over the relevant argument (the effective shell command, or a file
+    /// path). Empty means "match any arguments for this tool".
+    pub patterns: Vec<String>,
+    pub decision: PermissionDecision,
+    pub source: RuleSource,
+    /// Optional human reason, surfaced when the rule drives the decision.
+    pub reason: Option<String>,
+}
+
 /// A new opaque identifier (UUID v4) as a string.
 pub fn new_id() -> String {
     Uuid::new_v4().to_string()

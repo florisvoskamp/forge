@@ -1,13 +1,24 @@
-//! The permission broker (ADR-0008): the single chokepoint that decides whether a tool
-//! with side effects may run. Resolves a [`PermissionDecision`] from the session's mode.
-//! Per-tool/per-project allow-ask-deny rules layer on top of this (planned enhancement);
-//! the precedence is: an explicit `deny` wins, then `plan` mode denies, then the mode
-//! decides.
+//! The permission broker (ADR-0008): the single chokepoint that decides whether a tool may
+//! run. Two layers compose here:
+//!
+//! 1. **Global modes** ([`decide_mode`]) — the coarse `default`/`accept-edits`/`bypass`/`plan`
+//!    posture over a tool's [`SideEffect`] class.
+//! 2. **Fine-grained rules** ([`decide`], FR-10) — ordered allow/ask/deny rules matching a
+//!    tool by name + argument pattern, layered *on top of* the modes.
+//!
+//! Precedence (single source of truth):
+//! 1. a `Builtin` deny match → Deny (safety floor — beats every mode incl. `bypass`)
+//! 2. any deny match → Deny
+//! 3. `plan` mode + a side effect → Deny (read-only contract; an allow rule cannot escape it)
+//! 4. the most-specific allow/ask match → that decision
+//! 5. otherwise fall back to the mode ([`decide_mode`]).
 
-use forge_types::{PermissionDecision, PermissionMode, SideEffect};
+use forge_types::{PermissionDecision, PermissionMode, PermissionRule, RuleSource, SideEffect};
+use serde_json::Value;
 
-/// Decide the outcome for a tool with the given side-effect class under `mode`.
-pub fn decide(mode: PermissionMode, side_effect: SideEffect) -> PermissionDecision {
+/// Decide the outcome from the global mode alone (the pre-FR-10 behaviour). Retained as the
+/// fallback when no rule matches, so the mode contract is unchanged.
+pub fn decide_mode(mode: PermissionMode, side_effect: SideEffect) -> PermissionDecision {
     use PermissionDecision::*;
 
     // Read-only tools never prompt, regardless of mode.
@@ -31,10 +42,320 @@ pub fn decide(mode: PermissionMode, side_effect: SideEffect) -> PermissionDecisi
     }
 }
 
+/// Decide the outcome for a tool call, composing fine-grained `rules` with the global `mode`.
+pub fn decide(
+    mode: PermissionMode,
+    side_effect: SideEffect,
+    tool_name: &str,
+    args: &Value,
+    rules: &[PermissionRule],
+) -> PermissionDecision {
+    use PermissionDecision::*;
+
+    let matched: Vec<&PermissionRule> = rules
+        .iter()
+        .filter(|r| rule_matches(r, tool_name, args))
+        .collect();
+
+    // 1. Built-in safety floor — unoverridable, even by `bypass` or a project `allow`.
+    if matched
+        .iter()
+        .any(|r| r.source == RuleSource::Builtin && r.decision == Deny)
+    {
+        return Deny;
+    }
+    // 2. Any explicit deny beats any allow/ask.
+    if matched.iter().any(|r| r.decision == Deny) {
+        return Deny;
+    }
+    // 3. `plan` is a hard read-only contract: a side effect is denied and no allow escapes it.
+    if mode == PermissionMode::Plan && side_effect != SideEffect::ReadOnly {
+        return Deny;
+    }
+    // 4. Most-specific allow/ask wins.
+    if let Some(rule) = matched
+        .iter()
+        .filter(|r| r.decision != Deny)
+        .max_by_key(|r| specificity(r))
+    {
+        return rule.decision;
+    }
+    // 5. No rule applies: fall back to the global mode.
+    decide_mode(mode, side_effect)
+}
+
+/// Does this rule apply to the call? Tool name must match (exact or `*`) and, if the rule
+/// carries patterns, at least one must match the relevant argument.
+fn rule_matches(rule: &PermissionRule, tool_name: &str, args: &Value) -> bool {
+    if rule.tool != "*" && rule.tool != tool_name {
+        return false;
+    }
+    if rule.patterns.is_empty() {
+        return true; // matches any args for this tool
+    }
+    // Shell tool: match against every effective command extracted from the command line.
+    if is_shell_tool(tool_name) {
+        let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+        let (segments, parsed_ok) = effective_commands(cmd);
+        let any_glob = segments
+            .iter()
+            .any(|seg| rule.patterns.iter().any(|p| shell_match(p, seg)));
+        if any_glob {
+            return true;
+        }
+        // Conservative floor: if extraction was imperfect, still catch a literal builtin
+        // deny token hidden anywhere in the raw command (e.g. `bash -c 'rm -rf /'`).
+        if rule.source == RuleSource::Builtin && (!parsed_ok || segments.len() > 1) {
+            return rule
+                .patterns
+                .iter()
+                .any(|p| !p.contains('*') && cmd.contains(p.as_str()));
+        }
+        return false;
+    }
+    // Path tools: match against the path arg and its normalized variants.
+    if let Some(path) = args.get("path").and_then(Value::as_str) {
+        let candidates = path_candidates(path);
+        return rule
+            .patterns
+            .iter()
+            .any(|p| candidates.iter().any(|c| path_match(p, c)));
+    }
+    false
+}
+
+fn is_shell_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "shell" | "bash" | "run")
+}
+
+/// Specificity score so the most-specific match wins deterministically (spec §5.4).
+/// Exact tool name beats a `*` tool glob; among args, more literal characters wins.
+fn specificity(rule: &PermissionRule) -> usize {
+    let tool_score = if rule.tool == "*" { 0 } else { 1000 };
+    let arg_score = rule
+        .patterns
+        .iter()
+        .map(|p| p.chars().filter(|c| !matches!(c, '*' | '?')).count())
+        .max()
+        .unwrap_or(0);
+    tool_score + arg_score
+}
+
+/// Extract the effective command(s) from a shell command line so that arg-hidden danger
+/// (`bash -c '...'`, wrapper binaries, `;`/`&&`/`|` chains) is unwrapped before matching.
+/// Returns the segments and whether parsing fully succeeded.
+fn effective_commands(cmd: &str) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
+    let mut ok = true;
+    collect_commands(cmd, 0, &mut out, &mut ok);
+    if out.is_empty() {
+        out.push(cmd.trim().to_string());
+    }
+    (out, ok)
+}
+
+fn collect_commands(cmd: &str, depth: usize, out: &mut Vec<String>, ok: &mut bool) {
+    if depth > 4 {
+        *ok = false;
+        out.push(cmd.trim().to_string());
+        return;
+    }
+    // Split on shell operators into segments, then normalize each.
+    for raw in split_operators(cmd) {
+        let seg = raw.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let Some(tokens) = shell_words::split(seg).ok().filter(|t| !t.is_empty()) else {
+            *ok = false;
+            out.push(seg.to_string());
+            continue;
+        };
+        let stripped = strip_wrappers(&tokens);
+        // `bash -c "<script>"` / `sh -lc "<script>"`: recurse into the inner script.
+        if let Some(inner) = inner_script(&stripped) {
+            collect_commands(&inner, depth + 1, out, ok);
+            continue;
+        }
+        out.push(stripped.join(" "));
+    }
+}
+
+/// Split a command line on `;`, `&&`, `||`, `|` (outside of quotes).
+fn split_operators(cmd: &str) -> Vec<String> {
+    let mut segs = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let bytes: Vec<char> = cmd.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                cur.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    cur.push(c);
+                }
+                ';' => {
+                    segs.push(std::mem::take(&mut cur));
+                }
+                '&' | '|' => {
+                    // consume a possible doubled operator (&& / ||) and a single | .
+                    segs.push(std::mem::take(&mut cur));
+                    if i + 1 < bytes.len() && bytes[i + 1] == c {
+                        i += 1;
+                    }
+                }
+                _ => cur.push(c),
+            },
+        }
+        i += 1;
+    }
+    if !cur.trim().is_empty() {
+        segs.push(cur);
+    }
+    segs
+}
+
+/// Drop leading no-op wrapper binaries so `env X=1 nice rm ...` matches `rm ...`.
+fn strip_wrappers(tokens: &[String]) -> Vec<String> {
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i].as_str() {
+            "nohup" | "nice" | "time" | "command" | "builtin" | "exec" => i += 1,
+            // `env` followed by VAR=VAL assignments
+            "env" => {
+                i += 1;
+                while i < tokens.len() && tokens[i].contains('=') && !tokens[i].starts_with('-') {
+                    i += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    tokens[i..].to_vec()
+}
+
+/// If the command is `bash -c "<script>"` / `sh -lc "<script>"` etc., return the inner script.
+fn inner_script(tokens: &[String]) -> Option<String> {
+    if tokens.len() < 3 {
+        return None;
+    }
+    let bin = std::path::Path::new(&tokens[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&tokens[0]);
+    if !matches!(bin, "bash" | "sh" | "zsh" | "dash") {
+        return None;
+    }
+    // find a `-c` (possibly combined like `-lc`) and take the following token as the script.
+    for (i, t) in tokens.iter().enumerate().skip(1) {
+        if t.starts_with('-') && t.contains('c') {
+            return tokens.get(i + 1).cloned();
+        }
+    }
+    None
+}
+
+/// Lexically normalized candidate forms of a path for matching secret-deny globs against:
+/// the raw path, a `~`-expanded form, and a `.`/`..`-collapsed form. (Symlink resolution is
+/// intentionally out of scope for this iteration; see the spec edge-case table.)
+fn path_candidates(path: &str) -> Vec<String> {
+    let mut out = vec![path.to_string()];
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
+            format!("{home}/{rest}")
+        } else {
+            path.to_string()
+        }
+    } else {
+        path.to_string()
+    };
+    if expanded != path {
+        out.push(expanded.clone());
+    }
+    let cleaned = lexical_clean(&expanded);
+    if !out.contains(&cleaned) {
+        out.push(cleaned);
+    }
+    out
+}
+
+/// Collapse `.` and `..` segments lexically (no filesystem access).
+fn lexical_clean(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut stack: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if matches!(stack.last(), Some(&s) if s != "..") {
+                    stack.pop();
+                } else if !absolute {
+                    stack.push("..");
+                }
+            }
+            p => stack.push(p),
+        }
+    }
+    let joined = stack.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// Glob match for file paths: `*` does not cross `/`, `**` does (delegated to `globset`).
+fn path_match(pattern: &str, path: &str) -> bool {
+    match globset::Glob::new(pattern) {
+        Ok(g) => g.compile_matcher().is_match(path),
+        Err(_) => pattern == path,
+    }
+}
+
+/// Wildcard match for shell commands: `*` matches any run of characters (including `/`),
+/// `?` matches one. Linear time (no backtracking blowup).
+fn shell_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use PermissionDecision::*;
+    use forge_types::PermissionDecision::*;
+    use serde_json::json;
+
+    // ---- mode-only behaviour (unchanged; was `decide`, now `decide_mode`) ----
 
     #[test]
     fn read_only_always_allowed() {
@@ -44,33 +365,324 @@ mod tests {
             PermissionMode::Bypass,
             PermissionMode::Plan,
         ] {
-            assert_eq!(decide(mode, SideEffect::ReadOnly), Allow);
+            assert_eq!(decide_mode(mode, SideEffect::ReadOnly), Allow);
         }
     }
 
     #[test]
     fn plan_denies_all_side_effects() {
-        assert_eq!(decide(PermissionMode::Plan, SideEffect::Write), Deny);
-        assert_eq!(decide(PermissionMode::Plan, SideEffect::Shell), Deny);
+        assert_eq!(decide_mode(PermissionMode::Plan, SideEffect::Write), Deny);
+        assert_eq!(decide_mode(PermissionMode::Plan, SideEffect::Shell), Deny);
     }
 
     #[test]
     fn accept_edits_allows_write_asks_shell() {
         assert_eq!(
-            decide(PermissionMode::AcceptEdits, SideEffect::Write),
+            decide_mode(PermissionMode::AcceptEdits, SideEffect::Write),
             Allow
         );
-        assert_eq!(decide(PermissionMode::AcceptEdits, SideEffect::Shell), Ask);
+        assert_eq!(
+            decide_mode(PermissionMode::AcceptEdits, SideEffect::Shell),
+            Ask
+        );
     }
 
     #[test]
     fn bypass_allows_everything() {
-        assert_eq!(decide(PermissionMode::Bypass, SideEffect::Shell), Allow);
+        assert_eq!(
+            decide_mode(PermissionMode::Bypass, SideEffect::Shell),
+            Allow
+        );
     }
 
     #[test]
     fn default_asks_for_side_effects() {
-        assert_eq!(decide(PermissionMode::Default, SideEffect::Write), Ask);
-        assert_eq!(decide(PermissionMode::Default, SideEffect::Shell), Ask);
+        assert_eq!(decide_mode(PermissionMode::Default, SideEffect::Write), Ask);
+        assert_eq!(decide_mode(PermissionMode::Default, SideEffect::Shell), Ask);
+    }
+
+    // ---- helpers ----
+
+    fn rule(
+        tool: &str,
+        decision: PermissionDecision,
+        src: RuleSource,
+        pats: &[&str],
+    ) -> PermissionRule {
+        PermissionRule {
+            tool: tool.to_string(),
+            patterns: pats.iter().map(|s| s.to_string()).collect(),
+            decision,
+            source: src,
+            reason: None,
+        }
+    }
+    fn builtin_deny(tool: &str, pats: &[&str]) -> PermissionRule {
+        rule(tool, Deny, RuleSource::Builtin, pats)
+    }
+    fn cfg(tool: &str, d: PermissionDecision, pats: &[&str]) -> PermissionRule {
+        rule(tool, d, RuleSource::Configured, pats)
+    }
+    fn shell(cmd: &str) -> Value {
+        json!({ "command": cmd })
+    }
+    fn path(p: &str) -> Value {
+        json!({ "path": p })
+    }
+
+    // ---- spec §3 Given/When/Then ----
+
+    #[test]
+    fn gwt1_allow_rule_auto_approves_in_default_mode() {
+        let rules = [cfg("shell", Allow, &["git *"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                SideEffect::Shell,
+                "shell",
+                &shell("git status"),
+                &rules
+            ),
+            Allow
+        );
+    }
+
+    #[test]
+    fn gwt2_allow_rule_covers_writes() {
+        let rules = [cfg("write_file", Allow, &["src/**"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                SideEffect::Write,
+                "write_file",
+                &path("src/main.rs"),
+                &rules
+            ),
+            Allow
+        );
+    }
+
+    #[test]
+    fn gwt3_no_match_falls_back_to_mode() {
+        let rules = [cfg("shell", Allow, &["git *"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                SideEffect::Shell,
+                "shell",
+                &shell("make deploy"),
+                &rules
+            ),
+            Ask
+        );
+    }
+
+    #[test]
+    fn gwt4_builtin_deny_overrides_bypass() {
+        let rules = [builtin_deny("shell", &["rm -rf /"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Bypass,
+                SideEffect::Shell,
+                "shell",
+                &shell("rm -rf /"),
+                &rules
+            ),
+            Deny
+        );
+    }
+
+    #[test]
+    fn gwt5_secret_read_denied_in_every_mode() {
+        let rules = [builtin_deny("read_file", &["**/.env"])];
+        for mode in [PermissionMode::Default, PermissionMode::Bypass] {
+            assert_eq!(
+                decide(
+                    mode,
+                    SideEffect::ReadOnly,
+                    "read_file",
+                    &path("./.env"),
+                    &rules
+                ),
+                Deny,
+                "secret read must be denied in {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gwt6_deny_beats_allow_on_conflict() {
+        let rules = [
+            cfg("shell", Allow, &["git *"]),
+            cfg("shell", Deny, &["git push *"]),
+        ];
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                SideEffect::Shell,
+                "shell",
+                &shell("git push origin main"),
+                &rules
+            ),
+            Deny
+        );
+    }
+
+    #[test]
+    fn gwt7_most_specific_allow_beats_broad_ask() {
+        let rules = [
+            cfg("shell", Ask, &["*"]),
+            cfg("shell", Allow, &["cargo test*"]),
+        ];
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                SideEffect::Shell,
+                "shell",
+                &shell("cargo test"),
+                &rules
+            ),
+            Allow
+        );
+    }
+
+    #[test]
+    fn gwt8_arg_hidden_danger_is_unwrapped() {
+        let rules = [builtin_deny("shell", &["rm -rf /"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Bypass,
+                SideEffect::Shell,
+                "shell",
+                &shell("bash -c 'rm -rf /'"),
+                &rules
+            ),
+            Deny
+        );
+    }
+
+    #[test]
+    fn gwt9_deny_wins_when_layers_conflict() {
+        // Project layer adds a deny over a user allow on the same command.
+        let rules = [
+            cfg("shell", Allow, &["docker *"]),
+            cfg("shell", Deny, &["docker *"]),
+        ];
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                SideEffect::Shell,
+                "shell",
+                &shell("docker run x"),
+                &rules
+            ),
+            Deny
+        );
+    }
+
+    #[test]
+    fn gwt10_empty_config_is_pure_mode_behaviour() {
+        let rules: [PermissionRule; 0] = [];
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                SideEffect::Shell,
+                "shell",
+                &shell("anything"),
+                &rules
+            ),
+            Ask
+        );
+        assert_eq!(
+            decide(
+                PermissionMode::Bypass,
+                SideEffect::Write,
+                "write_file",
+                &path("x"),
+                &rules
+            ),
+            Allow
+        );
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                SideEffect::ReadOnly,
+                "read_file",
+                &path("x"),
+                &rules
+            ),
+            Allow
+        );
+    }
+
+    // ---- additional safety / extraction / normalization ----
+
+    #[test]
+    fn plan_mode_cannot_be_escaped_by_an_allow_rule() {
+        let rules = [cfg("shell", Allow, &["git *"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Plan,
+                SideEffect::Shell,
+                "shell",
+                &shell("git status"),
+                &rules
+            ),
+            Deny
+        );
+    }
+
+    #[test]
+    fn chained_command_each_segment_is_checked() {
+        let rules = [builtin_deny("shell", &["rm -rf /"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Bypass,
+                SideEffect::Shell,
+                "shell",
+                &shell("echo hi && rm -rf /"),
+                &rules
+            ),
+            Deny
+        );
+    }
+
+    #[test]
+    fn env_wrapper_is_stripped_before_matching() {
+        let rules = [builtin_deny("shell", &["rm -rf /"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Bypass,
+                SideEffect::Shell,
+                "shell",
+                &shell("env FOO=1 rm -rf /"),
+                &rules
+            ),
+            Deny
+        );
+    }
+
+    #[test]
+    fn secret_read_via_dotdot_path_is_denied() {
+        let rules = [builtin_deny("read_file", &["**/.env"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Bypass,
+                SideEffect::ReadOnly,
+                "read_file",
+                &path("src/../.env"),
+                &rules
+            ),
+            Deny
+        );
+    }
+
+    #[test]
+    fn shell_match_wildcards() {
+        assert!(shell_match("git *", "git status"));
+        assert!(shell_match("cargo test*", "cargo test --all"));
+        assert!(shell_match("*", "anything at all / with slashes"));
+        assert!(!shell_match("git *", "cargo build"));
+        assert!(shell_match("rm -rf /", "rm -rf /"));
     }
 }
