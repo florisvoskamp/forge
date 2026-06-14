@@ -152,6 +152,16 @@ impl Session {
         self.presenter.read_line()
     }
 
+    /// Surface a turn-level failure to the UI (a warning + a Done marker) so the caller's
+    /// loop ends the turn cleanly instead of leaving it hanging.
+    pub fn notify_error(&mut self, msg: &str) {
+        self.presenter
+            .emit(PresenterEvent::Warning(msg.to_string()));
+        self.presenter.emit(PresenterEvent::Done {
+            final_text: String::new(),
+        });
+    }
+
     fn next_seq(&mut self) -> i64 {
         let n = self.seq;
         self.seq += 1;
@@ -405,8 +415,12 @@ fn over_budget_message(b: &BudgetState) -> String {
 
 fn summarize(s: &str) -> String {
     let first = s.lines().next().unwrap_or("").trim();
-    if first.len() > 80 {
-        format!("{}…", &first[..80])
+    // Truncate by *characters*, not bytes — a byte slice (`&first[..80]`) panics when the
+    // cut falls inside a multi-byte UTF-8 char, which real tool output (file contents, shell
+    // output, accents/emoji) routinely contains.
+    if first.chars().count() > 80 {
+        let head: String = first.chars().take(80).collect();
+        format!("{head}…")
     } else {
         first.to_string()
     }
@@ -551,6 +565,24 @@ mod tests {
             ".",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn summarize_does_not_panic_on_multibyte_boundary() {
+        // Byte 80 lands inside the multi-byte 'é' — `&first[..80]` would panic here.
+        let line = format!(
+            "{}éééééé, and a tail to push well past eighty bytes",
+            "a".repeat(78)
+        );
+        let s = summarize(&line);
+        assert!(s.ends_with('…'), "long line is truncated with an ellipsis");
+        assert!(s.chars().count() <= 81);
+    }
+
+    #[test]
+    fn summarize_passes_short_lines_through() {
+        assert_eq!(summarize("ok: [workspace]"), "ok: [workspace]");
+        assert_eq!(summarize("line one\nline two"), "line one");
     }
 
     #[tokio::test]

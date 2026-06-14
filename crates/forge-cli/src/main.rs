@@ -292,6 +292,15 @@ async fn chat(mock: bool, mode: Option<Mode>, resume: Option<String>, plain: boo
     Ok(())
 }
 
+/// Sends the turn-complete signal on drop — so `busy` is released even if the turn task
+/// panics. Without this, a panic would skip the send and freeze the UI on the spinner.
+struct DoneGuard(std::sync::mpsc::Sender<()>);
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
 /// Animated TUI chat loop: renders at ~16fps, runs each turn on a task so a spinner
 /// ticks (and streamed tokens flow) while the model works.
 async fn run_chat_tui(mock: bool, mode: Option<Mode>, resume: Option<String>) -> Result<()> {
@@ -354,8 +363,13 @@ async fn run_chat_tui(mock: bool, mode: Option<Mode>, resume: Option<String>) ->
                         let s = session.clone();
                         let dt = done_tx.clone();
                         tokio::spawn(async move {
-                            let _ = s.lock().await.run_turn(&line).await;
-                            let _ = dt.send(());
+                            // DoneGuard fires on the way out — normal return OR panic unwind —
+                            // so a panicking turn can never leave the UI stuck "working".
+                            let _done = DoneGuard(dt);
+                            let mut sess = s.lock().await;
+                            if let Err(e) = sess.run_turn(&line).await {
+                                sess.notify_error(&format!("turn failed: {e}"));
+                            }
                         });
                     }
                     InputOutcome::Quit => {
