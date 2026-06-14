@@ -81,6 +81,7 @@ The capabilities that make Forge feel like *his* tool, including the #1 requeste
 | **Assay — analysis mode** ⚒ | **P1 (top user ask)** | Critical multi-agent crew that investigates code/design/architecture/docs for AI-slop, dead weight, unsafe/untested code, bad architecture; ranked findings, fixing opt-in. **Sibling to plan mode.** | [analysis-mode.md](features/analysis-mode.md) | Explicit #1 request; **depends on subagent-orchestration** |
 | **Commands + skills + autosuggest** | **P1** | Slash commands + reusable skills (CC-import compatible) + fuzzy command palette / `@path` autocomplete in the input box. | [command-skill-system.md](features/command-skill-system.md) | **212 skill uses, ~45 custom commands** authored |
 | **MCP client** | **P1** | Connect to MCP servers (stdio + HTTP/SSE), expose their tools through the existing tool path + permission broker; deferred tool loading; CC `.mcp.json` import. | [mcp-client.md](features/mcp-client.md) | **~270 MCP calls** (GitLab MR review = daily) |
+| **Lattice — built-in code intelligence** ⚒ | **P1 (flagship)** | Native, zero-setup semantic+structural code memory (tree-sitter + SQLite, incremental, persistent) that the agent loop **uses automatically** for ranked context retrieval — plus impact/blast-radius, git archaeology, git-native scoping, cross-repo. The "graphify but way better, built-in" feature. **Consolidates 4 former Wave-4 items.** | [code-intelligence.md](features/code-intelligence.md) | Owner relies on external graphify today (hooks-injected); wants it native + automatic + better |
 | **Web search + fetch tools** | **P1** | `web_search` + `web_fetch` tools for research. | _(vision — small; spec next)_ | WebSearch **373** + WebFetch **187** |
 | **Task / todo tracking** | **P1** | Structured task list with live status in the TUI. | _(vision — small; spec next)_ | TodoWrite **79** + Task* **~117** |
 
@@ -100,6 +101,7 @@ The power-user surface that makes the harness "better than Claude Code" (the sta
 | **Interactive clarification** | P2 | AskUserQuestion-style mid-task multiple-choice prompts. | **118** AskUserQuestion uses |
 | **Model selection UX** | P2 | `--model` pin flag, `/model`, effort/usage views (Mesh exists; add the controls). | `/model` **39** |
 | **Statusline / output styles / auto-title** | P2 | Configurable statusline + output styles (he invests in these). | auto-title hook, `/title`, caveman styles |
+| **Token counter + context gauge** | P2 | Live session token totals + context-window fill gauge next to the spinner/cost in the statusline. | [tui-token-counter.md](features/tui-token-counter.md) — explicit request |
 | **Plan mode** | **P2 (deprioritized)** | Read-only planning mode. | **Only 6 sessions / `/plan` 1** — overrated vs reputation; Assay is the higher-value "mode" |
 
 ---
@@ -109,17 +111,19 @@ The power-user surface that makes the harness "better than Claude Code" (the sta
 The Helm-note vision that makes developers switch. Each needs its own deep spec when its
 wave approaches.
 
+> **Note:** the four former Wave-4 code-intelligence items — *persistent semantic code
+> memory*, *AI archaeology*, *git-native context*, *cross-repo intelligence* — have been
+> **consolidated and promoted** into the single **Lattice** spec
+> ([code-intelligence.md](features/code-intelligence.md)) at Wave 2 (P1). They are no longer
+> separate Wave-4 entries.
+
 | Feature | What | Source |
 |---------|------|--------|
-| **Persistent semantic code memory** | AST-aware (tree-sitter) graph of the codebase that survives sessions; real structure/dependency/call-chain understanding; gets smarter over time. | Helm note |
 | **Skills/agents marketplace** | Publish/import skills, commands, agents — "npm for AI workflows" (25% rev share). | Helm note; designed to plug into the command/skill system |
 | **Session replay** | Record prompts + model versions + outputs; replay + diff; auditable, reproducible AI. | Helm note |
 | **Import / migration layer** | Auto-detect + import from Claude Code (skills/commands/agents/hooks/memory/settings), Codex CLI, Aider, Cursor/Windsurf, Continue.dev. | Helm note; prerequisite for CC-compat in skills + MCP specs |
 | **Natural-language shell** | "show me what changed performance-wise since last week" → runs the right commands, diffs, explains. | Helm note |
 | **Shell error interceptor** | Command fails → AI auto-explains + offers a fix, no prompt needed. | Helm note |
-| **AI archaeology** | "why does this exist / who broke this / when was this decided" — semantic search over git history + code. | Helm note |
-| **Git-native context** | Auto-focus on files changed since last commit; no manual file picking. | Helm note |
-| **Cross-repo intelligence** | Work across multiple repos; learn patterns between them. | Helm note |
 | **Voice interface** | whisper.cpp local STT, no cloud. | Helm note |
 | **More providers** | Gemini, Mistral, Cohere, OpenRouter, Groq, llama.cpp / LM Studio. | Helm note (genai already covers several) |
 | **Team layer (monetization)** | Shared team memory + skills registry, team session history/replay, admin/audit/SSO (~$15-20/seat); hosted relay for cross-machine sync. | Helm note |
@@ -138,13 +142,14 @@ Wave 1 (P0, parallel-ish):
 Wave 2 (P1):
   subagent-orchestration ── unblocks ──▶ Assay (analysis mode)   ◀── top user ask
   command-skill-system        web-tools        task-tracking
-  mcp-client
+  mcp-client                  Lattice (built-in code intelligence)  ◀── flagship
 
-Wave 3 (P2):  hooks · compaction · clarification · model UX · statusline · (plan mode)
+Wave 3 (P2):  hooks · compaction · clarification · model UX · statusline ·
+              token-counter+context-gauge · (plan mode)
 
-Wave 4 (P3):  semantic memory · marketplace · replay · import · NL shell ·
-              error interceptor · archaeology · git-native · cross-repo · voice ·
-              more providers · team tier
+Wave 4 (P3):  marketplace · session replay · import/migration · NL shell ·
+              shell error interceptor · voice · more providers · team tier
+              (semantic memory / archaeology / git-native / cross-repo → folded into Lattice)
 ```
 
 Key gates: **Assay requires subagent-orchestration. Shell-tool requires permission-rules.
@@ -190,3 +195,9 @@ graphify injection, auto-title) — validates P2 hooks.
 The analysis/cleanup mode is named **Assay** (`forge assay`) — metallurgy: determining the
 composition and purity of a metal. On-brand with Forge (⚒), distinctive in the AI-CLI space,
 professional. Chosen over Audit / Critique / Inquest.
+
+The built-in code-intelligence subsystem is named **Lattice** (`forge lattice`) — a metal's
+crystal lattice is its fundamental atomic structure, and "lattice" also literally means a
+graph/network: the structural graph underlying the code. On-brand, and it beats the external
+graphify on every axis (native, incremental, agent-automatic retrieval, hybrid
+structural+semantic, impact analysis) — see [code-intelligence.md](features/code-intelligence.md).
