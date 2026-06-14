@@ -4,7 +4,8 @@
 //! (persistence) and a presenter (UI) together, depending on each only through its trait.
 
 use forge_config::Config;
-use forge_mesh::{BudgetState, Router};
+use forge_mesh::pricing::Pricing;
+use forge_mesh::{BudgetState, BudgetStatus, Router};
 use forge_provider::{Provider, ToolSpec};
 use forge_store::Store;
 use forge_tools::ToolRegistry;
@@ -35,6 +36,7 @@ pub struct Session {
     tools: ToolRegistry,
     presenter: Box<dyn Presenter>,
     config: Config,
+    pricing: Pricing,
     mode: PermissionMode,
     transcript: Vec<Message>,
     seq: i64,
@@ -51,6 +53,7 @@ impl Session {
         cwd: &str,
     ) -> Result<Self, CoreError> {
         let mode = config.permission_mode;
+        let pricing = Pricing::from_config(&config);
         let id = store.create_session(cwd, format!("{mode:?}").as_str())?;
         let mut s = Self {
             id,
@@ -60,6 +63,7 @@ impl Session {
             tools,
             presenter,
             config,
+            pricing,
             mode,
             transcript: Vec::new(),
             seq: 0,
@@ -98,6 +102,20 @@ impl Session {
             spent_today_usd: self.store.session_cost(&self.id)?,
             daily_budget_usd: self.config.mesh.daily_budget_usd,
         };
+
+        // Surface budget pressure before routing (FR-5).
+        match budget.status() {
+            BudgetStatus::Warning => self.presenter.emit(PresenterEvent::Warning(format!(
+                "approaching daily budget cap (spent ${:.4})",
+                budget.spent_today_usd
+            ))),
+            BudgetStatus::Exhausted => self.presenter.emit(PresenterEvent::Warning(format!(
+                "daily budget cap reached (spent ${:.4}) — routing to the cheapest tier",
+                budget.spent_today_usd
+            ))),
+            BudgetStatus::Ok => {}
+        }
+
         let decision = self.router.route(prompt, budget);
         self.presenter.emit(PresenterEvent::Routing {
             tier: decision.tier.as_str().to_string(),
@@ -116,10 +134,17 @@ impl Session {
 
         // 3. Model <-> tool loop.
         for step in 0..MAX_STEPS {
-            let resp = self
+            let mut resp = self
                 .provider
                 .complete(&decision.model, &self.transcript, &specs)
                 .await?;
+
+            // Compute the real cost from token counts and the model's price (FR-5, A-7).
+            resp.usage.cost_usd = self.pricing.cost_for(
+                &decision.model,
+                resp.usage.input_tokens,
+                resp.usage.output_tokens,
+            );
 
             if !resp.content.is_empty() {
                 self.presenter
@@ -244,6 +269,22 @@ mod tests {
     use forge_mesh::HeuristicRouter;
     use forge_provider::MockProvider;
     use forge_tui::HeadlessPresenter;
+    use forge_types::SideEffect;
+    use std::sync::{Arc, Mutex};
+
+    /// A presenter that records every event so tests can assert on what was shown.
+    #[derive(Clone, Default)]
+    struct CapturePresenter {
+        events: Arc<Mutex<Vec<PresenterEvent>>>,
+    }
+    impl Presenter for CapturePresenter {
+        fn emit(&mut self, event: PresenterEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+        fn confirm(&mut self, _tool: &str, _side_effect: SideEffect) -> bool {
+            false
+        }
+    }
 
     #[tokio::test]
     async fn full_turn_routes_calls_tool_and_persists() {
@@ -274,5 +315,76 @@ mod tests {
 
     fn session_message_count(s: &Session) -> i64 {
         s.store.message_count(s.id()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cost_accumulates_for_a_priced_model() {
+        let store = Store::open_in_memory().unwrap();
+        let config = Config::default();
+        let mut session = Session::start(
+            store,
+            Box::new(MockProvider),
+            Box::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            ".",
+        )
+        .unwrap();
+
+        // "refactor ... concurrency" routes to the complex tier (a priced model),
+        // so the mock's token counts must turn into a non-zero session cost.
+        session
+            .run_turn("refactor the architecture for concurrency")
+            .await
+            .unwrap();
+        let cost = session.store.session_cost(session.id()).unwrap();
+        assert!(cost > 0.0, "expected a non-zero cost, got {cost}");
+    }
+
+    #[tokio::test]
+    async fn warns_when_budget_threshold_reached() {
+        // Pin the complex model's price so the test is independent of bundled rates:
+        // each complex turn costs (30+12)/1k + (42+18)/1k = 0.102 USD.
+        let mut config = Config::default();
+        config.mesh.daily_budget_usd = Some(0.12); // 80% = 0.096
+        config.mesh.pricing.insert(
+            "anthropic::claude-opus-4-8".to_string(),
+            forge_config::PriceOverride {
+                input_per_1k: 1.0,
+                output_per_1k: 1.0,
+            },
+        );
+
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        let mut session = Session::start(
+            Store::open_in_memory().unwrap(),
+            Box::new(MockProvider),
+            Box::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            config,
+            ".",
+        )
+        .unwrap();
+
+        // Turn 1 spends ~0.102 -> into the warning band (>= 0.096, < 0.12).
+        session
+            .run_turn("refactor the architecture for concurrency")
+            .await
+            .unwrap();
+        // Turn 2 starts already in the warning band, so it must warn.
+        session
+            .run_turn("refactor the concurrency design again")
+            .await
+            .unwrap();
+
+        let warned = events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, PresenterEvent::Warning(_)));
+        assert!(warned, "expected a budget Warning event");
     }
 }

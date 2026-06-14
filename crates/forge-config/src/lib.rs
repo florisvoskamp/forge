@@ -39,6 +39,17 @@ pub struct MeshConfig {
     pub models: HashMap<String, String>,
     /// Optional daily budget cap in USD; the router downshifts/blocks as it is approached.
     pub daily_budget_usd: Option<f64>,
+    /// Per-model pricing overrides (USD per 1k tokens), applied on top of bundled
+    /// defaults so a price change needs no release (A-7). Keyed by model id.
+    #[serde(default)]
+    pub pricing: HashMap<String, PriceOverride>,
+}
+
+/// A user-supplied price for one model (USD per 1,000 tokens).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PriceOverride {
+    pub input_per_1k: f64,
+    pub output_per_1k: f64,
 }
 
 impl Default for Config {
@@ -58,6 +69,7 @@ impl Default for Config {
             mesh: MeshConfig {
                 models,
                 daily_budget_usd: None,
+                pricing: HashMap::new(),
             },
         }
     }

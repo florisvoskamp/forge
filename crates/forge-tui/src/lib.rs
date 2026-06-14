@@ -19,6 +19,8 @@ pub enum PresenterEvent {
         rationale: String,
     },
     AssistantText(String),
+    /// A non-fatal advisory (e.g. budget threshold reached).
+    Warning(String),
     ToolStart {
         name: String,
         args: String,
@@ -79,6 +81,9 @@ impl Presenter for HeadlessPresenter {
             }
             PresenterEvent::AssistantText(text) => {
                 println!("\n{text}");
+            }
+            PresenterEvent::Warning(msg) => {
+                println!("  ⚠ {msg}");
             }
             PresenterEvent::ToolStart { name, args } => {
                 println!("  ↳ {name}({args})");

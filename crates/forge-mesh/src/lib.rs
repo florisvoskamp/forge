@@ -6,6 +6,8 @@
 use forge_config::Config;
 use forge_types::TaskTier;
 
+pub mod pricing;
+
 /// Live budget context the router considers when choosing a tier.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BudgetState {
@@ -13,10 +15,28 @@ pub struct BudgetState {
     pub daily_budget_usd: Option<f64>,
 }
 
+/// Where spending sits relative to the configured daily cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetStatus {
+    /// No cap, or comfortably under it.
+    Ok,
+    /// At or past the warn threshold (default 80% of the cap), not yet over.
+    Warning,
+    /// At or over the cap — the router downshifts to the cheapest tier.
+    Exhausted,
+}
+
+/// Fraction of the cap at which to warn the user.
+const WARN_FRACTION: f64 = 0.8;
+
 impl BudgetState {
-    /// True once spending has reached/passed the configured cap.
-    fn exhausted(&self) -> bool {
-        matches!(self.daily_budget_usd, Some(cap) if self.spent_today_usd >= cap)
+    /// Classify current spending against the cap.
+    pub fn status(&self) -> BudgetStatus {
+        match self.daily_budget_usd {
+            Some(cap) if self.spent_today_usd >= cap => BudgetStatus::Exhausted,
+            Some(cap) if self.spent_today_usd >= cap * WARN_FRACTION => BudgetStatus::Warning,
+            _ => BudgetStatus::Ok,
+        }
     }
 }
 
@@ -76,7 +96,7 @@ impl Router for HeuristicRouter {
         let mut why = rationale.to_string();
 
         // Budget pressure downshifts to the cheapest tier (FR-5).
-        if budget.exhausted() && tier != TaskTier::Trivial {
+        if budget.status() == BudgetStatus::Exhausted && tier != TaskTier::Trivial {
             tier = TaskTier::Trivial;
             rationale = "budget cap reached — downshifted to trivial tier";
             why = rationale.to_string();
@@ -104,6 +124,29 @@ mod tests {
     fn short_prompt_is_trivial() {
         let d = router().route("fix typo", BudgetState::default());
         assert_eq!(d.tier, TaskTier::Trivial);
+    }
+
+    #[test]
+    fn budget_status_thresholds() {
+        let mk = |spent| BudgetState {
+            spent_today_usd: spent,
+            daily_budget_usd: Some(10.0),
+        };
+        assert_eq!(mk(0.0).status(), BudgetStatus::Ok);
+        assert_eq!(mk(7.99).status(), BudgetStatus::Ok);
+        assert_eq!(mk(8.0).status(), BudgetStatus::Warning); // 80% of cap
+        assert_eq!(mk(9.5).status(), BudgetStatus::Warning);
+        assert_eq!(mk(10.0).status(), BudgetStatus::Exhausted);
+        assert_eq!(mk(99.0).status(), BudgetStatus::Exhausted);
+    }
+
+    #[test]
+    fn no_cap_is_always_ok() {
+        let b = BudgetState {
+            spent_today_usd: 1000.0,
+            daily_budget_usd: None,
+        };
+        assert_eq!(b.status(), BudgetStatus::Ok);
     }
 
     #[test]
