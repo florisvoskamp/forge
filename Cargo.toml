@@ -45,6 +45,9 @@ shell-words = "1"
 libc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 pulldown-cmark = { version = "0.12", default-features = false }
+# default-fancy = bundled syntaxes/themes with the pure-Rust fancy-regex backend
+# (no oniguruma C dep → clean cross-compile, smaller footprint).
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 [profile.release]
 lto = "thin"

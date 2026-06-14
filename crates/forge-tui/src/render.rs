@@ -5,9 +5,14 @@
 //! `pulldown-cmark` is *total* (it degrades malformed markdown to literal text and never
 //! panics), so this renderer never drops content or crashes on bad input.
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use std::sync::OnceLock;
+
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{FontStyle, Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
 
 // Palette — mirrors crate::app so rendered markdown belongs to the same TUI.
 const ORANGE: Color = Color::Rgb(255, 145, 60);
@@ -17,6 +22,54 @@ const CODEBG: Color = Color::Rgb(40, 40, 48);
 
 /// The base indent every rendered line carries (matches the plain `body_line` convention).
 const INDENT: &str = "  ";
+
+/// Bundled syntaxes + theme, loaded once. The cost is paid at most once per process and
+/// only when a code block is actually highlighted — never on `forge --help`/`forge run`.
+fn highlighter() -> &'static (SyntaxSet, Theme) {
+    static HL: OnceLock<(SyntaxSet, Theme)> = OnceLock::new();
+    HL.get_or_init(|| {
+        let ss = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
+        let theme = ts
+            .themes
+            .get("base16-ocean.dark")
+            .or_else(|| ts.themes.values().next())
+            .cloned()
+            .unwrap_or_default();
+        (ss, theme)
+    })
+}
+
+/// Syntax-highlight `lines` of source in `lang` into per-line span vectors. Unknown/empty
+/// language falls back to plain (single dim span per line); never panics.
+pub fn highlight_code(lang: &str, lines: &[String]) -> Vec<Vec<Span<'static>>> {
+    let (ss, theme) = highlighter();
+    let syntax = (!lang.is_empty())
+        .then(|| ss.find_syntax_by_token(lang))
+        .flatten()
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let mut h = HighlightLines::new(syntax, theme);
+    lines
+        .iter()
+        .map(|line| match h.highlight_line(line, ss) {
+            Ok(ranges) => ranges
+                .into_iter()
+                .map(|(st, text)| {
+                    let fg = st.foreground;
+                    let mut style = Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b));
+                    if st.font_style.contains(FontStyle::BOLD) {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    if st.font_style.contains(FontStyle::ITALIC) {
+                        style = style.add_modifier(Modifier::ITALIC);
+                    }
+                    Span::styled(text.to_string(), style)
+                })
+                .collect(),
+            Err(_) => vec![Span::styled(line.clone(), Style::default().fg(CODEFG))],
+        })
+        .collect()
+}
 
 /// Render a markdown document to styled lines, indented to match the conversation body.
 pub fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
@@ -37,8 +90,8 @@ struct Renderer {
     /// list markers stack: None = bullet, Some(n) = next ordered number
     lists: Vec<Option<u64>>,
     quote: u32,
-    /// when Some, we're inside a fenced code block accumulating raw lines
-    code: Option<Vec<String>>,
+    /// when Some, we're inside a fenced code block: (language tag, accumulated raw lines)
+    code: Option<(String, Vec<String>)>,
 }
 
 impl Renderer {
@@ -91,7 +144,7 @@ impl Renderer {
 
     fn event(&mut self, ev: Event<'_>) {
         // Inside a fenced code block, capture raw text verbatim until it closes.
-        if let Some(buf) = self.code.as_mut() {
+        if let Some((_, buf)) = self.code.as_mut() {
             match ev {
                 Event::Text(t) => {
                     for (i, part) in t.split('\n').enumerate() {
@@ -106,8 +159,8 @@ impl Renderer {
                     return;
                 }
                 Event::End(TagEnd::CodeBlock) => {
-                    let code = self.code.take().unwrap_or_default();
-                    self.render_code_block(&code);
+                    let (lang, code) = self.code.take().unwrap_or_default();
+                    self.render_code_block(&lang, &code);
                     return;
                 }
                 _ => return,
@@ -174,9 +227,15 @@ impl Renderer {
                     .push(Span::styled(marker, Style::default().fg(ORANGE)));
             }
             Event::End(TagEnd::Item) => self.flush_line(),
-            Event::Start(Tag::CodeBlock(_)) => {
+            Event::Start(Tag::CodeBlock(kind)) => {
                 self.flush_line();
-                self.code = Some(vec![String::new()]);
+                let lang = match kind {
+                    CodeBlockKind::Fenced(s) => {
+                        s.split_whitespace().next().unwrap_or("").to_string()
+                    }
+                    CodeBlockKind::Indented => String::new(),
+                };
+                self.code = Some((lang, vec![String::new()]));
             }
             Event::Start(Tag::Link { .. }) => {} // text rendered inline; URL appended on end
             Event::End(TagEnd::Link) => {}
@@ -205,23 +264,23 @@ impl Renderer {
         }
     }
 
-    fn render_code_block(&mut self, code: &[String]) {
+    fn render_code_block(&mut self, lang: &str, code: &[String]) {
         // Trim a trailing empty line that the fence parser commonly leaves.
         let mut lines: &[String] = code;
         while matches!(lines.last(), Some(l) if l.is_empty()) {
             lines = &lines[..lines.len() - 1];
         }
         let frame = Style::default().fg(DIM);
-        let body = Style::default().fg(CODEFG);
+        let label = if lang.is_empty() { "text" } else { lang };
+        let bar = "─".repeat(48usize.saturating_sub(label.len() + 2));
         self.lines.push(Line::from(Span::styled(
-            format!("{INDENT}┌{}", "─".repeat(48)),
+            format!("{INDENT}┌ {label} {bar}"),
             frame,
         )));
-        for l in lines {
-            self.lines.push(Line::from(vec![
-                Span::styled(format!("{INDENT}│ "), frame),
-                Span::styled(l.clone(), body),
-            ]));
+        for spans in highlight_code(lang, lines) {
+            let mut line = vec![Span::styled(format!("{INDENT}│ "), frame)];
+            line.extend(spans);
+            self.lines.push(Line::from(line));
         }
         self.lines.push(Line::from(Span::styled(
             format!("{INDENT}└{}", "─".repeat(48)),
@@ -324,5 +383,35 @@ mod tests {
     fn plain_text_passes_through() {
         let out = markdown_to_lines("the workspace looks healthy");
         assert_eq!(text_of(&out), "  the workspace looks healthy");
+    }
+
+    #[test]
+    fn highlight_known_language_colors_tokens() {
+        let lines = vec!["fn main() { let x = 1; }".to_string()];
+        let spans = highlight_code("rust", &lines);
+        assert_eq!(spans.len(), 1);
+        let joined: String = spans[0].iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.contains("fn main()"), "source preserved: {joined:?}");
+        // highlighting splits the line into more than one styled span.
+        assert!(spans[0].len() > 1, "tokens are colored into multiple spans");
+    }
+
+    #[test]
+    fn highlight_unknown_language_falls_back_to_plain() {
+        let lines = vec!["some arbitrary text".to_string()];
+        let spans = highlight_code("nonsense-lang-xyz", &lines);
+        let joined: String = spans[0].iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            joined.contains("some arbitrary text"),
+            "no crash, text kept"
+        );
+    }
+
+    #[test]
+    fn fenced_block_shows_language_label() {
+        let out = markdown_to_lines("```python\nprint('hi')\n```\n");
+        let t = text_of(&out);
+        assert!(t.contains("python"), "language label on the fence: {t:?}");
+        assert!(t.contains("print('hi')"), "code preserved");
     }
 }
