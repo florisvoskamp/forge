@@ -1,0 +1,15 @@
+[package]
+name = "forge-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Layered configuration and secret resolution for Forge."
+repository.workspace = true
+
+[dependencies]
+forge-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+figment = { version = "0.10", features = ["toml", "env"] }
+directories = "6"

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Floris Voskamp"]
+repository = "https://github.com/florisvoskamp/forge"
+description = "Fast, model-agnostic AI coding harness and CLI in Rust."
+
+[workspace.dependencies]
+# Internal crates
+forge-types = { path = "crates/forge-types", version = "0.1.0" }
+forge-config = { path = "crates/forge-config", version = "0.1.0" }
+forge-core = { path = "crates/forge-core", version = "0.1.0" }
+forge-mesh = { path = "crates/forge-mesh", version = "0.1.0" }
+forge-provider = { path = "crates/forge-provider", version = "0.1.0" }
+forge-store = { path = "crates/forge-store", version = "0.1.0" }
+forge-tools = { path = "crates/forge-tools", version = "0.1.0" }
+forge-tui = { path = "crates/forge-tui", version = "0.1.0" }
+
+# External (pinned to current stable as of 2026-06; see ADRs)
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "fs", "process", "io-util"] }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.6", features = ["derive"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+genai = "0.6"
+
+[profile.release]
+lto = "thin"
+strip = true

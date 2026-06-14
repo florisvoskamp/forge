@@ -1,0 +1,15 @@
+[package]
+name = "forge-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tool trait and core coding tools (read/write/shell/search) for Forge."
+repository.workspace = true
+
+[dependencies]
+forge-types.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }

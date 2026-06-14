@@ -51,6 +51,7 @@ subsystems (mesh, provider, tools, store) attach to.
 
 | Crate | Responsibility (one line) | Talks to |
 |-------|---------------------------|----------|
+| `forge-types` | Shared, dependency-free domain types (Message, Usage, TaskTier, PermissionMode, SideEffect…) — leaf crate everything depends on, keeping the graph acyclic | — |
 | `forge-cli` | Binary entry: clap parsing, command dispatch, runtime bootstrap, dependency wiring | core, config |
 | `forge-core` | Session orchestrator: the agent loop, permission broker, emits presenter events | tui, mesh, provider, tools, store |
 | `forge-mesh` | Model Mesh: `Router` trait + heuristic router; task classification, budget-aware tier→model selection, records rationale | config |
@@ -115,6 +116,7 @@ the **walking skeleton** target for Phase 4.
 forge/
 ├── Cargo.toml                # workspace manifest (members below)
 ├── crates/
+│   ├── forge-types/          # shared leaf domain types (no internal deps)
 │   ├── forge-cli/            # binary: clap, dispatch, wiring  -> produces `forge`
 │   ├── forge-core/           # session loop, permission broker, presenter events
 │   ├── forge-mesh/           # Router trait + heuristic router + budget
