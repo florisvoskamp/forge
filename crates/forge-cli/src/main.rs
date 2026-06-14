@@ -1,7 +1,7 @@
 //! The `forge` binary: parse arguments, load config, wire the subsystems behind their
 //! traits, and drive one agent turn. This is the thin composition root (ADR-0002).
 
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -44,6 +44,18 @@ enum Command {
         #[arg(long)]
         resume: Option<String>,
     },
+    /// Start an interactive multi-turn chat session (reads prompts from stdin).
+    Chat {
+        /// Use the offline deterministic mock provider.
+        #[arg(long)]
+        mock: bool,
+        /// Override the permission mode.
+        #[arg(long, value_enum)]
+        mode: Option<Mode>,
+        /// Resume an existing session by id.
+        #[arg(long)]
+        resume: Option<String>,
+    },
     /// List past sessions (newest first).
     Sessions,
 }
@@ -83,6 +95,7 @@ async fn main() -> Result<()> {
             tui,
             resume,
         } => run(prompt.join(" "), mock, mode, tui, resume).await,
+        Command::Chat { mock, mode, resume } => chat(mock, mode, resume).await,
         Command::Sessions => sessions(),
     }
 }
@@ -123,17 +136,13 @@ fn sessions() -> Result<()> {
     Ok(())
 }
 
-async fn run(
-    prompt: String,
+/// Build a ready session, either fresh or resumed, wiring all subsystems.
+fn build_session(
     mock: bool,
     mode: Option<Mode>,
     tui: bool,
     resume: Option<String>,
-) -> Result<()> {
-    if prompt.trim().is_empty() {
-        anyhow::bail!("empty prompt — usage: forge run \"<your task>\"");
-    }
-
+) -> Result<Session> {
     let mut config = forge_config::load().context("loading configuration")?;
     if let Some(m) = mode {
         config.permission_mode = m.into();
@@ -157,22 +166,102 @@ async fn run(
         Box::new(HeadlessPresenter::default())
     };
 
-    let mut session = match resume {
+    match resume {
         Some(prefix) => {
             let full = resolve_session(&store, &prefix)?;
             Session::resume(store, provider, router, tools, presenter, config, &full)
-                .with_context(|| format!("resuming session {full}"))?
+                .with_context(|| format!("resuming session {full}"))
         }
         None => {
             let cwd = std::env::current_dir()?.display().to_string();
             Session::start(store, provider, router, tools, presenter, config, &cwd)
-                .context("starting session")?
+                .context("starting session")
         }
-    };
+    }
+}
 
+async fn run(
+    prompt: String,
+    mock: bool,
+    mode: Option<Mode>,
+    tui: bool,
+    resume: Option<String>,
+) -> Result<()> {
+    if prompt.trim().is_empty() {
+        anyhow::bail!("empty prompt — usage: forge run \"<your task>\"");
+    }
+    let mut session = build_session(mock, mode, tui, resume)?;
     session
         .run_turn(&prompt)
         .await
         .context("running agent turn")?;
     Ok(())
+}
+
+/// What a line typed at the chat prompt means.
+#[derive(Debug, PartialEq, Eq)]
+enum ChatAction {
+    Quit,
+    Skip,
+    Run(String),
+}
+
+fn chat_action(line: &str) -> ChatAction {
+    match line.trim() {
+        "" => ChatAction::Skip,
+        "/quit" | "/exit" | "/q" => ChatAction::Quit,
+        task => ChatAction::Run(task.to_string()),
+    }
+}
+
+async fn chat(mock: bool, mode: Option<Mode>, resume: Option<String>) -> Result<()> {
+    // TUI chat (input box) is a planned follow-up; chat reads prompts from stdin.
+    let mut session = build_session(mock, mode, false, resume)?;
+
+    let stdin = std::io::stdin();
+    let interactive = stdin.is_terminal();
+    if interactive {
+        println!("forge chat — type a task and press enter; /quit to exit");
+    }
+
+    let mut handle = stdin.lock();
+    loop {
+        if interactive {
+            print!("› ");
+            std::io::stdout().flush().ok();
+        }
+        let mut line = String::new();
+        if handle.read_line(&mut line)? == 0 {
+            break; // EOF
+        }
+        match chat_action(&line) {
+            ChatAction::Quit => break,
+            ChatAction::Skip => continue,
+            ChatAction::Run(task) => {
+                session
+                    .run_turn(&task)
+                    .await
+                    .context("running agent turn")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_action_classifies_lines() {
+        assert_eq!(chat_action("  "), ChatAction::Skip);
+        assert_eq!(chat_action("\n"), ChatAction::Skip);
+        assert_eq!(chat_action("/quit"), ChatAction::Quit);
+        assert_eq!(chat_action("/exit\n"), ChatAction::Quit);
+        assert_eq!(chat_action("  /q "), ChatAction::Quit);
+        assert_eq!(
+            chat_action("fix the bug\n"),
+            ChatAction::Run("fix the bug".to_string())
+        );
+    }
 }
