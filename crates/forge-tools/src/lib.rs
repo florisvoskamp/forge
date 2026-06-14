@@ -10,7 +10,9 @@ use forge_types::SideEffect;
 use serde_json::Value;
 
 mod core_tools;
-pub use core_tools::{ReadFileTool, ShellTool, WriteFileTool};
+pub use core_tools::{
+    EditFileTool, ListDirTool, ReadFileTool, SearchTool, ShellTool, WriteFileTool,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -48,7 +50,10 @@ impl ToolRegistry {
         let mut r = Self::new();
         r.register(Box::new(ReadFileTool));
         r.register(Box::new(WriteFileTool));
+        r.register(Box::new(EditFileTool));
         r.register(Box::new(ShellTool));
+        r.register(Box::new(ListDirTool));
+        r.register(Box::new(SearchTool));
         r
     }
 
@@ -79,9 +84,16 @@ mod tests {
     #[test]
     fn registry_has_core_tools() {
         let r = ToolRegistry::with_core_tools();
-        assert!(r.get("read_file").is_some());
-        assert!(r.get("write_file").is_some());
-        assert!(r.get("shell").is_some());
+        for name in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "shell",
+            "list_dir",
+            "search",
+        ] {
+            assert!(r.get(name).is_some(), "missing tool: {name}");
+        }
     }
 
     #[test]
@@ -96,5 +108,11 @@ mod tests {
             SideEffect::Write
         );
         assert_eq!(r.get("shell").unwrap().side_effect(), SideEffect::Shell);
+        assert_eq!(r.get("edit_file").unwrap().side_effect(), SideEffect::Write);
+        assert_eq!(
+            r.get("list_dir").unwrap().side_effect(),
+            SideEffect::ReadOnly
+        );
+        assert_eq!(r.get("search").unwrap().side_effect(), SideEffect::ReadOnly);
     }
 }
