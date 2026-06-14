@@ -55,9 +55,9 @@ enum Command {
         /// Resume an existing session by id.
         #[arg(long)]
         resume: Option<String>,
-        /// Render the interactive ratatui TUI.
+        /// Force plain line output instead of the interactive TUI.
         #[arg(long)]
-        tui: bool,
+        plain: bool,
     },
     /// List past sessions (newest first).
     Sessions,
@@ -102,8 +102,8 @@ async fn main() -> Result<()> {
             mock,
             mode,
             resume,
-            tui,
-        } => chat(mock, mode, resume, tui).await,
+            plain,
+        } => chat(mock, mode, resume, plain).await,
         Command::Sessions => sessions(),
     }
 }
@@ -226,7 +226,9 @@ fn chat_action(line: &str) -> ChatAction {
     }
 }
 
-async fn chat(mock: bool, mode: Option<Mode>, resume: Option<String>, tui: bool) -> Result<()> {
+async fn chat(mock: bool, mode: Option<Mode>, resume: Option<String>, plain: bool) -> Result<()> {
+    // Default to the interactive TUI on a real terminal; fall back to plain lines otherwise.
+    let tui = !plain && std::io::stdout().is_terminal();
     let mut session = build_session(mock, mode, tui, resume)?;
     if !tui && std::io::stdin().is_terminal() {
         println!("forge chat — type a task and press enter; /quit to exit");

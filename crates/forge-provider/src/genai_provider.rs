@@ -5,10 +5,14 @@
 
 use async_trait::async_trait;
 use forge_types::{Message, Role, ToolCall, Usage};
-use genai::chat::{ChatMessage, ChatRequest, Tool, ToolCall as GenAiToolCall, ToolResponse};
+use futures::StreamExt;
+use genai::chat::{
+    ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, Tool, ToolCall as GenAiToolCall,
+    ToolResponse,
+};
 use genai::Client;
 
-use crate::{ModelResponse, Provider, ProviderError, ToolSpec};
+use crate::{ModelResponse, Provider, ProviderError, TextSink, ToolSpec};
 
 #[derive(Default)]
 pub struct GenAiProvider {
@@ -60,13 +64,14 @@ fn to_genai_tool(spec: &ToolSpec) -> Tool {
         .with_schema(spec.schema.clone())
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl Provider for GenAiProvider {
     async fn complete(
         &self,
         model: &str,
         messages: &[Message],
         tools: &[ToolSpec],
+        on_text: &mut TextSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
         // Config uses "provider::model"; genai infers the adapter from the bare model name.
         let model_name = model.rsplit("::").next().unwrap_or(model);
@@ -76,29 +81,58 @@ impl Provider for GenAiProvider {
             req = req.with_tools(tools.iter().map(to_genai_tool).collect::<Vec<_>>());
         }
 
+        // Capture flags so the terminal End event carries usage + tool calls.
+        let options = ChatOptions::default()
+            .with_capture_usage(true)
+            .with_capture_content(true)
+            .with_capture_tool_calls(true);
+
         let res = self
             .client
-            .exec_chat(model_name, req, None)
+            .exec_chat_stream(model_name, req, Some(&options))
             .await
             .map_err(|e| ProviderError::Request(e.to_string()))?;
 
-        let usage = Usage {
-            input_tokens: res.usage.prompt_tokens.unwrap_or(0).max(0) as u64,
-            output_tokens: res.usage.completion_tokens.unwrap_or(0).max(0) as u64,
-            cost_usd: 0.0, // priced by the mesh from token counts (FR-5)
-        };
+        let mut stream = res.stream;
+        let mut content = String::new();
+        let mut usage = Usage::default();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
 
-        let tool_calls: Vec<ToolCall> = res
-            .tool_calls()
-            .into_iter()
-            .map(|tc| ToolCall {
-                id: tc.call_id.clone(),
-                name: tc.fn_name.clone(),
-                args: tc.fn_arguments.clone(),
-            })
-            .collect();
-
-        let content = res.first_text().unwrap_or_default().to_string();
+        while let Some(event) = stream.next().await {
+            match event.map_err(|e| ProviderError::Request(e.to_string()))? {
+                ChatStreamEvent::Chunk(chunk) => {
+                    content.push_str(&chunk.content);
+                    on_text(&chunk.content);
+                }
+                ChatStreamEvent::End(end) => {
+                    if let Some(u) = &end.captured_usage {
+                        usage = Usage {
+                            input_tokens: u.prompt_tokens.unwrap_or(0).max(0) as u64,
+                            output_tokens: u.completion_tokens.unwrap_or(0).max(0) as u64,
+                            cost_usd: 0.0, // priced by the mesh from token counts (FR-5)
+                        };
+                    }
+                    // Some providers deliver text only at the end (not chunked).
+                    if content.is_empty() {
+                        if let Some(text) = end.captured_first_text() {
+                            content.push_str(text);
+                            on_text(text);
+                        }
+                    }
+                    if let Some(tcs) = end.captured_into_tool_calls() {
+                        tool_calls = tcs
+                            .into_iter()
+                            .map(|tc| ToolCall {
+                                id: tc.call_id,
+                                name: tc.fn_name,
+                                args: tc.fn_arguments,
+                            })
+                            .collect();
+                    }
+                }
+                _ => {}
+            }
+        }
 
         Ok(ModelResponse {
             content,

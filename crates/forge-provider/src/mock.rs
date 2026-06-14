@@ -8,25 +8,35 @@ use async_trait::async_trait;
 use forge_types::{new_id, Message, Role, ToolCall, Usage};
 use serde_json::json;
 
-use crate::{ModelResponse, Provider, ProviderError, ToolSpec};
+use crate::{ModelResponse, Provider, ProviderError, TextSink, ToolSpec};
 
 #[derive(Debug, Default)]
 pub struct MockProvider;
 
-#[async_trait]
+/// Emit `text` to the sink word by word, simulating streaming.
+fn stream_words(text: &str, on_text: &mut TextSink<'_>) {
+    for (i, word) in text.split_inclusive(' ').enumerate() {
+        let _ = i;
+        on_text(word);
+    }
+}
+
+#[async_trait(?Send)]
 impl Provider for MockProvider {
     async fn complete(
         &self,
         _model: &str,
         messages: &[Message],
         _tools: &[ToolSpec],
+        on_text: &mut TextSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
         let already_used_tool = messages.iter().any(|m| m.role == Role::Tool);
 
         if already_used_tool {
+            let content = "Done — I read the project manifest and the workspace looks healthy.";
+            stream_words(content, on_text);
             Ok(ModelResponse {
-                content: "Done — I read the project manifest and the workspace looks healthy."
-                    .to_string(),
+                content: content.to_string(),
                 tool_calls: vec![],
                 usage: Usage {
                     input_tokens: 42,
@@ -35,8 +45,10 @@ impl Provider for MockProvider {
                 },
             })
         } else {
+            let content = "Let me inspect the project manifest.";
+            stream_words(content, on_text);
             Ok(ModelResponse {
-                content: "Let me inspect the project manifest.".to_string(),
+                content: content.to_string(),
                 tool_calls: vec![ToolCall {
                     id: new_id(),
                     name: "read_file".to_string(),
@@ -60,7 +72,12 @@ mod tests {
     async fn first_turn_requests_a_tool() {
         let p = MockProvider;
         let res = p
-            .complete("mock", &[Message::user("check the project")], &[])
+            .complete(
+                "mock",
+                &[Message::user("check the project")],
+                &[],
+                &mut |_| {},
+            )
             .await
             .unwrap();
         assert!(res.wants_tools());
@@ -75,8 +92,24 @@ mod tests {
             Message::assistant("Let me inspect the project manifest."),
             Message::new(Role::Tool, "[workspace] ..."),
         ];
-        let res = p.complete("mock", &msgs, &[]).await.unwrap();
+        let res = p.complete("mock", &msgs, &[], &mut |_| {}).await.unwrap();
         assert!(!res.wants_tools());
         assert!(!res.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streams_text_to_the_sink() {
+        let p = MockProvider;
+        let mut streamed = String::new();
+        let res = p
+            .complete("mock", &[Message::user("check it")], &[], &mut |d| {
+                streamed.push_str(d)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            streamed, res.content,
+            "streamed deltas reconstruct the full content"
+        );
     }
 }

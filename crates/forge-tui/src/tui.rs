@@ -14,7 +14,7 @@ use forge_types::SideEffect;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::{self, handle_key, App, InputOutcome, KeyKind};
+use crate::app::{self, handle_key, App, InputOutcome, KeyKind, Line};
 use crate::{Presenter, PresenterEvent};
 
 pub struct TuiPresenter {
@@ -110,6 +110,8 @@ impl Presenter for TuiPresenter {
                     match handle_key(&mut self.app.input, key) {
                         InputOutcome::Editing => self.draw(),
                         InputOutcome::Submit(line) => {
+                            // Echo the user's message into the transcript.
+                            self.app.lines.push(Line::User(line.clone()));
                             self.draw();
                             return Some(line);
                         }

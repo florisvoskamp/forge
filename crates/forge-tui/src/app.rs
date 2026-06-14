@@ -2,15 +2,24 @@
 //! `render` draws that state with ratatui. Both are free of terminal I/O so they can be
 //! exercised offline with ratatui's `TestBackend`.
 
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line as TextLine, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::PresenterEvent;
 
-const FORGE_ORANGE: Color = Color::Rgb(255, 140, 60);
+// Palette.
+const ORANGE: Color = Color::Rgb(255, 145, 60); // brand accent
+const USER: Color = Color::Rgb(125, 180, 255); // user messages
+const DIM: Color = Color::Rgb(110, 110, 120); // secondary text
+const OKGREEN: Color = Color::Rgb(120, 210, 140);
+const ERRRED: Color = Color::Rgb(240, 110, 110);
+const WARNYEL: Color = Color::Rgb(235, 200, 110);
+const TOOLCYAN: Color = Color::Rgb(120, 200, 215);
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The Mesh routing decision currently displayed.
 #[derive(Debug, Clone, Default)]
@@ -23,6 +32,7 @@ pub struct RoutingView {
 /// One rendered line in the conversation transcript.
 #[derive(Debug, Clone)]
 pub enum Line {
+    User(String),
     Assistant(String),
     ToolStart {
         name: String,
@@ -48,6 +58,8 @@ pub struct App {
     pub prompt: Option<String>,
     /// The current input-line buffer (shown in the input bar during chat).
     pub input: String,
+    /// The assistant reply currently streaming in (committed to `lines` when done).
+    pub streaming: String,
 }
 
 /// A keystroke, decoupled from crossterm so input handling is testable.
@@ -106,6 +118,13 @@ impl App {
                 })
             }
             PresenterEvent::AssistantText(text) => self.lines.push(Line::Assistant(text)),
+            PresenterEvent::AssistantDelta(delta) => self.streaming.push_str(&delta),
+            PresenterEvent::AssistantDone => {
+                if !self.streaming.is_empty() {
+                    self.lines
+                        .push(Line::Assistant(std::mem::take(&mut self.streaming)));
+                }
+            }
             PresenterEvent::Warning(msg) => self.warnings.push(msg),
             PresenterEvent::ToolStart { name, args } => {
                 self.lines.push(Line::ToolStart { name, args })
@@ -121,144 +140,192 @@ impl App {
 
 /// Draw the whole UI for the current state.
 pub fn render(frame: &mut Frame, app: &App) {
-    // status box: 2 border rows + routing + cost + per-warning + optional prompt + done hint
-    // + optional input bar.
-    let status_h = 4u16
-        .saturating_add(app.warnings.len().min(u16::MAX as usize) as u16)
-        .saturating_add(app.prompt.is_some() as u16)
-        .saturating_add(app.done as u16)
-        .saturating_add(!app.input.is_empty() as u16);
+    let prompt_h = app.prompt.is_some() as u16;
     let areas = Layout::vertical([
-        Constraint::Length(1),        // header
+        Constraint::Length(1),        // header bar
         Constraint::Min(1),           // conversation
-        Constraint::Length(status_h), // mesh status
+        Constraint::Length(prompt_h), // permission bar (0 when none)
+        Constraint::Length(3),        // input box
+        Constraint::Length(1),        // footer hints
     ])
     .split(frame.area());
 
     render_header(frame, areas[0], app);
     render_conversation(frame, areas[1], app);
-    render_status(frame, areas[2], app);
+    if app.prompt.is_some() {
+        render_permission(frame, areas[2], app);
+    }
+    render_input(frame, areas[3], app);
+    render_footer(frame, areas[4], app);
 }
 
-fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let mut spans = vec![
-        Span::styled(
-            " ⚒ Forge ",
-            Style::default().fg(Color::Black).bg(FORGE_ORANGE).bold(),
-        ),
-        Span::raw(" "),
-    ];
+fn truncate(s: &str, max: usize) -> String {
+    let s = s.replace('\n', " ");
+    if s.chars().count() > max {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    } else {
+        s
+    }
+}
+
+fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(48)]).split(area);
+
+    let mut left = vec![Span::styled(
+        " ⚒ FORGE ",
+        Style::default().fg(Color::Black).bg(ORANGE).bold(),
+    )];
     if !app.session_id.is_empty() {
         let short: String = app.session_id.chars().take(8).collect();
-        spans.push(Span::styled(
-            format!("session {short}"),
-            Style::default().fg(Color::DarkGray),
+        left.push(Span::styled(format!("  {short}"), Style::default().fg(DIM)));
+    }
+    frame.render_widget(Paragraph::new(TextLine::from(left)), cols[0]);
+
+    let mut right = Vec::new();
+    if !app.streaming.is_empty() {
+        let f = SPINNER[app.streaming.chars().count() % SPINNER.len()];
+        right.push(Span::styled(format!("{f} "), Style::default().fg(ORANGE)));
+    }
+    if let Some(r) = &app.routing {
+        right.push(Span::styled(
+            r.model.clone(),
+            Style::default().fg(Color::White).bold(),
         ));
+        right.push(Span::raw("  "));
     }
-    if app.done {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("done", Style::default().fg(Color::Green)));
-    }
-    frame.render_widget(Paragraph::new(TextLine::from(spans)), area);
+    right.push(Span::styled(
+        format!("${:.4} ", app.cost_usd),
+        Style::default().fg(OKGREEN).bold(),
+    ));
+    frame.render_widget(
+        Paragraph::new(TextLine::from(right)).alignment(Alignment::Right),
+        cols[1],
+    );
 }
 
-fn render_conversation(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let items: Vec<ListItem> = app
-        .lines
-        .iter()
-        .map(|line| match line {
-            Line::Assistant(text) => ListItem::new(TextLine::from(text.as_str())),
-            Line::ToolStart { name, args } => ListItem::new(TextLine::from(vec![
-                Span::styled("  ↳ ", Style::default().fg(Color::Cyan)),
-                Span::styled(name.clone(), Style::default().fg(Color::Cyan).bold()),
-                Span::styled(format!("({args})"), Style::default().fg(Color::DarkGray)),
+fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
+    let mut lines: Vec<TextLine> = Vec::new();
+    let push_block = |label: &str, color: Color, body: &str, lines: &mut Vec<TextLine>| {
+        lines.push(TextLine::from(Span::styled(
+            format!("  {label}"),
+            Style::default().fg(color).bold(),
+        )));
+        for l in body.lines() {
+            lines.push(TextLine::from(format!("  {l}")));
+        }
+        lines.push(TextLine::default());
+    };
+
+    for line in &app.lines {
+        match line {
+            Line::User(t) => push_block("you", USER, t, &mut lines),
+            Line::Assistant(t) => push_block("⚒ forge", ORANGE, t, &mut lines),
+            Line::ToolStart { name, args } => lines.push(TextLine::from(vec![
+                Span::styled("  ↳ ", Style::default().fg(TOOLCYAN)),
+                Span::styled(name.clone(), Style::default().fg(TOOLCYAN).bold()),
+                Span::styled(
+                    format!("  {}", truncate(args, 48)),
+                    Style::default().fg(DIM),
+                ),
             ])),
             Line::ToolResult { name, ok, summary } => {
                 let (mark, color) = if *ok {
-                    ("  ✓ ", Color::Green)
+                    ("  ✓ ", OKGREEN)
                 } else {
-                    ("  ✗ ", Color::Red)
+                    ("  ✗ ", ERRRED)
                 };
-                ListItem::new(TextLine::from(vec![
+                lines.push(TextLine::from(vec![
                     Span::styled(mark, Style::default().fg(color)),
-                    Span::styled(format!("{name}: "), Style::default().fg(color)),
-                    Span::raw(summary.clone()),
-                ]))
+                    Span::styled(format!("{name}  "), Style::default().fg(color)),
+                    Span::styled(truncate(summary, 56), Style::default().fg(DIM)),
+                ]));
             }
-        })
-        .collect();
-
-    let block = Block::bordered()
-        .title(" Conversation ")
-        .border_style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(List::new(items).block(block), area);
-}
-
-fn render_status(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let mut lines: Vec<TextLine> = Vec::new();
-
-    match &app.routing {
-        Some(r) => lines.push(TextLine::from(vec![
-            Span::styled("mesh ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("[{}] ", r.tier),
-                Style::default().fg(FORGE_ORANGE).bold(),
-            ),
-            Span::styled(
-                r.model.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  ({})", r.rationale),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])),
-        None => lines.push(TextLine::from(Span::styled(
-            "mesh idle",
-            Style::default().fg(Color::DarkGray),
-        ))),
+        }
     }
-
-    lines.push(TextLine::from(vec![
-        Span::styled("cost ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("${:.4}", app.cost_usd),
-            Style::default().fg(Color::Green).bold(),
-        ),
-    ]));
 
     for w in &app.warnings {
         lines.push(TextLine::from(Span::styled(
-            format!("⚠ {w}"),
-            Style::default().fg(Color::Yellow),
+            format!("  ⚠ {w}"),
+            Style::default().fg(WARNYEL),
         )));
     }
 
-    if let Some(p) = &app.prompt {
+    // The reply currently streaming in, shown live with a cursor.
+    if !app.streaming.is_empty() {
         lines.push(TextLine::from(Span::styled(
-            format!("» {p} [y/N]"),
-            Style::default().fg(Color::Black).bg(Color::Yellow).bold(),
+            "  ⚒ forge",
+            Style::default().fg(ORANGE).bold(),
         )));
-    }
-
-    if app.done {
-        lines.push(TextLine::from(Span::styled(
-            "press q to quit",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    if !app.input.is_empty() {
         lines.push(TextLine::from(vec![
-            Span::styled("› ", Style::default().fg(FORGE_ORANGE).bold()),
-            Span::raw(app.input.clone()),
+            Span::raw(format!("  {}", app.streaming)),
+            Span::styled("▌", Style::default().fg(ORANGE)),
         ]));
     }
 
     let block = Block::bordered()
-        .title(" Model Mesh ")
-        .border_style(Style::default().fg(FORGE_ORANGE));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(" conversation ", Style::default().fg(DIM)));
+
+    // Keep the latest content in view (approximate; wrapping may add lines).
+    let inner_h = area.height.saturating_sub(2);
+    let scroll = (lines.len() as u16).saturating_sub(inner_h);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
+}
+
+fn render_permission(frame: &mut Frame, area: Rect, app: &App) {
+    if let Some(p) = &app.prompt {
+        frame.render_widget(
+            Paragraph::new(TextLine::from(Span::styled(
+                format!(" » {p}   [y]es / [N]o "),
+                Style::default().fg(Color::Black).bg(WARNYEL).bold(),
+            ))),
+            area,
+        );
+    }
+}
+
+fn render_input(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ORANGE))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(" message ", Style::default().fg(ORANGE)));
+    let line = TextLine::from(vec![
+        Span::styled("› ", Style::default().fg(ORANGE).bold()),
+        Span::raw(app.input.clone()),
+        Span::styled("▌", Style::default().fg(ORANGE)),
+    ]);
+    frame.render_widget(Paragraph::new(line).block(block), area);
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let mut spans = Vec::new();
+    if let Some(r) = &app.routing {
+        spans.push(Span::styled(
+            format!(" mesh [{}] ", r.tier),
+            Style::default().fg(ORANGE),
+        ));
+        spans.push(Span::styled(
+            truncate(&r.rationale, 40),
+            Style::default().fg(DIM),
+        ));
+        spans.push(Span::raw("   "));
+    }
+    let hint = if app.done {
+        "done · esc to quit"
+    } else {
+        "enter send · esc quit"
+    };
+    spans.push(Span::styled(hint, Style::default().fg(DIM)));
+    frame.render_widget(Paragraph::new(TextLine::from(spans)), area);
 }
 
 #[cfg(test)]
@@ -391,5 +458,33 @@ mod tests {
             ..Default::default()
         };
         assert!(screen(&app).contains("› fix the bug"));
+    }
+
+    #[test]
+    fn streamed_deltas_render_live_with_cursor() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::AssistantDelta("hello ".into()));
+        app.apply(PresenterEvent::AssistantDelta("world".into()));
+        let text = screen(&app);
+        assert!(text.contains("hello world"), "live stream shown:\n{text}");
+        assert!(text.contains('▌'), "cursor shown while streaming");
+    }
+
+    #[test]
+    fn assistant_done_commits_the_streamed_reply() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::AssistantDelta("committed text".into()));
+        app.apply(PresenterEvent::AssistantDone);
+        assert!(app.streaming.is_empty(), "streaming buffer cleared");
+        assert!(screen(&app).contains("committed text"));
+    }
+
+    #[test]
+    fn user_message_is_shown() {
+        let mut app = App::default();
+        app.lines.push(Line::User("my own task".into()));
+        let text = screen(&app);
+        assert!(text.contains("you"));
+        assert!(text.contains("my own task"));
     }
 }

@@ -23,6 +23,10 @@ pub enum PresenterEvent {
         rationale: String,
     },
     AssistantText(String),
+    /// A streamed fragment of the assistant's reply (tokens as they arrive).
+    AssistantDelta(String),
+    /// The assistant's streamed reply for this step is complete.
+    AssistantDone,
     /// A non-fatal advisory (e.g. budget threshold reached).
     Warning(String),
     ToolStart {
@@ -87,6 +91,13 @@ impl Presenter for HeadlessPresenter {
             }
             PresenterEvent::AssistantText(text) => {
                 println!("\n{text}");
+            }
+            PresenterEvent::AssistantDelta(delta) => {
+                print!("{delta}");
+                let _ = std::io::stdout().flush();
+            }
+            PresenterEvent::AssistantDone => {
+                println!();
             }
             PresenterEvent::Warning(msg) => {
                 println!("  ⚠ {msg}");

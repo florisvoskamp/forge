@@ -200,10 +200,25 @@ impl Session {
 
         // 3. Model <-> tool loop.
         for step in 0..MAX_STEPS {
-            let mut resp = self
-                .provider
-                .complete(&decision.model, &self.transcript, &specs)
-                .await?;
+            // Stream the reply: deltas flow to the presenter as the model produces them.
+            let mut resp = {
+                let provider = &self.provider;
+                let presenter = &mut self.presenter;
+                let r = provider
+                    .complete(
+                        &decision.model,
+                        &self.transcript,
+                        &specs,
+                        &mut |delta: &str| {
+                            presenter.emit(PresenterEvent::AssistantDelta(delta.to_string()));
+                        },
+                    )
+                    .await?;
+                if !r.content.is_empty() {
+                    presenter.emit(PresenterEvent::AssistantDone);
+                }
+                r
+            };
 
             // Compute the real cost from token counts and the model's price (FR-5, A-7).
             resp.usage.cost_usd = self.pricing.cost_for(
@@ -212,10 +227,6 @@ impl Session {
                 resp.usage.output_tokens,
             );
 
-            if !resp.content.is_empty() {
-                self.presenter
-                    .emit(PresenterEvent::AssistantText(resp.content.clone()));
-            }
             self.transcript.push(Message::assistant_tool_calls(
                 &resp.content,
                 resp.tool_calls.clone(),
