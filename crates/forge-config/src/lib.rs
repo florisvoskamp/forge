@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 pub enum ConfigError {
     #[error("failed to load configuration: {0}")]
     Load(Box<figment::Error>),
-    #[error("no API key found for provider '{0}' (set {1})")]
+    #[error("no API key found for provider '{0}' (set {1} or run `forge auth {0}`)")]
     MissingKey(String, String),
+    #[error("keyring error: {0}")]
+    Keyring(String),
 }
 
 impl From<figment::Error> for ConfigError {
@@ -105,16 +107,61 @@ pub fn load() -> Result<Config, ConfigError> {
     Ok(fig.extract()?)
 }
 
-/// Resolve an API key for a provider from its conventional environment variable.
-/// (Keyring-backed storage is a planned enhancement; env is the always-available source.)
+const KEYRING_SERVICE: &str = "forge";
+
+/// The conventional environment variable for a provider's API key, if it needs one.
+fn env_var_for(provider: &str) -> Option<&'static str> {
+    match provider {
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        _ => None, // local providers (e.g. ollama) need no key
+    }
+}
+
+/// Resolve an API key for a provider: environment variable first, then the OS keyring.
 pub fn api_key(provider: &str) -> Result<String, ConfigError> {
-    let var = match provider {
-        "anthropic" => "ANTHROPIC_API_KEY",
-        "openai" => "OPENAI_API_KEY",
-        // Local providers (e.g. ollama) need no key.
-        _ => return Ok(String::new()),
+    let Some(var) = env_var_for(provider) else {
+        return Ok(String::new());
     };
-    std::env::var(var).map_err(|_| ConfigError::MissingKey(provider.into(), var.into()))
+    if let Ok(key) = std::env::var(var) {
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, provider) {
+        if let Ok(key) = entry.get_password() {
+            return Ok(key);
+        }
+    }
+    Err(ConfigError::MissingKey(provider.into(), var.into()))
+}
+
+/// Securely store a provider API key in the OS keyring.
+pub fn store_api_key(provider: &str, key: &str) -> Result<(), ConfigError> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, provider)
+        .map_err(|e| ConfigError::Keyring(e.to_string()))?;
+    entry
+        .set_password(key)
+        .map_err(|e| ConfigError::Keyring(e.to_string()))
+}
+
+/// Make keyring-stored keys visible to the provider client (genai reads keys from the
+/// environment): for each known provider with no env var set, inject the keyring value.
+/// Best-effort — providers without a stored key are simply left unset.
+pub fn inject_provider_keys() {
+    for provider in ["anthropic", "openai"] {
+        let Some(var) = env_var_for(provider) else {
+            continue;
+        };
+        if std::env::var(var).is_ok() {
+            continue;
+        }
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, provider) {
+            if let Ok(key) = entry.get_password() {
+                std::env::set_var(var, key);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +174,18 @@ mod tests {
         assert!(c.model_for(TaskTier::Trivial).is_some());
         assert!(c.model_for(TaskTier::Standard).is_some());
         assert!(c.model_for(TaskTier::Complex).is_some());
+    }
+
+    #[test]
+    fn api_key_prefers_the_environment() {
+        std::env::set_var("OPENAI_API_KEY", "sk-env-precedence");
+        assert_eq!(api_key("openai").unwrap(), "sk-env-precedence");
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn local_providers_need_no_key() {
+        assert_eq!(api_key("ollama").unwrap(), "");
     }
 
     #[test]

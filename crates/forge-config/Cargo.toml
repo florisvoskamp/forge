@@ -13,3 +13,4 @@ serde.workspace = true
 thiserror.workspace = true
 figment = { version = "0.10", features = ["toml", "env"] }
 directories = "6"
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }

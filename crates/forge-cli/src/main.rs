@@ -61,6 +61,11 @@ enum Command {
     },
     /// List past sessions (newest first).
     Sessions,
+    /// Store a provider API key securely in the OS keyring (reads the key from stdin).
+    Auth {
+        /// Provider name, e.g. anthropic or openai.
+        provider: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -105,7 +110,29 @@ async fn main() -> Result<()> {
             plain,
         } => chat(mock, mode, resume, plain).await,
         Command::Sessions => sessions(),
+        Command::Auth { provider } => auth(&provider),
     }
+}
+
+fn auth(provider: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        print!("paste {provider} API key (input hidden is not supported; press enter): ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+    }
+    let mut key = String::new();
+    std::io::stdin()
+        .read_line(&mut key)
+        .context("reading key from stdin")?;
+    let key = key.trim();
+    if key.is_empty() {
+        anyhow::bail!("no key provided");
+    }
+    forge_config::store_api_key(provider, key).with_context(|| {
+        format!("storing {provider} key (is an OS keyring / secret service available?)")
+    })?;
+    println!("stored {provider} key in the OS keyring");
+    Ok(())
 }
 
 fn open_store() -> Result<Store> {
@@ -151,6 +178,9 @@ fn build_session(
     tui: bool,
     resume: Option<String>,
 ) -> Result<Session> {
+    // Make any keyring-stored provider keys visible to the provider client.
+    forge_config::inject_provider_keys();
+
     let mut config = forge_config::load().context("loading configuration")?;
     if let Some(m) = mode {
         config.permission_mode = m.into();
