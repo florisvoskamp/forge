@@ -18,8 +18,21 @@ const OKGREEN: Color = Color::Rgb(120, 210, 140);
 const ERRRED: Color = Color::Rgb(240, 110, 110);
 const WARNYEL: Color = Color::Rgb(235, 200, 110);
 const TOOLCYAN: Color = Color::Rgb(120, 200, 215);
+const STATUSBG: Color = Color::Rgb(28, 28, 34); // status bar background
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// ANSI-Shadow block wordmark shown as the welcome banner.
+const FORGE_WORDMARK: &[&str] = &[
+    "███████╗ ██████╗ ██████╗  ██████╗ ███████╗",
+    "██╔════╝██╔═══██╗██╔══██╗██╔════╝ ██╔════╝",
+    "█████╗  ██║   ██║██████╔╝██║  ███╗█████╗  ",
+    "██╔══╝  ██║   ██║██╔══██╗██║   ██║██╔══╝  ",
+    "██║     ╚██████╔╝██║  ██║╚██████╔╝███████╗",
+    "╚═╝      ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝",
+];
+const WORDMARK_WIDTH: u16 = 42;
+const TAGLINE: &str = "model-mesh coding agent · type a task to begin";
 
 /// The Mesh routing decision currently displayed.
 #[derive(Debug, Clone, Default)]
@@ -144,23 +157,67 @@ impl App {
 
 /// Draw the whole UI for the current state.
 pub fn render(frame: &mut Frame, app: &App) {
+    // Welcome state: nothing has happened yet -> show the brand banner instead of an
+    // empty transcript, and hide the compact header (the banner is the brand).
+    let welcome = app.lines.is_empty() && app.streaming.is_empty() && app.warnings.is_empty();
+    let header_h = u16::from(!welcome);
     let prompt_h = app.prompt.is_some() as u16;
     let areas = Layout::vertical([
-        Constraint::Length(1),        // header bar
-        Constraint::Min(1),           // conversation
+        Constraint::Length(header_h), // compact brand header (hidden on welcome)
+        Constraint::Min(1),           // banner (welcome) or conversation
         Constraint::Length(prompt_h), // permission bar (0 when none)
         Constraint::Length(3),        // input box
-        Constraint::Length(1),        // footer hints
+        Constraint::Length(1),        // statusline
     ])
     .split(frame.area());
 
-    render_header(frame, areas[0], app);
-    render_conversation(frame, areas[1], app);
+    if !welcome {
+        render_header(frame, areas[0], app);
+    }
+    if welcome {
+        render_banner(frame, areas[1]);
+    } else {
+        render_conversation(frame, areas[1], app);
+    }
     if app.prompt.is_some() {
         render_permission(frame, areas[2], app);
     }
     render_input(frame, areas[3], app);
-    render_footer(frame, areas[4], app);
+    render_statusline(frame, areas[4], app);
+}
+
+/// The ASCII welcome banner, centered (with a narrow-terminal fallback).
+fn render_banner(frame: &mut Frame, area: Rect) {
+    let mut lines: Vec<TextLine> = Vec::new();
+    if area.width < WORDMARK_WIDTH {
+        lines.push(TextLine::default());
+        lines.push(TextLine::from(Span::styled(
+            "⚒ FORGE",
+            Style::default().fg(ORANGE).bold(),
+        )));
+        lines.push(TextLine::from(Span::styled(
+            "model-mesh coding agent",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        let content_h = FORGE_WORDMARK.len() as u16 + 2;
+        let pad = area.height.saturating_sub(content_h) / 2;
+        for _ in 0..pad {
+            lines.push(TextLine::default());
+        }
+        for row in FORGE_WORDMARK {
+            lines.push(TextLine::from(Span::styled(
+                *row,
+                Style::default().fg(ORANGE).bold(),
+            )));
+        }
+        lines.push(TextLine::default());
+        lines.push(TextLine::from(Span::styled(
+            TAGLINE,
+            Style::default().fg(DIM),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -173,38 +230,15 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(48)]).split(area);
-
-    let mut left = vec![Span::styled(
+    let mut spans = vec![Span::styled(
         " ⚒ FORGE ",
         Style::default().fg(Color::Black).bg(ORANGE).bold(),
     )];
     if !app.session_id.is_empty() {
         let short: String = app.session_id.chars().take(8).collect();
-        left.push(Span::styled(format!("  {short}"), Style::default().fg(DIM)));
+        spans.push(Span::styled(format!("  {short}"), Style::default().fg(DIM)));
     }
-    frame.render_widget(Paragraph::new(TextLine::from(left)), cols[0]);
-
-    let mut right = Vec::new();
-    if app.busy {
-        let f = SPINNER[app.tick % SPINNER.len()];
-        right.push(Span::styled(format!("{f} "), Style::default().fg(ORANGE)));
-    }
-    if let Some(r) = &app.routing {
-        right.push(Span::styled(
-            r.model.clone(),
-            Style::default().fg(Color::White).bold(),
-        ));
-        right.push(Span::raw("  "));
-    }
-    right.push(Span::styled(
-        format!("${:.4} ", app.cost_usd),
-        Style::default().fg(OKGREEN).bold(),
-    ));
-    frame.render_widget(
-        Paragraph::new(TextLine::from(right)).alignment(Alignment::Right),
-        cols[1],
-    );
+    frame.render_widget(Paragraph::new(TextLine::from(spans)), area);
 }
 
 fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
@@ -310,26 +344,65 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = Vec::new();
-    if let Some(r) = &app.routing {
-        spans.push(Span::styled(
-            format!(" mesh [{}] ", r.tier),
-            Style::default().fg(ORANGE),
+/// A real status bar: working state · mesh tier+model · cost, with right-aligned key
+/// hints. Lower-priority segments drop out on narrow terminals; model+cost always show.
+fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
+    let bg = Style::default().bg(STATUSBG);
+    let w = area.width;
+    let sep = || Span::styled("  ·  ", Style::default().fg(DIM).bg(STATUSBG));
+
+    let model = app
+        .routing
+        .as_ref()
+        .map(|r| r.model.as_str())
+        .unwrap_or("—");
+    let tier = app.routing.as_ref().map(|r| r.tier.as_str());
+
+    let mut left: Vec<Span> = vec![Span::styled(" ", bg)];
+    if app.busy && w >= 40 {
+        let f = SPINNER[app.tick % SPINNER.len()];
+        left.push(Span::styled(
+            format!("{f} working"),
+            Style::default().fg(ORANGE).bg(STATUSBG),
         ));
-        spans.push(Span::styled(
-            truncate(&r.rationale, 40),
-            Style::default().fg(DIM),
-        ));
-        spans.push(Span::raw("   "));
+        left.push(sep());
     }
-    let hint = if app.done {
-        "done · esc to quit"
+    if let (Some(t), true) = (tier, w >= 52) {
+        left.push(Span::styled(
+            format!("[{t}] "),
+            Style::default().fg(ORANGE).bold().bg(STATUSBG),
+        ));
+    }
+    left.push(Span::styled(
+        model.to_string(),
+        Style::default().fg(Color::White).bg(STATUSBG),
+    ));
+    left.push(sep());
+    left.push(Span::styled(
+        format!("${:.4}", app.cost_usd),
+        Style::default().fg(OKGREEN).bold().bg(STATUSBG),
+    ));
+
+    if w >= 70 {
+        let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(22)]).split(area);
+        frame.render_widget(Paragraph::new(TextLine::from(left)).style(bg), cols[0]);
+        let hint = if app.done {
+            "done · esc quit "
+        } else {
+            "↵ send · esc quit "
+        };
+        frame.render_widget(
+            Paragraph::new(TextLine::from(Span::styled(
+                hint,
+                Style::default().fg(DIM).bg(STATUSBG),
+            )))
+            .alignment(Alignment::Right)
+            .style(bg),
+            cols[1],
+        );
     } else {
-        "enter send · esc quit"
-    };
-    spans.push(Span::styled(hint, Style::default().fg(DIM)));
-    frame.render_widget(Paragraph::new(TextLine::from(spans)), area);
+        frame.render_widget(Paragraph::new(TextLine::from(left)).style(bg), area);
+    }
 }
 
 #[cfg(test)]
@@ -339,7 +412,11 @@ mod tests {
     use ratatui::Terminal;
 
     fn screen(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        screen_wh(app, 80, 24)
+    }
+
+    fn screen_wh(app: &App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| render(f, app)).unwrap();
         terminal
             .backend()
@@ -348,6 +425,53 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    #[test]
+    fn welcome_shows_ascii_banner() {
+        let text = screen(&App::default());
+        assert!(text.contains('█'), "ASCII wordmark shown on empty session");
+        assert!(text.contains("model-mesh coding agent"), "tagline shown");
+    }
+
+    #[test]
+    fn banner_gives_way_to_compact_header_when_active() {
+        let mut app = App::default();
+        app.lines.push(Line::User("hi".into()));
+        let text = screen(&app);
+        assert!(
+            !text.contains("model-mesh coding agent"),
+            "banner gone once active"
+        );
+        assert!(text.contains("FORGE"), "compact brand header shown");
+        assert!(text.contains("hi"), "conversation shown");
+    }
+
+    #[test]
+    fn narrow_terminal_falls_back_to_compact_wordmark() {
+        let text = screen_wh(&App::default(), 30, 20);
+        assert!(
+            text.contains("FORGE"),
+            "compact wordmark on narrow terminal"
+        );
+        assert!(
+            !text.contains('█'),
+            "no block art when too narrow (no wrap garbage)"
+        );
+    }
+
+    #[test]
+    fn statusline_shows_model_and_cost() {
+        let mut app = App { cost_usd: 0.0042, ..Default::default() };
+        app.apply(PresenterEvent::Routing {
+            tier: "standard".into(),
+            model: "openai::gpt-4o-mini".into(),
+            rationale: "x".into(),
+        });
+        let text = screen(&app);
+        assert!(text.contains("openai::gpt-4o-mini"), "model in statusline");
+        assert!(text.contains("$0.0042"), "cost in statusline");
+        assert!(text.contains("standard"), "tier in statusline");
     }
 
     #[test]
