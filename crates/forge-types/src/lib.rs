@@ -25,6 +25,17 @@ impl Role {
             Role::Tool => "tool",
         }
     }
+
+    /// Parse the stored string form back into a `Role`.
+    pub fn parse(s: &str) -> Option<Role> {
+        match s {
+            "system" => Some(Role::System),
+            "user" => Some(Role::User),
+            "assistant" => Some(Role::Assistant),
+            "tool" => Some(Role::Tool),
+            _ => None,
+        }
+    }
 }
 
 /// A single message in a session transcript.

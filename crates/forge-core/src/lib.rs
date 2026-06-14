@@ -25,6 +25,8 @@ pub enum CoreError {
     Store(#[from] forge_store::StoreError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("session not found: {0}")]
+    SessionNotFound(String),
 }
 
 /// One interactive session. Construct with [`Session::start`], then drive [`Session::run_turn`].
@@ -53,8 +55,67 @@ impl Session {
         cwd: &str,
     ) -> Result<Self, CoreError> {
         let mode = config.permission_mode;
-        let pricing = Pricing::from_config(&config);
         let id = store.create_session(cwd, format!("{mode:?}").as_str())?;
+        Ok(Self::build(
+            id,
+            store,
+            provider,
+            router,
+            tools,
+            presenter,
+            config,
+            Vec::new(),
+            0,
+        ))
+    }
+
+    /// Resume an existing session: rehydrate its transcript and continue the same row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume(
+        store: Store,
+        provider: Box<dyn Provider>,
+        router: Box<dyn Router>,
+        tools: ToolRegistry,
+        presenter: Box<dyn Presenter>,
+        config: Config,
+        session_id: &str,
+    ) -> Result<Self, CoreError> {
+        if !store.session_exists(session_id)? {
+            return Err(CoreError::SessionNotFound(session_id.to_string()));
+        }
+        let stored = store.load_messages(session_id)?;
+        let seq = stored.len() as i64;
+        let transcript = stored
+            .into_iter()
+            .map(|m| Message::new(m.role, m.content))
+            .collect();
+        Ok(Self::build(
+            session_id.to_string(),
+            store,
+            provider,
+            router,
+            tools,
+            presenter,
+            config,
+            transcript,
+            seq,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        id: String,
+        store: Store,
+        provider: Box<dyn Provider>,
+        router: Box<dyn Router>,
+        tools: ToolRegistry,
+        presenter: Box<dyn Presenter>,
+        config: Config,
+        transcript: Vec<Message>,
+        seq: i64,
+    ) -> Self {
+        let mode = config.permission_mode;
+        let pricing = Pricing::from_config(&config);
         let mut s = Self {
             id,
             store,
@@ -65,12 +126,12 @@ impl Session {
             config,
             pricing,
             mode,
-            transcript: Vec::new(),
-            seq: 0,
+            transcript,
+            seq,
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
-        Ok(s)
+        s
     }
 
     pub fn id(&self) -> &str {
@@ -386,5 +447,89 @@ mod tests {
             .iter()
             .any(|e| matches!(e, PresenterEvent::Warning(_)));
         assert!(warned, "expected a budget Warning event");
+    }
+
+    fn fresh_session(store: Store, config: Config) -> Session {
+        Session::start(
+            store,
+            Box::new(MockProvider),
+            Box::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            ".",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn resume_rehydrates_transcript_and_continues_same_session() {
+        let path = std::env::temp_dir().join(format!("forge-resume-{}.db", forge_types::new_id()));
+        let config = Config::default();
+
+        // First run on a file-backed store, then drop it.
+        let (id, cost1, msgs1) = {
+            let mut s = fresh_session(Store::open(&path).unwrap(), config.clone());
+            s.run_turn("refactor the architecture for concurrency")
+                .await
+                .unwrap();
+            let id = s.id().to_string();
+            (
+                id.clone(),
+                s.store.session_cost(&id).unwrap(),
+                s.store.message_count(&id).unwrap(),
+            )
+        };
+
+        // Resume on a fresh connection to the same file.
+        let mut s2 = Session::resume(
+            Store::open(&path).unwrap(),
+            Box::new(MockProvider),
+            Box::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            &id,
+        )
+        .unwrap();
+
+        assert_eq!(s2.id(), id, "must continue the same session row");
+        assert_eq!(
+            s2.transcript.len() as i64,
+            msgs1,
+            "transcript should be rehydrated"
+        );
+        let cost_after_resume = s2.store.session_cost(&id).unwrap();
+        assert!(
+            (cost_after_resume - cost1).abs() < 1e-9,
+            "prior cost preserved"
+        );
+
+        // Continuing appends to the same session.
+        s2.run_turn("another complex refactor of the design")
+            .await
+            .unwrap();
+        assert!(
+            s2.store.message_count(&id).unwrap() > msgs1,
+            "new turn appended"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn resume_missing_session_errors() {
+        let err = Session::resume(
+            Store::open_in_memory().unwrap(),
+            Box::new(MockProvider),
+            Box::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            Config::default(),
+            "ghost-id",
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, CoreError::SessionNotFound(_)));
     }
 }
