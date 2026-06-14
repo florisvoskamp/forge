@@ -1,0 +1,52 @@
+@startuml containers
+title Forge — C4 Container / Crate View (v0.1 Cargo workspace)
+
+skinparam shadowing false
+skinparam defaultFontName "Sans"
+skinparam component {
+  BackgroundColor #F7F7FA
+  BorderColor #555
+}
+
+actor Developer as dev
+
+package "forge (single static binary)" {
+
+  [forge-cli\narg parsing (clap), command dispatch,\nbootstraps runtime + wiring] as cli #D9E8FF
+
+  [forge-tui\nratatui+crossterm renderer\n+ headless renderer] as tui
+  [forge-core\nsession orchestrator: agent loop,\npermission broker, presenter events] as core #FFE9CC
+  [forge-mesh\nModel Mesh: Router trait,\nheuristic routing + budget] as mesh #FFE9CC
+  [forge-provider\nProvider trait + GenAiProvider\n(Anthropic/OpenAI/Ollama)] as prov
+  [forge-tools\nTool trait + core tools:\nread/write/edit/shell/search] as tools
+  [forge-store\nrusqlite (bundled): sessions,\nmessages, costs, decisions] as store
+  [forge-config\nfigment layered config\n+ keyring secrets] as cfg
+}
+
+cloud "Providers" {
+  [genai crate] as genai
+}
+database "SQLite\n(.forge/forge.db)" as db
+[OS keyring] as kr
+
+dev --> cli
+cli --> core
+cli --> cfg
+core --> tui : presenter events
+tui --> core : user input / approvals
+core --> mesh : classify + route task
+core --> prov : chat/stream (chosen model)
+core --> tools : execute (after permission)
+core --> store : persist turn / costs
+mesh ..> cfg : routing rules, budget
+prov --> genai
+prov ..> cfg : provider settings
+cfg --> kr : fetch/store keys
+store --> db
+tools --> core : results
+
+note right of core
+  Dependency direction is one-way into core's
+  collaborators; no cycles between crates (ADR-0002).
+end note
+@enduml

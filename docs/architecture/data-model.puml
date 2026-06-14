@@ -1,0 +1,70 @@
+@startuml data-model
+title Forge — Core Data Model (SQLite, v0.1)
+
+skinparam shadowing false
+skinparam defaultFontName "Sans"
+hide circle
+skinparam linetype ortho
+
+entity "session" as session {
+  * id : TEXT (uuid) <<PK>>
+  --
+  title : TEXT
+  cwd : TEXT
+  permission_mode : TEXT
+  created_at : INTEGER
+  updated_at : INTEGER
+  total_cost_usd : REAL
+}
+
+entity "message" as message {
+  * id : TEXT <<PK>>
+  --
+  * session_id : TEXT <<FK>>
+  seq : INTEGER
+  role : TEXT  ' user | assistant | tool | system
+  content : TEXT
+  model : TEXT
+  created_at : INTEGER
+}
+
+entity "tool_call" as tool_call {
+  * id : TEXT <<PK>>
+  --
+  * message_id : TEXT <<FK>>
+  tool_name : TEXT
+  args_json : TEXT
+  result_json : TEXT
+  permission : TEXT   ' allowed | asked | denied
+  status : TEXT       ' ok | error
+  created_at : INTEGER
+}
+
+entity "routing_decision" as routing {
+  * id : TEXT <<PK>>
+  --
+  * message_id : TEXT <<FK>>
+  task_tier : TEXT     ' trivial | standard | complex
+  chosen_model : TEXT
+  rationale : TEXT     ' which rule/signal fired
+  budget_state : TEXT
+  created_at : INTEGER
+}
+
+entity "usage" as usage {
+  * id : TEXT <<PK>>
+  --
+  * message_id : TEXT <<FK>>
+  provider : TEXT
+  model : TEXT
+  input_tokens : INTEGER
+  output_tokens : INTEGER
+  cost_usd : REAL
+  created_at : INTEGER
+}
+
+session ||--o{ message
+message ||--o{ tool_call
+message ||--o| routing
+message ||--o| usage
+@enduml

@@ -1,0 +1,51 @@
+@startuml flow-agent-turn
+title Forge — Key Flow: one agent turn (mesh routing + tool with permission)
+
+skinparam shadowing false
+skinparam defaultFontName "Sans"
+
+actor Developer as dev
+participant "forge-tui" as tui
+participant "forge-core\n(session loop)" as core
+participant "forge-mesh\n(Router)" as mesh
+participant "forge-provider" as prov
+participant "Model API\n(chosen)" as api
+participant "forge-tools" as tools
+participant "Permission\nbroker (core)" as perm
+database "forge-store" as store
+
+dev -> tui : enter prompt
+tui -> core : UserInput(prompt)
+core -> mesh : classify(task signals, budget)
+mesh --> core : RoutingDecision(tier, model, rationale)
+core -> store : persist routing_decision
+core -> tui : present routing (model + why)
+
+core -> prov : chat_stream(model, messages, tools)
+prov -> api : provider request (user's key)
+api --> prov : streamed tokens + tool_call(s)
+prov --> core : stream events
+core -> tui : stream tokens live + cost meter
+
+alt model requested a tool with side effects
+  core -> perm : check(tool, args, mode, rules)
+  alt allowed (mode/rule)
+    perm --> core : Allow
+  else needs confirmation
+    perm -> tui : prompt approval
+    tui -> dev : "Run <tool>? (y/n)"
+    dev --> tui : decision
+    tui --> perm : approve / deny
+    perm --> core : Allow | Deny
+  end
+  core -> tools : execute(tool, args)   // only if allowed
+  tools --> core : result
+  core -> store : persist tool_call + permission
+  core -> prov : send tool result, continue loop
+end
+
+api --> prov : final usage (tokens)
+prov --> core : usage
+core -> store : persist message + usage + cost
+core -> tui : final answer + updated total cost
+@enduml

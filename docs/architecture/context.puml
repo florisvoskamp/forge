@@ -1,0 +1,35 @@
+@startuml context
+title Forge — C4 System Context (v0.1)
+
+skinparam shadowing false
+skinparam defaultFontName "Sans"
+skinparam rectangle {
+  BackgroundColor #F7F7FA
+  BorderColor #555
+}
+skinparam actorStyle awesome
+
+actor "Developer\n(BYOK)" as dev
+
+rectangle "**Forge CLI / TUI**\nLocal-first Rust binary: agentic coding\nloop with Model Mesh cost routing" as forge #D9E8FF
+
+rectangle "Anthropic API" as anthropic
+rectangle "OpenAI API" as openai
+rectangle "Ollama\n(local models)" as ollama
+rectangle "Local filesystem\n& shell" as os
+rectangle "OS keyring\n(secret store)" as keyring
+
+dev --> forge : prompts, approves\ntool actions, sets budget
+forge --> dev : streamed output,\nlive cost + routing
+
+forge --> anthropic : chat / stream / tools\n(HTTPS, user's key)
+forge --> openai : chat / stream / tools\n(HTTPS, user's key)
+forge --> ollama : chat / stream\n(localhost HTTP)
+forge --> os : read/write files,\nrun commands (gated)
+forge --> keyring : store / fetch\nAPI keys
+
+note bottom of forge
+  No Forge cloud account. Nothing leaves the
+  machine except calls to the user's own providers.
+end note
+@enduml
