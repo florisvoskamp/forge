@@ -1,0 +1,13 @@
+[package]
+name = "forge-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Local SQLite persistence for Forge sessions, messages, costs, and decisions."
+repository.workspace = true
+
+[dependencies]
+forge-types.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true

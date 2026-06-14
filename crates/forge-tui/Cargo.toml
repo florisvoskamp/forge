@@ -1,0 +1,11 @@
+[package]
+name = "forge-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Presenter abstraction and renderers (headless now; ratatui TUI next) for Forge."
+repository.workspace = true
+
+[dependencies]
+forge-types.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "forge-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The Forge command-line binary."
+repository.workspace = true
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+forge-types.workspace = true
+forge-config.workspace = true
+forge-core.workspace = true
+forge-mesh.workspace = true
+forge-provider.workspace = true
+forge-tools.workspace = true
+forge-store.workspace = true
+forge-tui.workspace = true
+clap.workspace = true
+tokio = { workspace = true }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
