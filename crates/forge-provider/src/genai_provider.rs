@@ -31,9 +31,27 @@ impl GenAiProvider {
     }
 }
 
-/// Config uses `"provider::model"`; genai infers the adapter from the bare model name.
-fn bare_model(model: &str) -> &str {
-    model.rsplit("::").next().unwrap_or(model)
+/// Forge model ids are `"provider::model"`. genai 0.6 resolves the adapter from a
+/// `namespace::name` prefix directly (its namespace table covers anthropic, openai, gemini,
+/// xai, deepseek, ollama, open_router, …), so we pass the namespaced form straight through
+/// rather than stripping it — that selects the right adapter (and its endpoint + default
+/// API-key env var) explicitly instead of relying on name inference. The only fix-up is
+/// Forge's `openrouter` alias → genai's `open_router` namespace. A model with no `::` is
+/// passed verbatim (genai falls back to name inference).
+fn to_genai_model(model: &str) -> String {
+    match model.split_once("::") {
+        Some((prefix, name)) => format!("{}::{}", normalize_namespace(prefix), name),
+        None => model.to_string(),
+    }
+}
+
+/// Map a Forge provider prefix to the namespace genai expects. Identity for everything
+/// except `openrouter`, which genai spells `open_router`.
+fn normalize_namespace(prefix: &str) -> &str {
+    match prefix {
+        "openrouter" => "open_router",
+        other => other,
+    }
 }
 
 fn to_genai_messages(messages: &[Message]) -> Vec<ChatMessage> {
@@ -84,7 +102,7 @@ impl Provider for GenAiProvider {
         tools: &[ToolSpec],
         on_text: &mut TextSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
-        let model_name = bare_model(model);
+        let model_name = to_genai_model(model);
 
         let mut req = ChatRequest::new(to_genai_messages(messages));
         if !tools.is_empty() {
@@ -99,7 +117,7 @@ impl Provider for GenAiProvider {
 
         let res = self
             .client
-            .exec_chat_stream(model_name, req, Some(&options))
+            .exec_chat_stream(model_name.as_str(), req, Some(&options))
             .await
             .map_err(|e| ProviderError::Request(e.to_string()))?;
 
@@ -158,12 +176,49 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn bare_model_strips_provider_prefix() {
-        assert_eq!(bare_model("ollama::llama3.2"), "llama3.2");
-        assert_eq!(bare_model("openai::gpt-4o"), "gpt-4o");
-        assert_eq!(bare_model("claude-3-5-sonnet"), "claude-3-5-sonnet");
-        assert_eq!(bare_model("a::b::c"), "c");
-        assert_eq!(bare_model(""), "");
+    fn to_genai_model_passes_namespaced_ids_through() {
+        // Native providers: namespace kept verbatim so genai selects the adapter explicitly.
+        assert_eq!(to_genai_model("ollama::llama3.2"), "ollama::llama3.2");
+        assert_eq!(to_genai_model("openai::gpt-4o"), "openai::gpt-4o");
+        assert_eq!(
+            to_genai_model("anthropic::claude-opus-4-8"),
+            "anthropic::claude-opus-4-8"
+        );
+        assert_eq!(
+            to_genai_model("gemini::gemini-2.5-pro"),
+            "gemini::gemini-2.5-pro"
+        );
+        assert_eq!(to_genai_model("xai::grok-4"), "xai::grok-4");
+        assert_eq!(
+            to_genai_model("deepseek::deepseek-chat"),
+            "deepseek::deepseek-chat"
+        );
+    }
+
+    #[test]
+    fn to_genai_model_renames_openrouter_alias() {
+        // Forge says `openrouter`; genai's namespace is `open_router`. The model part —
+        // including its `/` and any later separators — is preserved.
+        assert_eq!(
+            to_genai_model("openrouter::deepseek/deepseek-chat"),
+            "open_router::deepseek/deepseek-chat"
+        );
+        assert_eq!(
+            to_genai_model("openrouter::anthropic/claude-sonnet-4-5"),
+            "open_router::anthropic/claude-sonnet-4-5"
+        );
+    }
+
+    #[test]
+    fn to_genai_model_splits_on_first_separator() {
+        // genai splits namespace on the FIRST `::`, so the remainder stays intact.
+        assert_eq!(to_genai_model("openai::a::b"), "openai::a::b");
+    }
+
+    #[test]
+    fn to_genai_model_without_prefix_is_verbatim() {
+        assert_eq!(to_genai_model("claude-3-5-sonnet"), "claude-3-5-sonnet");
+        assert_eq!(to_genai_model(""), "");
     }
 
     #[test]

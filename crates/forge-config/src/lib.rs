@@ -285,13 +285,30 @@ pub fn load() -> Result<Config, ConfigError> {
 
 const KEYRING_SERVICE: &str = "forge";
 
+/// Providers that authenticate with an API key, paired with the environment variable the
+/// genai client reads for that provider. The env var names must match genai's
+/// `API_KEY_DEFAULT_ENV_NAME` per adapter exactly (note OpenRouter's underscore). Local
+/// providers (e.g. ollama) need no key and are intentionally absent.
+const PROVIDER_ENV_VARS: &[(&str, &str)] = &[
+    ("anthropic", "ANTHROPIC_API_KEY"),
+    ("openai", "OPENAI_API_KEY"),
+    ("gemini", "GEMINI_API_KEY"),
+    ("xai", "XAI_API_KEY"),
+    ("deepseek", "DEEPSEEK_API_KEY"),
+    ("openrouter", "OPEN_ROUTER_API_KEY"),
+];
+
 /// The conventional environment variable for a provider's API key, if it needs one.
 fn env_var_for(provider: &str) -> Option<&'static str> {
-    match provider {
-        "anthropic" => Some("ANTHROPIC_API_KEY"),
-        "openai" => Some("OPENAI_API_KEY"),
-        _ => None, // local providers (e.g. ollama) need no key
-    }
+    PROVIDER_ENV_VARS
+        .iter()
+        .find(|(name, _)| *name == provider)
+        .map(|(_, var)| *var)
+}
+
+/// Provider names Forge knows how to authenticate (for `forge auth` validation/help).
+pub fn known_key_providers() -> impl Iterator<Item = &'static str> {
+    PROVIDER_ENV_VARS.iter().map(|(name, _)| *name)
 }
 
 /// Resolve an API key for a provider: environment variable first, then the OS keyring.
@@ -325,10 +342,7 @@ pub fn store_api_key(provider: &str, key: &str) -> Result<(), ConfigError> {
 /// environment): for each known provider with no env var set, inject the keyring value.
 /// Best-effort — providers without a stored key are simply left unset.
 pub fn inject_provider_keys() {
-    for provider in ["anthropic", "openai"] {
-        let Some(var) = env_var_for(provider) else {
-            continue;
-        };
+    for (provider, var) in PROVIDER_ENV_VARS {
         if std::env::var(var).is_ok() {
             continue;
         }
@@ -362,6 +376,43 @@ mod tests {
     #[test]
     fn local_providers_need_no_key() {
         assert_eq!(api_key("ollama").unwrap(), "");
+    }
+
+    #[test]
+    fn env_var_mapping_covers_all_key_providers() {
+        // Names must match genai's per-adapter API_KEY_DEFAULT_ENV_NAME exactly.
+        assert_eq!(env_var_for("anthropic"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(env_var_for("openai"), Some("OPENAI_API_KEY"));
+        assert_eq!(env_var_for("gemini"), Some("GEMINI_API_KEY"));
+        assert_eq!(env_var_for("xai"), Some("XAI_API_KEY"));
+        assert_eq!(env_var_for("deepseek"), Some("DEEPSEEK_API_KEY"));
+        // Forge's `openrouter` alias maps to genai's underscored env var.
+        assert_eq!(env_var_for("openrouter"), Some("OPEN_ROUTER_API_KEY"));
+        assert_eq!(env_var_for("ollama"), None);
+    }
+
+    #[test]
+    fn missing_key_error_names_the_env_var_and_auth_command() {
+        std::env::remove_var("DEEPSEEK_API_KEY");
+        let err = api_key("deepseek").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("DEEPSEEK_API_KEY"), "got: {msg}");
+        assert!(msg.contains("forge auth deepseek"), "got: {msg}");
+    }
+
+    #[test]
+    fn known_key_providers_lists_the_new_providers() {
+        let providers: Vec<_> = known_key_providers().collect();
+        for p in [
+            "anthropic",
+            "openai",
+            "gemini",
+            "xai",
+            "deepseek",
+            "openrouter",
+        ] {
+            assert!(providers.contains(&p), "{p} should be a known key provider");
+        }
     }
 
     #[test]
