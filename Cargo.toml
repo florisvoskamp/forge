@@ -38,7 +38,14 @@ uuid = { version = "1", features = ["v4"] }
 genai = "0.6"
 # unstable-rendered-line-info: Paragraph::line_count, used to size insert_before so
 # scrollback lines never clip or overlap the inline viewport. Compiles on stable.
-ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+ratatui = { version = "0.30", features = [
+    "unstable-rendered-line-info",
+    # insert_before MUST use terminal scroll-regions (ScrollUpInRegion + append_lines), NOT a
+    # synchronous cursor-position DSR query. Without this, insert_before calls
+    # crossterm::cursor::position() which writes `ESC[6n` and reads stdin for the reply — racing
+    # our event-read loop on the same stdin → the whole TUI freezes (Ctrl-C dead).
+    "scrolling-regions",
+] }
 crossterm = "0.29"
 globset = "0.4"
 shell-words = "1"

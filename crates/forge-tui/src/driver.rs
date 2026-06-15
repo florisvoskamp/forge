@@ -99,8 +99,27 @@ pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
+/// Install (once) a panic hook that disables raw mode before the default hook prints, so a
+/// panic anywhere can never leave the terminal stuck. Idempotent across `Tui`/`TuiPresenter`.
+pub fn install_panic_restore() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
+            prev(info);
+        }));
+    });
+}
+
 impl Tui {
     pub fn new() -> io::Result<Self> {
+        // Belt-and-suspenders: if *anything* panics while the terminal is in raw mode, restore
+        // it before the panic prints — otherwise a panic would leave the shell wedged (no echo,
+        // Ctrl-C inert). `Drop` covers the normal/unwind path; this covers the print itself.
+        install_panic_restore();
         enable_raw_mode()?;
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::with_options(
