@@ -98,9 +98,9 @@ pub enum AssayProgress {
     },
 }
 
-/// Max concurrent model calls in the crew. Bounded so the few live models (when most are
-/// rate-limited) aren't hammered into 429s — the cause of lenses skipping under heavy bench.
-const MAX_CONCURRENCY: usize = 4;
+/// Max concurrent model calls in the crew. Kept low so the few live models (when most are
+/// rate-limited) aren't burst over free-tier RPM limits — the cause of lenses skipping.
+const MAX_CONCURRENCY: usize = 2;
 
 /// A one-line, user-facing rendering of a progress event.
 pub fn progress_line(p: &AssayProgress) -> String {
@@ -263,12 +263,14 @@ async fn complete_with_failover(
     if chain.is_empty() {
         return Err("no usable model for this tier".to_string());
     }
+    use forge_provider::ProviderError;
+    const MAX_ATTEMPTS: usize = 3;
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
     let mut sink = |_ev: StreamEvent| {};
     let mut last = String::from("no usable model");
     for model in chain {
         // Skip models another critic (or a prior run) already benched — avoids re-hammering a
-        // known-dead model with a slow request, the main cause of assay being sluggish under
-        // rate limits.
+        // known-dead model with a slow request.
         if store
             .current_benched()
             .map(|b| b.is_benched(model))
@@ -277,18 +279,41 @@ async fn complete_with_failover(
             last = "rate-limited".to_string();
             continue;
         }
-        match provider.complete(model, messages, &[], &mut sink).await {
-            Ok(r) => {
-                let cost = pricing.cost_for(model, r.usage.input_tokens, r.usage.output_tokens);
-                return Ok((r.content, cost));
-            }
-            Err(e) => {
-                last = e.reason().to_string();
-                // Bench retryable failures so other critics + later runs route around them.
-                if e.is_retryable() {
-                    let _ = store.bench_for(model, e.cooldown(cooldown), e.reason());
+        for attempt in 0..MAX_ATTEMPTS {
+            match provider.complete(model, messages, &[], &mut sink).await {
+                Ok(r) => {
+                    let cost = pricing.cost_for(model, r.usage.input_tokens, r.usage.output_tokens);
+                    return Ok((r.content, cost));
                 }
-                // Try the next candidate in the chain.
+                Err(e) => {
+                    last = e.reason().to_string();
+                    // A 429 / 5xx is transient: wait (the server's retry-after, capped + jittered
+                    // so concurrent critics don't retry in lockstep) and retry the SAME model
+                    // rather than benching it — benching on a single 429 was skipping every later
+                    // critic. Only after retries are exhausted (or on a permanent error) do we
+                    // bench and fall over to the next model.
+                    let transient = matches!(
+                        e,
+                        ProviderError::RateLimited { .. } | ProviderError::Unavailable(_)
+                    );
+                    if transient && attempt + 1 < MAX_ATTEMPTS {
+                        let base = e
+                            .cooldown(std::time::Duration::from_millis(600u64 << attempt))
+                            .min(MAX_WAIT);
+                        let jitter = std::time::Duration::from_millis(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| (d.subsec_millis() % 400) as u64)
+                                .unwrap_or(0),
+                        );
+                        tokio::time::sleep(base + jitter).await;
+                        continue;
+                    }
+                    if e.is_retryable() {
+                        let _ = store.bench_for(model, e.cooldown(cooldown), e.reason());
+                    }
+                    break;
+                }
             }
         }
     }
@@ -532,7 +557,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn critic_fails_over_when_its_model_is_rate_limited() {
         // The first complex-tier model 429s; the critic must fall over to the next and still
         // produce a finding (the bug the user hit: one dead model skipped the whole tier).
@@ -636,7 +661,7 @@ mod tests {
         assert!(report.findings.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_lens_falls_back_across_tiers_when_its_own_tier_is_down() {
         // dead-weight is a trivial-tier lens; its trivial model is rate-limited, so it must fall
         // back to the complex tier's live model rather than being skipped.

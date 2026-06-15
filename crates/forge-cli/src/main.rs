@@ -495,6 +495,11 @@ async fn discover_catalog() -> forge_mesh::ModelCatalog {
             Err(_) => tracing::debug!("model discovery timed out for {p}"),
         }
     }
+    // Always-available subscription bridges (claude-cli/codex-cli) if their CLI is installed.
+    // They don't rate-limit like the free API tiers, so the mesh can rely on them — and being
+    // $0 subscriptions they rank first (prefer_subscription), so routing reaches a working model
+    // instead of erroring out when metered providers are throttled.
+    models.extend(forge_provider::available_bridge_models());
     forge_mesh::ModelCatalog::new(models)
 }
 
