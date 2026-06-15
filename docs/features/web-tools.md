@@ -57,11 +57,16 @@ host/query pattern regardless of mode (e.g. deny `web_fetch` to internal hosts).
 
 - Args: `{ "query": string, "count"?: number }` (default 5, capped at 10).
 - `SearchBackend` trait → two impls shipped:
-  - **`DuckDuckGo`** — the **keyless free default**. Scrapes the no-JS HTML endpoint
-    (`GET https://html.duckduckgo.com/html/?q=…`); parses `<a class="result__a">` (title+url)
-    + `<a class="result__snippet">`; decodes `uddg=` redirect hrefs. Free forever, zero setup.
-    Best-effort: DDG rate-limits and the layout can drift, so parsing is defensive and a
-    rate-limit / layout change degrades to "no results", not a turn error.
+  - **`DuckDuckGo`** — the **keyless free default**, two-stage:
+    1. the no-JS HTML endpoint (`GET https://html.duckduckgo.com/html/?q=…`) for full ranked
+       web results — parses `<a class="result__a">` + `result__snippet`, decodes `uddg=` hrefs;
+    2. **fallback to the official Instant-Answer JSON API** (`api.duckduckgo.com?format=json`)
+       when the HTML endpoint is throttled. DDG returns **HTTP 202 + a challenge page** when it
+       rate-limits an IP — which is *technically* 2xx, so the first cut parsed it to an empty
+       list and silently reported "No results found" (the bug). The IA API still returns an
+       abstract + related topics under that throttle, so keyless search degrades gracefully.
+    If both stages are empty **and** the HTML endpoint was throttled, `web_search` returns an
+    actionable error (rate-limited; retry or `forge auth brave`) — never a misleading empty.
   - **`BraveSearch`** — used when a key is set. **Verified contract** (official docs, 2026-06):
     `GET https://api.search.brave.com/res/v1/web/search?q=…&count=…`, header
     `X-Subscription-Token: <key>`, results at `web.results[].{title,url,description}`.

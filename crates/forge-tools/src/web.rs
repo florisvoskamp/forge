@@ -311,41 +311,133 @@ pub(crate) fn parse_brave_results(body: &Value) -> Vec<SearchResult> {
 }
 
 /// Keyless DuckDuckGo backend — the free default when no search-API key is configured.
-/// Scrapes the no-JS HTML endpoint (`https://html.duckduckgo.com/html/`). Free forever but
-/// best-effort: DDG rate-limits and the HTML layout can drift, so parsing is defensive and a
-/// rate-limit / layout change degrades to "no results" rather than erroring the turn.
+/// Two-stage + honest about blocks:
+/// 1. the no-JS HTML endpoint (`html.duckduckgo.com/html/`) for full ranked web results;
+/// 2. when DDG rate-limits the HTML endpoint (it serves HTTP 202 + a challenge page, which
+///    is *technically* 2xx — the old code parsed it to an empty list and silently reported
+///    "no results"), fall back to the official Instant-Answer JSON API
+///    (`api.duckduckgo.com`), which still returns an abstract + related topics under throttle.
+///
+/// If both yield nothing AND the HTML endpoint was throttled, return an actionable error
+/// instead of a misleading empty result. Keyless search is inherently best-effort — for
+/// reliable, higher-volume search set a key (`forge auth brave`).
 pub struct DuckDuckGo;
+
+const DDG_UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0";
 
 #[async_trait]
 impl SearchBackend for DuckDuckGo {
     async fn search(&self, query: &str, count: u32) -> Result<Vec<SearchResult>, ToolError> {
         let client = reqwest::Client::builder()
-            // DDG blocks obvious bot UAs — present a browser-like agent.
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0")
+            .user_agent(DDG_UA)
             .timeout(FETCH_TIMEOUT)
             .build()
             .map_err(|e| ToolError::Failed(format!("http client: {e}")))?;
-        let resp = client
+
+        // Stage 1: HTML results endpoint.
+        let html_resp = client
             .get("https://html.duckduckgo.com/html/")
             .query(&[("q", query)])
+            .header("Accept-Language", "en-US,en;q=0.9")
             .send()
             .await
             .map_err(|e| ToolError::Failed(format!("duckduckgo request: {e}")))?;
-        let status = resp.status();
-        let body = resp
-            .text()
+        let html_status = html_resp.status();
+        let html_ok = html_status == reqwest::StatusCode::OK;
+        let body = html_resp.text().await.unwrap_or_default();
+        if html_ok {
+            let mut results = parse_ddg_results(&body);
+            if !results.is_empty() {
+                results.truncate(count as usize);
+                return Ok(results);
+            }
+        }
+
+        // Stage 2: Instant-Answer JSON API (works even when the HTML endpoint is throttled).
+        if let Ok(resp) = client
+            .get("https://api.duckduckgo.com/")
+            .query(&[
+                ("q", query),
+                ("format", "json"),
+                ("no_html", "1"),
+                ("t", "forge"),
+            ])
+            .send()
             .await
-            .map_err(|e| ToolError::Failed(format!("duckduckgo response: {e}")))?;
-        if !status.is_success() {
+        {
+            if let Ok(json) = resp.json::<Value>().await {
+                let mut results = parse_ddg_ia(&json);
+                if !results.is_empty() {
+                    results.truncate(count as usize);
+                    return Ok(results);
+                }
+            }
+        }
+
+        // Nothing. If the HTML endpoint was blocked, say so (don't pretend "no results").
+        if !html_ok {
             return Err(ToolError::Failed(format!(
-                "duckduckgo returned HTTP {status} (likely rate-limited — try again later \
-                 or configure a search key with `forge auth brave`/`tavily`)"
+                "DuckDuckGo rate-limited this IP (HTTP {html_status}) and the fallback returned \
+                 nothing. Retry shortly, or set a search key for reliable results: \
+                 `forge auth brave`."
             )));
         }
-        let mut results = parse_ddg_results(&body);
-        results.truncate(count as usize);
-        Ok(results)
+        Ok(Vec::new())
     }
+}
+
+/// Map DuckDuckGo's Instant-Answer JSON to results: the Abstract (usually a Wikipedia
+/// summary), then official `Results[]`, then flat/nested `RelatedTopics[]`. Deduped by URL.
+pub(crate) fn parse_ddg_ia(json: &Value) -> Vec<SearchResult> {
+    let mut out: Vec<SearchResult> = Vec::new();
+
+    let abstract_url = json
+        .get("AbstractURL")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if abstract_url.starts_with("http") {
+        out.push(SearchResult {
+            title: str_field(json, "Heading"),
+            url: abstract_url.to_string(),
+            description: str_field(json, "AbstractText"),
+        });
+    }
+
+    for key in ["Results", "RelatedTopics"] {
+        let Some(arr) = json.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in arr {
+            // Flat topic, or a nested {Name, Topics:[…]} category group.
+            match item.get("Topics").and_then(Value::as_array) {
+                Some(sub) => sub.iter().for_each(|t| push_ia_topic(&mut out, t)),
+                None => push_ia_topic(&mut out, item),
+            }
+        }
+    }
+    out
+}
+
+fn str_field(json: &Value, key: &str) -> String {
+    json.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Append a `{Text, FirstURL}` Instant-Answer topic as a result (title = text before " - "),
+/// skipping empties and URL duplicates.
+fn push_ia_topic(out: &mut Vec<SearchResult>, t: &Value) {
+    let url = t.get("FirstURL").and_then(Value::as_str).unwrap_or("");
+    let text = t.get("Text").and_then(Value::as_str).unwrap_or("");
+    if !url.starts_with("http") || text.is_empty() || out.iter().any(|r| r.url == url) {
+        return;
+    }
+    out.push(SearchResult {
+        title: text.split(" - ").next().unwrap_or(text).to_string(),
+        url: url.to_string(),
+        description: text.to_string(),
+    });
 }
 
 /// Parse DuckDuckGo's HTML result page. Each hit is an `<a class="result__a" href="URL">TITLE
@@ -655,6 +747,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_ddg_ia_maps_abstract_results_and_topics() {
+        let json = json!({
+            "Heading": "Rust (programming language)",
+            "AbstractText": "Rust is a systems language.",
+            "AbstractURL": "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+            "Results": [
+                { "Text": "Rust — official site", "FirstURL": "https://rust-lang.org/" }
+            ],
+            "RelatedTopics": [
+                { "Text": "Cargo - the Rust build tool", "FirstURL": "https://doc.rust-lang.org/cargo/" },
+                { "Name": "group", "Topics": [
+                    { "Text": "Crates.io - the registry", "FirstURL": "https://crates.io/" }
+                ]},
+                { "Text": "dup", "FirstURL": "https://rust-lang.org/" }
+            ]
+        });
+        let r = parse_ddg_ia(&json);
+        assert_eq!(
+            r[0].url,
+            "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+        );
+        assert_eq!(r[0].title, "Rust (programming language)");
+        assert_eq!(r[1].url, "https://rust-lang.org/");
+        assert_eq!(r[1].title, "Rust — official site");
+        assert!(
+            r.iter().any(|x| x.url == "https://crates.io/"),
+            "nested topic included"
+        );
+        // "dup" reusing rust-lang.org URL is deduped.
+        assert_eq!(
+            r.iter()
+                .filter(|x| x.url == "https://rust-lang.org/")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn parse_ddg_ia_empty_when_no_urls() {
+        assert!(parse_ddg_ia(&json!({ "Heading": "x", "RelatedTopics": [] })).is_empty());
+    }
+
     #[tokio::test]
     async fn web_search_defaults_to_duckduckgo_without_key() {
         std::env::remove_var("BRAVE_API_KEY");
@@ -668,6 +803,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn ddg_live_search() {
+        // Exercises the html→Instant-Answer fallback: even when DDG throttles the HTML
+        // endpoint (HTTP 202), the IA API still returns the Rust abstract + topics.
         let out = WebSearchTool::new()
             .run(&json!({ "query": "rust programming language", "count": 3 }))
             .await
