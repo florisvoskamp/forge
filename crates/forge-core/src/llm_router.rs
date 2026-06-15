@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use forge_mesh::{BudgetState, HeuristicRouter, Router, RoutingDecision};
+use forge_mesh::{BudgetState, HeuristicRouter, RouteHints, Router, RoutingDecision};
 use forge_provider::Provider;
 use forge_types::{Message, ModelHealth, TaskTier};
 
@@ -79,6 +79,7 @@ impl Router for LlmRouter {
                 format!("classified by {} as {}", self.model, t.as_str()),
                 budget,
                 health,
+                RouteHints::from_prompt(prompt),
             ),
             None => {
                 // Couldn't classify → deterministic heuristic, noted in the rationale.

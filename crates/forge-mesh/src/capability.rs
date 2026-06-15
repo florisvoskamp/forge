@@ -7,7 +7,7 @@
 use forge_types::TaskTier;
 
 /// Coarse quality class inferred from a model id's family (0 = unknown/small … 3 = frontier).
-fn quality_class(id: &str) -> u8 {
+pub(crate) fn quality_class(id: &str) -> u8 {
     let m = id.to_lowercase();
     // Small / fast FIRST: a size/speed marker (mini, haiku, -lite, -8b) downgrades even a
     // frontier-family name — `gpt-5.4-mini` and `gpt-4o-mini` are small, not frontier.
@@ -62,7 +62,7 @@ pub fn is_frontier(id: &str) -> bool {
 }
 
 /// Coarse speed class — roughly the inverse of size (3 = fastest small model).
-fn speed_class(id: &str) -> u8 {
+pub(crate) fn speed_class(id: &str) -> u8 {
     match quality_class(id) {
         3 => 1,
         2 => 2,
@@ -70,20 +70,17 @@ fn speed_class(id: &str) -> u8 {
     }
 }
 
-/// Score a model for a tier (higher = better fit). `cost` is the estimated USD/turn (0 = free).
-/// Trivial favours speed + cheapness; Complex favours quality; Standard balances. A free model
-/// gets a small bonus so $0 options edge out paid ones of equal class.
-pub fn tier_score(id: &str, tier: TaskTier, cost: f64) -> f64 {
+/// The pure *capability* fit of a model for a tier (higher = better), with no cost/provider terms
+/// — those are layered on in the catalog's routing score so cost-tiering + spread stay in one
+/// place. Trivial favours speed, Complex favours quality, Standard balances.
+pub(crate) fn capability_score(id: &str, tier: TaskTier) -> f64 {
     let q = quality_class(id) as f64;
     let s = speed_class(id) as f64;
-    let free_bonus = if cost <= f64::EPSILON { 0.5 } else { 0.0 };
-    let cost_penalty = cost * 4.0; // cents-scale; keeps cheap models ahead without dominating
-    let base = match tier {
+    match tier {
         TaskTier::Trivial => s * 2.0 + q * 0.5,
         TaskTier::Standard => q + s,
         TaskTier::Complex => q * 2.0 + s * 0.25,
-    };
-    base + free_bonus - cost_penalty
+    }
 }
 
 #[cfg(test)]
@@ -92,28 +89,31 @@ mod tests {
 
     #[test]
     fn trivial_prefers_a_fast_small_model_over_a_frontier_one() {
-        let small = tier_score("groq::llama-3.1-8b-instant", TaskTier::Trivial, 0.0);
-        let big = tier_score("anthropic::claude-opus-4-8", TaskTier::Trivial, 0.06);
+        let small = capability_score("groq::llama-3.1-8b-instant", TaskTier::Trivial);
+        let big = capability_score("anthropic::claude-opus-4-8", TaskTier::Trivial);
         assert!(
             small > big,
-            "trivial should pick the fast/cheap model: {small} vs {big}"
+            "trivial should favour the fast/small model: {small} vs {big}"
         );
     }
 
     #[test]
     fn complex_prefers_a_frontier_model_over_a_tiny_one() {
-        let big = tier_score("anthropic::claude-opus-4-8", TaskTier::Complex, 0.06);
-        let small = tier_score("groq::llama-3.1-8b-instant", TaskTier::Complex, 0.0);
+        let big = capability_score("anthropic::claude-opus-4-8", TaskTier::Complex);
+        let small = capability_score("groq::llama-3.1-8b-instant", TaskTier::Complex);
         assert!(
             big > small,
-            "complex should pick the strong model: {big} vs {small}"
+            "complex should favour the strong model: {big} vs {small}"
         );
     }
 
     #[test]
-    fn free_breaks_ties_within_a_class() {
-        let free = tier_score("groq::llama-3.3-70b-versatile", TaskTier::Complex, 0.0);
-        let paid = tier_score("openrouter::meta/llama-3.3-70b", TaskTier::Complex, 0.02);
-        assert!(free > paid, "equal-class free model edges out the paid one");
+    fn mini_and_haiku_are_small_not_frontier() {
+        // The reorder fix: a size marker downgrades even a frontier-family name.
+        assert!(!is_frontier("codex-cli::gpt-5.4-mini"));
+        assert!(!is_frontier("openai::gpt-4o-mini"));
+        assert!(!is_frontier("claude-cli::haiku"));
+        assert!(is_frontier("codex-cli::gpt-5.4"));
+        assert!(is_frontier("claude-cli::opus"));
     }
 }

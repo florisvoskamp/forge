@@ -212,6 +212,34 @@ struct Classification {
     reasons: Vec<&'static str>,
 }
 
+/// Prompt-derived context for model selection (beyond the tier): whether the task is code-heavy
+/// (mild coding-provider prior) and a stable per-prompt seed (so genuine ties spread across
+/// equally-good providers instead of always the alphabetically-first one). `Default` = a neutral
+/// context for callers that have no prompt.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RouteHints {
+    pub code_heavy: bool,
+    pub seed: u64,
+}
+
+impl RouteHints {
+    pub fn from_prompt(prompt: &str) -> Self {
+        Self {
+            code_heavy: is_code_heavy(prompt),
+            seed: catalog::stable_hash(prompt),
+        }
+    }
+}
+
+/// Whether a prompt reads as a coding task (code fences, code tokens, or a dev-action verb) — the
+/// signal behind the mild coding-provider prior.
+fn is_code_heavy(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    prompt.contains("```")
+        || CODE_TOKENS.iter().any(|t| lower.contains(t))
+        || ACTION_VERBS.iter().any(|v| lower.contains(v))
+}
+
 /// Score a prompt's difficulty from weighted local signals (deterministic, no I/O). Capability
 /// signals (reasoning terms, code, errors) can lift a *short* prompt to Complex; trivial-edit
 /// patterns and "quick" hints pull it down. Length is one capped signal, never the decider —
@@ -333,13 +361,15 @@ impl HeuristicRouter {
     /// Candidate models for a tier: the auto-discovered, capability-ranked shortlist when
     /// [`auto_active`](Self::auto_active); otherwise the configured `[mesh.models]` candidates
     /// (the manual/override path, and the offline/no-catalog default).
-    fn candidates_for_tier(&self, tier: TaskTier) -> Vec<String> {
+    fn candidates_for_tier(&self, tier: TaskTier, hints: RouteHints) -> Vec<String> {
         if self.auto_active() {
-            let ranked = self
-                .catalog
-                .as_ref()
-                .unwrap()
-                .ranked_for(tier, &self.pricing, 5);
+            let ranked = self.catalog.as_ref().unwrap().ranked_seeded(
+                tier,
+                &self.pricing,
+                5,
+                hints.code_heavy,
+                hints.seed,
+            );
             if !ranked.is_empty() {
                 return ranked;
             }
@@ -401,8 +431,13 @@ impl HeuristicRouter {
     /// Usable candidates for one tier, in preference order: the auto-discovered capability
     /// ranking (cost folded in) when auto is active, else cheapest-first over the configured
     /// candidates.
-    fn ordered_usable_for_tier(&self, tier: TaskTier, health: &ModelHealth) -> Vec<String> {
-        let candidates = self.candidates_for_tier(tier);
+    fn ordered_usable_for_tier(
+        &self,
+        tier: TaskTier,
+        health: &ModelHealth,
+        hints: RouteHints,
+    ) -> Vec<String> {
+        let candidates = self.candidates_for_tier(tier, hints);
         let mut usable: Vec<String> = candidates
             .iter()
             .filter(|m| self.is_usable(m, health))
@@ -417,13 +452,18 @@ impl HeuristicRouter {
 
     /// Build the ordered failover chain for the routed tier: that tier's usable models first,
     /// then the other tiers (Complex → Standard → Trivial) as cross-tier fallbacks, deduped.
-    fn build_chain(&self, routed: TaskTier, health: &ModelHealth) -> Vec<String> {
-        let mut chain = self.ordered_usable_for_tier(routed, health);
+    fn build_chain(
+        &self,
+        routed: TaskTier,
+        health: &ModelHealth,
+        hints: RouteHints,
+    ) -> Vec<String> {
+        let mut chain = self.ordered_usable_for_tier(routed, health, hints);
         for tier in [TaskTier::Complex, TaskTier::Standard, TaskTier::Trivial] {
             if tier == routed {
                 continue;
             }
-            for m in self.ordered_usable_for_tier(tier, health) {
+            for m in self.ordered_usable_for_tier(tier, health, hints) {
                 if !chain.contains(&m) {
                     chain.push(m);
                 }
@@ -459,6 +499,7 @@ impl HeuristicRouter {
         classify_reason: String,
         budget: BudgetState,
         health: &ModelHealth,
+        hints: RouteHints,
     ) -> RoutingDecision {
         let exhausted = budget.status() == BudgetStatus::Exhausted;
         let cap_overrides_pin = self.config.mesh.budget.cap_overrides_pin;
@@ -472,7 +513,7 @@ impl HeuristicRouter {
             let mut why = "pinned via --model".to_string();
             // Fallbacks even for a pin: if the pinned model is rate-limited/down mid-turn we
             // still want to keep working.
-            let mut chain = self.build_chain(classified_tier, health);
+            let mut chain = self.build_chain(classified_tier, health, hints);
             let model = if self.is_usable(pin, health) {
                 pin.clone()
             } else {
@@ -515,12 +556,12 @@ impl HeuristicRouter {
         // `routed_usable` lets us tell a same-tier pick (normal rationale) from a cross-tier
         // fallback ("fell back …") for the message.
         let auto = self.auto_active();
-        let routed_usable = self.ordered_usable_for_tier(tier, health);
-        let mut chain = self.build_chain(tier, health);
+        let routed_usable = self.ordered_usable_for_tier(tier, health, hints);
+        let mut chain = self.build_chain(tier, health, hints);
         match chain.first().cloned() {
             Some(model) => {
                 if routed_usable.contains(&model) {
-                    let n = self.usable_count(&self.candidates_for_tier(tier), health);
+                    let n = self.usable_count(&self.candidates_for_tier(tier, hints), health);
                     if auto {
                         why.push_str(&format!(
                             " — auto-selected best of {n} usable {} models: {model}",
@@ -534,7 +575,7 @@ impl HeuristicRouter {
                     }
                 } else {
                     let original = self
-                        .candidates_for_tier(tier)
+                        .candidates_for_tier(tier, hints)
                         .first()
                         .cloned()
                         .unwrap_or_else(|| "unknown".into());
@@ -555,7 +596,7 @@ impl HeuristicRouter {
             }
             None => {
                 let original = self
-                    .candidates_for_tier(tier)
+                    .candidates_for_tier(tier, hints)
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "unknown".into());
@@ -582,7 +623,13 @@ impl Router for HeuristicRouter {
         health: &ModelHealth,
     ) -> RoutingDecision {
         let (tier, reason) = Self::classify(prompt);
-        self.decide(tier, reason, budget, health)
+        self.decide(
+            tier,
+            reason,
+            budget,
+            health,
+            RouteHints::from_prompt(prompt),
+        )
     }
 }
 
@@ -594,6 +641,185 @@ mod tests {
         // Treat every provider as available so tier-classification tests are deterministic
         // (no dependence on ambient env/keyring) and exercise no fallback.
         HeuristicRouter::new(Config::default()).with_availability(|_| true)
+    }
+
+    /// A realistic mixed catalog mirroring a user with claude+codex CLIs, local ollama, and
+    /// keys for free-tier groq + metered gemini — the setup the routing policy targets.
+    fn mixed_catalog() -> ModelCatalog {
+        ModelCatalog::new(vec![
+            "claude-cli::".into(),
+            "claude-cli::opus".into(),
+            "claude-cli::sonnet".into(),
+            "claude-cli::haiku".into(),
+            "codex-cli::".into(),
+            "codex-cli::gpt-5.5".into(),
+            "codex-cli::gpt-5.3-codex".into(),
+            "codex-cli::gpt-5.4".into(),
+            "codex-cli::gpt-5.4-mini".into(),
+            "ollama::qwen3-coder:30b".into(),
+            "ollama::llama3.2".into(),
+            "groq::llama-3.1-8b-instant".into(),
+            "groq::llama-3.3-70b-versatile".into(),
+            "gemini::gemini-2.5-pro".into(),
+            "gemini::gemini-2.5-flash".into(),
+        ])
+    }
+
+    fn mixed_router() -> HeuristicRouter {
+        HeuristicRouter::new(Config::default())
+            .with_availability(|_| true)
+            .with_catalog(mixed_catalog())
+    }
+
+    async fn route_model(r: &HeuristicRouter, prompt: &str) -> String {
+        r.route(prompt, BudgetState::default(), &ModelHealth::default())
+            .await
+            .model
+    }
+
+    #[tokio::test]
+    async fn trivial_tasks_use_a_free_model_to_preserve_subscription_quota() {
+        let r = mixed_router();
+        for p in [
+            "fix this typo in the readme",
+            "rename foo to bar",
+            "format this file",
+        ] {
+            let m = route_model(&r, p).await;
+            assert!(
+                !is_subscription(&m),
+                "trivial '{p}' should route to a free model, not burn subscription: got {m}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn complex_tasks_use_the_subscription_flagship() {
+        let r = mixed_router();
+        for p in [
+            "design a lock-free queue and prove it is correct",
+            "refactor the auth module to use the new token store",
+        ] {
+            let d = r
+                .route(p, BudgetState::default(), &ModelHealth::default())
+                .await;
+            assert_eq!(d.tier, TaskTier::Complex, "{p}");
+            assert!(
+                is_subscription(&d.model),
+                "complex '{p}' should use the subscription flagship: got {}",
+                d.model
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_spreads_across_providers_not_only_claude() {
+        // The regression this fixes: every task went to claude-cli (alphabetical tie-break).
+        let r = mixed_router();
+        let prompts = [
+            "fix this typo",
+            "rename the variable",
+            "write a function that validates an email and wire it into signup",
+            "add a unit test for the parser",
+            "implement a retry wrapper around the http client",
+            "refactor the auth module to use the new token store",
+            "design a lock-free queue and prove it is correct",
+            "debug why the scheduler stalls under load",
+            "optimize the hot path in the parser",
+            "explain how tokio's scheduler works",
+        ];
+        let mut providers = std::collections::HashSet::new();
+        for p in prompts {
+            providers.insert(forge_config::provider_of(&route_model(&r, p).await).to_string());
+        }
+        // Must use more than one provider, and specifically both subscription bridges + a free one.
+        assert!(
+            providers.len() >= 3,
+            "routing should spread across providers, got {providers:?}"
+        );
+        assert!(
+            providers.contains("claude-cli") && providers.contains("codex-cli"),
+            "both subscription bridges should be used across a workload, got {providers:?}"
+        );
+        assert!(
+            providers
+                .iter()
+                .any(|p| p == "groq" || p == "ollama" || p == "gemini"),
+            "a free provider should be used for the easy tasks, got {providers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_heavy_complex_prefers_a_coding_provider() {
+        let r = mixed_router();
+        // A code-heavy complex task should land on a coding-tuned provider (codex/claude), not
+        // a general free model, via the mild prior + complex subscription preference.
+        let m = route_model(
+            &r,
+            "refactor the auth module and add tests for the token store",
+        )
+        .await;
+        assert!(
+            forge_config::provider_of(&m) == "codex-cli"
+                || forge_config::provider_of(&m) == "claude-cli",
+            "code-heavy complex should use a coding provider: got {m}"
+        );
+    }
+
+    // DIAGNOSTIC (ignored): print what the mesh routes to across a realistic catalog.
+    // Run: cargo test -p forge-mesh routing_distribution_diagnostic -- --nocapture --ignored
+    #[ignore]
+    #[tokio::test]
+    async fn routing_distribution_diagnostic() {
+        let cat = ModelCatalog::new(vec![
+            "claude-cli::".into(),
+            "claude-cli::opus".into(),
+            "claude-cli::sonnet".into(),
+            "claude-cli::haiku".into(),
+            "codex-cli::".into(),
+            "codex-cli::gpt-5.5".into(),
+            "codex-cli::gpt-5.3-codex".into(),
+            "codex-cli::gpt-5.4".into(),
+            "codex-cli::gpt-5.4-mini".into(),
+            "ollama::qwen3-coder:30b".into(),
+            "ollama::llama3.2".into(),
+            "groq::llama-3.1-8b-instant".into(),
+            "groq::llama-3.3-70b-versatile".into(),
+            "gemini::gemini-2.5-pro".into(),
+            "gemini::gemini-2.5-flash".into(),
+        ]);
+        let pricing = crate::pricing::Pricing::default();
+        println!("\n=== ranked_for (top 6) per tier ===");
+        for tier in [TaskTier::Trivial, TaskTier::Standard, TaskTier::Complex] {
+            println!(
+                "{:<9} {:?}",
+                tier.as_str(),
+                cat.ranked_for(tier, &pricing, 6)
+            );
+        }
+
+        let r = HeuristicRouter::new(Config::default())
+            .with_availability(|_| true)
+            .with_catalog(cat);
+        let prompts = [
+            "fix this typo in the readme",
+            "rename the variable foo to bar",
+            "format this file",
+            "write a function that validates an email address and wire it into the signup handler",
+            "add a unit test for the parser",
+            "refactor the auth module to use the new token store",
+            "design a lock-free queue and prove it is correct",
+            "debug why the mesh routes everything to one provider and propose a fix",
+            "explain how tokio's scheduler works",
+        ];
+        println!("\n=== route() per prompt ===");
+        for p in prompts {
+            let d = r
+                .route(p, BudgetState::default(), &ModelHealth::default())
+                .await;
+            println!("[{:?}] {} -> {}", d.tier, &p[..p.len().min(46)], d.model);
+        }
+        println!();
     }
 
     #[tokio::test]
@@ -1094,13 +1320,16 @@ mod tests {
     async fn all_benched_falls_through_to_the_no_fallback_warning() {
         // Every model benched → behaves like nothing usable (AC-6 surfaces downstream).
         let r = HeuristicRouter::new(Config::default()).with_availability(|_| true);
-        let everything =
-            HeuristicRouter::new(Config::default()).candidates_for_tier(TaskTier::Complex);
+        let everything = HeuristicRouter::new(Config::default())
+            .candidates_for_tier(TaskTier::Complex, RouteHints::default());
         let refs: Vec<&str> = everything.iter().map(String::as_str).collect();
         // Bench the complex candidates AND the cross-tier ones by benching all configured tiers.
         let mut all: Vec<String> = Vec::new();
         for t in [TaskTier::Complex, TaskTier::Standard, TaskTier::Trivial] {
-            all.extend(HeuristicRouter::new(Config::default()).candidates_for_tier(t));
+            all.extend(
+                HeuristicRouter::new(Config::default())
+                    .candidates_for_tier(t, RouteHints::default()),
+            );
         }
         let all_refs: Vec<&str> = all.iter().map(String::as_str).collect();
         let _ = refs; // (kept for clarity; all_refs is the superset used below)
