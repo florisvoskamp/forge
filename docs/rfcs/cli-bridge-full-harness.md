@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | DRAFT |
+| Status | Phase 1 + Phase 2 SHIPPED (codex harness = Phase 3, pending) |
 | Author | Forge |
 | Created | 2026-06-15 |
 | Implements | follow-up to PR #26/#29 (CLI bridge) |

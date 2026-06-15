@@ -203,6 +203,11 @@ pub struct MeshConfig {
     /// heuristic classifier. Falls back to the trivial-tier model when unset.
     #[serde(default)]
     pub classifier_model: Option<String>,
+    /// How a CLI-bridge (`claude-cli::`/`codex-cli::`) turn runs (RFC cli-bridge-full-harness):
+    /// `harness` (default) routes the model's tools through Forge's own MCP server + permission
+    /// gate; `text` runs the CLI as its own agent with its own tools.
+    #[serde(default)]
+    pub bridge_mode: BridgeMode,
     /// Enforcement behavior once a cap is reached.
     #[serde(default)]
     pub budget: BudgetBehavior,
@@ -218,6 +223,18 @@ fn default_warn_threshold() -> f64 {
 
 fn default_prefer_subscription() -> bool {
     true
+}
+
+/// How a CLI-bridge turn runs (RFC cli-bridge-full-harness).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeMode {
+    /// Forge serves its own tools to the CLI via `forge mcp-serve` (MCP) and gates them with
+    /// the permission engine; the CLI's built-in tools are disabled. The full Forge harness.
+    #[default]
+    Harness,
+    /// The CLI runs as its own agent with its own tools (no Forge tools/permission gate).
+    Text,
 }
 
 /// How the mesh decides a task's tier (ADR-0006).
@@ -279,6 +296,7 @@ impl Default for Config {
                 prefer_subscription: default_prefer_subscription(),
                 classifier: ClassifierKind::default(),
                 classifier_model: None,
+                bridge_mode: BridgeMode::default(),
                 daily_budget_usd: None,
                 monthly_cap_usd: None,
                 warn_threshold: default_warn_threshold(),

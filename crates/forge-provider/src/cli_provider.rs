@@ -6,12 +6,17 @@
 //! a prompt and parses its stdout. See docs/features/provider-integrations.md (Part B) for the
 //! honest ToS analysis — this is opt-in and run at the user's discretion.
 //!
-//! Phase 1 (RFC cli-bridge-full-harness) runs the CLIs as FULL agents (claude with
-//! `--permission-mode acceptEdits`, codex `exec --sandbox read-only`) and parses their rich
-//! event stream — thinking/reasoning, tool activity, and answer text — surfacing each as a
-//! [`StreamEvent`]. The CLI runs its own agent loop with its own tools (Forge owning the tools
-//! via an in-process MCP server is Phase 2). Each turn is a fresh invocation (no session reuse).
-//! Subscription-billed, so usage costs $0 against Forge's USD budget.
+//! Two modes (RFC cli-bridge-full-harness), selected by `mesh.bridge_mode`:
+//! - **harness** (default): claude's built-in tools are disabled (`--tools ""`) and Forge's
+//!   own tools are served to it over MCP (`--mcp-config` → `forge mcp-serve`, `--strict-mcp-config`,
+//!   `--allowedTools "mcp__forge"`), so every tool/side-effect runs through Forge's registry +
+//!   permission gate. The Forge harness on the subscription model.
+//! - **text**: claude runs as its own agent with its own tools (`--permission-mode acceptEdits`).
+//!
+//! Either way Forge parses the rich event stream — thinking/reasoning, tool activity, answer
+//! text — surfacing each as a [`StreamEvent`]. codex always runs as its own read-only agent
+//! (Forge-tool MCP for codex is Phase 3). Each turn is a fresh invocation. Subscription-billed,
+//! so usage costs $0 against Forge's USD budget. Forge never reads/transmits the CLI's auth.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -71,6 +76,10 @@ pub struct CliProvider {
     kind: CliKind,
     binary: String,
     timeout: Duration,
+    /// Harness mode (RFC cli-bridge-full-harness Phase 2): claude runs Forge's tools via the
+    /// `forge mcp-serve` MCP server under Forge's permission gate. When false, the CLI runs as
+    /// its own agent with its own tools (Phase 1). Only claude supports harness today.
+    harness: bool,
 }
 
 impl CliProvider {
@@ -79,7 +88,14 @@ impl CliProvider {
             kind,
             binary: kind.default_binary().to_string(),
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            harness: true,
         }
+    }
+
+    /// Toggle harness mode (Forge-tool MCP bridge) vs Phase-1 self-agent.
+    pub fn with_harness(mut self, harness: bool) -> Self {
+        self.harness = harness;
+        self
     }
 
     pub fn claude_code() -> Self {
@@ -111,23 +127,57 @@ fn bare_model(model: &str) -> &str {
 /// Build the argv for one invocation. Pure (no I/O, no env, no secrets) so it can be asserted
 /// in tests — the boundary guarantee is that Forge passes only the prompt and non-secret flags,
 /// never a credential or auth token (the CLI sources those itself).
-fn build_args(kind: CliKind, bare_model: &str, prompt: &str) -> Vec<String> {
-    let mut args: Vec<String> = match kind {
-        CliKind::ClaudeCode => vec![
+/// The `--mcp-config` JSON wiring claude to spawn `<forge_exe> mcp-serve` as a stdio MCP
+/// server (Forge's tools under Forge's permission gate). No secrets — just the binary path.
+fn forge_mcp_config(forge_exe: &str) -> String {
+    format!(
+        r#"{{"mcpServers":{{"forge":{{"command":{exe},"args":["mcp-serve"]}}}}}}"#,
+        exe = serde_json::Value::String(forge_exe.to_string())
+    )
+}
+
+fn build_args(
+    kind: CliKind,
+    bare_model: &str,
+    prompt: &str,
+    harness: bool,
+    forge_exe: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = match (kind, harness) {
+        // Phase 2 harness: Forge serves its tools via `forge mcp-serve`. `--allowedTools
+        // "mcp__forge"` permits ONLY Forge's tools, so claude can't use its built-ins (they'd
+        // need a permission it can't get headless) — every side-effect goes through Forge's MCP
+        // server + permission gate. NOTE: do NOT use --permission-mode bypassPermissions here —
+        // it bypasses the allowlist and re-enables the built-ins. No secrets passed.
+        (CliKind::ClaudeCode, true) => vec![
             "-p".into(),
             prompt.into(),
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
-            // Phase 1 (RFC cli-bridge-full-harness): run claude as a FULL agent with its own
-            // tools so it can actually read/edit, and parse its rich event stream (thinking +
-            // tool activity + text). `acceptEdits` auto-allows read/edit without prompting
-            // (headless can't answer prompts); Forge's own permission gate arrives in Phase 2
-            // (Forge-tool MCP bridge). No secrets ever passed — the CLI owns its auth.
+            // `--tools ""` disables claude's BUILT-IN tools (incl. auto-permitted read-only
+            // Read/Grep/Glob), leaving only the MCP tools from --mcp-config available.
+            "--tools".into(),
+            "".into(),
+            "--mcp-config".into(),
+            forge_mcp_config(forge_exe),
+            "--strict-mcp-config".into(),
+            "--allowedTools".into(),
+            "mcp__forge".into(),
+        ],
+        // Phase 1: claude as its own full agent (its own tools), acceptEdits so it doesn't
+        // block on prompts headless. Forge parses its rich event stream either way.
+        (CliKind::ClaudeCode, false) => vec![
+            "-p".into(),
+            prompt.into(),
+            "--output-format".into(),
+            "stream-json".into(),
+            "--verbose".into(),
             "--permission-mode".into(),
             "acceptEdits".into(),
         ],
-        CliKind::Codex => vec![
+        // codex harness (Forge-tool MCP) is Phase 3; for now codex runs read-only as its own agent.
+        (CliKind::Codex, _) => vec![
             "exec".into(),
             "--json".into(),
             "--skip-git-repo-check".into(),
@@ -368,7 +418,18 @@ impl Provider for CliProvider {
         on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
         let prompt = render_prompt(messages);
-        let args = build_args(self.kind, bare_model(model), &prompt);
+        // Path to *this* forge binary, so harness mode can spawn `forge mcp-serve`.
+        let forge_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| "forge".to_string());
+        let args = build_args(
+            self.kind,
+            bare_model(model),
+            &prompt,
+            self.harness,
+            &forge_exe,
+        );
 
         let mut cmd = Command::new(&self.binary);
         cmd.args(&args)
@@ -548,25 +609,45 @@ mod tests {
     }
 
     #[test]
-    fn claude_args_run_a_full_agent_and_carry_no_secret() {
-        let args = build_args(CliKind::ClaudeCode, "sonnet", "hi there");
-        // Phase 1: NOT tool-disabled — a full agent with acceptEdits.
-        assert!(!args.iter().any(|a| a == "--tools"));
+    fn claude_harness_args_route_tools_through_forge_mcp() {
+        let args = build_args(
+            CliKind::ClaudeCode,
+            "sonnet",
+            "hi there",
+            true,
+            "/bin/forge",
+        );
+        // Forge owns the tools: strict MCP + only mcp__forge tools.
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+        assert!(args.contains(&"mcp__forge".to_string()));
+        // bypassPermissions must NOT be set — it overrides the allowlist and re-enables built-ins.
+        assert!(!args.iter().any(|a| a == "bypassPermissions"));
+        let mc = args.iter().position(|a| a == "--mcp-config").unwrap();
+        assert!(args[mc + 1].contains("mcp-serve") && args[mc + 1].contains("/bin/forge"));
+        // Boundary: no credential/auth material in the argv.
+        assert!(!args
+            .iter()
+            .any(|a| a.contains("API_KEY") || a.contains("token")));
+    }
+
+    #[test]
+    fn claude_text_mode_runs_a_self_agent_with_accept_edits() {
+        let args = build_args(
+            CliKind::ClaudeCode,
+            "sonnet",
+            "hi there",
+            false,
+            "/bin/forge",
+        );
+        assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
         let i = args.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(args[i + 1], "acceptEdits");
-        assert!(args.contains(&"stream-json".to_string()));
-        assert_eq!(args.iter().filter(|a| *a == "hi there").count(), 1);
         assert!(args.contains(&"--model".to_string()) && args.contains(&"sonnet".to_string()));
-        // Boundary: no credential/auth material in the argv.
-        assert!(!args.iter().any(|a| a.contains("API_KEY")
-            || a.contains("token")
-            || a.contains(".credentials")
-            || a.contains("auth")));
     }
 
     #[test]
     fn codex_args_put_prompt_last_and_are_read_only() {
-        let args = build_args(CliKind::Codex, "", "do a thing");
+        let args = build_args(CliKind::Codex, "", "do a thing", true, "/bin/forge");
         assert_eq!(args[0], "exec");
         assert!(args.contains(&"--json".to_string()));
         assert!(args.contains(&"read-only".to_string()));

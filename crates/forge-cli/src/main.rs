@@ -18,6 +18,8 @@ use forge_tui::{HeadlessPresenter, Presenter, TuiPresenter};
 use forge_types::PermissionMode;
 use forge_types::TaskTier;
 
+mod mcp_serve;
+
 #[derive(Parser)]
 #[command(
     name = "forge",
@@ -71,6 +73,10 @@ enum Command {
     },
     /// List past sessions (newest first).
     Sessions,
+    /// Internal: run Forge's tool registry as an MCP server on stdio (spawned by the CLI
+    /// bridge so claude/codex use Forge's tools under Forge's permission gate). Not for direct use.
+    #[command(hide = true)]
+    McpServe,
     /// Store a provider API key securely in the OS keyring (reads the key from stdin).
     Auth {
         /// Provider: anthropic, openai, gemini, xai, deepseek, or openrouter.
@@ -123,6 +129,7 @@ async fn main() -> Result<()> {
         } => chat(mock, mode, resume, plain, model).await,
         Command::Sessions => sessions(),
         Command::Auth { provider } => auth(&provider),
+        Command::McpServe => mcp_serve::run().await,
     }
 }
 
@@ -210,9 +217,10 @@ fn build_session_with(
     let provider: Box<dyn Provider> = if mock {
         Box::new(MockProvider)
     } else {
-        // Routes API models to genai and `claude-cli::`/`codex-cli::` to the subscription
-        // CLI bridge (provider-integrations Part B).
-        Box::new(DispatchProvider::new())
+        // Routes API models to genai and `claude-cli::`/`codex-cli::` to the subscription CLI
+        // bridge. `harness` mode runs the bridge's tools through Forge's MCP server (RFC Phase 2).
+        let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
+        Box::new(DispatchProvider::new(harness))
     };
     let heuristic = HeuristicRouter::new(config.clone()).with_pin(pin);
     let router: Box<dyn Router> = if config.mesh.classifier == ClassifierKind::Llm {
@@ -227,7 +235,7 @@ fn build_session_with(
         let classify_provider: Arc<dyn Provider> = if mock {
             Arc::new(MockProvider)
         } else {
-            Arc::new(DispatchProvider::new())
+            Arc::new(DispatchProvider::new(false)) // classification needs no tools/harness
         };
         Box::new(LlmRouter::new(
             classify_provider,

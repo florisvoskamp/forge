@@ -93,11 +93,13 @@ pub struct DispatchProvider {
 }
 
 impl DispatchProvider {
-    pub fn new() -> Self {
+    /// `harness` = run CLI-bridge turns through Forge's MCP tool server + permission gate
+    /// (RFC Phase 2); `false` runs the CLI as its own agent (Phase 1).
+    pub fn new(harness: bool) -> Self {
         Self {
             genai: GenAiProvider::new(),
-            claude_cli: CliProvider::claude_code(),
-            codex_cli: CliProvider::codex(),
+            claude_cli: CliProvider::claude_code().with_harness(harness),
+            codex_cli: CliProvider::codex().with_harness(harness),
             notice: std::sync::Once::new(),
         }
     }
@@ -116,7 +118,7 @@ impl DispatchProvider {
 
 impl Default for DispatchProvider {
     fn default() -> Self {
-        Self::new()
+        Self::new(true)
     }
 }
 
