@@ -349,6 +349,24 @@ snapshot only changed files; tests for snapshot/restore round-trip incl create+d
 | 2026-06-15 | `/undo` is an interactive picker, not a one-step rewind | User: pick any past message to rewind to, not just the last turn. `/undo` and `/checkpoints` open the same picker over the per-turn checkpoints (prompt preview as the row title); Enter rewinds chat + restores files. |
 | 2026-06-15 | Interrupt the AI with Esc/Ctrl-C (busy → stop, idle → quit) | A running turn is a tokio task; Esc aborts it (the task's DoneGuard drop releases the session lock) and Forge keeps running. A per-turn generation counter on the done-signal makes an aborted turn's late signal harmless to a later turn. |
 
+## Fixes (2026-06-15) — rewind UX + file-revert correctness
+
+Reported: rewind worked but (a) the rewound-to message vanished and (b) file edits didn't revert.
+- **Input box**: `rewind_to`/`undo` now return a `RewindOutcome { restore, rewound_prompt }`; the
+  picker puts the rewound-to prompt back in the input line for editing/resubmitting.
+- **Absolute snapshot keys**: snapshot path keys are normalized to absolute (`std::path::absolute`)
+  so capture + restore are independent of cwd and consistent across processes (relative vs absolute
+  paths from the model no longer matter).
+- **Stale-snapshot-after-undo**: `restore_turn` now deletes the turn's snapshot dir after restoring,
+  so reusing that seq (a new turn after the rewind) captures fresh pre-bytes instead of an old
+  manifest entry (which "first touch wins" would have skipped).
+- **Cross-process (CLI bridge)**: a subscription model (claude/codex) edits files in `forge mcp-serve`
+  (separate process), which previously took no snapshot. `run_turn` now exports the turn's snapshot
+  context via env (`FORGE_CHECKPOINT_SESSION/SEQ/ROOT`); `mcp-serve::call_tool` snapshots Write-tool
+  targets into the parent turn's dir, so `/undo` reverts bridge edits too.
+- Tests: production-faithful default-root revert (`tests/checkpoint_cwd.rs`); cross-process env
+  round-trip (`tests/bridge_snapshot_env.rs`); reused-seq freshness; picker rewind reverts files.
+
 ## Follow-up build (2026-06-15) — auto-checkpoints, interactive undo, interrupt
 
 On branch `feat/auto-checkpoints-undo-picker-interrupt`:

@@ -10,6 +10,38 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Env vars that carry the current turn's snapshot context across the process boundary to the
+/// CLI bridge's `forge mcp-serve`, so files a subscription model (claude/codex) edits get
+/// snapshotted into the *parent* turn's dir and are restorable by `/undo` (RFC PR3, cross-process).
+pub const ENV_SESSION: &str = "FORGE_CHECKPOINT_SESSION";
+pub const ENV_SEQ: &str = "FORGE_CHECKPOINT_SEQ";
+pub const ENV_ROOT: &str = "FORGE_CHECKPOINT_ROOT";
+
+/// Snapshot a write happening in the bridge subprocess into the parent turn's dir, reading the
+/// turn context from the environment (set by the parent's `run_turn`). No-op when unset (the
+/// bridge wasn't launched by a checkpointing turn) — so `mcp-serve` used standalone is unaffected.
+pub fn snapshot_from_env_before_write(path: &Path) -> std::io::Result<()> {
+    if let Some((root, session, seq)) = env_context() {
+        snapshot_before_write(&root, &session, seq, path)?;
+    }
+    Ok(())
+}
+
+/// Record post-write bytes for a bridge write (see [`snapshot_from_env_before_write`]).
+pub fn record_from_env_after_write(path: &Path) -> std::io::Result<()> {
+    if let Some((root, session, seq)) = env_context() {
+        record_post_write(&root, &session, seq, path)?;
+    }
+    Ok(())
+}
+
+fn env_context() -> Option<(PathBuf, String, i64)> {
+    let session = std::env::var(ENV_SESSION).ok()?;
+    let seq = std::env::var(ENV_SEQ).ok()?.parse::<i64>().ok()?;
+    let root = std::env::var(ENV_ROOT).ok()?;
+    Some((PathBuf::from(root), session, seq))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Manifest {
     seq: i64,
@@ -49,6 +81,14 @@ fn turn_dir(root: &Path, session: &str, seq: i64) -> PathBuf {
     root.join(session).join(seq.to_string())
 }
 
+/// Resolve a tool's path to an absolute one (without requiring it to exist), so the snapshot key
+/// is independent of the working directory — the same file resolves identically whether the write
+/// happened in-process or in the `forge mcp-serve` bridge subprocess, and whether the model passed
+/// a relative or absolute path.
+fn abs(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn manifest_path(root: &Path, session: &str, seq: i64) -> PathBuf {
     turn_dir(root, session, seq).join("manifest.json")
 }
@@ -84,6 +124,7 @@ pub fn snapshot_before_write(
     seq: i64,
     path: &Path,
 ) -> std::io::Result<()> {
+    let path = abs(path);
     let key = path.to_string_lossy().to_string();
     let mut manifest = load_manifest(root, session, seq).unwrap_or(Manifest {
         seq,
@@ -97,7 +138,7 @@ pub fn snapshot_before_write(
         let blob = format!("{idx}.blob");
         let dir = turn_dir(root, session, seq);
         std::fs::create_dir_all(&dir)?;
-        std::fs::copy(path, dir.join(&blob))?;
+        std::fs::copy(&path, dir.join(&blob))?;
         FileEntry {
             path: key,
             status: "modified".into(),
@@ -122,8 +163,9 @@ pub fn record_post_write(root: &Path, session: &str, seq: i64, path: &Path) -> s
     let Some(mut manifest) = load_manifest(root, session, seq) else {
         return Ok(());
     };
+    let path = abs(path);
     let key = path.to_string_lossy().to_string();
-    let hash = std::fs::read(path).ok().map(|b| stable_hash(&b));
+    let hash = std::fs::read(&path).ok().map(|b| stable_hash(&b));
     if let Some(entry) = manifest.files.iter_mut().find(|f| f.path == key) {
         entry.post_hash = hash;
         return save_manifest(root, session, seq, &manifest);
@@ -161,6 +203,10 @@ pub fn restore_turn(root: &Path, session: &str, seq: i64) -> std::io::Result<Res
         }
         report.restored.push(entry.path.clone());
     }
+    // The turn's snapshot is consumed once restored. Remove it so that if this seq is later
+    // reused (a new turn after the rewind), `snapshot_before_write` starts fresh and captures the
+    // new pre-turn bytes instead of seeing a stale manifest entry ("first touch" against old data).
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(report)
 }
 
@@ -250,6 +296,32 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             "original",
             "restored anyway"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reusing_a_seq_after_restore_captures_fresh_bytes_not_stale() {
+        // Undo then a new turn can reuse the same seq. The second turn must snapshot its OWN
+        // pre-bytes, not see the (consumed) earlier manifest and skip on "first touch".
+        let root = root();
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let file = work.join("a.txt");
+
+        std::fs::write(&file, "v0").unwrap();
+        snapshot_before_write(&root, "s", 1, &file).unwrap();
+        std::fs::write(&file, "v1").unwrap();
+        restore_turn(&root, "s", 1).unwrap(); // back to v0, snapshot consumed
+
+        // A new turn reuses seq 1; pre-bytes are now v0.
+        snapshot_before_write(&root, "s", 1, &file).unwrap();
+        std::fs::write(&file, "v2").unwrap();
+        restore_turn(&root, "s", 1).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "v0",
+            "the reused seq captured fresh pre-bytes, not a stale manifest"
         );
         std::fs::remove_dir_all(&root).ok();
     }

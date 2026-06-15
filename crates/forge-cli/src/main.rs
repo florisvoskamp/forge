@@ -1083,15 +1083,19 @@ async fn picker_accept(
         }
         forge_tui::PickerKind::Checkpoints => {
             let seq: i64 = row.id.parse().unwrap_or(0);
-            let (history, report) = {
+            let (history, outcome) = {
                 let mut s = session.lock().await;
-                let report = s.rewind_to(seq).map_err(|e| anyhow::anyhow!("{e}"))?;
-                (s.history(), report)
+                let outcome = s.rewind_to(seq).map_err(|e| anyhow::anyhow!("{e}"))?;
+                (s.history(), outcome)
             };
             tui.clear_screen();
             app.note("● rewound to that point");
             app.replay_history(&history);
-            note_restore(app, &report);
+            note_restore(app, &outcome.restore);
+            // Put the rewound-to message back in the input box so it can be edited/resubmitted.
+            if let Some(prompt) = outcome.rewound_prompt {
+                app.input = prompt;
+            }
         }
     }
     Ok(())

@@ -127,8 +127,24 @@ impl ServerHandler for ForgeMcp {
             ))]));
         }
 
+        // Snapshot the target's pre-edit bytes into the parent turn's checkpoint dir (read from
+        // the env the parent's run_turn exported), so files a bridge model edits are restorable by
+        // `/undo` exactly like in-process edits (RFC PR3, cross-process). No-op if unset.
+        let write_path = (tool.side_effect() == forge_types::SideEffect::Write)
+            .then(|| args.get("path").and_then(|v| v.as_str()))
+            .flatten()
+            .map(std::path::PathBuf::from);
+        if let Some(path) = &write_path {
+            let _ = forge_core::snapshot::snapshot_from_env_before_write(path);
+        }
+
         match tool.run(&args).await {
-            Ok(out) => Ok(CallToolResult::success(vec![Content::text(out)])),
+            Ok(out) => {
+                if let Some(path) = &write_path {
+                    let _ = forge_core::snapshot::record_from_env_after_write(path);
+                }
+                Ok(CallToolResult::success(vec![Content::text(out)]))
+            }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         }
     }

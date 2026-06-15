@@ -38,6 +38,14 @@ pub enum CoreError {
     NoHealthyModel,
 }
 
+/// Result of a [`Session::rewind_to`] / [`Session::undo`]: what the file-restore did, plus the
+/// prompt that began the rewound-to turn (the UI re-offers it in the input box).
+#[derive(Debug, Default, Clone)]
+pub struct RewindOutcome {
+    pub restore: snapshot::RestoreReport,
+    pub rewound_prompt: Option<String>,
+}
+
 /// One interactive session. Construct with [`Session::start`], then drive [`Session::run_turn`].
 pub struct Session {
     id: String,
@@ -170,31 +178,52 @@ impl Session {
 
     /// Rewind the conversation to a transcript boundary (`seq`): soft-delete the messages at/after
     /// it, restore any files those turns wrote (PR3 shadow snapshots), and truncate the live
-    /// transcript. Returns what the file-restore did, for the UI. Powers `/undo` and `/checkpoints`.
-    pub fn rewind_to(&mut self, boundary: i64) -> Result<snapshot::RestoreReport, CoreError> {
+    /// transcript. Returns the file-restore result plus the prompt that started the rewound-to turn
+    /// (so the UI can put it back in the input box). Powers `/undo` and `/checkpoints`.
+    pub fn rewind_to(&mut self, boundary: i64) -> Result<RewindOutcome, CoreError> {
         let boundary = boundary.max(0);
-        let mut report = snapshot::RestoreReport::default();
+        // The message AT the boundary is the user prompt of the rewound-to turn; capture it before
+        // truncation so the UI can re-offer it for editing/resubmitting.
+        let rewound_prompt = self
+            .transcript
+            .get(boundary as usize)
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.content.clone());
+        let mut restore = snapshot::RestoreReport::default();
         // Turns are keyed by their user-message seq. Restore every snapshotted turn at/after the
         // boundary, newest first so an earlier turn's blob (pre-turn bytes) wins the final state.
         for seq in (boundary..self.seq).rev() {
             if let Ok(r) = snapshot::restore_turn(&self.checkpoint_root, &self.id, seq) {
-                report.restored.extend(r.restored);
-                report.warnings.extend(r.warnings);
+                restore.restored.extend(r.restored);
+                restore.warnings.extend(r.warnings);
             }
         }
         self.store.deactivate_messages_from(&self.id, boundary)?;
         self.transcript.truncate(boundary as usize);
         self.seq = boundary;
-        Ok(report)
+        Ok(RewindOutcome {
+            restore,
+            rewound_prompt,
+        })
     }
 
     /// Undo the last user turn: rewind to (and including) the most recent user message, dropping
     /// that prompt and everything after it. `Ok(None)` if there's nothing to undo.
-    pub fn undo(&mut self) -> Result<Option<snapshot::RestoreReport>, CoreError> {
+    pub fn undo(&mut self) -> Result<Option<RewindOutcome>, CoreError> {
         let Some(idx) = self.transcript.iter().rposition(|m| m.role == Role::User) else {
             return Ok(None);
         };
         Ok(Some(self.rewind_to(idx as i64)?))
+    }
+
+    /// Publish the current turn's snapshot context (session id, seq, absolute root) to the
+    /// environment so the CLI bridge's `forge mcp-serve` snapshots its writes into this turn's dir.
+    fn export_checkpoint_env(&self, seq: i64) {
+        let root = std::path::absolute(&self.checkpoint_root)
+            .unwrap_or_else(|_| self.checkpoint_root.clone());
+        std::env::set_var(snapshot::ENV_SESSION, &self.id);
+        std::env::set_var(snapshot::ENV_SEQ, seq.to_string());
+        std::env::set_var(snapshot::ENV_ROOT, root);
     }
 
     /// Save a conversation checkpoint at the current boundary. `label` None = an auto checkpoint.
@@ -392,6 +421,10 @@ impl Session {
         let _ = self
             .store
             .add_checkpoint(&self.id, Some(&checkpoint_preview(prompt)), seq);
+        // Export this turn's snapshot context so a CLI-bridge model's file edits (which run in
+        // `forge mcp-serve`, a separate process) get snapshotted into THIS turn's dir and are
+        // restorable by `/undo` (the in-process tool path snapshots directly in `invoke_tool`).
+        self.export_checkpoint_env(seq);
 
         let specs = self.tool_specs();
         let mut final_text = String::new();
@@ -1866,6 +1899,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn picker_rewind_to_an_earlier_turn_reverts_files() {
+        // Mirrors the /undo picker path: two turns edit a file, then rewind to the FIRST turn's
+        // checkpoint seq (as the picker does) — the file must return to its pre-turn-1 bytes.
+        let dir = std::env::temp_dir().join(format!("forge-rew-{}", forge_types::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "ORIGINAL").unwrap();
+
+        let config = Config {
+            permission_mode: PermissionMode::Bypass,
+            ..Config::default()
+        };
+        let mut session = Session::start(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(WritingProvider {
+                path: file.to_string_lossy().to_string(),
+                content: "MODEL-EDIT".into(),
+            }),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            ".",
+        )
+        .unwrap();
+        session.set_checkpoint_root(dir.join("snaps"));
+
+        session.run_turn("turn one edits the file").await.unwrap();
+        session.run_turn("turn two edits it again").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "MODEL-EDIT");
+
+        // Picker uses the checkpoint's seq; pick the OLDEST (first turn).
+        let cps = session.checkpoints().unwrap();
+        let first_turn_seq = cps.last().unwrap().seq;
+        let report = session.rewind_to(first_turn_seq).unwrap().restore;
+
+        assert!(
+            !report.restored.is_empty(),
+            "files were restored: {report:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "ORIGINAL",
+            "rewinding to turn 1 reverts the file to its pre-turn-1 bytes"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn undo_restores_files_written_during_the_turn() {
         let dir = std::env::temp_dir().join(format!("forge-undo-{}", forge_types::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1898,7 +1980,7 @@ mod tests {
             "the turn wrote the file"
         );
 
-        let report = session.undo().unwrap().unwrap();
+        let report = session.undo().unwrap().unwrap().restore;
         assert!(
             report.restored.iter().any(|p| p.contains("edited.txt")),
             "the written file was restored: {report:?}"
