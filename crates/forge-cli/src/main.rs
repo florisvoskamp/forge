@@ -293,66 +293,50 @@ fn prompt_line(prompt: &str) -> Result<String> {
 /// writes the plans to the user config. Keys go to the OS keyring, never the config (ADR-0007).
 fn init() -> Result<()> {
     use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         anyhow::bail!("`forge init` is interactive — run it in a terminal");
     }
-    println!("⚒ Forge setup\n");
-    println!("Enable providers by entering an API key (press Enter to skip each).");
-    println!("Keys are stored in your OS keyring, never in a config file.\n");
+    // Build the wizard inputs from what Forge knows: every key-based provider (with a friendly
+    // label + whether a key is already stored) and every INSTALLED CLI bridge (with its plans).
+    let providers = forge_config::known_key_providers()
+        .map(|p| forge_tui::ProviderItem {
+            id: p.to_string(),
+            label: provider_label(p).to_string(),
+            had_key: forge_config::has_api_key(p),
+        })
+        .collect();
+    let bridges = forge_provider::CliKind::all()
+        .into_iter()
+        .filter(|k| k.available())
+        .map(|k| forge_tui::BridgeItem {
+            prefix: k.prefix().to_string(),
+            plans: bridge_plans(k)
+                .iter()
+                .map(|(l, s)| (l.to_string(), s.to_string()))
+                .collect(),
+        })
+        .collect();
 
-    let mut enabled = 0usize;
-    for provider in forge_config::known_key_providers() {
-        let have = forge_config::has_api_key(provider);
-        let status = if have { "  [already set]" } else { "" };
-        println!("• {} ({provider}){status}", provider_label(provider));
-        let prompt = if have {
-            "    new key to replace it (Enter to keep): "
-        } else {
-            "    API key (Enter to skip): "
-        };
-        let key = prompt_line(prompt)?;
-        if !key.is_empty() {
-            forge_config::store_api_key(provider, &key)
-                .with_context(|| format!("storing {provider} key"))?;
-            println!("    ✓ stored");
-            enabled += 1;
-        } else if have {
-            enabled += 1;
-        }
+    let outcome = forge_tui::init_wizard::run(forge_tui::WizardInput { providers, bridges })
+        .context("running the setup wizard")?;
+    if outcome.cancelled {
+        println!("Setup cancelled — run `forge init` anytime.");
+        return Ok(());
     }
 
-    println!("\nSubscription bridges (use your Claude/ChatGPT plan at $0 marginal cost):");
-    let mut subs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for kind in forge_provider::CliKind::all() {
-        let prefix = kind.prefix();
-        if !kind.available() {
-            println!("• {prefix}: not installed — skipping");
-            continue;
-        }
-        let plans = bridge_plans(kind);
-        println!("• {prefix} is installed. Which plan do you have?");
-        for (i, (label, _)) in plans.iter().enumerate() {
-            println!("    {}) {label}", i + 1);
-        }
-        let choice = prompt_line("    choose [1-5, Enter to skip]: ")?;
-        if let Some(slug) = choice
-            .parse::<usize>()
-            .ok()
-            .and_then(|n| plans.get(n.wrapping_sub(1)))
-            .map(|(_, slug)| *slug)
-        {
-            subs.insert(prefix.to_string(), slug.to_string());
-            println!("    ✓ {prefix} → {slug}");
-        }
+    // Keys → OS keyring (never the config file, ADR-0007); plans → user config.
+    for (provider, key) in &outcome.keys {
+        forge_config::store_api_key(provider, key)
+            .with_context(|| format!("storing {provider} key"))?;
     }
-
-    let path = forge_config::write_subscriptions(&subs).context("writing config")?;
-    println!("\n✓ Setup written to {}", path.display());
+    let path = forge_config::write_subscriptions(&outcome.plans).context("writing config")?;
+    println!("✓ Setup saved to {}", path.display());
     println!(
-        "  {enabled} provider(s) enabled, {} bridge plan(s) recorded.",
-        subs.len()
+        "  {} provider key(s) stored · {} bridge plan(s) recorded.",
+        outcome.keys.len(),
+        outcome.plans.len()
     );
-    println!("  The mesh will route across these by task tier and cost. Try `forge models`.");
+    println!("  The mesh routes across these by task tier + cost. Try `forge models`.");
     Ok(())
 }
 
