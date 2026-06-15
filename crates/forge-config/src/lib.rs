@@ -10,6 +10,9 @@ use figment::Figment;
 use forge_types::{PermissionDecision, PermissionMode, PermissionRule, RuleSource, TaskTier};
 use serde::{Deserialize, Serialize};
 
+pub mod agents;
+pub use agents::{load_agents, AgentDef};
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to load configuration: {0}")]

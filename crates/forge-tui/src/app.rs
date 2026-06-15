@@ -78,6 +78,20 @@ pub struct App {
     pub tick: usize,
     /// Finalized scrollback lines, in arrival order; drained by the I/O shell.
     flush: Vec<TextLine<'static>>,
+    /// Subagents in the current `spawn_agents` batch (RFC subagent-orchestration). Running rows
+    /// animate with a spinner in the live preview; on completion each becomes a scrollback
+    /// branch line, and the whole group folds (header + branches + footer) when all finish.
+    subagents: Vec<SubRow>,
+}
+
+/// One subagent's live row in the TUI.
+#[derive(Debug, Clone)]
+struct SubRow {
+    id: String,
+    agent: String,
+    task: String,
+    done: bool,
+    cost: f64,
 }
 
 /// A keystroke, decoupled from crossterm so input handling is testable.
@@ -174,18 +188,41 @@ impl App {
                 self.flush.push(tool_result_line(&name, ok, &summary))
             }
             PresenterEvent::Cost { session_total_usd } => self.cost_usd = session_total_usd,
-            PresenterEvent::SubagentStart { agent, task, .. } => {
-                self.flush.push(subagent_start_line(&agent, &task))
+            PresenterEvent::SubagentStart { id, agent, task } => {
+                // First child of a batch opens the group box in scrollback.
+                if self.subagents.is_empty() {
+                    self.flush.push(subagent_header_line());
+                }
+                self.subagents.push(SubRow {
+                    id,
+                    agent,
+                    task,
+                    done: false,
+                    cost: 0.0,
+                });
             }
             PresenterEvent::SubagentResult {
+                id,
                 agent,
                 ok,
                 summary,
                 cost_usd,
-                ..
-            } => self
-                .flush
-                .push(subagent_result_line(&agent, ok, &summary, cost_usd)),
+            } => {
+                self.flush
+                    .push(subagent_branch_line(&agent, ok, cost_usd, &summary));
+                if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id) {
+                    row.done = true;
+                    row.cost = cost_usd;
+                }
+                // When every child in the batch has reported, close the box and clear the live
+                // running list.
+                if self.subagents.iter().all(|r| r.done) {
+                    let n = self.subagents.len();
+                    let total: f64 = self.subagents.iter().map(|r| r.cost).sum();
+                    self.flush.push(subagent_footer_line(n, total));
+                    self.subagents.clear();
+                }
+            }
             PresenterEvent::Diff(diff) => {
                 self.flush.extend(crate::render::diff_to_lines(&diff));
                 self.flush.push(TextLine::default());
@@ -256,27 +293,45 @@ fn tool_start_line(name: &str, args: &str) -> TextLine<'static> {
     ])
 }
 
-fn subagent_start_line(agent: &str, task: &str) -> TextLine<'static> {
+/// Opens the subagent group box in scrollback.
+fn subagent_header_line() -> TextLine<'static> {
     TextLine::from(vec![
-        Span::styled("  ⤷ spawn ", Style::default().fg(DIM)),
-        Span::styled(format!("[{agent}]  "), Style::default().fg(OKGREEN)),
-        Span::styled(truncate(task, 56), Style::default().fg(DIM)),
+        Span::styled("  ╭─ ", Style::default().fg(DIM)),
+        Span::styled("subagents", Style::default().fg(TOOLCYAN).bold()),
+        Span::styled(" ─────────────", Style::default().fg(DIM)),
     ])
 }
 
-fn subagent_result_line(agent: &str, ok: bool, summary: &str, cost_usd: f64) -> TextLine<'static> {
+/// One completed subagent as a branch of the group box.
+fn subagent_branch_line(agent: &str, ok: bool, cost_usd: f64, summary: &str) -> TextLine<'static> {
     let (mark, color) = if ok {
-        ("  ✓ agent ", OKGREEN)
+        ("✓", OKGREEN)
     } else {
-        ("  ✗ agent ", ERRRED)
+        ("✗", ERRRED)
     };
     TextLine::from(vec![
-        Span::styled(mark, Style::default().fg(color)),
-        Span::styled(
-            format!("[{agent}] (${cost_usd:.4})  "),
-            Style::default().fg(color),
-        ),
-        Span::styled(truncate(summary, 48), Style::default().fg(DIM)),
+        Span::styled("  ├─ ", Style::default().fg(DIM)),
+        Span::styled(format!("{mark} "), Style::default().fg(color)),
+        Span::styled(format!("[{agent}] "), Style::default().fg(TOOLCYAN)),
+        Span::styled(format!("${cost_usd:.4}  "), Style::default().fg(DIM)),
+        Span::styled(truncate(summary, 44), Style::default().fg(DIM)),
+    ])
+}
+
+/// Closes the subagent group box with a total.
+fn subagent_footer_line(n: usize, total_usd: f64) -> TextLine<'static> {
+    TextLine::from(Span::styled(
+        format!("  ╰─ {n} agents · ${total_usd:.4}"),
+        Style::default().fg(DIM),
+    ))
+}
+
+/// A still-running subagent row for the live preview (animated spinner).
+fn subagent_running_line(spin: &str, agent: &str, task: &str) -> TextLine<'static> {
+    TextLine::from(vec![
+        Span::styled(format!("  {spin} "), Style::default().fg(TOOLCYAN)),
+        Span::styled(format!("[{agent}] "), Style::default().fg(TOOLCYAN).bold()),
+        Span::styled(truncate(task, 50), Style::default().fg(DIM)),
     ])
 }
 
@@ -355,17 +410,39 @@ pub fn render_live(frame: &mut Frame, app: &App) {
 /// The in-flight streaming reply's trailing edge, scrolled to its bottom so the freshest
 /// text and the `▌` cursor stay visible.
 fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
-    if !app.streaming_active {
+    if app.streaming_active {
+        let line = TextLine::from(vec![
+            Span::raw(format!("  {}", app.streaming)),
+            Span::styled("▌", Style::default().fg(ORANGE)),
+        ]);
+        let para = Paragraph::new(line).wrap(Wrap { trim: false });
+        let count = para.line_count(area.width) as u16;
+        let scroll = count.saturating_sub(area.height);
+        frame.render_widget(para.scroll((scroll, 0)), area);
         return;
     }
-    let line = TextLine::from(vec![
-        Span::raw(format!("  {}", app.streaming)),
-        Span::styled("▌", Style::default().fg(ORANGE)),
-    ]);
-    let para = Paragraph::new(line).wrap(Wrap { trim: false });
-    let count = para.line_count(area.width) as u16;
-    let scroll = count.saturating_sub(area.height);
-    frame.render_widget(para.scroll((scroll, 0)), area);
+
+    // While a spawn_agents batch runs (and nothing is streaming), animate the still-running
+    // children here in the live region; finished ones have already flowed to scrollback.
+    let running: Vec<&SubRow> = app.subagents.iter().filter(|r| !r.done).collect();
+    if running.is_empty() {
+        return;
+    }
+    let spin = SPINNER[app.tick % SPINNER.len()];
+    let h = area.height as usize;
+    let mut lines: Vec<TextLine> = running
+        .iter()
+        .take(h)
+        .map(|r| subagent_running_line(spin, &r.agent, &r.task))
+        .collect();
+    if running.len() > h {
+        lines.pop();
+        lines.push(TextLine::from(Span::styled(
+            format!("  … +{} more running", running.len() - h + 1),
+            Style::default().fg(DIM),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_permission(frame: &mut Frame, area: Rect, app: &App) {
@@ -486,6 +563,62 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[test]
+    fn subagent_batch_animates_live_then_folds_into_a_scrollback_box() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "reviewer".into(),
+            task: "review the diff".into(),
+        });
+        app.apply(PresenterEvent::SubagentStart {
+            id: "b".into(),
+            agent: "general".into(),
+            task: "find call sites".into(),
+        });
+
+        // Both children animate in the live region while running.
+        let live = screen(&app);
+        assert!(
+            live.contains("reviewer"),
+            "running child shown live: {live}"
+        );
+
+        app.apply(PresenterEvent::SubagentResult {
+            id: "a".into(),
+            agent: "reviewer".into(),
+            ok: true,
+            summary: "2 issues".into(),
+            cost_usd: 0.001,
+        });
+        // Box stays open (b still running) → b animates, a has flowed to scrollback.
+        assert!(
+            screen(&app).contains("general"),
+            "remaining child still live"
+        );
+
+        app.apply(PresenterEvent::SubagentResult {
+            id: "b".into(),
+            agent: "general".into(),
+            ok: true,
+            summary: "5 sites".into(),
+            cost_usd: 0.002,
+        });
+
+        // Once all done the live list clears and the group box is in scrollback.
+        assert!(
+            !screen(&app).contains("reviewer"),
+            "running list cleared after all complete"
+        );
+        let sb = flush_text(&mut app);
+        assert!(sb.contains("subagents"), "group header: {sb}");
+        assert!(
+            sb.contains("reviewer") && sb.contains("2 issues"),
+            "branch: {sb}"
+        );
+        assert!(sb.contains("2 agents"), "footer with count: {sb}");
     }
 
     #[test]

@@ -7,20 +7,25 @@
 //! `forge_tools::Tool` (it needs the provider/router/store, which ordinary tools can't reach).
 //! [`Session`](crate::Session) intercepts it and calls [`run_subagent`] here.
 //!
-//! Phase 1 (this module): one or more **inline, read-only** children run **sequentially**,
-//! each as a persisted child session linked to the parent. Children get only read-only tools
-//! and **never** the `spawn_agents` tool itself — a structural depth-1 guard against recursion.
-//! Parallel fan-out and `.forge/agents/*.md` agent types are Phase 2.
+//! Children run **concurrently** (bounded by `max_concurrency`), each as a persisted child
+//! session linked to the parent. A child's toolset comes from its agent type (default:
+//! read-only `read_file`/`list_dir`/`search`) and **never** includes `spawn_agents` — a
+//! structural depth-1 guard against recursion. Named agent types load from `.forge/agents/*.md`
+//! (system prompt + optional tool subset + optional pinned tier); unknown/inline agents use the
+//! default read-only investigator and are mesh-routed.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use forge_config::Config;
+use forge_config::{AgentDef, Config};
 use forge_mesh::pricing::Pricing;
-use forge_mesh::{BudgetState, Router};
+use forge_mesh::{BudgetState, Router, RoutingDecision};
 use forge_provider::{Provider, StreamEvent, ToolSpec};
 use forge_store::Store;
 use forge_tools::ToolRegistry;
-use forge_types::{Message, PermissionDecision, PermissionMode, PermissionRule, Role, Usage};
+use forge_types::{
+    Message, PermissionDecision, PermissionMode, PermissionRule, Role, TaskTier, Usage,
+};
 
 use crate::{permission, CoreError, MAX_STEPS};
 
@@ -114,6 +119,42 @@ pub fn parse_requests(
     Ok(out)
 }
 
+/// A request resolved against the loaded agent types — owned so it can move into a spawned
+/// task. A named agent supplies its system prompt / tool subset / pinned tier; an unknown or
+/// inline (`general`) agent falls back to the default read-only investigator.
+#[derive(Clone)]
+pub struct ResolvedAgent {
+    pub name: String,
+    pub task: String,
+    pub system_prompt: String,
+    pub tools: Vec<String>,
+    pub tier: Option<TaskTier>,
+}
+
+/// Resolve a parsed request against the loaded agent-type map (RFC subagent-orchestration Ph2).
+pub fn resolve(req: &AgentRequest, agents: &HashMap<String, AgentDef>) -> ResolvedAgent {
+    match agents.get(&req.agent) {
+        Some(def) => ResolvedAgent {
+            name: def.name.clone(),
+            task: req.task.clone(),
+            system_prompt: if def.system_prompt.is_empty() {
+                SUBAGENT_SYSTEM.to_string()
+            } else {
+                def.system_prompt.clone()
+            },
+            tools: def.tools.clone(),
+            tier: def.tier,
+        },
+        None => ResolvedAgent {
+            name: req.agent.clone(),
+            task: req.task.clone(),
+            system_prompt: SUBAGENT_SYSTEM.to_string(),
+            tools: Vec::new(),
+            tier: None,
+        },
+    }
+}
+
 /// Shared, cheaply-cloneable machinery a subagent needs — the same backends the parent uses.
 #[derive(Clone)]
 pub struct AgentCtx {
@@ -138,12 +179,25 @@ pub struct SubagentOutcome {
 pub async fn run_subagent(
     ctx: &AgentCtx,
     child_id: &str,
-    task: &str,
+    agent: &ResolvedAgent,
     budget: BudgetState,
 ) -> Result<SubagentOutcome, CoreError> {
-    // Read-only registry, WITHOUT spawn_agents — children can't recurse (depth-1 guard).
+    let task = agent.task.as_str();
+    // Registry WITHOUT spawn_agents — children can't recurse (depth-1 guard). The agent type
+    // may widen the toolset beyond read-only, but never to the spawn tool, and writes/shell
+    // still pass the permission gate (where Ask→Deny in a child).
     let full = ToolRegistry::with_core_tools();
-    let specs: Vec<ToolSpec> = SUBAGENT_TOOLS
+    let allowed: Vec<&str> = if agent.tools.is_empty() {
+        SUBAGENT_TOOLS.to_vec()
+    } else {
+        agent
+            .tools
+            .iter()
+            .map(String::as_str)
+            .filter(|t| *t != SPAWN_AGENTS_TOOL)
+            .collect()
+    };
+    let specs: Vec<ToolSpec> = allowed
         .iter()
         .filter_map(|name| full.get(name))
         .map(|t| ToolSpec {
@@ -153,9 +207,20 @@ pub async fn run_subagent(
         })
         .collect();
 
-    let decision = ctx.router.route(task, budget).await;
+    // Routing: an agent type may pin a tier; otherwise route the task through the mesh.
+    let decision = match agent
+        .tier
+        .and_then(|t| ctx.config.model_for(t).map(|m| (t, m)))
+    {
+        Some((tier, model)) => RoutingDecision {
+            tier,
+            model: model.to_string(),
+            rationale: format!("pinned by agent type '{}'", agent.name),
+        },
+        None => ctx.router.route(task, budget).await,
+    };
 
-    let mut transcript = vec![Message::system(SUBAGENT_SYSTEM), Message::user(task)];
+    let mut transcript = vec![Message::system(&agent.system_prompt), Message::user(task)];
     let mut seq: i64 = 0;
     let mut next_seq = || {
         let n = seq;
@@ -313,6 +378,42 @@ mod tests {
         assert!(parse_requests(&json!({"agents": []}), 8).is_err());
         assert!(parse_requests(&json!({"agents": [{"agent": "x"}]}), 8).is_err());
         assert!(parse_requests(&json!({"nope": 1}), 8).is_err());
+    }
+
+    #[test]
+    fn resolve_applies_named_agent_type_and_defaults_unknown() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "reviewer".to_string(),
+            AgentDef {
+                name: "reviewer".into(),
+                description: "d".into(),
+                tools: vec!["read_file".into()],
+                tier: Some(TaskTier::Complex),
+                system_prompt: "You review.".into(),
+            },
+        );
+        let named = resolve(
+            &AgentRequest {
+                agent: "reviewer".into(),
+                task: "look at the diff".into(),
+            },
+            &agents,
+        );
+        assert_eq!(named.system_prompt, "You review.");
+        assert_eq!(named.tools, vec!["read_file"]);
+        assert_eq!(named.tier, Some(TaskTier::Complex));
+
+        let unknown = resolve(
+            &AgentRequest {
+                agent: "general".into(),
+                task: "t".into(),
+            },
+            &agents,
+        );
+        assert!(unknown.tools.is_empty()); // → default read-only set
+        assert_eq!(unknown.tier, None); // → mesh-routed
+        assert_eq!(unknown.system_prompt, SUBAGENT_SYSTEM);
     }
 
     #[test]

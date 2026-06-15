@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | Phase 1 SHIPPED (sequential inline, read-only, mesh-routed); parallel + agent files = Phase 2 |
+| Status | Phase 1 + 2 SHIPPED (parallel fan-out, `.forge/agents/*.md` types, live TUI panel) |
 | Author | Floris (with Claude) |
 | Created | 2026-06-15 |
 | Last updated | 2026-06-15 |
@@ -304,11 +304,20 @@ classify each). Store mutex is not a bottleneck at these write volumes.
   `parent_session_id`; `Ask`→`Deny` in children; coarse `SubagentStart`/`SubagentResult`
   events; usage rolls into the shared budget. (Implemented sequentially; the schema already
   accepts N agents — parallelism is the Phase-2 change.)
-- **Phase 2 — parallel fan-out + agent files.** Bounded concurrency for N children;
-  `.forge/agents/*.md` loading, per-agent toolset/tier; combined labeled result; budget
-  pre-check + caps. This is the headline capability. **Ship.**
-- **Phase 3 (future, separate RFC) — nested live streaming + recursion + cross-agent
-  sequencing.** Out of scope here.
+- **Phase 2 — parallel fan-out + agent files + live TUI. ✅ SHIPPED.** Children run
+  concurrently on tokio tasks bounded by a `max_concurrency` `Semaphore`, sharing the parent's
+  `Arc` backends; since the presenter is single-threaded, each child reports completion over an
+  `mpsc` channel that `spawn_agents` drains on the main task, emitting `SubagentResult` **live**
+  as each finishes. `.forge/agents/*.md` agent types load via `forge_config::load_agents`
+  (name/description/tools/tier front matter, dependency-free parser); a named type sets the
+  child's system prompt, tool subset, and optional pinned tier (else mesh-routed); unknown/inline
+  → default read-only investigator. **TUI:** running children animate with a spinner in the live
+  preview region; as each completes it flows into a grouped scrollback box
+  (`╭─ subagents` · `├─ ✓ [agent] $cost summary` · `╰─ N agents · $total`).
+- **Phase 3 (future, separate RFC) — nested live token streaming + recursion + cross-agent
+  sequencing + exposing `spawn_agents` to the CLI-bridge (claude/codex) turns.** Out of scope
+  here. (Today `spawn_agents` is advertised to API-model turns via `tool_specs`; the CLI bridge
+  gets tools via `mcp-serve`, which does not expose the virtual tool.)
 
 ### Spike checklist (before Phase 2)
 1. Confirm `Box`→`Arc` compiles cleanly across `forge-cli` construction sites and tests.

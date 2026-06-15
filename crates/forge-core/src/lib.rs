@@ -23,6 +23,16 @@ pub use llm_router::LlmRouter;
 /// Hard cap on model<->tool round trips within a single turn.
 pub(crate) const MAX_STEPS: usize = 8;
 
+/// One subagent's completion, sent from its tokio task back to the orchestrator's drain loop.
+struct ChildDone {
+    index: usize,
+    id: String,
+    agent: String,
+    text: String,
+    ok: bool,
+    cost: f64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error(transparent)]
@@ -433,14 +443,19 @@ impl Session {
         Ok(result)
     }
 
-    /// Handle a `spawn_agents` call: run each requested child agent (Phase 1: sequentially),
-    /// each in its own mesh-routed, read-only, persisted child session, and return their
-    /// combined results to the parent transcript (RFC subagent-orchestration).
+    /// Handle a `spawn_agents` call: resolve each requested child against the loaded agent
+    /// types, then run them **concurrently** (bounded by `max_concurrency`), each in its own
+    /// mesh-routed, persisted child session. Children run on tokio tasks (they share the
+    /// parent's `Arc` backends); since the presenter is single-threaded, each child reports its
+    /// lifecycle over a channel that this method drains on the main task — so `SubagentResult`
+    /// events surface live as children finish (RFC subagent-orchestration, Phase 2).
     async fn spawn_agents(
         &mut self,
         msg_id: &str,
         call: &forge_types::ToolCall,
     ) -> Result<String, CoreError> {
+        use tokio::sync::{mpsc, Semaphore};
+
         let args_json = serde_json::to_string(&call.args)?;
         let max = self.config.mesh.subagents.max_agents;
         let requests = match subagent::parse_requests(&call.args, max) {
@@ -463,6 +478,8 @@ impl Session {
             warn_fraction: self.config.mesh.warn_threshold,
         };
 
+        let agents =
+            forge_config::load_agents(std::path::Path::new(&self.config.mesh.subagents.agents_dir));
         let ctx = subagent::AgentCtx {
             provider: Arc::clone(&self.provider),
             router: Arc::clone(&self.router),
@@ -472,38 +489,70 @@ impl Session {
             mode: self.mode,
             rules: self.rules.clone(),
         };
+        let mode_label = format!("{:?}", self.mode);
+        let n = requests.len();
+        let sem = Arc::new(Semaphore::new(
+            self.config.mesh.subagents.max_concurrency.max(1),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel::<ChildDone>();
 
-        let mut combined = String::new();
-        let mut all_ok = true;
-        for (i, req) in requests.iter().enumerate() {
-            let child_id =
-                self.store
-                    .create_child_session(".", &format!("{:?}", self.mode), &self.id)?;
+        // Create each child session + emit its Start up front (so the UI shows the whole batch
+        // as running immediately), then spawn the work bounded by the concurrency permit.
+        for (i, req) in requests.into_iter().enumerate() {
+            let resolved = subagent::resolve(&req, &agents);
+            let child_id = self
+                .store
+                .create_child_session(".", &mode_label, &self.id)?;
             self.presenter.emit(PresenterEvent::SubagentStart {
                 id: child_id.clone(),
-                agent: req.agent.clone(),
-                task: req.task.clone(),
+                agent: resolved.name.clone(),
+                task: resolved.task.clone(),
             });
 
-            let (text, ok) = match subagent::run_subagent(&ctx, &child_id, &req.task, budget).await
-            {
-                Ok(out) => (out.final_text, out.ok),
-                Err(e) => (format!("error: subagent failed: {e}"), false),
-            };
-            all_ok &= ok;
-            let cost = self.store.session_cost(&child_id).unwrap_or(0.0);
+            let ctx = ctx.clone();
+            let tx = tx.clone();
+            let sem = Arc::clone(&sem);
+            tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                let outcome = subagent::run_subagent(&ctx, &child_id, &resolved, budget).await;
+                let (text, ok) = match outcome {
+                    Ok(out) => (out.final_text, out.ok),
+                    Err(e) => (format!("error: subagent failed: {e}"), false),
+                };
+                let cost = ctx.store.session_cost(&child_id).unwrap_or(0.0);
+                let _ = tx.send(ChildDone {
+                    index: i,
+                    id: child_id,
+                    agent: resolved.name,
+                    text,
+                    ok,
+                    cost,
+                });
+            });
+        }
+        drop(tx); // close the channel once all tasks hold their own clone
 
+        // Drain completions as they arrive — emit each result live, and keep ordered slots for
+        // the combined transcript text.
+        let mut slots: Vec<Option<(String, String)>> = vec![None; n];
+        let mut all_ok = true;
+        while let Some(done) = rx.recv().await {
+            all_ok &= done.ok;
             self.presenter.emit(PresenterEvent::SubagentResult {
-                id: child_id,
-                agent: req.agent.clone(),
-                ok,
-                summary: summarize(&text),
-                cost_usd: cost,
+                id: done.id,
+                agent: done.agent.clone(),
+                ok: done.ok,
+                summary: summarize(&done.text),
+                cost_usd: done.cost,
             });
-
-            combined.push_str(&format!("[agent {}: {}]\n{}\n\n", i + 1, req.agent, text));
+            slots[done.index] = Some((done.agent, done.text));
         }
 
+        let mut combined = String::new();
+        for (i, slot) in slots.into_iter().enumerate() {
+            let (agent, text) = slot.unwrap_or_else(|| ("?".into(), "error: no result".into()));
+            combined.push_str(&format!("[agent {}: {}]\n{}\n\n", i + 1, agent, text));
+        }
         let combined = combined.trim_end().to_string();
         self.store.record_tool_call(
             msg_id,
@@ -1039,5 +1088,55 @@ mod tests {
             child_models.iter().any(|m| m == "ollama::small"),
             "a trivial child routed to the cheap tier independently: {child_models:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_type_file_pins_tier_alongside_mesh_routed_inline_child() {
+        // A `.forge/agents/reviewer.md` pins tier=complex; the inline "fix the typo" child has
+        // no pin and mesh-routes to trivial. Both must coexist in one spawn_agents call.
+        let dir = std::env::temp_dir().join(format!("forge-agents-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("reviewer.md"),
+            "---\nname: reviewer\ntier: complex\ntools: [read_file]\n---\nYou review code.",
+        )
+        .unwrap();
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut config = tiered_config();
+        config.mesh.subagents.agents_dir = dir.to_string_lossy().to_string();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(SpawnThenSynthProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            ".",
+        )
+        .unwrap();
+        let parent_id = session.id().to_string();
+
+        session
+            .run_turn("design and architect a complex concurrency refactor across modules")
+            .await
+            .unwrap();
+
+        let children = store.child_sessions(&parent_id).unwrap();
+        let child_models: Vec<String> = children
+            .iter()
+            .flat_map(|c| store.session_models(c).unwrap())
+            .collect();
+        // reviewer pinned → complex tier model; the inline "fix typo" → trivial tier model.
+        assert!(
+            child_models.iter().any(|m| m == "ollama::big"),
+            "pinned reviewer routed to its tier: {child_models:?}"
+        );
+        assert!(
+            child_models.iter().any(|m| m == "ollama::small"),
+            "inline child still mesh-routed cheaply: {child_models:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
