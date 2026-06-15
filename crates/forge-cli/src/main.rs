@@ -43,6 +43,9 @@ enum Command {
         /// Resume an existing session by id instead of starting a new one.
         #[arg(long)]
         resume: Option<String>,
+        /// Pin a specific model (e.g. `openai::gpt-4o`), bypassing mesh classification.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Start an interactive multi-turn chat session.
     Chat {
@@ -58,6 +61,9 @@ enum Command {
         /// Force plain line output instead of the interactive TUI.
         #[arg(long)]
         plain: bool,
+        /// Pin a specific model (e.g. `openai::gpt-4o`), bypassing mesh classification.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// List past sessions (newest first).
     Sessions,
@@ -102,13 +108,15 @@ async fn main() -> Result<()> {
             mode,
             tui,
             resume,
-        } => run(prompt.join(" "), mock, mode, tui, resume).await,
+            model,
+        } => run(prompt.join(" "), mock, mode, tui, resume, model).await,
         Command::Chat {
             mock,
             mode,
             resume,
             plain,
-        } => chat(mock, mode, resume, plain).await,
+            model,
+        } => chat(mock, mode, resume, plain, model).await,
         Command::Sessions => sessions(),
         Command::Auth { provider } => auth(&provider),
     }
@@ -184,6 +192,7 @@ fn build_session_with(
     mock: bool,
     mode: Option<Mode>,
     resume: Option<String>,
+    pin: Option<String>,
 ) -> Result<Session> {
     // Make any keyring-stored provider keys visible to the provider client.
     forge_config::inject_provider_keys();
@@ -201,7 +210,7 @@ fn build_session_with(
         // CLI bridge (provider-integrations Part B).
         Box::new(DispatchProvider::new())
     };
-    let router = Box::new(HeuristicRouter::new(config.clone()));
+    let router = Box::new(HeuristicRouter::new(config.clone()).with_pin(pin));
     let tools = ToolRegistry::with_core_tools();
 
     match resume {
@@ -224,6 +233,7 @@ fn build_session(
     mode: Option<Mode>,
     tui: bool,
     resume: Option<String>,
+    pin: Option<String>,
 ) -> Result<Session> {
     let presenter: Box<dyn Presenter> = if tui && std::io::stdout().is_terminal() {
         Box::new(TuiPresenter::new().context("initializing TUI")?)
@@ -233,7 +243,7 @@ fn build_session(
         }
         Box::new(HeadlessPresenter::default())
     };
-    build_session_with(presenter, mock, mode, resume)
+    build_session_with(presenter, mock, mode, resume, pin)
 }
 
 async fn run(
@@ -242,11 +252,12 @@ async fn run(
     mode: Option<Mode>,
     tui: bool,
     resume: Option<String>,
+    pin: Option<String>,
 ) -> Result<()> {
     if prompt.trim().is_empty() {
         anyhow::bail!("empty prompt — usage: forge run \"<your task>\"");
     }
-    let mut session = build_session(mock, mode, tui, resume)?;
+    let mut session = build_session(mock, mode, tui, resume, pin)?;
     session
         .run_turn(&prompt)
         .await
@@ -274,15 +285,26 @@ fn chat_action(line: &str) -> ChatAction {
     }
 }
 
-async fn chat(mock: bool, mode: Option<Mode>, resume: Option<String>, plain: bool) -> Result<()> {
+async fn chat(
+    mock: bool,
+    mode: Option<Mode>,
+    resume: Option<String>,
+    plain: bool,
+    pin: Option<String>,
+) -> Result<()> {
     // Default to the interactive (animated) TUI on a real terminal.
     if !plain && std::io::stdout().is_terminal() {
-        return run_chat_tui(mock, mode, resume).await;
+        return run_chat_tui(mock, mode, resume, pin).await;
     }
 
     // Plain line mode: read prompts from stdin.
-    let mut session =
-        build_session_with(Box::new(HeadlessPresenter::default()), mock, mode, resume)?;
+    let mut session = build_session_with(
+        Box::new(HeadlessPresenter::default()),
+        mock,
+        mode,
+        resume,
+        pin,
+    )?;
     if std::io::stdin().is_terminal() {
         println!("forge chat — type a task and press enter; /quit to exit");
     }
@@ -312,7 +334,12 @@ impl Drop for DoneGuard {
 
 /// Animated TUI chat loop: renders at ~16fps, runs each turn on a task so a spinner
 /// ticks (and streamed tokens flow) while the model works.
-async fn run_chat_tui(mock: bool, mode: Option<Mode>, resume: Option<String>) -> Result<()> {
+async fn run_chat_tui(
+    mock: bool,
+    mode: Option<Mode>,
+    resume: Option<String>,
+    pin: Option<String>,
+) -> Result<()> {
     use forge_tui::{
         banner_lines, handle_key, App, ChannelPresenter, InputOutcome, KeyKind, Tui, UiMsg,
     };
@@ -320,7 +347,7 @@ async fn run_chat_tui(mock: bool, mode: Option<Mode>, resume: Option<String>) ->
 
     let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    let session = build_session_with(Box::new(ChannelPresenter::new(tx)), mock, mode, resume)?;
+    let session = build_session_with(Box::new(ChannelPresenter::new(tx)), mock, mode, resume, pin)?;
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
 
     let mut tui = Tui::new().context("initializing TUI")?;

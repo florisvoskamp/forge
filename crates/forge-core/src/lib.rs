@@ -494,7 +494,7 @@ mod tests {
     #[tokio::test]
     async fn cost_accumulates_for_a_priced_model() {
         let store = Store::open_in_memory().unwrap();
-        let config = Config::default();
+        let config = priced_complex_config();
         let mut session = Session::start(
             store,
             Box::new(MockProvider),
@@ -518,17 +518,10 @@ mod tests {
 
     #[tokio::test]
     async fn warns_when_budget_threshold_reached() {
-        // Pin the complex model's price so the test is independent of bundled rates:
-        // each complex turn costs (30+12)/1k + (42+18)/1k = 0.102 USD.
-        let mut config = Config::default();
+        // Complex turn costs (30+12)/1k + (42+18)/1k = 0.102 USD (keyless priced model, so
+        // provider-fallback can't re-route and change the cost).
+        let mut config = priced_complex_config();
         config.mesh.daily_budget_usd = Some(0.12); // 80% = 0.096
-        config.mesh.pricing.insert(
-            "anthropic::claude-opus-4-8".to_string(),
-            forge_config::PriceOverride {
-                input_per_1k: 1.0,
-                output_per_1k: 1.0,
-            },
-        );
 
         let capture = CapturePresenter::default();
         let events = capture.events.clone();
@@ -560,6 +553,26 @@ mod tests {
             .iter()
             .any(|e| matches!(e, PresenterEvent::Warning(_)));
         assert!(warned, "expected a budget Warning event");
+    }
+
+    /// A config whose complex tier points at a keyless (always-available) model with a fixed
+    /// 1.0/1k price, so budget/cost tests are deterministic regardless of which API keys the
+    /// host happens to have — otherwise provider-fallback would re-route to an available model
+    /// and change the cost out from under the test.
+    fn priced_complex_config() -> Config {
+        let mut config = Config::default();
+        config
+            .mesh
+            .models
+            .insert("complex".to_string(), "ollama::opus-sim".to_string());
+        config.mesh.pricing.insert(
+            "ollama::opus-sim".to_string(),
+            forge_config::PriceOverride {
+                input_per_1k: 1.0,
+                output_per_1k: 1.0,
+            },
+        );
+        config
     }
 
     fn fresh_session(store: Store, config: Config) -> Session {
@@ -597,15 +610,8 @@ mod tests {
     async fn hard_stop_refuses_once_over_cap() {
         // AC-7: once the day total exceeds the cap, the next turn is refused before any
         // provider call and records no further spend.
-        let mut config = Config::default();
+        let mut config = priced_complex_config();
         config.mesh.daily_budget_usd = Some(0.05);
-        config.mesh.pricing.insert(
-            "anthropic::claude-opus-4-8".to_string(),
-            forge_config::PriceOverride {
-                input_per_1k: 1.0,
-                output_per_1k: 1.0,
-            },
-        );
         let mut session = fresh_session(Store::open_in_memory().unwrap(), config);
 
         // Turn 1 sees $0 spent -> proceeds, spends ~$0.102 (over the $0.05 cap).
@@ -639,7 +645,7 @@ mod tests {
     async fn daily_spend_aggregates_across_sessions() {
         // AC-1/AC-2: a second session sees the first session's spend in the day total.
         let path = std::env::temp_dir().join(format!("forge-budget-{}.db", forge_types::new_id()));
-        let config = Config::default(); // no cap -> both proceed; complex tier is priced
+        let config = priced_complex_config(); // no cap -> both proceed; complex tier is priced
 
         let day_total_after_a = {
             let mut a = fresh_session(Store::open(&path).unwrap(), config.clone());

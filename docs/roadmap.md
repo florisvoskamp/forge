@@ -43,9 +43,9 @@ claimed. Three real gaps, one of which breaks the headline differentiator:
 |-----|---------|--------|------|
 | FR-1 | Agent loop (stream, tools, iterate) | **done** | 10 core tests |
 | FR-2 | Tool system (read/write/edit/list/search) | **done** | 10 tests; **no shell tool** (see P0-1) |
-| FR-3 | Multi-provider (genai) | **partial** | works live; **untested** (D2) |
-| FR-4 | Model Mesh routing | **done** | heuristic classifier; no `--model` pin flag |
-| FR-5 | Cost + budget | **partial** | cost OK; **cap is fake** (D1) |
+| FR-3 | Multi-provider (genai) | **done** | contract-tested (#20); 7 providers + CLI bridge (#25/#26) |
+| FR-4 | Model Mesh routing | **done** | heuristic (length+keyword+hints+code+dev-verbs), `--model` pin, provider fallback; cost-aware candidate selection = future (provider-cost-routing.md) |
+| FR-5 | Cost + budget | **done** | real day+month cap across sessions (#19) |
 | FR-6 | TUI | **done** | inline-scrollback; plain markdown only (see P0-5) |
 | FR-7 | Session persistence | **done** | list + resume |
 | FR-8 | Config (layered) | **done** | figment |

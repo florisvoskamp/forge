@@ -311,6 +311,29 @@ pub fn known_key_providers() -> impl Iterator<Item = &'static str> {
     PROVIDER_ENV_VARS.iter().map(|(name, _)| *name)
 }
 
+/// The provider prefix of a `"provider::model"` id (the part before the first `::`), or `""`
+/// when the id is unprefixed.
+pub fn provider_of(model: &str) -> &str {
+    model.split_once("::").map(|(p, _)| p).unwrap_or("")
+}
+
+/// Whether a usable API key is available for `model`'s provider *without* erroring. True for
+/// keyless providers (local `ollama::`, the `claude-cli::`/`codex-cli::` bridges that own
+/// their own auth, and unprefixed ids we can't classify). For key-based providers, true iff
+/// the env var is set or the keyring holds an entry. The mesh uses this for provider fallback.
+pub fn has_api_key(provider: &str) -> bool {
+    let Some(var) = env_var_for(provider) else {
+        return true; // keyless / unknown -> don't block routing on it
+    };
+    if std::env::var(var).map(|v| !v.is_empty()).unwrap_or(false) {
+        return true;
+    }
+    keyring::Entry::new(KEYRING_SERVICE, provider)
+        .and_then(|e| e.get_password())
+        .map(|k| !k.is_empty())
+        .unwrap_or(false)
+}
+
 /// Resolve an API key for a provider: environment variable first, then the OS keyring.
 pub fn api_key(provider: &str) -> Result<String, ConfigError> {
     let Some(var) = env_var_for(provider) else {
