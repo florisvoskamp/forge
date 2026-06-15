@@ -163,6 +163,9 @@ impl ForgeMcp {
             subagent::Lifecycle::Start { agent, task, .. } => {
                 tracing::info!(agent, task, "subagent started")
             }
+            // Live deltas have nowhere to go over the MCP boundary; the bridge sees the final
+            // combined result. (Streaming them to the parent TUI is Phase 3b-bridge, deferred.)
+            subagent::Lifecycle::Progress { .. } => {}
             subagent::Lifecycle::Done {
                 agent,
                 ok,

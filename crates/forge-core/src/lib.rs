@@ -491,6 +491,12 @@ impl Session {
                     task: task.to_string(),
                 })
             }
+            subagent::Lifecycle::Progress { id, snippet } => {
+                presenter.emit(PresenterEvent::SubagentProgress {
+                    id: id.to_string(),
+                    snippet: snippet.to_string(),
+                })
+            }
             subagent::Lifecycle::Done {
                 id,
                 agent,
@@ -1008,6 +1014,13 @@ mod tests {
             .filter(|e| matches!(e, PresenterEvent::SubagentResult { .. }))
             .count();
         assert_eq!((starts, results), (2, 2), "start+result per child");
+
+        // Children stream their activity → live progress events surface (Phase 3b).
+        let progress = ev
+            .iter()
+            .filter(|e| matches!(e, PresenterEvent::SubagentProgress { .. }))
+            .count();
+        assert!(progress > 0, "at least one live progress delta surfaced");
 
         // Child usage rolled into the shared day budget (children did real model work).
         assert!(store.spend_today_usd().unwrap() > 0.0);

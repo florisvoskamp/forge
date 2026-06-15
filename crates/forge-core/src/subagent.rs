@@ -183,6 +183,7 @@ pub async fn run_subagent(
     child_id: &str,
     agent: &ResolvedAgent,
     budget: BudgetState,
+    on_delta: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<SubagentOutcome, CoreError> {
     let task = agent.task.as_str();
     // Registry WITHOUT spawn_agents — children can't recurse (depth-1 guard). The agent type
@@ -236,8 +237,9 @@ pub async fn run_subagent(
     let mut ok = true;
 
     for step in 0..MAX_STEPS {
-        // Subagents don't stream inner tokens to the UI in Phase 1 (coarse events only).
-        let mut sink = |_: StreamEvent| {};
+        // Forward the child's streamed deltas so the orchestrator can show live per-child
+        // activity (RFC subagent-orchestration Phase 3b).
+        let mut sink = |ev: StreamEvent| on_delta(ev);
         let mut resp = ctx
             .provider
             .complete(&decision.model, &transcript, &specs, &mut sink)
@@ -297,6 +299,13 @@ pub async fn run_subagent(
     Ok(SubagentOutcome { final_text, ok })
 }
 
+/// A message from a child task to the orchestrator's drain loop: a live activity delta, or the
+/// final completion.
+enum ChildMsg {
+    Progress { index: usize, snippet: String },
+    Done(ChildDone),
+}
+
 /// One subagent's completion, sent from its task back to the orchestrator's drain loop.
 struct ChildDone {
     index: usize,
@@ -315,6 +324,8 @@ pub enum Lifecycle<'a> {
         agent: &'a str,
         task: &'a str,
     },
+    /// A live activity snippet (streamed text/reasoning) from a still-running child.
+    Progress { id: &'a str, snippet: &'a str },
     Done {
         id: &'a str,
         agent: &'a str,
@@ -343,7 +354,8 @@ pub async fn orchestrate(
     let mode_label = format!("{:?}", ctx.mode);
     let n = requests.len();
     let sem = Arc::new(Semaphore::new(max_concurrency.max(1)));
-    let (tx, mut rx) = mpsc::unbounded_channel::<ChildDone>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<ChildMsg>();
+    let mut ids: Vec<String> = Vec::with_capacity(n);
 
     // Create each child session + announce Start up front (so a UI shows the whole batch as
     // running immediately), then spawn the work bounded by a concurrency permit.
@@ -357,42 +369,61 @@ pub async fn orchestrate(
             agent: &resolved.name,
             task: &resolved.task,
         });
+        ids.push(child_id.clone());
 
         let ctx = ctx.clone();
         let tx = tx.clone();
         let sem = Arc::clone(&sem);
         tokio::spawn(async move {
             let _permit = sem.acquire_owned().await;
-            let outcome = run_subagent(&ctx, &child_id, &resolved, budget).await;
+            // Forward streamed text/reasoning as live progress for this child's UI row.
+            let mut on_delta = |ev: StreamEvent| {
+                let snippet = match ev {
+                    StreamEvent::Text(t) | StreamEvent::Reasoning(t) => t,
+                    _ => return,
+                };
+                let _ = tx.send(ChildMsg::Progress { index: i, snippet });
+            };
+            let outcome = run_subagent(&ctx, &child_id, &resolved, budget, &mut on_delta).await;
             let (text, ok) = match outcome {
                 Ok(out) => (out.final_text, out.ok),
                 Err(e) => (format!("error: subagent failed: {e}"), false),
             };
             let cost = ctx.store.session_cost(&child_id).unwrap_or(0.0);
-            let _ = tx.send(ChildDone {
+            let _ = tx.send(ChildMsg::Done(ChildDone {
                 index: i,
                 id: child_id,
                 agent: resolved.name,
                 text,
                 ok,
                 cost,
-            });
+            }));
         });
     }
     drop(tx); // close the channel once every task holds its own clone
 
     let mut slots: Vec<Option<(String, String)>> = vec![None; n];
     let mut all_ok = true;
-    while let Some(done) = rx.recv().await {
-        all_ok &= done.ok;
-        on_event(Lifecycle::Done {
-            id: &done.id,
-            agent: &done.agent,
-            ok: done.ok,
-            summary: &summary(&done.text),
-            cost_usd: done.cost,
-        });
-        slots[done.index] = Some((done.agent, done.text));
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            ChildMsg::Progress { index, snippet } => {
+                on_event(Lifecycle::Progress {
+                    id: &ids[index],
+                    snippet: &snippet,
+                });
+            }
+            ChildMsg::Done(done) => {
+                all_ok &= done.ok;
+                on_event(Lifecycle::Done {
+                    id: &done.id,
+                    agent: &done.agent,
+                    ok: done.ok,
+                    summary: &summary(&done.text),
+                    cost_usd: done.cost,
+                });
+                slots[done.index] = Some((done.agent, done.text));
+            }
+        }
     }
 
     let mut combined = String::new();
