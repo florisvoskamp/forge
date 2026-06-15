@@ -30,21 +30,22 @@ names stay stable). Temper is a **display + UX layer** plus runtime switching. C
 
 | Canonical key | Temper label | Behaviour | In SHIFT+TAB cycle? |
 |---------------|--------------|-----------|---------------------|
-| `plan` | **Survey** | Read-only: investigate & propose, **no** side effects (hard contract). | yes |
-| `default` | **Guarded** | Ask before each side effect. | yes |
-| `accept-edits` | **Smith** | Auto-apply file edits; still ask for shell. | yes |
-| `bypass` | **Unfettered** | All permission guards off (the unoverridable safety denylist still applies). | **no — explicit opt-in only** |
+| `plan` | **Read-only** | Investigate & propose, **no** side effects (hard contract). | yes |
+| `default` | **Ask** | Ask before each side effect. | yes |
+| `accept-edits` | **Auto-edit** | Auto-apply file edits; still ask for shell. | yes |
+| `bypass` | **Full** | All permission guards off (the unoverridable safety denylist still applies). | **no — explicit opt-in only** |
 
-`--mode` and `[permission] mode = …` accept **either** the canonical key **or** the temper
-label (e.g. `--mode survey` == `--mode plan`). Survey/Guarded/Smith/Unfettered are themed but
-each keeps an obvious, unambiguous meaning — clarity wins over cuteness for a security control.
+The dimension is themed **temper**; the values are **descriptive** so the active permission is
+obvious at a glance (the prior themed value-names hid which mode was which). `--mode` and
+`[permission] mode = …` accept **either** the canonical key **or** the label
+(e.g. `--mode read-only` == `--mode plan`, `--mode auto-edit` == `--mode accept-edits`).
 
-**Cycle order** (SHIFT+TAB): `Guarded → Smith → Survey → Guarded …`. Unfettered is deliberately
+**Cycle order** (SHIFT+TAB): `Ask → Auto-edit → Read-only → Ask …`. **Full** is deliberately
 **excluded** from the cycle: landing on "all guards off" by tapping a key is a footgun, so it is
-reachable only via `--mode unfettered` / config. (Claude Code likewise never cycles into bypass.)
+reachable only via `--mode full` / config. (Claude Code likewise never cycles into bypass.)
 
 **Reserved:** `Assay` (read-only analysis crew) is the next feature and will slot in beside
-Survey as a read-only sibling. Not wired into the cycle this turn.
+Read-only as a read-only sibling. Not wired into the cycle this turn.
 
 ---
 

@@ -672,23 +672,23 @@ mod tests {
     #[test]
     fn temper_shows_in_statusline_and_switch_notes_scrollback() {
         let mut app = App {
-            temper: "Guarded".into(),
+            temper: "Ask".into(),
             ..App::default()
         };
         // Wide enough that the temper segment renders.
         assert!(
-            screen_wh(&app, 90, LIVE_H).contains("Guarded"),
+            screen_wh(&app, 90, LIVE_H).contains("Ask"),
             "active temper shown in the statusline"
         );
 
-        app.set_temper("Smith");
-        assert_eq!(app.temper, "Smith");
+        app.set_temper("Auto-edit");
+        assert_eq!(app.temper, "Auto-edit");
         assert!(
-            screen_wh(&app, 90, LIVE_H).contains("Smith"),
+            screen_wh(&app, 90, LIVE_H).contains("Auto-edit"),
             "statusline reflects the new temper"
         );
         assert!(
-            flush_text(&mut app).contains("temper → Smith"),
+            flush_text(&mut app).contains("temper → Auto-edit"),
             "a switch note is queued to scrollback"
         );
     }

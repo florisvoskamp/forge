@@ -91,13 +91,13 @@ enum Command {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Mode {
-    #[value(alias = "guarded")]
+    #[value(alias = "ask")]
     Default,
-    #[value(alias = "smith")]
+    #[value(alias = "auto-edit", alias = "autoedit")]
     AcceptEdits,
-    #[value(alias = "unfettered")]
+    #[value(alias = "full")]
     Bypass,
-    #[value(alias = "survey")]
+    #[value(alias = "read-only", alias = "readonly")]
     Plan,
 }
 

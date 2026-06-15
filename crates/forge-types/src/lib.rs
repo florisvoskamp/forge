@@ -138,29 +138,30 @@ impl TaskTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
-    /// Ask before any side effect. Temper: **Guarded**.
+    /// Ask before any side effect. Temper: **Ask**.
     #[default]
-    #[serde(alias = "guarded")]
+    #[serde(alias = "ask")]
     Default,
-    /// Auto-allow file writes/edits; still ask for shell. Temper: **Smith**.
-    #[serde(alias = "smith")]
+    /// Auto-allow file writes/edits; still ask for shell. Temper: **Auto-edit**.
+    #[serde(alias = "auto-edit", alias = "autoedit")]
     AcceptEdits,
-    /// Auto-allow everything (explicit, dangerous opt-in). Temper: **Unfettered**.
-    #[serde(alias = "unfettered")]
+    /// Auto-allow everything (explicit, dangerous opt-in). Temper: **Full**.
+    #[serde(alias = "full")]
     Bypass,
-    /// Read-only: deny all side effects. Temper: **Survey**.
-    #[serde(alias = "survey")]
+    /// Read-only: deny all side effects. Temper: **Read-only**.
+    #[serde(alias = "read-only", alias = "readonly")]
     Plan,
 }
 
 impl PermissionMode {
-    /// The themed temper label shown in the UI.
+    /// The temper label shown in the UI — names the permission plainly so the active posture
+    /// is obvious at a glance (the dimension is themed "temper"; the values are descriptive).
     pub fn label(self) -> &'static str {
         match self {
-            PermissionMode::Plan => "Survey",
-            PermissionMode::Default => "Guarded",
-            PermissionMode::AcceptEdits => "Smith",
-            PermissionMode::Bypass => "Unfettered",
+            PermissionMode::Plan => "Read-only",
+            PermissionMode::Default => "Ask",
+            PermissionMode::AcceptEdits => "Auto-edit",
+            PermissionMode::Bypass => "Full",
         }
     }
 
@@ -271,11 +272,11 @@ mod tests {
     }
 
     #[test]
-    fn temper_labels_are_themed() {
-        assert_eq!(PermissionMode::Plan.label(), "Survey");
-        assert_eq!(PermissionMode::Default.label(), "Guarded");
-        assert_eq!(PermissionMode::AcceptEdits.label(), "Smith");
-        assert_eq!(PermissionMode::Bypass.label(), "Unfettered");
+    fn temper_labels_name_the_permission_plainly() {
+        assert_eq!(PermissionMode::Plan.label(), "Read-only");
+        assert_eq!(PermissionMode::Default.label(), "Ask");
+        assert_eq!(PermissionMode::AcceptEdits.label(), "Auto-edit");
+        assert_eq!(PermissionMode::Bypass.label(), "Full");
     }
 
     #[test]
@@ -302,10 +303,12 @@ mod tests {
 
     #[test]
     fn temper_labels_deserialize_as_aliases() {
-        let m: PermissionMode = serde_json::from_str("\"survey\"").unwrap();
+        let m: PermissionMode = serde_json::from_str("\"read-only\"").unwrap();
         assert_eq!(m, PermissionMode::Plan);
-        let m: PermissionMode = serde_json::from_str("\"smith\"").unwrap();
+        let m: PermissionMode = serde_json::from_str("\"auto-edit\"").unwrap();
         assert_eq!(m, PermissionMode::AcceptEdits);
+        let m: PermissionMode = serde_json::from_str("\"full\"").unwrap();
+        assert_eq!(m, PermissionMode::Bypass);
         // Canonical keys still work.
         let m: PermissionMode = serde_json::from_str("\"accept-edits\"").unwrap();
         assert_eq!(m, PermissionMode::AcceptEdits);
