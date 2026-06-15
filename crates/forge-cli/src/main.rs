@@ -78,6 +78,8 @@ enum Command {
     },
     /// List past sessions (newest first).
     Sessions,
+    /// Show the auto-discovered model catalog and the mesh's best pick per tier.
+    Models,
     /// Internal: run Forge's tool registry as an MCP server on stdio (spawned by the CLI
     /// bridge so claude/codex use Forge's tools under Forge's permission gate). Not for direct use.
     #[command(hide = true)]
@@ -137,6 +139,7 @@ async fn main() -> Result<()> {
             model,
         } => chat(mock, mode, resume, plain, model).await,
         Command::Sessions => sessions(),
+        Command::Models => models().await,
         Command::Auth { provider } => auth(&provider),
         Command::McpServe => mcp_serve::run().await,
     }
@@ -212,6 +215,7 @@ pub(crate) fn build_provider_and_router(
     config: &forge_config::Config,
     mock: bool,
     pin: Option<String>,
+    catalog: Option<forge_mesh::ModelCatalog>,
 ) -> (Arc<dyn Provider>, Arc<dyn Router>) {
     let provider: Arc<dyn Provider> = if mock {
         Arc::new(MockProvider)
@@ -221,7 +225,10 @@ pub(crate) fn build_provider_and_router(
         let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
         Arc::new(DispatchProvider::new(harness))
     };
-    let heuristic = HeuristicRouter::new(config.clone()).with_pin(pin);
+    let mut heuristic = HeuristicRouter::new(config.clone()).with_pin(pin);
+    if let Some(cat) = catalog {
+        heuristic = heuristic.with_catalog(cat);
+    }
     let router: Arc<dyn Router> = if config.mesh.classifier == ClassifierKind::Llm {
         // Opt-in cheap-LLM classifier: a separate (stateless) provider labels the tier, then
         // the heuristic router does the cost-aware selection; any failure falls back to it.
@@ -248,7 +255,59 @@ pub(crate) fn build_provider_and_router(
 }
 
 /// Build a session around a caller-provided presenter, wiring all subsystems.
-fn build_session_with(
+/// Discover the models the user can actually use, as a [`forge_mesh::ModelCatalog`] for
+/// auto-discovery routing: query each provider that has a key (plus keyless local `ollama`) for
+/// its model list, with a short per-provider timeout, and skip any that error. Cheap providers
+/// usually number 1–3, so this runs sequentially at session start (cached for the process).
+async fn discover_catalog() -> forge_mesh::ModelCatalog {
+    use std::time::Duration;
+    let mut models = Vec::new();
+    // Keyless local first, then every key-holding provider.
+    let mut providers = vec!["ollama".to_string()];
+    providers.extend(
+        forge_config::known_key_providers()
+            .filter(|p| forge_config::has_api_key(p))
+            .map(str::to_string),
+    );
+    for p in providers {
+        match tokio::time::timeout(Duration::from_secs(4), forge_provider::list_models(&p)).await {
+            Ok(Ok(list)) => models.extend(list),
+            Ok(Err(e)) => tracing::debug!("model discovery skipped {p}: {e}"),
+            Err(_) => tracing::debug!("model discovery timed out for {p}"),
+        }
+    }
+    forge_mesh::ModelCatalog::new(models)
+}
+
+/// `forge models`: discover the usable models + show the mesh's capability-ranked pick per tier.
+async fn models() -> Result<()> {
+    forge_config::inject_provider_keys();
+    let config = forge_config::load().unwrap_or_default();
+    let cat = discover_catalog().await;
+    if cat.is_empty() {
+        println!(
+            "no models discovered — set a provider key (`forge auth <provider>`) or run ollama"
+        );
+        return Ok(());
+    }
+    println!("discovered {} usable models:", cat.models().len());
+    for m in cat.models() {
+        println!("  {m}");
+    }
+    let pricing = forge_mesh::pricing::Pricing::from_config(&config);
+    println!("\nmesh auto-pick per tier:");
+    for tier in [TaskTier::Trivial, TaskTier::Standard, TaskTier::Complex] {
+        let pick = cat
+            .ranked_for(tier, &pricing, 1)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "—".into());
+        println!("  {:<9} {pick}", tier.as_str());
+    }
+    Ok(())
+}
+
+async fn build_session_with(
     presenter: Box<dyn Presenter>,
     mock: bool,
     mode: Option<Mode>,
@@ -264,7 +323,14 @@ fn build_session_with(
     }
 
     let store = Arc::new(open_store()?);
-    let (provider, router) = build_provider_and_router(&config, mock, pin);
+    // Auto-discovery: build a live model catalog so the mesh routes to the best usable model
+    // (docs/features/auto-discovery-mesh.md). Skipped for the offline mock and when disabled.
+    let catalog = if !mock && config.mesh.auto_discover {
+        Some(discover_catalog().await)
+    } else {
+        None
+    };
+    let (provider, router) = build_provider_and_router(&config, mock, pin, catalog);
     let tools = ToolRegistry::with_core_tools();
 
     match resume {
@@ -282,7 +348,7 @@ fn build_session_with(
 }
 
 /// Build a session with the default surface (TUI on a tty, else plain).
-fn build_session(
+async fn build_session(
     mock: bool,
     mode: Option<Mode>,
     tui: bool,
@@ -297,7 +363,7 @@ fn build_session(
         }
         Box::new(HeadlessPresenter::default())
     };
-    build_session_with(presenter, mock, mode, resume, pin)
+    build_session_with(presenter, mock, mode, resume, pin).await
 }
 
 async fn run(
@@ -311,7 +377,7 @@ async fn run(
     if prompt.trim().is_empty() {
         anyhow::bail!("empty prompt — usage: forge run \"<your task>\"");
     }
-    let mut session = build_session(mock, mode, tui, resume, pin)?;
+    let mut session = build_session(mock, mode, tui, resume, pin).await?;
     session
         .run_turn(&prompt)
         .await
@@ -358,7 +424,8 @@ async fn chat(
         mode,
         resume,
         pin,
-    )?;
+    )
+    .await?;
     if std::io::stdin().is_terminal() {
         println!("forge chat — type a task and press enter; /quit to exit");
     }
@@ -401,7 +468,8 @@ async fn run_chat_tui(
 
     let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    let session = build_session_with(Box::new(ChannelPresenter::new(tx)), mock, mode, resume, pin)?;
+    let session =
+        build_session_with(Box::new(ChannelPresenter::new(tx)), mock, mode, resume, pin).await?;
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
 
     let mut tui = Tui::new().context("initializing TUI")?;

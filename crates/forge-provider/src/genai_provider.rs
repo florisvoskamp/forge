@@ -37,6 +37,25 @@ impl GenAiProvider {
     }
 }
 
+/// List the models a provider currently offers, as Forge `provider::model` ids, by querying the
+/// provider's models endpoint via genai (`all_model_names`). Used by the auto-discovery mesh to
+/// build a live catalog of usable models (docs/features/auto-discovery-mesh.md). The provider's
+/// key + endpoint are resolved by genai from the environment. Providers genai can't list (no
+/// native adapter, e.g. `cerebras`) return an error and are simply skipped by the caller.
+pub async fn list_models(namespace: &str) -> Result<Vec<String>, ProviderError> {
+    let kind = AdapterKind::from_lower_str(normalize_namespace(namespace))
+        .ok_or_else(|| ProviderError::Request(format!("no genai adapter for `{namespace}`")))?;
+    let names = Client::default()
+        .all_model_names(kind, None)
+        .await
+        .map_err(|e| ProviderError::Request(e.to_string()))?;
+    // Re-namespace with Forge's provider name (so `openrouter` stays `openrouter::…`).
+    Ok(names
+        .into_iter()
+        .map(|n| format!("{namespace}::{n}"))
+        .collect())
+}
+
 /// Build the genai client with a custom-endpoint resolver for providers genai has no native
 /// adapter for. Today that's **Cerebras** (`cerebras::<model>`): an OpenAI-compatible API at
 /// `api.cerebras.ai`, keyed by `CEREBRAS_API_KEY`. genai keeps the full `cerebras::…` string as

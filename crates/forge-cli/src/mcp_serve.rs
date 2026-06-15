@@ -226,7 +226,7 @@ pub async fn run() -> Result<()> {
         .unwrap_or(0);
     let subagents = if config.mesh.subagents.enabled && depth < config.mesh.subagents.max_depth {
         let store = Arc::new(Store::open(std::path::Path::new(".forge/forge.db"))?);
-        let (provider, router) = crate::build_provider_and_router(&config, false, None);
+        let (provider, router) = crate::build_provider_and_router(&config, false, None, None);
         let parent_id = store.create_session(".", &format!("{:?}", config.permission_mode))?;
         let agents = Arc::new(forge_config::load_agents(std::path::Path::new(
             &config.mesh.subagents.agents_dir,

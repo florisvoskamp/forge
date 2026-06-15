@@ -7,7 +7,11 @@ use async_trait::async_trait;
 use forge_config::Config;
 use forge_types::TaskTier;
 
+pub mod capability;
+pub mod catalog;
 pub mod pricing;
+
+pub use catalog::ModelCatalog;
 
 /// Live budget context the router considers when choosing a tier. Carries both the daily
 /// and monthly axes (FR-5); the stricter of the two governs.
@@ -178,6 +182,9 @@ pub struct HeuristicRouter {
     model_available: fn(&str) -> bool,
     /// Bundled+configured rates, used to rank candidate models by relative cost.
     pricing: pricing::Pricing,
+    /// Live catalog of usable models (auto-discovery). When present and `mesh.auto_discover` is
+    /// on, the router ranks the best discovered model per tier instead of the configured lists.
+    catalog: Option<ModelCatalog>,
 }
 
 fn default_model_available(model: &str) -> bool {
@@ -292,6 +299,7 @@ impl HeuristicRouter {
             pin: None,
             model_available: default_model_available,
             pricing,
+            catalog: None,
         }
     }
 
@@ -299,6 +307,34 @@ impl HeuristicRouter {
     pub fn with_pin(mut self, pin: Option<String>) -> Self {
         self.pin = pin.filter(|s| !s.is_empty());
         self
+    }
+
+    /// Attach a discovered model catalog for auto-discovery routing (no-op when empty).
+    pub fn with_catalog(mut self, catalog: ModelCatalog) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
+    /// Whether auto-discovery routing is active (enabled + a non-empty catalog attached).
+    fn auto_active(&self) -> bool {
+        self.config.mesh.auto_discover && self.catalog.as_ref().is_some_and(|c| !c.is_empty())
+    }
+
+    /// Candidate models for a tier: the auto-discovered, capability-ranked shortlist when
+    /// [`auto_active`](Self::auto_active); otherwise the configured `[mesh.models]` candidates
+    /// (the manual/override path, and the offline/no-catalog default).
+    fn candidates_for_tier(&self, tier: TaskTier) -> Vec<String> {
+        if self.auto_active() {
+            let ranked = self
+                .catalog
+                .as_ref()
+                .unwrap()
+                .ranked_for(tier, &self.pricing, 5);
+            if !ranked.is_empty() {
+                return ranked;
+            }
+        }
+        self.config.candidates_for(tier)
     }
 
     /// Inject a deterministic provider-availability predicate (tests only).
@@ -351,7 +387,7 @@ impl HeuristicRouter {
     /// the actionable MissingKey message — same as today).
     fn cross_tier_cheapest(&self, original: &str, why: &mut String) -> String {
         for tier in [TaskTier::Complex, TaskTier::Standard, TaskTier::Trivial] {
-            if let Some(m) = self.cheapest_usable(&self.config.candidates_for(tier)) {
+            if let Some(m) = self.cheapest_usable(&self.candidates_for_tier(tier)) {
                 why.push_str(&format!(
                     " — fell back to {m} (no usable key for {original})"
                 ));
@@ -410,16 +446,36 @@ impl HeuristicRouter {
             classify_reason
         };
 
-        // Cost-aware selection among the tier's usable candidates (L1/L2).
-        let candidates = self.config.candidates_for(tier);
-        let model = match self.cheapest_usable(&candidates) {
+        let auto = self.auto_active();
+        let candidates = self.candidates_for_tier(tier);
+        // Selection. In the **auto-discovery** path the catalog order already encodes capability
+        // *and* cost (the ranker folds both), so we take the first *usable* model in that order —
+        // re-sorting by raw cost here would wrongly pick a tiny cheap model for a Complex task.
+        // In the **configured** path we keep cost-aware selection over the user's candidates.
+        let chosen = if auto {
+            candidates
+                .iter()
+                .find(|m| (self.model_available)(m))
+                .cloned()
+        } else {
+            self.cheapest_usable(&candidates)
+        };
+        let model = match chosen {
             Some(m) => {
-                let n = self.usable_count(&candidates);
-                if n > 1 {
+                if auto {
                     why.push_str(&format!(
-                        " — cheapest of {n} usable {} models: {m}",
+                        " — auto-selected best of {} usable {} models: {m}",
+                        self.usable_count(&candidates),
                         tier.as_str()
                     ));
+                } else {
+                    let n = self.usable_count(&candidates);
+                    if n > 1 {
+                        why.push_str(&format!(
+                            " — cheapest of {n} usable {} models: {m}",
+                            tier.as_str()
+                        ));
+                    }
                 }
                 if self.config.mesh.prefer_subscription && is_subscription(&m) {
                     why.push_str(" (paid subscription)");
@@ -735,6 +791,59 @@ mod tests {
         assert_eq!(d.tier, TaskTier::Standard);
         assert_eq!(d.model, "openai::gpt-4o-mini");
         assert!(d.rationale.contains("cheapest of 2"), "{}", d.rationale);
+    }
+
+    #[tokio::test]
+    async fn auto_discovery_routes_to_the_capability_ranked_catalog_model() {
+        // Auto-discovery on (default) + a catalog → the mesh ranks by capability (cost folded in),
+        // NOT pure cheapest, so a Complex task picks the frontier model over a tiny free one.
+        let cat = ModelCatalog::new(vec![
+            "groq::llama-3.1-8b-instant".into(),
+            "anthropic::claude-opus-4-8".into(),
+        ]);
+        let r = HeuristicRouter::new(Config::default())
+            .with_availability(|_| true)
+            .with_catalog(cat);
+        let prompt = "design and architect a complex concurrency refactor across modules";
+        let d = r.route(prompt, BudgetState::default()).await;
+        assert_eq!(d.tier, TaskTier::Complex);
+        assert_eq!(d.model, "anthropic::claude-opus-4-8", "{}", d.rationale);
+        assert!(d.rationale.contains("auto-selected"), "{}", d.rationale);
+    }
+
+    #[tokio::test]
+    async fn auto_discovery_trivial_prefers_the_small_fast_model() {
+        let cat = ModelCatalog::new(vec![
+            "groq::llama-3.1-8b-instant".into(),
+            "anthropic::claude-opus-4-8".into(),
+        ]);
+        let r = HeuristicRouter::new(Config::default())
+            .with_availability(|_| true)
+            .with_catalog(cat);
+        let d = r.route("fix typo", BudgetState::default()).await;
+        assert_eq!(d.tier, TaskTier::Trivial);
+        assert_eq!(d.model, "groq::llama-3.1-8b-instant", "{}", d.rationale);
+    }
+
+    #[tokio::test]
+    async fn auto_discovery_off_uses_configured_candidates() {
+        // With auto off, the catalog is ignored and the configured tier wins (manual override).
+        let mut config = Config::default();
+        config.mesh.auto_discover = false;
+        config.mesh.models.insert(
+            "complex".to_string(),
+            forge_config::OneOrMany::One("openai::gpt-4o-mini".to_string()),
+        );
+        let r = HeuristicRouter::new(config)
+            .with_availability(|_| true)
+            .with_catalog(ModelCatalog::new(vec!["anthropic::claude-opus-4-8".into()]));
+        let d = r
+            .route(
+                "design and architect a complex concurrency refactor across modules",
+                BudgetState::default(),
+            )
+            .await;
+        assert_eq!(d.model, "openai::gpt-4o-mini", "{}", d.rationale);
     }
 
     #[tokio::test]

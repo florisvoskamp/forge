@@ -221,6 +221,16 @@ pub struct MeshConfig {
     /// Subagent orchestration (RFC subagent-orchestration): the `spawn_agents` tool.
     #[serde(default)]
     pub subagents: SubagentsConfig,
+    /// Auto-discovery routing (docs/features/auto-discovery-mesh.md): when true (default), the
+    /// mesh discovers the models the user can actually use and ranks the best per tier itself,
+    /// rather than relying on the `[mesh.models]` lists. Set false to route strictly from the
+    /// configured `[mesh.models]` candidates.
+    #[serde(default = "default_auto_discover")]
+    pub auto_discover: bool,
+}
+
+fn default_auto_discover() -> bool {
+    true
 }
 
 /// Subagent orchestration settings (RFC subagent-orchestration).
@@ -374,6 +384,7 @@ impl Default for Config {
                 budget: BudgetBehavior::default(),
                 pricing: HashMap::new(),
                 subagents: SubagentsConfig::default(),
+                auto_discover: default_auto_discover(),
             },
             permissions: PermissionsConfig::default(),
         }

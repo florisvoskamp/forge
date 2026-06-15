@@ -12,7 +12,7 @@ mod genai_provider;
 mod mock;
 
 pub use cli_provider::{CliKind, CliProvider, SUBAGENT_SINK_ENV};
-pub use genai_provider::GenAiProvider;
+pub use genai_provider::{list_models, GenAiProvider};
 pub use mock::MockProvider;
 
 #[derive(Debug, thiserror::Error)]
