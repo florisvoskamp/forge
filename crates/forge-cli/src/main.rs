@@ -1572,6 +1572,17 @@ async fn run_chat_tui(
                                     &mut busy_since,
                                 ));
                             }
+                            DispatchOutcome::RunCompact => {
+                                turn_gen += 1;
+                                turn_handle = Some(spawn_compact(
+                                    &session,
+                                    &done_tx,
+                                    turn_gen,
+                                    &mut app,
+                                    &mut busy,
+                                    &mut busy_since,
+                                ));
+                            }
                         }
                     }
                     KeyKind::Char(c) => {
@@ -1772,6 +1783,17 @@ async fn run_chat_tui(
                                         &mut busy_since,
                                     ));
                                 }
+                                DispatchOutcome::RunCompact => {
+                                    turn_gen += 1;
+                                    turn_handle = Some(spawn_compact(
+                                        &session,
+                                        &done_tx,
+                                        turn_gen,
+                                        &mut app,
+                                        &mut busy,
+                                        &mut busy_since,
+                                    ));
+                                }
                             }
                         } else {
                             turn_gen += 1;
@@ -1925,6 +1947,31 @@ fn spawn_turn_with(
     })
 }
 
+/// Spawn `/compact` as a background task (it makes a cheap model call): the spinner ticks while the
+/// older transcript is summarized, exactly like a turn.
+fn spawn_compact(
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    done_tx: &std::sync::mpsc::Sender<u64>,
+    gen: u64,
+    app: &mut forge_tui::App,
+    busy: &mut bool,
+    busy_since: &mut std::time::Instant,
+) -> tokio::task::JoinHandle<()> {
+    app.done = false;
+    app.tick = 0;
+    *busy = true;
+    *busy_since = std::time::Instant::now();
+    let s = session.clone();
+    let dt = done_tx.clone();
+    tokio::spawn(async move {
+        let _done = DoneGuard(dt, gen);
+        let mut sess = s.lock().await;
+        if let Err(e) = sess.compact().await {
+            sess.notify_error(&format!("compact failed: {e}"));
+        }
+    })
+}
+
 /// What the render loop must do after [`dispatch_command`].
 enum DispatchOutcome {
     /// Command fully handled in-loop (palette, picker, note, …) — keep going.
@@ -1937,6 +1984,8 @@ enum DispatchOutcome {
         guidance: Vec<String>,
         tier: Option<forge_types::TaskTier>,
     },
+    /// `/compact` — summarize older messages in a background task (it makes a model call).
+    RunCompact,
 }
 
 /// Execute a slash command (command-skill-system.md). Builtins are matched first; an unrecognised
@@ -2095,6 +2144,8 @@ async fn dispatch_command(
                 None => app.note("✓ checkpoint saved"),
             }
         }
+        // `/compact` makes a model call → run it as a background task so the spinner ticks.
+        CommandAction::Compact => return Ok(DispatchOutcome::RunCompact),
         // Not a builtin → try the file-based command/skill catalog.
         CommandAction::Unknown(_) => {
             return dispatch_catalog(line, catalog, session, app, armed, trust_project, busy).await

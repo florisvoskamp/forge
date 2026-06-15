@@ -74,6 +74,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/checkpoints",
     },
     Command {
+        name: "compact",
+        desc: "summarize older messages to free up context",
+        usage: "/compact",
+    },
+    Command {
         name: "clear",
         desc: "clear the screen (keep the session)",
         usage: "/clear",
@@ -110,6 +115,8 @@ pub enum CommandAction {
     Checkpoint(Option<String>),
     /// Open the checkpoint picker.
     ListCheckpoints,
+    /// Summarize older transcript messages to free up context (`/compact`).
+    Compact,
     Quit,
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
@@ -142,6 +149,7 @@ pub fn parse_command(line: &str) -> CommandAction {
         "undo" | "u" => CommandAction::Undo,
         "checkpoint" | "cp" => CommandAction::Checkpoint((!arg.is_empty()).then_some(arg)),
         "checkpoints" => CommandAction::ListCheckpoints,
+        "compact" => CommandAction::Compact,
         "clear" | "cls" => CommandAction::ClearScreen,
         "quit" | "exit" | "q" => CommandAction::Quit,
         other => CommandAction::Unknown(other.to_string()),

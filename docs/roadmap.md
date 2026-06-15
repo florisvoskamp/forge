@@ -97,7 +97,7 @@ The power-user surface that makes the harness "better than Claude Code" (the sta
 | Feature | Priority | What | Evidence |
 |---------|----------|------|----------|
 | **Hooks system** | P2 — **MVP done** (observe + block; rewrite/inject deferred) | Pre/post tool-use shell hooks (`[[hooks]]`): `PreToolUse` can block a tool, `PostToolUse` observes; tool call piped as JSON on stdin; time-bounded. The owner's whole env runs on hooks (rtk token proxy, graphify injection, auto-title). **Deferred:** input-rewriting / context-injection hooks, the CLI-bridge path, other events. | [hooks.md](features/hooks.md); his entire setup |
-| **Context compaction** | P2 | Auto-summarize long sessions (`/compact` equivalent). | `/compact` **21** |
+| **Context compaction** | P2 — **MVP done** (`/compact`; manual, live-only) | Auto-summarize long sessions. **Shipped:** `/compact` summarizes the older transcript (keeps the recent N) into one system message via a cheap trivial-tier model call, shrinking what later turns send — runs as a background task (spinner ticks). **Deferred:** auto-trigger on a high context gauge, and persisting the compacted view across resume. | `/compact` **21** |
 | **Interactive clarification** | P2 | AskUserQuestion-style mid-task multiple-choice prompts. | **118** AskUserQuestion uses |
 | **Model selection UX** | P2 | `--model` pin flag, `/model`, effort/usage views (Mesh exists; add the controls). | `/model` **39** |
 | **Statusline / output styles / auto-title** | P2 | Configurable statusline + output styles (he invests in these). | auto-title hook, `/title`, caveman styles |

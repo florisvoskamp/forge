@@ -26,6 +26,14 @@ pub use llm_router::LlmRouter;
 /// Hard cap on model<->tool round trips within a single turn.
 pub(crate) const MAX_STEPS: usize = 8;
 
+/// Compaction (`/compact`): keep this many of the most recent messages verbatim; summarize the
+/// rest. Only compact when there are at least `COMPACT_MIN_OLDER` older messages to fold.
+pub(crate) const COMPACT_KEEP_RECENT: usize = 6;
+pub(crate) const COMPACT_MIN_OLDER: usize = 4;
+const COMPACT_SYSTEM: &str = "You are compacting a coding-assistant conversation to save context. \
+Summarize the messages below concisely but preserve: decisions made, key facts, file paths, \
+function/type names, and any open threads or TODOs. Output only the summary.";
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error(transparent)]
@@ -507,6 +515,70 @@ impl Session {
     /// Run one full turn: route -> (model -> tools)* -> final answer. Returns the answer.
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, CoreError> {
         self.run_turn_with(prompt, &[], None).await
+    }
+
+    /// Compact the live context: summarize the older messages (everything but the most recent
+    /// `COMPACT_KEEP_RECENT`) into a single system message via a cheap model call, shrinking what
+    /// subsequent turns send to the model. In-memory only — the full transcript stays in the store
+    /// for audit/resume (persisting the compacted view across resume is a follow-up). No-op when
+    /// the transcript is already short. Returns `(messages_before, messages_after)`.
+    pub async fn compact(&mut self) -> Result<(usize, usize), CoreError> {
+        let before = self.transcript.len();
+        if before <= COMPACT_KEEP_RECENT + COMPACT_MIN_OLDER {
+            return Ok((before, before)); // not worth a model call yet
+        }
+        let split = before - COMPACT_KEEP_RECENT;
+        let older = &self.transcript[..split];
+        let rendered = older
+            .iter()
+            .map(|m| format!("{}: {}", m.role.as_str(), m.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Route the summary at the trivial tier (it's cheap, fixed work) and call the model once.
+        let budget = BudgetState {
+            spent_today_usd: self.store.spend_today_usd()?,
+            daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_month_usd: self.store.spend_this_month_usd()?,
+            monthly_cap_usd: self.config.mesh.monthly_cap_usd,
+            warn_fraction: self.config.mesh.warn_threshold,
+        };
+        let health = self.store.current_benched().unwrap_or_default();
+        let quota = self.store.current_quota().unwrap_or_default();
+        let decision = self
+            .router
+            .route_hinted(
+                "summarize this conversation",
+                budget,
+                &health,
+                &quota,
+                Some(TaskTier::Trivial),
+            )
+            .await;
+
+        let messages = [Message::system(COMPACT_SYSTEM), Message::user(rendered)];
+        let mut sink = |_: StreamEvent| {};
+        let summary = self
+            .provider
+            .complete(&decision.model, &messages, &[], &mut sink)
+            .await
+            .map(|r| r.content)
+            .map_err(CoreError::Provider)?;
+
+        let mut compacted = Vec::with_capacity(COMPACT_KEEP_RECENT + 1);
+        compacted.push(Message::system(format!(
+            "[Earlier conversation summarized to save context]\n{}",
+            summary.trim()
+        )));
+        compacted.extend(self.transcript.split_off(split));
+        self.transcript = compacted;
+
+        let after = self.transcript.len();
+        self.presenter.emit(PresenterEvent::Warning(format!(
+            "compacted {before} messages → {after} (summary via {})",
+            decision.model
+        )));
+        Ok((before, after))
     }
 
     /// Inject command/skill guidance as persisted system messages *without* a model call — for
@@ -1715,6 +1787,77 @@ mod tests {
                 quota: None,
             })
         }
+    }
+
+    /// Returns a fixed summary for compaction; never requests tools.
+    struct SummarizingProvider;
+    #[async_trait::async_trait]
+    impl Provider for SummarizingProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            Ok(forge_provider::ModelResponse {
+                content: "SUMMARY: built the parser, wired the CLI.".into(),
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+                quota: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_folds_older_messages_into_a_summary() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(SummarizingProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        // 12 messages → compact keeps the last 6, folds the first 6 into one summary.
+        for i in 0..12 {
+            session
+                .transcript
+                .push(Message::user(format!("message {i}")));
+        }
+        let (before, after) = session.compact().await.unwrap();
+        assert_eq!(before, 12);
+        assert_eq!(
+            after,
+            COMPACT_KEEP_RECENT + 1,
+            "summary + the kept recent messages"
+        );
+        assert!(session.transcript[0].content.contains("SUMMARY:"));
+        assert!(session.transcript[0].content.contains("summarized"));
+        // The most recent message is preserved verbatim at the tail.
+        assert_eq!(session.transcript.last().unwrap().content, "message 11");
+    }
+
+    #[tokio::test]
+    async fn compact_is_a_noop_for_a_short_transcript() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(SummarizingProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+        session.transcript.push(Message::user("just one"));
+        let (before, after) = session.compact().await.unwrap();
+        assert_eq!((before, after), (1, 1), "nothing to compact");
     }
 
     #[tokio::test]
