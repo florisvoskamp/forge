@@ -3,6 +3,7 @@
 //! and adds no model calls. The [`Router`] trait keeps a smarter (e.g. LLM-based)
 //! classifier pluggable later without changing callers.
 
+use async_trait::async_trait;
 use forge_config::Config;
 use forge_types::TaskTier;
 
@@ -74,12 +75,29 @@ pub struct RoutingDecision {
     pub rationale: String,
 }
 
-/// A routing strategy. Implement this to add a new classifier (e.g. an LLM-based one).
-pub trait Router: Send {
-    fn route(&self, prompt: &str, budget: BudgetState) -> RoutingDecision;
+/// A routing strategy. `async` so an implementation may consult a model (e.g. the opt-in
+/// LLM classifier); the default [`HeuristicRouter`] resolves instantly with no I/O.
+#[async_trait]
+pub trait Router: Send + Sync {
+    async fn route(&self, prompt: &str, budget: BudgetState) -> RoutingDecision;
 }
 
-const COMPLEX_KEYWORDS: &[&str] = &[
+// --- Classification signals (weighted scoring; see `classify`). Capability over length. ---
+
+/// Explicit user hint that forces Complex regardless of anything else (ADR-0006: user hints).
+const COMPLEX_HINTS: &[&str] = &[
+    "think hard",
+    "think deeply",
+    "ultrathink",
+    "think carefully",
+    "step by step",
+];
+/// Explicit "this is easy" hints — a strong pull toward Trivial.
+const TRIVIAL_HINTS: &[&str] = &["quick", "simple", "one-liner", "one liner"];
+/// Reasoning / algorithmic / architectural terms — the load is cognitive, not length. A
+/// single one can carry a *short* prompt to Complex (the headline fix).
+const REASONING_TERMS: &[&str] = &[
+    "architect",
     "architecture",
     "refactor",
     "design",
@@ -88,37 +106,65 @@ const COMPLEX_KEYWORDS: &[&str] = &[
     "explain",
     "optimi",
     "concurren",
+    "lock-free",
+    "lockless",
+    "race condition",
+    "deadlock",
+    "thread-safe",
+    "prove",
+    "proof",
+    "complexity",
+    "invariant",
+    "distributed",
+    "analyze",
+    "analyse",
+    "trade-off",
+    "tradeoff",
+    "algorithm",
 ];
-
-/// Explicit user hints that force a tier, regardless of length (ADR-0006: user hints).
-const COMPLEX_HINTS: &[&str] = &[
-    "think hard",
-    "think deeply",
-    "ultrathink",
-    "carefully",
-    "step by step",
-];
-const TRIVIAL_HINTS: &[&str] = &["quick", "simple", "one-liner", "one liner", "trivial"];
-/// Dev-action verbs that imply real (non-trivial) work — deliberately excludes ambiguous
-/// short-task verbs like "fix"/"add" so trivial requests ("fix typo") stay trivial.
-const DEV_VERBS: &[&str] = &[
+/// Dev-action verbs that imply real (non-trivial) work. Phrases ("add a"/"write a") avoid
+/// matching trivial requests like "add a comment" (handled by TRIVIAL_PATTERNS first).
+const ACTION_VERBS: &[&str] = &[
     "implement",
     "migrate",
+    "integrate",
     "benchmark",
     "profile",
-    "integrate",
-    "deploy",
     "parallelize",
+    "deploy",
+    "wire ",
+    "add a ",
+    "write a ",
+    "create a ",
+    "build a ",
 ];
-/// Cheap code-vs-prose markers (besides a fenced ```code block```).
-const CODE_TOKENS: &[&str] = &[
-    "fn ",
-    "def ",
-    "function ",
-    "class ",
-    "import ",
-    "});",
-    "() =>",
+/// Trivial-edit patterns — a strong pull toward Trivial regardless of length.
+const TRIVIAL_PATTERNS: &[&str] = &[
+    "typo",
+    "rename",
+    "bump version",
+    "bump the version",
+    "reformat",
+    "add a comment",
+    "fix import",
+    "fix the import",
+    "whitespace",
+    "one-liner",
+    "one liner",
+];
+/// Code-vs-prose markers (besides a fenced ```code block```). Symbol-based on purpose —
+/// natural-language words like "function"/"class"/"import" appear in prose and would false-
+/// positive ("write a function that…" is not code).
+const CODE_TOKENS: &[&str] = &["fn ", "});", "() =>", "();", "{\n", "=> {"];
+/// Error / stack-trace markers (a concrete failure usually means real debugging).
+const ERROR_MARKERS: &[&str] = &[
+    "panic",
+    "traceback",
+    "stack trace",
+    "error[",
+    "exception",
+    "segfault",
+    " at line ",
 ];
 
 /// The default v0.1 router: deterministic heuristics over cheap local signals (ADR-0006).
@@ -141,6 +187,101 @@ fn default_model_available(model: &str) -> bool {
 /// A model billed to an already-paid subscription (the CLI bridges) — $0 marginal cost.
 fn is_subscription(model: &str) -> bool {
     matches!(forge_config::provider_of(model), "claude-cli" | "codex-cli")
+}
+
+/// Tier classification with the human-readable signals that drove it.
+struct Classification {
+    tier: TaskTier,
+    reasons: Vec<&'static str>,
+}
+
+/// Score a prompt's difficulty from weighted local signals (deterministic, no I/O). Capability
+/// signals (reasoning terms, code, errors) can lift a *short* prompt to Complex; trivial-edit
+/// patterns and "quick" hints pull it down. Length is one capped signal, never the decider —
+/// this is the fix for the old length-bucket classifier.
+fn score_prompt(prompt: &str) -> Classification {
+    let lower = prompt.to_lowercase();
+
+    // An explicit "think hard" hint is a hard override — the user told us it's hard.
+    if COMPLEX_HINTS.iter().any(|h| lower.contains(h)) {
+        return Classification {
+            tier: TaskTier::Complex,
+            reasons: vec!["explicit 'think hard' hint"],
+        };
+    }
+
+    let words = prompt.split_whitespace().count();
+    let mut pts: i32 = 0;
+    let mut reasons: Vec<&'static str> = Vec::new();
+
+    // Length: a single capped nudge, not the decider.
+    if words > 120 {
+        pts += 3;
+        reasons.push("very long prompt");
+    } else if words > 40 {
+        pts += 1;
+        reasons.push("long prompt");
+    }
+
+    let has_code = prompt.contains("```") || CODE_TOKENS.iter().any(|t| lower.contains(t));
+    if REASONING_TERMS.iter().any(|t| lower.contains(t)) {
+        pts += 5;
+        reasons.push("reasoning/algorithmic term");
+    }
+    if has_code {
+        pts += 3;
+        reasons.push("code present");
+    }
+    if ACTION_VERBS.iter().any(|v| lower.contains(v)) {
+        pts += 2;
+        reasons.push("dev-action verb");
+    }
+    if is_multistep(&lower) {
+        pts += 2;
+        reasons.push("multi-step scope");
+    }
+    if lower.contains("test") || lower.contains("benchmark") || lower.contains("edge case") {
+        pts += 1;
+        reasons.push("tests/edge-cases");
+    }
+    if ERROR_MARKERS.iter().any(|m| lower.contains(m)) {
+        pts += 1;
+        reasons.push("error/stack trace");
+    }
+
+    // Trivial pulls (strong, regardless of length).
+    if TRIVIAL_HINTS.iter().any(|h| lower.contains(h)) {
+        pts -= 5;
+        reasons.push("explicit 'quick' hint");
+    }
+    if TRIVIAL_PATTERNS.iter().any(|p| lower.contains(p)) {
+        pts -= 4;
+        reasons.push("trivial-edit pattern");
+    }
+
+    // Thresholds: <=0 Trivial, >=5 Complex, else Standard.
+    let tier = if pts <= 0 {
+        TaskTier::Trivial
+    } else if pts >= 5 {
+        TaskTier::Complex
+    } else {
+        TaskTier::Standard
+    };
+    if reasons.is_empty() {
+        reasons.push(match tier {
+            TaskTier::Trivial => "short prompt, no strong signals",
+            TaskTier::Standard => "moderate task",
+            TaskTier::Complex => "complex task",
+        });
+    }
+    Classification { tier, reasons }
+}
+
+fn is_multistep(lower: &str) -> bool {
+    lower.contains(" then ")
+        || lower.contains("\n- ")
+        || lower.contains("\n* ")
+        || (lower.contains("1.") && lower.contains("2."))
 }
 
 impl HeuristicRouter {
@@ -167,34 +308,9 @@ impl HeuristicRouter {
         self
     }
 
-    fn classify(prompt: &str) -> (TaskTier, &'static str) {
-        let len = prompt.chars().count();
-        let lower = prompt.to_lowercase();
-        let has_code = prompt.contains("```") || CODE_TOKENS.iter().any(|t| lower.contains(t));
-
-        if COMPLEX_HINTS.iter().any(|h| lower.contains(h)) {
-            return (TaskTier::Complex, "explicit 'think hard' hint");
-        }
-        if COMPLEX_KEYWORDS.iter().any(|k| lower.contains(k))
-            || len > 600
-            || (has_code && len > 200)
-        {
-            return (
-                TaskTier::Complex,
-                "complex signal (keyword, long prompt, or substantial code)",
-            );
-        }
-        if TRIVIAL_HINTS.iter().any(|h| lower.contains(h)) && len < 120 && !has_code {
-            return (TaskTier::Trivial, "explicit 'quick' hint");
-        }
-        if has_code || DEV_VERBS.iter().any(|v| lower.contains(v)) {
-            return (TaskTier::Standard, "code or dev-action present");
-        }
-        if len < 80 {
-            (TaskTier::Trivial, "short prompt, no complex signals")
-        } else {
-            (TaskTier::Standard, "medium prompt, no complex signals")
-        }
+    fn classify(prompt: &str) -> (TaskTier, String) {
+        let c = score_prompt(prompt);
+        (c.tier, c.reasons.join(", "))
     }
 
     /// Pick the cheapest *usable* model from `candidates` (L1). Usable = the injected
@@ -249,8 +365,16 @@ impl HeuristicRouter {
     }
 }
 
-impl Router for HeuristicRouter {
-    fn route(&self, prompt: &str, budget: BudgetState) -> RoutingDecision {
+impl HeuristicRouter {
+    /// Given an already-decided tier (from the heuristic OR an external classifier) + the
+    /// reason it was chosen, apply pin / budget pressure / cost-aware candidate selection.
+    /// Pure + sync, so any [`Router`] (incl. the LLM one) can reuse the whole selection path.
+    pub fn decide(
+        &self,
+        classified_tier: TaskTier,
+        classify_reason: String,
+        budget: BudgetState,
+    ) -> RoutingDecision {
         let exhausted = budget.status() == BudgetStatus::Exhausted;
         let cap_overrides_pin = self.config.mesh.budget.cap_overrides_pin;
 
@@ -260,7 +384,6 @@ impl Router for HeuristicRouter {
             .as_ref()
             .filter(|_| !(exhausted && cap_overrides_pin))
         {
-            let (tier, _) = Self::classify(prompt); // recorded for stats only
             let mut why = "pinned via --model".to_string();
             let model = if (self.model_available)(pin) {
                 pin.clone()
@@ -268,14 +391,14 @@ impl Router for HeuristicRouter {
                 self.cross_tier_cheapest(pin, &mut why)
             };
             return RoutingDecision {
-                tier,
+                tier: classified_tier,
                 model,
                 rationale: why,
             };
         }
 
-        // Classify, then apply budget pressure (FR-5).
-        let (mut tier, base_reason) = Self::classify(prompt);
+        // Apply budget pressure (FR-5).
+        let mut tier = classified_tier;
         let mut why = if self.pin.is_some() {
             // pin was set but an exhausted budget overrode it (see filter above)
             tier = TaskTier::Trivial;
@@ -284,7 +407,7 @@ impl Router for HeuristicRouter {
             tier = TaskTier::Trivial;
             "budget cap reached — downshifted to trivial tier".to_string()
         } else {
-            base_reason.to_string()
+            classify_reason
         };
 
         // Cost-aware selection among the tier's usable candidates (L1/L2).
@@ -320,6 +443,14 @@ impl Router for HeuristicRouter {
     }
 }
 
+#[async_trait]
+impl Router for HeuristicRouter {
+    async fn route(&self, prompt: &str, budget: BudgetState) -> RoutingDecision {
+        let (tier, reason) = Self::classify(prompt);
+        self.decide(tier, reason, budget)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,10 +461,64 @@ mod tests {
         HeuristicRouter::new(Config::default()).with_availability(|_| true)
     }
 
-    #[test]
-    fn short_prompt_is_trivial() {
-        let d = router().route("fix typo", BudgetState::default());
+    #[tokio::test]
+    async fn short_prompt_is_trivial() {
+        let d = router().route("fix typo", BudgetState::default()).await;
         assert_eq!(d.tier, TaskTier::Trivial);
+    }
+
+    // --- Scoring classifier: capability over length (the headline fix) ---
+
+    #[test]
+    fn hard_short_prompt_is_complex_despite_length() {
+        // "design a lock-free queue" is 24 chars — the old <80 rule called this Trivial.
+        assert_eq!(
+            score_prompt("design a lock-free queue").tier,
+            TaskTier::Complex
+        );
+        assert_eq!(
+            score_prompt("prove this sort is stable").tier,
+            TaskTier::Complex
+        );
+        assert_eq!(score_prompt("debug this deadlock").tier, TaskTier::Complex);
+    }
+
+    #[test]
+    fn trivial_edit_stays_trivial_even_with_a_path() {
+        assert_eq!(
+            score_prompt("rename foo to bar in utils.rs").tier,
+            TaskTier::Trivial
+        );
+        assert_eq!(score_prompt("fix typo").tier, TaskTier::Trivial);
+        assert_eq!(
+            score_prompt("bump version to 1.2.0").tier,
+            TaskTier::Trivial
+        );
+    }
+
+    #[test]
+    fn action_and_multistep_is_standard_not_complex() {
+        let p = "write a function that validates email addresses against the RFC rules and \
+                 returns which inputs were rejected, then wire it into the signup handler";
+        assert_eq!(score_prompt(p).tier, TaskTier::Standard); // AC-A3
+    }
+
+    #[test]
+    fn long_prose_without_signals_is_not_auto_complex() {
+        // Length alone is a capped nudge — 200 plain words must not force Complex.
+        let p = "word ".repeat(200);
+        assert_ne!(score_prompt(&p).tier, TaskTier::Complex); // AC-A7
+    }
+
+    #[test]
+    fn every_decision_names_a_signal() {
+        for p in [
+            "fix typo",
+            "design a lock-free queue",
+            "add a logging helper module",
+        ] {
+            assert!(!score_prompt(p).reasons.is_empty(), "no reason for {p:?}");
+        }
     }
 
     #[test]
@@ -373,74 +558,84 @@ mod tests {
         assert_eq!(b.status(), BudgetStatus::Exhausted);
     }
 
-    #[test]
-    fn keyword_forces_complex() {
-        let d = router().route("refactor the auth module", BudgetState::default());
+    #[tokio::test]
+    async fn keyword_forces_complex() {
+        let d = router()
+            .route("refactor the auth module", BudgetState::default())
+            .await;
         assert_eq!(d.tier, TaskTier::Complex);
     }
 
-    #[test]
-    fn medium_prompt_is_standard() {
+    #[tokio::test]
+    async fn medium_prompt_is_standard() {
         let prompt = "add a new endpoint that returns the list of users as json".repeat(2);
-        let d = router().route(&prompt, BudgetState::default());
+        let d = router().route(&prompt, BudgetState::default()).await;
         assert_eq!(d.tier, TaskTier::Standard);
     }
 
-    #[test]
-    fn exhausted_budget_downshifts() {
+    #[tokio::test]
+    async fn exhausted_budget_downshifts() {
         let budget = BudgetState {
             spent_today_usd: 5.0,
             daily_cap_usd: Some(5.0),
             ..Default::default()
         };
-        let d = router().route("refactor the whole architecture", budget);
+        let d = router()
+            .route("refactor the whole architecture", budget)
+            .await;
         assert_eq!(d.tier, TaskTier::Trivial);
         assert!(d.rationale.contains("budget"));
     }
 
     // --- New: richer signals (AC-5, AC-6, AC-7) ---
 
-    #[test]
-    fn explicit_think_hard_hint_forces_complex() {
-        let d = router().route(
-            "rename x; but think hard about edge cases",
-            BudgetState::default(),
-        );
+    #[tokio::test]
+    async fn explicit_think_hard_hint_forces_complex() {
+        let d = router()
+            .route(
+                "rename x; but think hard about edge cases",
+                BudgetState::default(),
+            )
+            .await;
         assert_eq!(d.tier, TaskTier::Complex); // AC-6
     }
 
-    #[test]
-    fn fenced_code_is_at_least_standard_despite_short_length() {
-        let d = router().route("```rust\nlet x=1;\n```", BudgetState::default());
+    #[tokio::test]
+    async fn fenced_code_is_at_least_standard_despite_short_length() {
+        let d = router()
+            .route("```rust\nlet x=1;\n```", BudgetState::default())
+            .await;
         assert_eq!(d.tier, TaskTier::Standard); // AC-5
     }
 
-    #[test]
-    fn dev_verb_lifts_short_prompt_to_standard() {
-        let d = router().route("integrate the parser", BudgetState::default());
+    #[tokio::test]
+    async fn dev_verb_lifts_short_prompt_to_standard() {
+        let d = router()
+            .route("integrate the parser", BudgetState::default())
+            .await;
         assert_eq!(d.tier, TaskTier::Standard);
     }
 
-    #[test]
-    fn fix_typo_stays_trivial_no_regression() {
-        let d = router().route("fix typo", BudgetState::default());
+    #[tokio::test]
+    async fn fix_typo_stays_trivial_no_regression() {
+        let d = router().route("fix typo", BudgetState::default()).await;
         assert_eq!(d.tier, TaskTier::Trivial); // AC-7
     }
 
     // --- New: pin / override (AC-1, AC-2) ---
 
-    #[test]
-    fn pin_overrides_classification() {
+    #[tokio::test]
+    async fn pin_overrides_classification() {
         let r = HeuristicRouter::new(Config::default())
             .with_availability(|_| true)
             .with_pin(Some("openai::gpt-4o".into()));
-        let d = r.route("fix typo", BudgetState::default());
+        let d = r.route("fix typo", BudgetState::default()).await;
         assert_eq!(d.model, "openai::gpt-4o"); // AC-1
         assert!(d.rationale.contains("pinned"));
     }
 
-    #[test]
-    fn exhausted_budget_overrides_pin() {
+    #[tokio::test]
+    async fn exhausted_budget_overrides_pin() {
         // hard_stop is enforced pre-routing in core; here cap_overrides_pin governs.
         let mut config = Config::default();
         config.mesh.budget.cap_overrides_pin = true;
@@ -452,7 +647,7 @@ mod tests {
             daily_cap_usd: Some(5.0),
             ..Default::default()
         };
-        let d = r.route("design a system", budget);
+        let d = r.route("design a system", budget).await;
         // pin ignored; trivial-tier model chosen (AC-2)
         assert_eq!(
             d.model,
@@ -463,12 +658,14 @@ mod tests {
 
     // --- New: provider fallback (AC-3, AC-4) ---
 
-    #[test]
-    fn falls_back_to_an_available_model_when_key_missing() {
+    #[tokio::test]
+    async fn falls_back_to_an_available_model_when_key_missing() {
         // Only ollama (the trivial-tier default) is "available"; complex (anthropic) is not.
         let r =
             HeuristicRouter::new(Config::default()).with_availability(|m| m.starts_with("ollama"));
-        let d = r.route("design the architecture", BudgetState::default());
+        let d = r
+            .route("design the architecture", BudgetState::default())
+            .await;
         assert_eq!(d.tier, TaskTier::Complex, "tier still reflects difficulty");
         assert!(
             d.model.starts_with("ollama"),
@@ -478,11 +675,13 @@ mod tests {
         assert!(d.rationale.contains("fell back"), "{}", d.rationale);
     }
 
-    #[test]
-    fn no_usable_model_keeps_original_and_warns() {
+    #[tokio::test]
+    async fn no_usable_model_keeps_original_and_warns() {
         // Nothing available → keep the routed model (errors downstream as today).
         let r = HeuristicRouter::new(Config::default()).with_availability(|_| false);
-        let d = r.route("design the architecture", BudgetState::default());
+        let d = r
+            .route("design the architecture", BudgetState::default())
+            .await;
         assert_eq!(
             d.model,
             Config::default().model_for(TaskTier::Complex).unwrap()
@@ -524,55 +723,59 @@ mod tests {
         assert_eq!(r.cheapest_usable(&cands).unwrap(), "openai::gpt-4o-mini"); // AC-L1b
     }
 
-    #[test]
-    fn route_picks_cheapest_standard_candidate_with_rationale() {
+    #[tokio::test]
+    async fn route_picks_cheapest_standard_candidate_with_rationale() {
         let c = list_config(
             "standard",
             &["deepseek::deepseek-chat", "openai::gpt-4o-mini"],
         );
         let r = HeuristicRouter::new(c).with_availability(|_| true);
         let prompt = "add a new endpoint that returns the list of users as json".repeat(2);
-        let d = r.route(&prompt, BudgetState::default());
+        let d = r.route(&prompt, BudgetState::default()).await;
         assert_eq!(d.tier, TaskTier::Standard);
         assert_eq!(d.model, "openai::gpt-4o-mini");
         assert!(d.rationale.contains("cheapest of 2"), "{}", d.rationale);
     }
 
-    #[test]
-    fn legacy_single_string_tier_routes_unchanged() {
+    #[tokio::test]
+    async fn legacy_single_string_tier_routes_unchanged() {
         // AC-L1c: the single-string form behaves as a one-candidate list.
         let prompt = "add a new endpoint that returns the list of users as json".repeat(2);
-        let d = router().route(&prompt, BudgetState::default());
+        let d = router().route(&prompt, BudgetState::default()).await;
         assert_eq!(d.model, "openai::gpt-4o-mini");
     }
 
-    #[test]
-    fn subscription_is_preferred_when_enabled() {
+    #[tokio::test]
+    async fn subscription_is_preferred_when_enabled() {
         // AC-L2a: a $0 paid subscription (CLI bridge) wins over a metered API model.
         let r = HeuristicRouter::new(list_config(
             "complex",
             &["anthropic::claude-opus-4-8", "claude-cli::"],
         ))
         .with_availability(|_| true);
-        let d = r.route(
-            "design the system architecture carefully",
-            BudgetState::default(),
-        );
+        let d = r
+            .route(
+                "design the system architecture carefully",
+                BudgetState::default(),
+            )
+            .await;
         assert_eq!(d.model, "claude-cli::");
         assert!(d.rationale.contains("paid subscription"), "{}", d.rationale);
     }
 
-    #[test]
-    fn subscription_still_cheapest_when_preference_disabled() {
+    #[tokio::test]
+    async fn subscription_still_cheapest_when_preference_disabled() {
         // prefer_subscription off → pure cost ranking; the $0 bridge is still cheapest, but the
         // rationale no longer flags it as a subscription.
         let mut c = list_config("complex", &["anthropic::claude-opus-4-8", "claude-cli::"]);
         c.mesh.prefer_subscription = false;
         let r = HeuristicRouter::new(c).with_availability(|_| true);
-        let d = r.route(
-            "design the system architecture carefully",
-            BudgetState::default(),
-        );
+        let d = r
+            .route(
+                "design the system architecture carefully",
+                BudgetState::default(),
+            )
+            .await;
         assert_eq!(d.model, "claude-cli::");
         assert!(!d.rationale.contains("paid subscription"));
     }

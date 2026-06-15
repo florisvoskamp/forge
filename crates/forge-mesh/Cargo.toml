@@ -10,3 +10,7 @@ repository.workspace = true
 [dependencies]
 forge-types.workspace = true
 forge-config.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
