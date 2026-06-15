@@ -264,13 +264,11 @@ impl App {
         }
     }
 
-    /// Update the active temper label and note the switch in scrollback.
+    /// Update the active temper label. The colored statusline segment is the live indicator —
+    /// switching no longer spams a scrollback line per change (that flooded the view on rapid
+    /// SHIFT+TAB cycling).
     pub fn set_temper(&mut self, label: &str) {
         self.temper = label.to_string();
-        self.flush.push(TextLine::from(vec![
-            Span::styled("  temper → ", Style::default().fg(DIM)),
-            Span::styled(label.to_string(), Style::default().fg(ORANGE).bold()),
-        ]));
     }
 
     /// Begin an AskUserQuestion: render the question + numbered options into scrollback and arm
@@ -499,6 +497,18 @@ pub fn banner_lines(width: u16) -> Vec<TextLine<'static>> {
     lines
 }
 
+/// Color for a temper label, by permissiveness (the at-a-glance posture cue): Read-only=blue,
+/// Ask=yellow, Auto-edit=green, Full=red. Unknown → cyan.
+fn temper_color(label: &str) -> Color {
+    match label {
+        "Read-only" => USER,
+        "Ask" => WARNYEL,
+        "Auto-edit" => OKGREEN,
+        "Full" => ERRRED,
+        _ => TOOLCYAN,
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() > max {
@@ -623,13 +633,20 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
     let list_h = h.saturating_sub(1); // rows below the heading
     let revealed = ((p.anim * list_h as f32).ceil() as usize).clamp(1, list_h.max(1));
     let start = p.selected.saturating_sub(list_h.saturating_sub(1));
+    let tempers = p.kind == Some(crate::commands::PickerKind::Tempers);
     for (i, row) in matches.iter().enumerate().skip(start).take(revealed) {
         let selected = i == p.selected;
         let marker = if selected { "▸ " } else { "  " };
-        let title_style = if selected {
-            Style::default().fg(ORANGE).bold()
+        // In the mode picker, color each row by its temper so the posture reads at a glance.
+        let base = if tempers {
+            temper_color(&row.title)
         } else {
-            Style::default().fg(USER)
+            USER
+        };
+        let title_style = if selected {
+            Style::default().fg(base).bold()
+        } else {
+            Style::default().fg(base)
         };
         lines.push(TextLine::from(vec![
             Span::styled(format!("  {marker}{}", row.title), title_style),
@@ -744,12 +761,16 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
         format!("${:.4}", app.cost_usd),
         Style::default().fg(OKGREEN).bold().bg(STATUSBG),
     ));
-    // The active temper (operating mode), always shown when set.
+    // The active temper (operating mode), color-coded by how permissive it is so the current
+    // posture reads at a glance: Read-only=blue, Ask=yellow, Auto-edit=green, Full=red.
     if !app.temper.is_empty() && w >= 46 {
         left.push(sep());
         left.push(Span::styled(
-            app.temper.clone(),
-            Style::default().fg(TOOLCYAN).bold().bg(STATUSBG),
+            format!("◆ {}", app.temper),
+            Style::default()
+                .fg(temper_color(&app.temper))
+                .bold()
+                .bg(STATUSBG),
         ));
     }
 
@@ -877,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn temper_shows_in_statusline_and_switch_notes_scrollback() {
+    fn temper_shows_in_statusline_and_switching_does_not_spam_scrollback() {
         let mut app = App {
             temper: "Ask".into(),
             ..App::default()
@@ -894,10 +915,21 @@ mod tests {
             screen_wh(&app, 90, LIVE_H).contains("Auto-edit"),
             "statusline reflects the new temper"
         );
+        // Switching updates the (colored) statusline indicator only — no per-switch scrollback
+        // line (rapid SHIFT+TAB cycling used to flood the view).
         assert!(
-            flush_text(&mut app).contains("temper → Auto-edit"),
-            "a switch note is queued to scrollback"
+            flush_text(&mut app).is_empty(),
+            "switching the temper queues nothing to scrollback"
         );
+    }
+
+    #[test]
+    fn temper_indicator_is_color_coded_by_posture() {
+        // Each temper renders in its own color so the current posture reads at a glance.
+        assert_eq!(temper_color("Read-only"), USER);
+        assert_eq!(temper_color("Ask"), WARNYEL);
+        assert_eq!(temper_color("Auto-edit"), OKGREEN);
+        assert_eq!(temper_color("Full"), ERRRED);
     }
 
     #[test]

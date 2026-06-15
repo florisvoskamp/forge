@@ -296,7 +296,13 @@ impl Session {
     /// Advance the temper through the SHIFT+TAB cycle, persist it, and return the new temper
     /// (RFC/temper-modes). Takes effect on the next turn's permission decisions.
     pub fn cycle_temper(&mut self) -> PermissionMode {
-        self.mode = self.mode.cycle_next();
+        self.set_temper(self.mode.cycle_next())
+    }
+
+    /// Set the temper to a specific mode (the `/mode` picker), persist it, and return it. Unlike
+    /// the cycle this can reach `Bypass`/Full, since the picker is an explicit, deliberate choice.
+    pub fn set_temper(&mut self, mode: PermissionMode) -> PermissionMode {
+        self.mode = mode;
         let _ = self
             .store
             .update_session_mode(&self.id, &format!("{:?}", self.mode));

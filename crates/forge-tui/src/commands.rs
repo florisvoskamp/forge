@@ -29,6 +29,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/resume <id>",
     },
     Command {
+        name: "mode",
+        desc: "switch the operating mode (temper)",
+        usage: "/mode",
+    },
+    Command {
         name: "new",
         desc: "start a fresh session",
         usage: "/new",
@@ -69,6 +74,8 @@ pub enum CommandAction {
     Resume(String),
     New,
     ClearScreen,
+    /// Open the operating-mode (temper) picker.
+    Mode,
     /// Rewind the last turn (conversation + file edits).
     Undo,
     /// Save a checkpoint at the current point; `None` = an auto/unnamed checkpoint.
@@ -99,6 +106,7 @@ pub fn parse_command(line: &str) -> CommandAction {
             }
         }
         "new" | "n" => CommandAction::New,
+        "mode" | "m" | "temper" => CommandAction::Mode,
         "undo" | "u" => CommandAction::Undo,
         "checkpoint" | "cp" => CommandAction::Checkpoint((!arg.is_empty()).then_some(arg)),
         "checkpoints" => CommandAction::ListCheckpoints,
@@ -216,6 +224,8 @@ pub enum PickerKind {
     Sessions,
     /// Pick a checkpoint to rewind to (`/checkpoints`).
     Checkpoints,
+    /// Pick the operating mode / temper (`/mode`).
+    Tempers,
 }
 
 /// One row in an interactive picker: an opaque `id` the loop acts on, plus two display strings.
@@ -333,6 +343,8 @@ mod tests {
 
     #[test]
     fn parses_new_commands() {
+        assert_eq!(parse_command("/mode"), CommandAction::Mode);
+        assert_eq!(parse_command("/m"), CommandAction::Mode);
         assert_eq!(parse_command("/undo"), CommandAction::Undo);
         assert_eq!(
             parse_command("/checkpoints"),

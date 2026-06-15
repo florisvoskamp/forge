@@ -305,14 +305,23 @@ async fn assay(path: Option<String>, mock: bool) -> Result<()> {
         if cat.is_empty() {
             anyhow::bail!("no models available — `forge auth <provider>` or run ollama");
         }
+        // Route critics around rate-limited / down models (model-health): pick the best ranked
+        // model per tier that ISN'T currently benched, so a critic isn't sent to a dead model.
+        let benched = store.current_benched().unwrap_or_default();
         let pick = |tier| {
-            cat.ranked_for(tier, &pricing, 5)
+            cat.ranked_for(tier, &pricing, 8)
                 .into_iter()
-                .next()
+                .find(|m| !benched.is_benched(m))
                 .or_else(|| config.model_for(tier).map(String::from))
                 .unwrap_or_default()
         };
-        (pick(TaskTier::Trivial), pick(TaskTier::Complex))
+        let (t, c) = (pick(TaskTier::Trivial), pick(TaskTier::Complex));
+        if t.is_empty() && c.is_empty() {
+            anyhow::bail!(
+                "every discovered model is rate-limited / benched — `forge models --probe` to recheck"
+            );
+        }
+        (t, c)
     };
 
     println!(
@@ -1187,6 +1196,34 @@ async fn dispatch_command(
             tui.clear_screen();
             app.note("● new session");
         }
+        // `/mode` opens the operating-mode (temper) picker — a reliable, discoverable alternative
+        // to SHIFT+TAB. Enter sets the chosen temper in picker_accept.
+        CommandAction::Mode => {
+            let current = {
+                let s = session.lock().await;
+                s.temper().label()
+            };
+            let rows = forge_types::PermissionMode::all()
+                .iter()
+                .map(|m| {
+                    let mark = if m.label() == current {
+                        "   ● current"
+                    } else {
+                        ""
+                    };
+                    forge_tui::PickerRow {
+                        id: m.label().to_string(),
+                        title: m.label().to_string(),
+                        subtitle: format!("{}{mark}", m.description()),
+                    }
+                })
+                .collect();
+            app.picker.open_with(
+                forge_tui::PickerKind::Tempers,
+                "switch operating mode",
+                rows,
+            );
+        }
         // `/resume [prefix]` and `/sessions` both open the interactive picker; a prefix pre-fills
         // its filter. Resolving + swapping the session happens on Enter (picker_accept).
         CommandAction::Resume(prefix) => open_sessions_picker(app, &prefix)?,
@@ -1319,6 +1356,16 @@ async fn picker_accept(
             // Put the rewound-to message back in the input box so it can be edited/resubmitted.
             if let Some(prompt) = outcome.rewound_prompt {
                 app.input = prompt;
+            }
+        }
+        forge_tui::PickerKind::Tempers => {
+            if let Some(mode) = forge_types::PermissionMode::from_label(&row.id) {
+                let label = {
+                    let mut s = session.lock().await;
+                    s.set_temper(mode).label()
+                };
+                app.set_temper(label);
+                app.note(&format!("◆ mode → {label}"));
             }
         }
     }

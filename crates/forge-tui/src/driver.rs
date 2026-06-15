@@ -187,8 +187,13 @@ impl Tui {
                     KeyCode::Backspace => KeyKind::Backspace,
                     KeyCode::Enter => KeyKind::Enter,
                     KeyCode::Esc => KeyKind::Esc,
-                    // Shift+Tab — crossterm reports it as BackTab — cycles the operating temper.
+                    // Shift+Tab cycles the operating temper. Most terminals report it as
+                    // `BackTab`, but some (depending on the keyboard protocol) report it as
+                    // `Tab` + the SHIFT modifier — accept both so the switch is reliable.
                     KeyCode::BackTab => KeyKind::CycleTemper,
+                    KeyCode::Tab if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                        KeyKind::CycleTemper
+                    }
                     KeyCode::Up => KeyKind::Up,
                     KeyCode::Down => KeyKind::Down,
                     KeyCode::Tab => KeyKind::Tab,

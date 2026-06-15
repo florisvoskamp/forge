@@ -416,6 +416,38 @@ impl PermissionMode {
         }
     }
 
+    /// One-line description of what this temper does, for the mode picker.
+    pub fn description(self) -> &'static str {
+        match self {
+            PermissionMode::Plan => "analyze & plan only — no file edits or commands",
+            PermissionMode::Default => "ask before every file edit and command",
+            PermissionMode::AcceptEdits => "auto-apply file edits; still ask before shell commands",
+            PermissionMode::Bypass => "auto-approve everything — dangerous, explicit opt-in",
+        }
+    }
+
+    /// All tempers, safest → most permissive, for the mode picker (unlike the SHIFT+TAB cycle,
+    /// the picker can reach `Full`/Bypass since it's an explicit, deliberate choice).
+    pub fn all() -> &'static [PermissionMode] {
+        &[
+            PermissionMode::Plan,
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Bypass,
+        ]
+    }
+
+    /// Parse a temper from its UI label (or canonical/kebab key) — used to resolve a picker row.
+    pub fn from_label(s: &str) -> Option<PermissionMode> {
+        match s.trim().to_lowercase().as_str() {
+            "read-only" | "readonly" | "plan" => Some(PermissionMode::Plan),
+            "ask" | "default" => Some(PermissionMode::Default),
+            "auto-edit" | "autoedit" | "acceptedits" => Some(PermissionMode::AcceptEdits),
+            "full" | "bypass" => Some(PermissionMode::Bypass),
+            _ => None,
+        }
+    }
+
     /// The next temper in the SHIFT+TAB cycle. The cycle covers the three everyday tempers and
     /// **wraps** — `Bypass`/Unfettered is intentionally excluded (reachable only via explicit
     /// `--mode unfettered`/config, never by tapping a key). From Unfettered, cycling re-enters
