@@ -308,6 +308,24 @@ fn build_args(
     args
 }
 
+/// Prepended to harness-mode prompts so the bridged CLI prefers Forge's gated MCP tools over
+/// any built-in/native web search or browsing (which Forge can't see/cost-track/route).
+const HARNESS_TOOL_PREAMBLE: &str = "[Forge harness] You are running inside the Forge coding \
+agent. For ANY web access — searching the web or opening a URL — you MUST use the \
+`mcp__forge__web_search` and `mcp__forge__web_fetch` tools exposed over MCP. Do NOT use any \
+built-in, native, or provider web-search/browsing capability. Likewise route all file and \
+shell actions through the `mcp__forge__*` tools.";
+
+/// Prepend the harness tool-preamble in harness mode; pass the prompt through unchanged
+/// otherwise (Phase-1 self-agent turns keep their own tools).
+fn apply_harness_preamble(harness: bool, prompt: String) -> String {
+    if harness {
+        format!("{HARNESS_TOOL_PREAMBLE}\n\n{prompt}")
+    } else {
+        prompt
+    }
+}
+
 /// Flatten a transcript into a single prompt string for a one-shot CLI invocation. System
 /// messages become a preamble; the rest is a role-labelled transcript ending on the latest
 /// turn so the CLI responds to it.
@@ -798,7 +816,13 @@ impl Provider for CliProvider {
         // builds its own registry — not from this param; text mode uses the CLI's own tools.
         on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
-        let prompt = render_prompt(messages);
+        let mut prompt = render_prompt(messages);
+        // Soft nudge: steer the CLI to route web access through Forge's MCP tools rather than
+        // its own native search/browsing. codex's subscription-backed web search (web.run)
+        // can't be hard-disabled from here, so this instruction is best-effort; claude has no
+        // native search left (its built-ins are off). Forge still observes any native search
+        // in the event stream and surfaces it.
+        prompt = apply_harness_preamble(self.harness, prompt);
         // Path to *this* forge binary, so harness mode can spawn `forge mcp-serve`.
         let forge_exe = std::env::current_exe()
             .ok()
@@ -1262,6 +1286,16 @@ mod tests {
         assert!(!args.contains(&"--search".to_string()));
         assert_eq!(args.last().unwrap(), "do a thing");
         assert!(!args.contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn harness_preamble_nudges_to_forge_tools_only_in_harness_mode() {
+        let out = apply_harness_preamble(true, "User: search the web".into());
+        assert!(out.contains("mcp__forge__web_search"));
+        assert!(out.contains("Do NOT use any") || out.contains("MUST use"));
+        assert!(out.ends_with("User: search the web"));
+        // Phase-1 self-agent turns are untouched.
+        assert_eq!(apply_harness_preamble(false, "User: hi".into()), "User: hi");
     }
 
     #[test]

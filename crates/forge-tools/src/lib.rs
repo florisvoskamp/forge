@@ -14,7 +14,7 @@ mod shell;
 mod web;
 pub use core_tools::{EditFileTool, ListDirTool, ReadFileTool, SearchTool, WriteFileTool};
 pub use shell::ShellTool;
-pub use web::{BraveSearch, SearchBackend, SearchResult, WebFetchTool, WebSearchTool};
+pub use web::{BraveSearch, DuckDuckGo, SearchBackend, SearchResult, WebFetchTool, WebSearchTool};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {

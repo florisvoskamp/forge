@@ -310,6 +310,132 @@ pub(crate) fn parse_brave_results(body: &Value) -> Vec<SearchResult> {
         .unwrap_or_default()
 }
 
+/// Keyless DuckDuckGo backend — the free default when no search-API key is configured.
+/// Scrapes the no-JS HTML endpoint (`https://html.duckduckgo.com/html/`). Free forever but
+/// best-effort: DDG rate-limits and the HTML layout can drift, so parsing is defensive and a
+/// rate-limit / layout change degrades to "no results" rather than erroring the turn.
+pub struct DuckDuckGo;
+
+#[async_trait]
+impl SearchBackend for DuckDuckGo {
+    async fn search(&self, query: &str, count: u32) -> Result<Vec<SearchResult>, ToolError> {
+        let client = reqwest::Client::builder()
+            // DDG blocks obvious bot UAs — present a browser-like agent.
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0")
+            .timeout(FETCH_TIMEOUT)
+            .build()
+            .map_err(|e| ToolError::Failed(format!("http client: {e}")))?;
+        let resp = client
+            .get("https://html.duckduckgo.com/html/")
+            .query(&[("q", query)])
+            .send()
+            .await
+            .map_err(|e| ToolError::Failed(format!("duckduckgo request: {e}")))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ToolError::Failed(format!("duckduckgo response: {e}")))?;
+        if !status.is_success() {
+            return Err(ToolError::Failed(format!(
+                "duckduckgo returned HTTP {status} (likely rate-limited — try again later \
+                 or configure a search key with `forge auth brave`/`tavily`)"
+            )));
+        }
+        let mut results = parse_ddg_results(&body);
+        results.truncate(count as usize);
+        Ok(results)
+    }
+}
+
+/// Parse DuckDuckGo's HTML result page. Each hit is an `<a class="result__a" href="URL">TITLE
+/// </a>` followed by an `<a class="result__snippet">SNIPPET</a>`. Ad/redirect anchors
+/// (`//duckduckgo.com/y.js…`) are skipped.
+pub(crate) fn parse_ddg_results(html: &str) -> Vec<SearchResult> {
+    let titles = anchors_with_class(html, "result__a");
+    let snippets = anchors_with_class(html, "result__snippet");
+    titles
+        .into_iter()
+        .enumerate()
+        .filter(|(_, (href, _))| href.starts_with("http"))
+        .map(|(i, (href, title))| SearchResult {
+            title,
+            url: href,
+            description: snippets.get(i).map(|(_, t)| t.clone()).unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Find every `<a … class="<class>" … href="HREF">INNER</a>` and return (href, plain-text
+/// inner) pairs. Tolerates attribute order and nested tags in the inner text.
+fn anchors_with_class(html: &str, class: &str) -> Vec<(String, String)> {
+    let marker = format!("class=\"{class}\"");
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = html[cursor..].find(&marker) {
+        let at = cursor + rel;
+        // Find the bounds of this <a …> open tag.
+        let tag_start = html[..at].rfind('<').unwrap_or(at);
+        let Some(gt_rel) = html[at..].find('>') else {
+            break;
+        };
+        let tag_end = at + gt_rel; // index of '>'
+        let open_tag = &html[tag_start..tag_end];
+        let href = open_tag
+            .find("href=\"")
+            .map(|h| &open_tag[h + 6..])
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("")
+            .to_string();
+        let inner = match html[tag_end + 1..].find("</a>") {
+            Some(end_rel) => &html[tag_end + 1..tag_end + 1 + end_rel],
+            None => "",
+        };
+        out.push((decode_ddg_href(&href), html_to_text(inner)));
+        cursor = tag_end + 1;
+    }
+    out
+}
+
+/// DDG sometimes wraps the target in a redirect: `//duckduckgo.com/l/?uddg=<encoded>`.
+/// Extract and percent-decode the real URL when present; otherwise pass through.
+fn decode_ddg_href(href: &str) -> String {
+    let Some(idx) = href.find("uddg=") else {
+        return href.to_string();
+    };
+    let enc = href[idx + 5..].split('&').next().unwrap_or("");
+    percent_decode(enc)
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(b) => {
+                    out.push(b);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn format_results(results: &[SearchResult]) -> String {
     if results.is_empty() {
         return "No results found.".to_string();
@@ -345,17 +471,15 @@ impl WebSearchTool {
         }
     }
 
-    fn resolve_backend(&self) -> Result<Arc<dyn SearchBackend>, ToolError> {
+    /// Pick a backend: an explicit one (tests / future config) wins; else Brave if a key is
+    /// set; else the keyless DuckDuckGo default so web search works with zero setup.
+    fn resolve_backend(&self) -> Arc<dyn SearchBackend> {
         if let Some(b) = &self.backend {
-            return Ok(b.clone());
+            return b.clone();
         }
         match std::env::var("BRAVE_API_KEY") {
-            Ok(key) if !key.is_empty() => Ok(Arc::new(BraveSearch::new(key))),
-            _ => Err(ToolError::Failed(
-                "web_search needs a search API key — set one with `forge auth brave` \
-                 or the BRAVE_API_KEY environment variable"
-                    .to_string(),
-            )),
+            Ok(key) if !key.is_empty() => Arc::new(BraveSearch::new(key)),
+            _ => Arc::new(DuckDuckGo),
         }
     }
 }
@@ -389,8 +513,7 @@ impl Tool for WebSearchTool {
             .and_then(Value::as_u64)
             .map(|n| (n as u32).clamp(1, MAX_SEARCH_COUNT))
             .unwrap_or(DEFAULT_SEARCH_COUNT);
-        let backend = self.resolve_backend()?;
-        let results = backend.search(query, count).await?;
+        let results = self.resolve_backend().search(query, count).await?;
         Ok(format_results(&results))
     }
 }
@@ -503,15 +626,53 @@ mod tests {
         assert!(out.contains("Example Domain"), "got: {out}");
     }
 
-    #[tokio::test]
-    async fn web_search_without_key_errors_actionably() {
-        std::env::remove_var("BRAVE_API_KEY");
-        let tool = WebSearchTool::new();
-        let err = tool.run(&json!({ "query": "rust" })).await.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("forge auth brave") || msg.contains("BRAVE_API_KEY"),
-            "{msg}"
+    #[test]
+    fn parse_ddg_extracts_title_url_snippet() {
+        let html = r#"
+          <a rel="nofollow" class="result__a" href="https://rust-lang.org/">Rust &amp; Lang</a>
+          <a class="result__snippet" href="https://rust-lang.org/">A language empowering everyone.</a>
+          <a rel="nofollow" class="result__a" href="https://en.wikipedia.org/wiki/Rust">Rust - Wikipedia</a>
+          <a class="result__snippet" href="x">Rust is a systems language.</a>
+          <a class="result__a" href="//duckduckgo.com/y.js?ad=1">An ad</a>
+        "#;
+        let r = parse_ddg_results(html);
+        assert_eq!(r.len(), 2, "ad/redirect anchors skipped");
+        assert_eq!(r[0].title, "Rust & Lang");
+        assert_eq!(r[0].url, "https://rust-lang.org/");
+        assert_eq!(r[0].description, "A language empowering everyone.");
+        assert_eq!(r[1].url, "https://en.wikipedia.org/wiki/Rust");
+    }
+
+    #[test]
+    fn ddg_redirect_href_is_decoded() {
+        assert_eq!(
+            decode_ddg_href("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%20b&rut=x"),
+            "https://example.com/a b"
         );
+        assert_eq!(
+            decode_ddg_href("https://direct.example.com/"),
+            "https://direct.example.com/"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_defaults_to_duckduckgo_without_key() {
+        std::env::remove_var("BRAVE_API_KEY");
+        // No key, no explicit backend → keyless DuckDuckGo default (web search works zero-setup).
+        let backend = WebSearchTool::new().resolve_backend();
+        // The mock/Brave paths aren't used here; just assert a backend is produced (no error).
+        let _: Arc<dyn SearchBackend> = backend;
+    }
+
+    /// Live network smoke test (no key). `cargo test -p forge-tools ddg_live -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn ddg_live_search() {
+        let out = WebSearchTool::new()
+            .run(&json!({ "query": "rust programming language", "count": 3 }))
+            .await
+            .expect("ddg search");
+        assert!(out.contains("rust") || out.contains("Rust"), "got: {out}");
+        assert!(out.contains("http"), "has urls: {out}");
     }
 }

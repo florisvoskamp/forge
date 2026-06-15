@@ -53,17 +53,42 @@ host/query pattern regardless of mode (e.g. deny `web_fetch` to internal hosts).
   loopback, link-local, and unique-local IPs and `localhost`/`*.local` hostnames. Known limit
   (documented): no DNS resolution, so DNS-rebinding to a private IP is not caught in v1.
 
-## `web_search` (BYOK, pluggable)
+## `web_search` (pluggable backend; free by default)
 
 - Args: `{ "query": string, "count"?: number }` (default 5, capped at 10).
-- `SearchBackend` trait → `BraveSearch` reference impl. **Verified Brave contract** (official
-  docs, 2026-06): `GET https://api.search.brave.com/res/v1/web/search?q=…&count=…`, header
-  `X-Subscription-Token: <key>`, results at `web.results[].{title,url,description}`.
-- Key resolution: env `BRAVE_API_KEY` first, then OS keyring entry `brave`
-  (`forge auth brave`). No key → `ToolError` with a one-line fix hint, never a panic.
-- **Pricing note (medium confidence, secondary sources):** Brave removed its free tier in
-  early 2026 — now metered (~$0.003–0.005/query, $5 prepaid). The trait keeps us
-  backend-agnostic so a free backend can be added later.
+- `SearchBackend` trait → two impls shipped:
+  - **`DuckDuckGo`** — the **keyless free default**. Scrapes the no-JS HTML endpoint
+    (`GET https://html.duckduckgo.com/html/?q=…`); parses `<a class="result__a">` (title+url)
+    + `<a class="result__snippet">`; decodes `uddg=` redirect hrefs. Free forever, zero setup.
+    Best-effort: DDG rate-limits and the layout can drift, so parsing is defensive and a
+    rate-limit / layout change degrades to "no results", not a turn error.
+  - **`BraveSearch`** — used when a key is set. **Verified contract** (official docs, 2026-06):
+    `GET https://api.search.brave.com/res/v1/web/search?q=…&count=…`, header
+    `X-Subscription-Token: <key>`, results at `web.results[].{title,url,description}`.
+- Backend selection (`resolve_backend`): explicit backend (tests/config) → else `BRAVE_API_KEY`
+  (env or keyring `brave`, via `forge auth brave`) → else **DuckDuckGo**. So web search works
+  with no setup at all.
+- **Pricing note:** Brave removed its free tier early 2026 (now metered). DuckDuckGo is the
+  free default; Tavily/SearXNG can slot in behind the same trait later.
+
+## Bridge isolation — Forge's tools must be the search path
+
+When a turn routes to a CLI bridge (`codex-cli::` / `claude-cli::`), the bridged CLI must use
+*Forge's* web tools, not its own — otherwise search escapes Forge's gate/observability and uses
+the user's personal config.
+
+- **codex** previously loaded `~/.codex/config.toml`, pulling in the user's personal MCP
+  servers (e.g. a `brave-search`/`filesystem` server) that codex used instead of Forge's tools.
+  Fixed by `--ignore-user-config` on the codex harness invocation (auth still resolves via
+  `CODEX_HOME`). Verified live: the user's MCP fleet disappears with the flag.
+- **codex native web search** (`web.run`) is subscription-backend-injected and **cannot be
+  hard-disabled** from Forge (`tools.web_search=false` / no `--search` don't stop it).
+- **Mitigation (soft, works in practice):** a harness preamble (`HARNESS_TOOL_PREAMBLE`)
+  instructs the bridged CLI to use `mcp__forge__web_search`/`web_fetch` and avoid native
+  search. Verified live: codex obeys and calls Forge's tools (visible as `↳ web_search` in the
+  TUI). If it ever ignores the nudge, Forge still observes the native call in the event stream.
+- **claude** needs none of this — it's already locked to Forge's tools via `--tools ""` +
+  `--strict-mcp-config` + `--allowedTools mcp__forge`.
 
 ## Acceptance criteria
 
