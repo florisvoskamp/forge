@@ -120,7 +120,9 @@ fn build_args(kind: CliKind, bare_model: &str, prompt: &str) -> Vec<String> {
             "stream-json".into(),
             "--verbose".into(),
             // Tool-disabled: Forge runs its own tool loop; the CLI is a text backend only.
-            "--allowedTools".into(),
+            // `--tools ""` truly disables all tools (an empty `--allowedTools` does NOT —
+            // claude still uses Bash, then --max-turns 1 cuts it off as error_max_turns).
+            "--tools".into(),
             "".into(),
             "--max-turns".into(),
             "1".into(),
@@ -467,9 +469,9 @@ mod tests {
     #[test]
     fn claude_args_are_tool_disabled_and_carry_no_secret() {
         let args = build_args(CliKind::ClaudeCode, "sonnet", "hi there");
-        assert!(args.contains(&"--allowedTools".to_string()));
-        // tool list is the empty string right after the flag
-        let i = args.iter().position(|a| a == "--allowedTools").unwrap();
+        assert!(args.contains(&"--tools".to_string()));
+        // tool list is the empty string right after the flag → all tools disabled
+        let i = args.iter().position(|a| a == "--tools").unwrap();
         assert_eq!(args[i + 1], "");
         assert!(args.contains(&"stream-json".to_string()));
         assert_eq!(args.iter().filter(|a| *a == "hi there").count(), 1);
