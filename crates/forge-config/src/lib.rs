@@ -57,6 +57,49 @@ pub struct Config {
     /// Native code-intelligence graph (code-intelligence.md).
     #[serde(default)]
     pub lattice: LatticeConfig,
+    /// Pre/post tool-use shell hooks (hooks.md). Each `[[hooks]]` entry runs a command around a
+    /// matching tool call.
+    #[serde(default)]
+    pub hooks: Vec<HookConfig>,
+}
+
+/// When a hook fires relative to a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    /// Before the tool runs; a non-zero exit blocks the call (stderr/stdout = the reason).
+    PreToolUse,
+    /// After the tool returns; output is surfaced as a note, exit code is advisory.
+    PostToolUse,
+}
+
+/// One `[[hooks]]` entry: a shell command run around tool calls matching `matcher`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookConfig {
+    pub event: HookEvent,
+    /// Tool-name filter: absent or `"*"` = every tool; otherwise a comma-separated list of exact
+    /// tool names (e.g. `"shell"`, `"edit_file,write_file"`).
+    #[serde(default)]
+    pub matcher: Option<String>,
+    /// POSIX `sh -c` command line. Receives the tool call as JSON on stdin.
+    pub command: String,
+    /// Kill the hook after this many seconds (default 30).
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_hook_timeout() -> u64 {
+    30
+}
+
+impl HookConfig {
+    /// Whether this hook applies to `tool_name`.
+    pub fn matches(&self, tool_name: &str) -> bool {
+        match self.matcher.as_deref() {
+            None | Some("") | Some("*") => true,
+            Some(list) => list.split(',').any(|m| m.trim() == tool_name),
+        }
+    }
 }
 
 /// Settings for the Lattice code-intelligence subsystem.
@@ -487,6 +530,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             commands: CommandsConfig::default(),
             lattice: LatticeConfig::default(),
+            hooks: Vec::new(),
         }
     }
 }
@@ -799,6 +843,39 @@ pub fn inject_provider_keys() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_matcher_filters_by_tool_name() {
+        let mk = |m: Option<&str>| HookConfig {
+            event: HookEvent::PreToolUse,
+            matcher: m.map(String::from),
+            command: "true".into(),
+            timeout_secs: 30,
+        };
+        assert!(mk(None).matches("shell"), "no matcher = all tools");
+        assert!(mk(Some("*")).matches("anything"));
+        assert!(mk(Some("shell")).matches("shell"));
+        assert!(!mk(Some("shell")).matches("edit_file"));
+        assert!(
+            mk(Some("edit_file,write_file")).matches("write_file"),
+            "comma list"
+        );
+    }
+
+    #[test]
+    fn hooks_parse_from_toml() {
+        let cfg: Config = figment::Figment::from(figment::providers::Serialized::defaults(
+            Config::default(),
+        ))
+        .merge(figment::providers::Toml::string(
+            "[[hooks]]\nevent = \"pre_tool_use\"\nmatcher = \"shell\"\ncommand = \"rtk $TOOL\"\n",
+        ))
+        .extract()
+        .unwrap();
+        assert_eq!(cfg.hooks.len(), 1);
+        assert_eq!(cfg.hooks[0].event, HookEvent::PreToolUse);
+        assert_eq!(cfg.hooks[0].timeout_secs, 30, "default applied");
+    }
 
     #[test]
     fn defaults_have_a_model_per_tier() {

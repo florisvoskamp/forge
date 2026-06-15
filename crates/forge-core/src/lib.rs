@@ -15,6 +15,7 @@ use forge_tui::{Presenter, PresenterEvent};
 use forge_types::{Message, PermissionDecision, PermissionMode, PermissionRule, Role, TaskTier};
 
 pub mod assay;
+pub mod hooks;
 pub mod llm_router;
 pub mod permission;
 pub mod snapshot;
@@ -853,6 +854,34 @@ impl Session {
             args: args_json.clone(),
         });
 
+        // PreToolUse hooks (hooks.md): run user shell hooks before the tool. A non-zero exit
+        // blocks the call (the hook's output is the reason the model sees). Inert when no hooks.
+        if !self.config.hooks.is_empty() {
+            let payload = serde_json::json!({ "tool": call.name, "args": call.args }).to_string();
+            let outcome = hooks::run_hooks(
+                &self.config.hooks,
+                forge_config::HookEvent::PreToolUse,
+                &call.name,
+                &payload,
+            )
+            .await;
+            for n in outcome.notes {
+                self.presenter.emit(PresenterEvent::Warning(n));
+            }
+            if let Some(reason) = outcome.blocked {
+                let result = format!("blocked by hook: {reason}");
+                self.presenter.emit(PresenterEvent::ToolResult {
+                    name: call.name.clone(),
+                    ok: false,
+                    summary: "blocked by hook".to_string(),
+                });
+                self.store.record_tool_call(
+                    msg_id, &call.name, &args_json, &result, "blocked", "error",
+                )?;
+                return Ok(result);
+            }
+        }
+
         // For a file-mutating tool, show the proposed change BEFORE the permission gate so
         // the user reviews a diff instead of approving a blind write.
         if side_effect == forge_types::SideEffect::Write {
@@ -917,6 +946,24 @@ impl Session {
             permission_label,
             if ok { "ok" } else { "error" },
         )?;
+
+        // PostToolUse hooks (hooks.md): observe the completed call (e.g. re-index, notify). The
+        // tool result is already final; post hooks only surface notes, they don't change it.
+        if !self.config.hooks.is_empty() {
+            let payload =
+                serde_json::json!({ "tool": call.name, "args": call.args, "result": result, "ok": ok })
+                    .to_string();
+            let outcome = hooks::run_hooks(
+                &self.config.hooks,
+                forge_config::HookEvent::PostToolUse,
+                &call.name,
+                &payload,
+            )
+            .await;
+            for n in outcome.notes {
+                self.presenter.emit(PresenterEvent::Warning(n));
+            }
+        }
 
         Ok(result)
     }
@@ -1634,6 +1681,80 @@ mod tests {
             .iter()
             .any(|e| matches!(e, PresenterEvent::Tasks(t) if t.len() == 2));
         assert!(emitted, "a Tasks event was emitted for the TUI");
+    }
+
+    /// Requests a `list_dir` tool call once, then answers `done` after the tool result.
+    struct ListDirProvider;
+    #[async_trait::async_trait]
+    impl Provider for ListDirProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            if messages.iter().any(|m| m.role == Role::Tool) {
+                return Ok(ModelResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                    quota: None,
+                });
+            }
+            Ok(ModelResponse {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "list_dir".into(),
+                    args: serde_json::json!({ "path": "." }),
+                }],
+                usage: Usage::default(),
+                quota: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pretooluse_hook_blocks_the_tool_call() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        // Bypass so the only thing that can stop the (ReadOnly) tool is the hook itself.
+        let config = Config {
+            permission_mode: forge_types::PermissionMode::Bypass,
+            hooks: vec![forge_config::HookConfig {
+                event: forge_config::HookEvent::PreToolUse,
+                matcher: Some("list_dir".into()),
+                command: "echo blocked-by-test 1>&2; exit 1".into(),
+                timeout_secs: 10,
+            }],
+            ..Config::default()
+        };
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(ListDirProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            config,
+            ".",
+        )
+        .unwrap();
+
+        session.run_turn("list the files").await.unwrap();
+
+        let evs = events.lock().unwrap();
+        let blocked = evs.iter().any(|e| {
+            matches!(e, PresenterEvent::ToolResult { name, ok, summary }
+                if name == "list_dir" && !ok && summary.contains("blocked by hook"))
+        });
+        assert!(
+            blocked,
+            "the list_dir call was blocked by the PreToolUse hook"
+        );
     }
 
     #[tokio::test]

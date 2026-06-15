@@ -36,6 +36,9 @@ a budget; Forge stays under it.
 - **MCP client** — connect external MCP servers (stdio + HTTP/SSE) and drive their tools
   through Forge's permission gate; declare them in `.forge/mcp.toml` or `forge mcp import`
   a Claude-Code `.mcp.json`. `forge mcp` / `/mcp` list status; tools load on demand.
+- **Hooks** — `[[hooks]]` shell commands that run around tool calls: `PreToolUse` can block a
+  call (non-zero exit), `PostToolUse` observes; the call is piped as JSON on stdin, time-bounded.
+  (POSIX `sh`; input-rewriting/context-injection hooks are on the roadmap.)
 - **Commands & skills** — reusable prompt templates and methodologies as markdown files in
   `./.forge/commands`, `./.forge/skills/<name>/SKILL.md` (and the same dirs under your user
   config). Type `/` in the TUI for a fuzzy palette; `/name args` expands a template (`$1`,
