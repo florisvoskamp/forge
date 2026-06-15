@@ -87,6 +87,9 @@ pub struct App {
     /// animate with a spinner in the live preview; on completion each becomes a scrollback
     /// branch line, and the whole group folds (header + branches + footer) when all finish.
     subagents: Vec<SubRow>,
+    /// The inline slash-command palette (RFC session-management-and-commands). Open while the
+    /// input line starts with `/`.
+    pub palette: crate::commands::Palette,
 }
 
 /// One subagent's live row in the TUI.
@@ -108,6 +111,11 @@ pub enum KeyKind {
     Backspace,
     Enter,
     Esc,
+    /// Arrow up/down — navigate the command palette / pickers (ignored by the input line).
+    Up,
+    Down,
+    /// TAB — complete the palette selection (ignored by the input line).
+    Tab,
     /// SHIFT+TAB — cycle the operating temper (handled by the shell, not the input line).
     CycleTemper,
 }
@@ -139,8 +147,8 @@ pub fn handle_key(input: &mut String, key: KeyKind) -> InputOutcome {
             }
         }
         KeyKind::Esc => InputOutcome::Quit,
-        // Temper cycling is handled by the shell before reaching the input line; ignore here.
-        KeyKind::CycleTemper => InputOutcome::Editing,
+        // Navigation / temper keys are handled by the shell before reaching the input line.
+        KeyKind::Up | KeyKind::Down | KeyKind::Tab | KeyKind::CycleTemper => InputOutcome::Editing,
     }
 }
 
@@ -334,6 +342,30 @@ impl App {
         self.flush.push(TextLine::default());
     }
 
+    /// Render a resumed session's prior transcript into scrollback (after a `/resume` swap), so
+    /// the conversation reappears without restarting. User turns echo like live input; assistant
+    /// turns render markdown under the `⚒ forge` header.
+    pub fn replay_history(&mut self, msgs: &[(forge_types::Role, String)]) {
+        for (role, content) in msgs {
+            match role {
+                forge_types::Role::User => self.submit_user(content),
+                _ => {
+                    self.flush.push(header_line("⚒ forge", ORANGE));
+                    self.flush.extend(crate::render::markdown_to_lines(content));
+                    self.flush.push(TextLine::default());
+                }
+            }
+        }
+    }
+
+    /// Push a dim informational line into scrollback (command feedback, session lists, etc).
+    pub fn note(&mut self, text: &str) {
+        self.flush.push(TextLine::from(Span::styled(
+            format!("  {text}"),
+            Style::default().fg(DIM),
+        )));
+    }
+
     /// Take the finalized scrollback lines queued since the last call.
     pub fn drain_flush(&mut self) -> Vec<TextLine<'static>> {
         std::mem::take(&mut self.flush)
@@ -479,12 +511,60 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     ])
     .split(frame.area());
 
-    render_preview(frame, areas[0], app);
+    if app.palette.open {
+        render_palette(frame, areas[0], app);
+    } else {
+        render_preview(frame, areas[0], app);
+    }
     if app.prompt.is_some() {
         render_permission(frame, areas[1], app);
     }
     render_input(frame, areas[2], app);
     render_statusline(frame, areas[3], app);
+}
+
+/// The inline slash-command palette: a scrolling window of filtered commands, selected row
+/// highlighted, revealed by an ease-in animation (RFC session-management-and-commands).
+fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 {
+        return; // degenerate viewport (e.g. 0-height terminal) — nothing to draw, never clamp(1,0).
+    }
+    let matches = app.palette.matches();
+    if matches.is_empty() {
+        frame.render_widget(
+            Paragraph::new(TextLine::from(Span::styled(
+                "  no commands match",
+                Style::default().fg(DIM),
+            ))),
+            area,
+        );
+        return;
+    }
+    let h = area.height as usize;
+    // Ease-in reveal: rows appear over the first few frames after opening.
+    let revealed = ((app.palette.anim * h as f32).ceil() as usize).clamp(1, h);
+    // Scroll so the selected row stays visible within the window.
+    let start = app.palette.selected.saturating_sub(h.saturating_sub(1));
+    let lines: Vec<TextLine> = matches
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(revealed)
+        .map(|(i, c)| {
+            let selected = i == app.palette.selected;
+            let marker = if selected { "▸ " } else { "  " };
+            let name_style = if selected {
+                Style::default().fg(ORANGE).bold()
+            } else {
+                Style::default().fg(USER)
+            };
+            TextLine::from(vec![
+                Span::styled(format!("  {marker}/{}", c.name), name_style),
+                Span::styled(format!("  {}", c.desc), Style::default().fg(DIM)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// The in-flight streaming reply's trailing edge, scrolled to its bottom so the freshest
@@ -915,6 +995,28 @@ mod tests {
         assert!(text.contains("openai::gpt-4o-mini"), "model in statusline");
         assert!(text.contains("$0.0042"), "cost in statusline");
         assert!(text.contains("standard"), "tier in statusline");
+    }
+
+    #[test]
+    fn command_palette_renders_filtered_commands() {
+        let mut app = App::default();
+        app.palette.open_with("");
+        app.palette.anim = 1.0; // fully revealed
+        let text = screen(&app);
+        assert!(text.contains("/help"), "palette shows commands: {text}");
+        assert!(text.contains("▸"), "selected row marked");
+    }
+
+    #[test]
+    fn command_palette_zero_height_does_not_panic() {
+        // Regression: clamp(1, 0) panicked on a 0-height viewport.
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::default();
+        app.palette.open_with("");
+        let mut term = Terminal::new(TestBackend::new(80, 0)).unwrap();
+        // Must not panic.
+        let _ = term.draw(|f| render_live(f, &app));
     }
 
     #[test]

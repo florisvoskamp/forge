@@ -630,6 +630,61 @@ async fn run_chat_tui(
         // fast typing to the frame rate (~16 keys/sec) — the source of the input lag.
         while let Some(key) = tui.poll_key().context("reading input")? {
             dirty = true;
+
+            // The command palette is modal while open: it owns every key. Esc dismisses it
+            // (so the user isn't surprised by a quit); Ctrl-C still maps to Esc → here it just
+            // closes the palette, and a second Esc with the palette closed quits as usual.
+            if app.palette.open {
+                match key {
+                    KeyKind::Esc => {
+                        app.palette.close();
+                        app.input.clear();
+                    }
+                    KeyKind::Up => app.palette.move_up(),
+                    KeyKind::Down => app.palette.move_down(),
+                    KeyKind::Tab => {
+                        if let Some(name) = app.palette.selected_name() {
+                            app.input = format!("/{name}");
+                            app.palette.query = name.to_string();
+                            app.palette.clamp();
+                        }
+                    }
+                    KeyKind::Enter => {
+                        let line = app
+                            .palette
+                            .selected_name()
+                            .map(|n| format!("/{n}"))
+                            .unwrap_or_else(|| app.input.clone());
+                        app.palette.close();
+                        app.input.clear();
+                        if dispatch_command(&line, &session, &mut tui, &mut app, busy).await? {
+                            quit = true;
+                            break;
+                        }
+                    }
+                    KeyKind::Char(c) => {
+                        app.input.push(c);
+                        if app.input.starts_with("//") {
+                            app.palette.close(); // `//` escapes to a literal prompt
+                        } else {
+                            app.palette.query = app.input[1..].to_string();
+                            app.palette.clamp();
+                        }
+                    }
+                    KeyKind::Backspace => {
+                        app.input.pop();
+                        if app.input.starts_with('/') {
+                            app.palette.query = app.input[1..].to_string();
+                            app.palette.clamp();
+                        } else {
+                            app.palette.close();
+                        }
+                    }
+                    KeyKind::CycleTemper => {}
+                }
+                continue;
+            }
+
             // Esc / Ctrl-C ALWAYS quit — checked before any prompt handling, so the user can
             // never get wedged at a permission/question prompt with no way out. A pending reply
             // is dropped (its sender closes → the blocked turn task unblocks and the process exits).
@@ -676,28 +731,43 @@ async fn run_chat_tui(
             } else {
                 match handle_key(&mut app.input, key) {
                     InputOutcome::Submit(line) => {
-                        app.submit_user(&line);
-                        app.done = false;
-                        app.tick = 0;
-                        busy = true;
-                        busy_since = Instant::now();
-                        let s = session.clone();
-                        let dt = done_tx.clone();
-                        tokio::spawn(async move {
-                            // DoneGuard fires on the way out — normal return OR panic unwind —
-                            // so a panicking turn can never leave the UI stuck "working".
-                            let _done = DoneGuard(dt);
-                            let mut sess = s.lock().await;
-                            if let Err(e) = sess.run_turn(&line).await {
-                                sess.notify_error(&format!("turn failed: {e}"));
+                        // `//foo` escapes to a literal prompt `/foo`; a bare `/cmd` typed without
+                        // the palette still dispatches as a command; everything else is a prompt.
+                        if let Some(rest) = line.strip_prefix("//") {
+                            spawn_turn(
+                                &format!("/{rest}"),
+                                &session,
+                                &done_tx,
+                                &mut app,
+                                &mut busy,
+                                &mut busy_since,
+                            );
+                        } else if line.starts_with('/') {
+                            if dispatch_command(&line, &session, &mut tui, &mut app, busy).await? {
+                                quit = true;
+                                break;
                             }
-                        });
+                        } else {
+                            spawn_turn(
+                                &line,
+                                &session,
+                                &done_tx,
+                                &mut app,
+                                &mut busy,
+                                &mut busy_since,
+                            );
+                        }
                     }
                     InputOutcome::Quit => {
                         quit = true;
                         break;
                     }
-                    InputOutcome::Editing => {}
+                    InputOutcome::Editing => {
+                        // Typing `/` as the first character opens the command palette.
+                        if app.input.starts_with('/') && !app.input.starts_with("//") {
+                            app.palette.open_with(&app.input[1..]);
+                        }
+                    }
                 }
             }
         }
@@ -740,6 +810,11 @@ async fn run_chat_tui(
                 dirty = true;
             }
         }
+        // Animate the command palette's ease-in reveal while it's open.
+        if app.palette.open && app.palette.anim < 1.0 {
+            app.palette.tick_anim();
+            dirty = true;
+        }
 
         // Push any finalized lines into native scrollback (above the pinned live region).
         let flushed = app.drain_flush();
@@ -750,6 +825,117 @@ async fn run_chat_tui(
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
     Ok(())
+}
+
+/// Echo a prompt + spawn the turn task (shared by normal submit and the `//` literal escape).
+fn spawn_turn(
+    prompt: &str,
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    done_tx: &std::sync::mpsc::Sender<()>,
+    app: &mut forge_tui::App,
+    busy: &mut bool,
+    busy_since: &mut std::time::Instant,
+) {
+    app.submit_user(prompt);
+    app.done = false;
+    app.tick = 0;
+    *busy = true;
+    *busy_since = std::time::Instant::now();
+    let s = session.clone();
+    let dt = done_tx.clone();
+    let prompt = prompt.to_string();
+    tokio::spawn(async move {
+        // DoneGuard fires on the way out — normal return OR panic unwind — so a panicking turn
+        // can never leave the UI stuck "working".
+        let _done = DoneGuard(dt);
+        let mut sess = s.lock().await;
+        if let Err(e) = sess.run_turn(&prompt).await {
+            sess.notify_error(&format!("turn failed: {e}"));
+        }
+    });
+}
+
+/// Execute a slash command (RFC session-management-and-commands, PR1). Returns `Ok(true)` to
+/// quit. Session-mutating commands (`/new`, `/resume`, `/clear`) are gated while a turn is in
+/// flight (the turn task holds the session `Mutex`). All session access is `lock().await` — no
+/// blocking on the render-loop thread (the #45 invariant).
+async fn dispatch_command(
+    line: &str,
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    tui: &mut forge_tui::Tui,
+    app: &mut forge_tui::App,
+    busy: bool,
+) -> Result<bool> {
+    use forge_tui::CommandAction;
+    let action = forge_tui::parse_command(line);
+    let mutates = matches!(
+        action,
+        CommandAction::Resume(_) | CommandAction::New | CommandAction::ClearScreen
+    );
+    if busy && mutates {
+        app.note("⚠ finish or Esc the current turn first");
+        return Ok(false);
+    }
+    match action {
+        CommandAction::Help => app.palette.open_with(""),
+        CommandAction::Quit => return Ok(true),
+        CommandAction::ClearScreen => {
+            tui.clear_screen();
+            app.note("— screen cleared —");
+        }
+        CommandAction::New => {
+            let cwd = std::env::current_dir()?.display().to_string();
+            {
+                let mut s = session.lock().await;
+                s.reset_fresh(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            tui.clear_screen();
+            app.note("● new session");
+        }
+        CommandAction::Resume(prefix) => {
+            let store = open_store()?;
+            match store.matching_session_ids(&prefix) {
+                Ok(ids) if ids.len() == 1 => {
+                    let id = ids.into_iter().next().unwrap();
+                    let history = {
+                        let mut s = session.lock().await;
+                        s.reset_resumed(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        s.history()
+                    };
+                    tui.clear_screen();
+                    app.note(&format!(
+                        "● resumed {}",
+                        id.chars().take(8).collect::<String>()
+                    ));
+                    app.replay_history(&history);
+                }
+                Ok(ids) if ids.is_empty() => app.note(&format!("no session matching '{prefix}'")),
+                Ok(_) => app.note(&format!("'{prefix}' is ambiguous — use more characters")),
+                Err(e) => app.note(&format!("resume failed: {e}")),
+            }
+        }
+        CommandAction::ListSessions => {
+            let store = open_store()?;
+            match store.list_sessions() {
+                Ok(list) if list.is_empty() => app.note("no past sessions yet"),
+                Ok(list) => {
+                    app.note("past sessions — /resume <id>:");
+                    for s in list.into_iter().take(15) {
+                        let id: String = s.id.chars().take(8).collect();
+                        let preview: String =
+                            s.preview.unwrap_or_default().chars().take(48).collect();
+                        app.note(&format!(
+                            "  {id}  ${:>7.4}  {:>3} msgs  {preview}",
+                            s.total_cost_usd, s.message_count
+                        ));
+                    }
+                }
+                Err(e) => app.note(&format!("list failed: {e}")),
+            }
+        }
+        CommandAction::Unknown(x) => app.note(&format!("unknown command: /{x} — try /help")),
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

@@ -164,6 +164,14 @@ impl Tui {
         let _ = self.terminal.draw(|f| app::render_live(f, app));
     }
 
+    /// Clear the visible screen (used by `/clear`). Native scrollback above is wiped from view;
+    /// the session/transcript are untouched. `terminal.clear()` forces a full viewport redraw.
+    pub fn clear_screen(&mut self) {
+        use crossterm::terminal::{Clear, ClearType};
+        let _ = crossterm::execute!(io::stdout(), Clear(ClearType::All));
+        let _ = self.terminal.clear();
+    }
+
     /// Non-blocking: returns a keystroke if one is pending, else `None`.
     pub fn poll_key(&self) -> io::Result<Option<KeyKind>> {
         if !event::poll(Duration::from_millis(0))? {
@@ -181,6 +189,9 @@ impl Tui {
                     KeyCode::Esc => KeyKind::Esc,
                     // Shift+Tab — crossterm reports it as BackTab — cycles the operating temper.
                     KeyCode::BackTab => KeyKind::CycleTemper,
+                    KeyCode::Up => KeyKind::Up,
+                    KeyCode::Down => KeyKind::Down,
+                    KeyCode::Tab => KeyKind::Tab,
                     _ => return Ok(None),
                 };
                 return Ok(Some(key));

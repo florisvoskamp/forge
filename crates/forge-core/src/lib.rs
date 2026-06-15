@@ -155,6 +155,56 @@ impl Session {
         &self.id
     }
 
+    /// Visible conversation history (user + non-empty assistant messages), oldest first, for
+    /// redrawing the transcript into the TUI scrollback after a `/resume` swap.
+    pub fn history(&self) -> Vec<(Role, String)> {
+        self.transcript
+            .iter()
+            .filter(|m| {
+                matches!(m.role, Role::User | Role::Assistant) && !m.content.trim().is_empty()
+            })
+            .map(|m| (m.role, m.content.clone()))
+            .collect()
+    }
+
+    /// Reconfigure this session in place as a **fresh** one (new id, empty transcript), keeping
+    /// the same backends + live presenter so events keep flowing to the running TUI. Powers
+    /// `/new` — no process restart, no Session move (it lives behind the loop's `Mutex`).
+    pub fn reset_fresh(&mut self, cwd: &str) -> Result<(), CoreError> {
+        let id = self
+            .store
+            .create_session(cwd, format!("{:?}", self.mode).as_str())?;
+        self.id = id.clone();
+        self.transcript.clear();
+        self.seq = 0;
+        self.presenter.emit(PresenterEvent::SessionStarted { id });
+        Ok(())
+    }
+
+    /// Reconfigure this session in place, **resumed** from `session_id`: rehydrate the stored
+    /// transcript, keep the same backends + live presenter. Powers `/resume`.
+    pub fn reset_resumed(&mut self, session_id: &str) -> Result<(), CoreError> {
+        if !self.store.session_exists(session_id)? {
+            return Err(CoreError::SessionNotFound(session_id.to_string()));
+        }
+        let stored = self.store.load_messages(session_id)?;
+        self.seq = stored.len() as i64;
+        self.transcript = stored
+            .into_iter()
+            .map(|m| Message {
+                role: m.role,
+                content: m.content,
+                tool_calls: m.tool_calls,
+                tool_call_id: m.tool_call_id,
+            })
+            .collect();
+        self.id = session_id.to_string();
+        self.presenter.emit(PresenterEvent::SessionStarted {
+            id: session_id.to_string(),
+        });
+        Ok(())
+    }
+
     /// The session's current temper (permission mode).
     pub fn temper(&self) -> PermissionMode {
         self.mode
@@ -1612,5 +1662,47 @@ mod tests {
             session.run_turn("hi").await,
             Err(CoreError::NoHealthyModel)
         ));
+    }
+
+    // --- In-TUI session swap (RFC session-management-and-commands, PR1) ---
+
+    #[tokio::test]
+    async fn reset_resumed_and_fresh_swap_the_live_session() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        // Seed a past session A with a user+assistant exchange.
+        let a = store.create_session(".", "default").unwrap();
+        store.add_message(&a, 0, Role::User, "hello", None).unwrap();
+        store
+            .add_message(&a, 1, Role::Assistant, "hi there", Some("m"))
+            .unwrap();
+        // A live session B (what the TUI is holding).
+        let mut b = Session::start(
+            Arc::clone(&store),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+        let b_id = b.id().to_string();
+
+        // /resume A: B becomes A, rehydrating A's transcript.
+        b.reset_resumed(&a).unwrap();
+        assert_eq!(b.id(), a);
+        assert_ne!(b.id(), b_id);
+        assert_eq!(
+            b.history(),
+            vec![
+                (Role::User, "hello".to_string()),
+                (Role::Assistant, "hi there".to_string()),
+            ]
+        );
+
+        // /new: a fresh empty session, new id.
+        b.reset_fresh(".").unwrap();
+        assert!(b.history().is_empty());
+        assert_ne!(b.id(), a);
     }
 }
