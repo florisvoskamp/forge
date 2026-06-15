@@ -345,6 +345,21 @@ snapshot only changed files; tests for snapshot/restore round-trip incl create+d
 | 2026-06-15 | PR2 + PR3 shipped together | `/undo` = rewind chat **and** restore files in one action — shipping conversation-undo without code-restore would be a half-undo. Combined in one PR. |
 | 2026-06-15 | `/sessions` `/resume` `/checkpoints` are interactive pickers, not text lists | User: "all commands as interactive as possible." A shared animated, filter-narrowed `Picker` widget replaces the text dump; `Resume(prefix)` pre-fills the filter. Enter resumes/rewinds + redraws the transcript. |
 | 2026-06-15 | Picker lives in the fixed-height inline live region (scrolls, doesn't grow) | ratatui inline viewports can't resize at runtime; the picker scrolls a 3-row window with a heading + position counter. Beauty comes from animation + formatting, not height. |
+| 2026-06-15 | Auto-checkpoint every turn (drop manual-only) | A checkpoint is saved automatically at each turn boundary, labeled with the prompt preview. `/checkpoint [name]` stays for explicit named points, but undo no longer needs it. |
+| 2026-06-15 | `/undo` is an interactive picker, not a one-step rewind | User: pick any past message to rewind to, not just the last turn. `/undo` and `/checkpoints` open the same picker over the per-turn checkpoints (prompt preview as the row title); Enter rewinds chat + restores files. |
+| 2026-06-15 | Interrupt the AI with Esc/Ctrl-C (busy → stop, idle → quit) | A running turn is a tokio task; Esc aborts it (the task's DoneGuard drop releases the session lock) and Forge keeps running. A per-turn generation counter on the done-signal makes an aborted turn's late signal harmless to a later turn. |
+
+## Follow-up build (2026-06-15) — auto-checkpoints, interactive undo, interrupt
+
+On branch `feat/auto-checkpoints-undo-picker-interrupt`:
+- **Auto-checkpoint per turn**: `run_turn` saves a checkpoint at the turn boundary labeled with
+  the prompt preview (`checkpoint_preview`). No manual step needed.
+- **Interactive `/undo`**: opens a picker of past turns (prompt preview + age); Enter rewinds the
+  conversation and restores files to that point. `/checkpoints` shares the picker.
+- **Interrupt**: Esc/Ctrl-C while busy aborts the turn task and keeps Forge alive (idle Esc still
+  quits); statusline shows `esc stop` while working. Generation-gated done-signal prevents a stale
+  abort from ending a later turn. Verified by a core test that an aborted turn releases the
+  session lock (no deadlock) + the updated pty e2e (turn → `/undo` picker → rewind). 263 pass.
 
 ## Post-build status (2026-06-15)
 

@@ -387,6 +387,11 @@ impl Session {
         self.store
             .add_message(&self.id, seq, Role::User, prompt, None)?;
         self.transcript.push(Message::user(prompt));
+        // Auto-checkpoint at the turn boundary, labeled with the prompt preview, so `/undo` can
+        // offer a list of past messages to rewind to (no manual /checkpoint needed).
+        let _ = self
+            .store
+            .add_checkpoint(&self.id, Some(&checkpoint_preview(prompt)), seq);
 
         let specs = self.tool_specs();
         let mut final_text = String::new();
@@ -866,6 +871,16 @@ fn over_budget_message(b: &BudgetState) -> String {
         b.spent_month_usd,
         cap(b.monthly_cap_usd)
     )
+}
+
+/// A short single-line label for an auto-checkpoint: the prompt's first line, char-truncated.
+fn checkpoint_preview(prompt: &str) -> String {
+    let first = prompt.lines().next().unwrap_or("").trim();
+    if first.chars().count() > 60 {
+        format!("{}…", first.chars().take(60).collect::<String>())
+    } else {
+        first.to_string()
+    }
 }
 
 fn summarize(s: &str) -> String {
@@ -1772,6 +1787,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_turn_auto_checkpoints_with_a_prompt_preview() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = fresh_session(Arc::clone(&store), Config::default());
+
+        session
+            .run_turn("check the project manifest")
+            .await
+            .unwrap();
+        session.run_turn("now check it again please").await.unwrap();
+
+        let cps = session.checkpoints().unwrap();
+        assert_eq!(cps.len(), 2, "one auto checkpoint per turn");
+        // Newest first, labeled with the prompt preview (so /undo can show the message).
+        assert_eq!(cps[0].label.as_deref(), Some("now check it again please"));
+        assert_eq!(cps[1].label.as_deref(), Some("check the project manifest"));
+        // Each checkpoint's boundary is its turn's start, so rewinding there undoes that turn.
+        assert!(cps[0].seq > cps[1].seq);
+    }
+
+    #[tokio::test]
     async fn checkpoint_then_turn_then_rewind_to_it() {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let mut session = fresh_session(Arc::clone(&store), Config::default());
@@ -1875,6 +1910,69 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A provider that blocks for a long time, so a turn can be interrupted mid-flight.
+    struct SlowProvider;
+    #[async_trait::async_trait]
+    impl Provider for SlowProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(forge_provider::ModelResponse {
+                content: "too late".into(),
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_a_running_turn_releases_the_session_lock() {
+        // The interrupt feature aborts the turn task; this proves the invariant it relies on —
+        // cancelling a task that holds the session Mutex across an await frees the lock, so the
+        // session stays usable (no deadlock / frozen UI).
+        use std::time::Duration;
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let session = Arc::new(tokio::sync::Mutex::new(
+            Session::start(
+                store,
+                Arc::new(SlowProvider),
+                Arc::new(HeuristicRouter::new(Config::default())),
+                ToolRegistry::with_core_tools(),
+                Box::new(HeadlessPresenter::new(false)),
+                Config::default(),
+                ".",
+            )
+            .unwrap(),
+        ));
+
+        let s = session.clone();
+        let handle = tokio::spawn(async move {
+            let mut g = s.lock().await;
+            let _ = g.run_turn("a slow request").await;
+        });
+        // Let the task acquire the lock and enter the 30s provider sleep, then interrupt it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        // The lock must be free immediately (the aborted task dropped its guard).
+        let guard = tokio::time::timeout(Duration::from_secs(2), session.lock())
+            .await
+            .expect("abort released the session lock");
+        assert!(
+            guard
+                .history()
+                .iter()
+                .any(|(r, c)| matches!(r, Role::User) && c == "a slow request"),
+            "the interrupted turn's prompt was recorded before the abort"
+        );
     }
 
     // --- In-TUI session swap (RFC session-management-and-commands, PR1) ---

@@ -306,6 +306,12 @@ impl App {
         self.question.is_some()
     }
 
+    /// Drop any in-flight question/permission prompt (e.g. when the turn is interrupted).
+    pub fn clear_question(&mut self) {
+        self.question = None;
+        self.prompt = None;
+    }
+
     /// Try to resolve a submitted line against the active question. `Some(answer)` clears the
     /// question; `None` means invalid input — keep the question open and re-prompt.
     pub fn resolve_question(&mut self, line: &str) -> Option<String> {
@@ -750,7 +756,9 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
     if w >= 70 {
         let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(24)]).split(area);
         frame.render_widget(Paragraph::new(TextLine::from(left)).style(bg), cols[0]);
-        let hint = if app.done {
+        let hint = if app.busy {
+            "esc stop "
+        } else if app.done {
             "done · esc quit "
         } else {
             "⇧⇥ temper · esc quit "
