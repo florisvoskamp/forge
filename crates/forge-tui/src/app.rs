@@ -93,6 +93,9 @@ pub struct App {
     /// The interactive session/checkpoint picker (RFC session-management-and-commands). Modal
     /// while open; reused for `/sessions`, `/resume`, and `/checkpoints`.
     pub picker: crate::commands::Picker,
+    /// For the `/models` browser only: `Some(provider)` when drilled into a provider's models,
+    /// `None` at the top-level provider list. Lets Esc step back a level instead of closing.
+    pub models_drilled: Option<String>,
 }
 
 /// One subagent's live row in the TUI.
@@ -520,6 +523,24 @@ fn temper_color(label: &str) -> Color {
     }
 }
 
+/// Color a `/models` browser row: provider rows blue; model rows by category (subscription=green,
+/// frontier=orange, free=cyan, paid=yellow). Provider vs model is told apart by the `::` in `id`.
+fn models_row_color(row: &crate::commands::PickerRow) -> Color {
+    if !row.id.contains("::") {
+        return USER; // a provider header row
+    }
+    let s = row.subtitle.to_lowercase();
+    if s.contains("subscription") {
+        OKGREEN
+    } else if s.contains("frontier") {
+        ORANGE
+    } else if s.contains("free") {
+        TOOLCYAN
+    } else {
+        WARNYEL // paid
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() > max {
@@ -645,12 +666,15 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
     let revealed = ((p.anim * list_h as f32).ceil() as usize).clamp(1, list_h.max(1));
     let start = p.selected.saturating_sub(list_h.saturating_sub(1));
     let tempers = p.kind == Some(crate::commands::PickerKind::Tempers);
+    let models = p.kind == Some(crate::commands::PickerKind::Models);
     for (i, row) in matches.iter().enumerate().skip(start).take(revealed) {
         let selected = i == p.selected;
         let marker = if selected { "▸ " } else { "  " };
-        // In the mode picker, color each row by its temper so the posture reads at a glance.
+        // In the mode picker, color each row by its temper; in the models browser, by category.
         let base = if tempers {
             temper_color(&row.title)
+        } else if models {
+            models_row_color(row)
         } else {
             USER
         };

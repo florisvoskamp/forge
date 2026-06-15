@@ -9,8 +9,23 @@ use forge_types::TaskTier;
 /// Coarse quality class inferred from a model id's family (0 = unknown/small … 3 = frontier).
 fn quality_class(id: &str) -> u8 {
     let m = id.to_lowercase();
+    // Small / fast FIRST: a size/speed marker (mini, haiku, -lite, -8b) downgrades even a
+    // frontier-family name — `gpt-5.4-mini` and `gpt-4o-mini` are small, not frontier.
+    if m.contains("-8b")
+        || m.contains("-7b")
+        || m.contains("-3b")
+        || m.contains("-1b")
+        || m.contains("mini")
+        || m.contains("nano")
+        || m.contains("haiku")
+        || m.contains("instant")
+        || m.contains("flash-lite")
+        || m.contains("-lite")
+        || m.contains("small")
+    {
+        1
     // Frontier / large.
-    if m.contains("opus")
+    } else if m.contains("opus")
         || m.contains("gpt-5")
         || m.contains("sonnet")
         || m.contains("-405b")
@@ -34,23 +49,16 @@ fn quality_class(id: &str) -> u8 {
         || (m.contains("pro") && !m.contains("flash"))
     {
         2
-    // Small / fast.
-    } else if m.contains("-8b")
-        || m.contains("-7b")
-        || m.contains("-3b")
-        || m.contains("-1b")
-        || m.contains("mini")
-        || m.contains("nano")
-        || m.contains("haiku")
-        || m.contains("instant")
-        || m.contains("flash-lite")
-        || m.contains("small")
-    {
-        1
     } else {
         // Unknown family — assume a capable default (e.g. `flash`, `llama3.2`, codex models).
         2
     }
+}
+
+/// Whether a model id reads as frontier-class (top quality prior) — used to count "frontier"
+/// models in the `/models` overview. Same family heuristic the router ranks by.
+pub fn is_frontier(id: &str) -> bool {
+    quality_class(id) == 3
 }
 
 /// Coarse speed class — roughly the inverse of size (3 = fastest small model).

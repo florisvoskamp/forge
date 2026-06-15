@@ -235,6 +235,13 @@ pub struct MeshConfig {
     /// Default bench duration (seconds) when a rate-limited provider gives no `Retry-After`.
     #[serde(default = "default_failover_cooldown_secs")]
     pub failover_cooldown_secs: u64,
+    /// Override which models a CLI bridge exposes to auto-discovery, keyed by bridge prefix
+    /// (`claude-cli` / `codex-cli`); each value is a list of model aliases/ids the CLI's `--model`
+    /// flag accepts (e.g. `["opus","sonnet","haiku"]`). Empty/absent → the bridge's built-in
+    /// defaults. The CLIs expose no machine-readable model list, so this is how a user pins the
+    /// exact set; a stale alias just benches itself via failover.
+    #[serde(default)]
+    pub bridge_models: HashMap<String, Vec<String>>,
 }
 
 fn default_auto_discover() -> bool {
@@ -403,6 +410,7 @@ impl Default for Config {
                 auto_discover: default_auto_discover(),
                 failover: default_failover(),
                 failover_cooldown_secs: default_failover_cooldown_secs(),
+                bridge_models: HashMap::new(),
             },
             permissions: PermissionsConfig::default(),
         }

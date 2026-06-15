@@ -39,6 +39,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/assay",
     },
     Command {
+        name: "models",
+        desc: "browse available models by provider (counts + frontier/free)",
+        usage: "/models",
+    },
+    Command {
         name: "new",
         desc: "start a fresh session",
         usage: "/new",
@@ -77,6 +82,8 @@ pub enum CommandAction {
     Help,
     ListSessions,
     Resume(String),
+    /// Open the interactive model browser (`/models`).
+    ListModels,
     New,
     ClearScreen,
     /// Open the operating-mode (temper) picker.
@@ -112,6 +119,7 @@ pub fn parse_command(line: &str) -> CommandAction {
                 CommandAction::Resume(arg)
             }
         }
+        "models" | "mc" => CommandAction::ListModels,
         "new" | "n" => CommandAction::New,
         "mode" | "m" | "temper" => CommandAction::Mode,
         "assay" | "analyze" | "analyse" => CommandAction::Assay,
@@ -236,6 +244,8 @@ pub enum PickerKind {
     Tempers,
     /// Pick the Assay action: analysis-only vs full cleanup (`/assay`).
     AssayChoice,
+    /// Browse available models (`/models`): a provider list that drills into per-provider models.
+    Models,
 }
 
 /// One row in an interactive picker: an opaque `id` the loop acts on, plus two display strings.

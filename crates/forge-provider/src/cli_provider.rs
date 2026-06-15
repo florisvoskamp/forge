@@ -78,6 +78,26 @@ impl CliKind {
         format!("{}::", self.prefix())
     }
 
+    /// The model aliases this bridge exposes by default, so auto-discovery surfaces more than just
+    /// the CLI's single default — letting the mesh size each turn (haiku/mini for trivial, opus for
+    /// complex). The official CLIs publish no machine-readable model list, so these are the
+    /// documented `--model` aliases; users can override the set via `[mesh.bridge_models]`, and any
+    /// alias that's stale or unavailable just benches itself via failover (never a hard error).
+    pub fn default_models(self) -> &'static [&'static str] {
+        match self {
+            // `claude --model` accepts these aliases (claude 2.x); they span the capability tiers.
+            CliKind::ClaudeCode => &["opus", "sonnet", "haiku"],
+            // `codex --model` (codex 0.13x model picker). gpt-5.4-mini is the fast/cheap tier.
+            CliKind::Codex => &[
+                "gpt-5.5",
+                "gpt-5.3-codex",
+                "gpt-5.2",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+            ],
+        }
+    }
+
     /// How to tell the user to make this CLI usable.
     fn setup_hint(self) -> &'static str {
         match self {
@@ -98,12 +118,22 @@ fn binary_on_path(bin: &str) -> bool {
 
 /// Forge model ids for every CLI bridge whose CLI is installed — the always-available
 /// subscription models the mesh should fall back to (and prefer, being $0). Empty if none.
+///
+/// Each installed bridge contributes its bare default id (`claude-cli::`, the CLI's own configured
+/// default) plus one id per [`CliKind::default_models`] alias (`claude-cli::opus`, …) so the mesh
+/// has a model per tier rather than a single mid one. Callers that want a custom set per bridge
+/// should build ids from [`CliKind::default_models`] / a config override instead.
 pub fn available_bridge_models() -> Vec<String> {
-    CliKind::all()
-        .into_iter()
-        .filter(|k| k.available())
-        .map(|k| k.default_model_id())
-        .collect()
+    let mut out = Vec::new();
+    for k in CliKind::all().into_iter().filter(|k| k.available()) {
+        out.push(k.default_model_id());
+        out.extend(
+            k.default_models()
+                .iter()
+                .map(|m| format!("{}::{m}", k.prefix())),
+        );
+    }
+    out
 }
 
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
@@ -889,6 +919,26 @@ mod tests {
     fn default_model_id_is_the_bare_prefix() {
         assert_eq!(CliKind::ClaudeCode.default_model_id(), "claude-cli::");
         assert_eq!(CliKind::Codex.default_model_id(), "codex-cli::");
+    }
+
+    #[test]
+    fn default_models_span_tiers_and_namespace_under_the_prefix() {
+        // Each bridge exposes more than one model so the mesh can size a turn (haiku/mini ↔ opus).
+        let claude = CliKind::ClaudeCode.default_models();
+        assert!(
+            claude.contains(&"opus") && claude.contains(&"haiku"),
+            "{claude:?}"
+        );
+        let codex = CliKind::Codex.default_models();
+        assert!(
+            codex.contains(&"gpt-5.5") && codex.contains(&"gpt-5.4-mini"),
+            "{codex:?}"
+        );
+        // A model alias namespaces into a full Forge id under the bridge prefix.
+        assert_eq!(
+            format!("{}::{}", CliKind::ClaudeCode.prefix(), claude[0]),
+            "claude-cli::opus"
+        );
     }
 
     #[test]
