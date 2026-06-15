@@ -6,12 +6,12 @@
 //! a prompt and parses its stdout. See docs/features/provider-integrations.md (Part B) for the
 //! honest ToS analysis — this is opt-in and run at the user's discretion.
 //!
-//! v1 runs the CLIs **tool-disabled** (`claude --allowedTools ""`, `codex exec --sandbox
-//! read-only`) so they behave as a plain text-completion backend: Forge keeps its own mesh,
-//! permission engine, and tool loop around the turn. Consequences (documented non-goals): a
-//! CLI-bridge turn returns text only (no Forge-shaped tool calls), and each turn is a fresh
-//! invocation (no CLI session reuse). Subscription-billed, so usage costs $0 against Forge's
-//! USD budget.
+//! Phase 1 (RFC cli-bridge-full-harness) runs the CLIs as FULL agents (claude with
+//! `--permission-mode acceptEdits`, codex `exec --sandbox read-only`) and parses their rich
+//! event stream — thinking/reasoning, tool activity, and answer text — surfacing each as a
+//! [`StreamEvent`]. The CLI runs its own agent loop with its own tools (Forge owning the tools
+//! via an in-process MCP server is Phase 2). Each turn is a fresh invocation (no session reuse).
+//! Subscription-billed, so usage costs $0 against Forge's USD budget.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -22,7 +22,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 
-use crate::{ModelResponse, Provider, ProviderError, TextSink, ToolSpec};
+use crate::{EventSink, ModelResponse, Provider, ProviderError, StreamEvent, ToolSpec};
 
 /// Which official CLI to bridge to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,13 +119,13 @@ fn build_args(kind: CliKind, bare_model: &str, prompt: &str) -> Vec<String> {
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
-            // Tool-disabled: Forge runs its own tool loop; the CLI is a text backend only.
-            // `--tools ""` truly disables all tools (an empty `--allowedTools` does NOT —
-            // claude still uses Bash, then --max-turns 1 cuts it off as error_max_turns).
-            "--tools".into(),
-            "".into(),
-            "--max-turns".into(),
-            "1".into(),
+            // Phase 1 (RFC cli-bridge-full-harness): run claude as a FULL agent with its own
+            // tools so it can actually read/edit, and parse its rich event stream (thinking +
+            // tool activity + text). `acceptEdits` auto-allows read/edit without prompting
+            // (headless can't answer prompts); Forge's own permission gate arrives in Phase 2
+            // (Forge-tool MCP bridge). No secrets ever passed — the CLI owns its auth.
+            "--permission-mode".into(),
+            "acceptEdits".into(),
         ],
         CliKind::Codex => vec![
             "exec".into(),
@@ -174,17 +174,27 @@ fn render_prompt(messages: &[Message]) -> String {
     out
 }
 
-/// What one parsed JSON event line contributes. A line may carry text to stream, final usage,
-/// the authoritative final text, and/or an error — all optional.
-#[derive(Debug, Default, PartialEq)]
-struct LineOutcome {
-    /// Assistant text to append + stream now.
-    delta: Option<String>,
-    usage: Option<Usage>,
-    /// Authoritative final text (Claude's `result.result`); used only if nothing streamed.
-    final_text: Option<String>,
-    /// A terminal error reported by the CLI in-band.
-    error: Option<String>,
+/// One item extracted from a CLI event line. A single line may yield several (e.g. an
+/// assistant message with both thinking and a tool call). Control items (Usage/Final/Error)
+/// are handled by `complete`; the rest map to [`StreamEvent`]s.
+#[derive(Debug, PartialEq)]
+enum Parsed {
+    Reasoning(String),
+    Text(String),
+    ToolStarted {
+        id: String,
+        name: String,
+        args: String,
+    },
+    ToolFinished {
+        id: String,
+        ok: bool,
+        summary: String,
+    },
+    Usage(Usage),
+    /// Authoritative final answer (Claude's `result.result`); used if nothing streamed.
+    Final(String),
+    Error(String),
 }
 
 fn usage_from(v: &Value) -> Usage {
@@ -197,89 +207,151 @@ fn usage_from(v: &Value) -> Usage {
     }
 }
 
-/// Parse one Claude Code `--output-format stream-json` (NDJSON) line. Field-tolerant: unknown
-/// event types and unexpected shapes are ignored, so CLI version drift degrades gracefully.
-fn parse_claude_line(line: &str) -> LineOutcome {
+/// Parse one Claude Code `--output-format stream-json` (NDJSON) line into zero or more items.
+/// Field-tolerant: unknown event types and shapes are ignored, so CLI drift degrades gracefully.
+fn parse_claude_line(line: &str) -> Vec<Parsed> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return LineOutcome::default();
+        return Vec::new();
     };
+    let mut out = Vec::new();
     match v.get("type").and_then(Value::as_str) {
+        // assistant message: content blocks of thinking / text / tool_use.
         Some("assistant") => {
-            // message.content[] → concat the text blocks.
-            let text: String = v
+            if let Some(blocks) = v
                 .get("message")
                 .and_then(|m| m.get("content"))
                 .and_then(Value::as_array)
-                .map(|blocks| {
-                    blocks
-                        .iter()
-                        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                        .filter_map(|b| b.get("text").and_then(Value::as_str))
-                        .collect::<String>()
-                })
-                .unwrap_or_default();
-            LineOutcome {
-                delta: (!text.is_empty()).then_some(text),
-                ..Default::default()
+            {
+                for b in blocks {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("thinking") => {
+                            if let Some(t) = b.get("thinking").and_then(Value::as_str) {
+                                if !t.is_empty() {
+                                    out.push(Parsed::Reasoning(t.to_string()));
+                                }
+                            }
+                        }
+                        Some("text") => {
+                            if let Some(t) = b.get("text").and_then(Value::as_str) {
+                                if !t.is_empty() {
+                                    out.push(Parsed::Text(t.to_string()));
+                                }
+                            }
+                        }
+                        Some("tool_use") => {
+                            let id = b
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let name = b
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("tool")
+                                .to_string();
+                            let args = b.get("input").map(|i| i.to_string()).unwrap_or_default();
+                            out.push(Parsed::ToolStarted { id, name, args });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // user message: tool_result blocks (the outcome of a tool the agent ran).
+        Some("user") => {
+            if let Some(blocks) = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+            {
+                for b in blocks {
+                    if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                        let id = b
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let ok = !b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                        let summary = tool_result_summary(b.get("content"));
+                        out.push(Parsed::ToolFinished { id, ok, summary });
+                    }
+                }
             }
         }
         Some("result") => {
-            let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+            if let Some(u) = v.get("usage").map(usage_from) {
+                out.push(Parsed::Usage(u));
+            }
             let result_text = v.get("result").and_then(Value::as_str).map(str::to_string);
-            LineOutcome {
-                usage: v.get("usage").map(usage_from),
-                final_text: result_text.clone(),
-                error: is_error.then(|| {
+            if let Some(f) = &result_text {
+                out.push(Parsed::Final(f.clone()));
+            }
+            if v.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                out.push(Parsed::Error(
                     v.get("api_error_status")
                         .and_then(Value::as_str)
                         .map(str::to_string)
                         .or(result_text)
-                        .unwrap_or_else(|| "claude reported an error".into())
-                }),
-                ..Default::default()
+                        .unwrap_or_else(|| "claude reported an error".into()),
+                ));
             }
         }
-        _ => LineOutcome::default(),
+        _ => {}
     }
+    out
 }
 
-/// Parse one Codex `exec --json` (JSONL) line. Field-tolerant like the Claude parser.
-fn parse_codex_line(line: &str) -> LineOutcome {
+/// Collapse a tool_result `content` (string, or array of {type:text,text}) into a short summary.
+fn tool_result_summary(content: Option<&Value>) -> String {
+    let text = match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    let one_line = text.split('\n').next().unwrap_or("").trim();
+    one_line.chars().take(120).collect()
+}
+
+/// Parse one Codex `exec --json` (JSONL) line. Reasoning-item schema is best-effort.
+fn parse_codex_line(line: &str) -> Vec<Parsed> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return LineOutcome::default();
+        return Vec::new();
     };
     match v.get("type").and_then(Value::as_str) {
         Some("item.completed") => {
             let item = v.get("item");
-            let is_msg =
-                item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("agent_message");
+            let kind = item.and_then(|i| i.get("type")).and_then(Value::as_str);
             let text = item
                 .and_then(|i| i.get("text"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            LineOutcome {
-                delta: if is_msg { text } else { None },
-                ..Default::default()
+            match (kind, text) {
+                (Some("agent_message"), Some(t)) => vec![Parsed::Text(t)],
+                (Some("reasoning"), Some(t)) => vec![Parsed::Reasoning(t)],
+                _ => Vec::new(),
             }
         }
-        Some("turn.completed") => LineOutcome {
-            usage: v.get("usage").map(usage_from),
-            ..Default::default()
-        },
-        Some(t) if t.contains("error") || t.contains("failed") => LineOutcome {
-            error: Some(
-                v.get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("codex reported an error")
-                    .to_string(),
-            ),
-            ..Default::default()
-        },
-        _ => LineOutcome::default(),
+        Some("turn.completed") => v
+            .get("usage")
+            .map(usage_from)
+            .map(Parsed::Usage)
+            .into_iter()
+            .collect(),
+        Some(t) if t.contains("error") || t.contains("failed") => vec![Parsed::Error(
+            v.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("codex reported an error")
+                .to_string(),
+        )],
+        _ => Vec::new(),
     }
 }
 
-fn parse_line(kind: CliKind, line: &str) -> LineOutcome {
+fn parse_line(kind: CliKind, line: &str) -> Vec<Parsed> {
     match kind {
         CliKind::ClaudeCode => parse_claude_line(line),
         CliKind::Codex => parse_codex_line(line),
@@ -292,8 +364,8 @@ impl Provider for CliProvider {
         &self,
         model: &str,
         messages: &[Message],
-        _tools: &[ToolSpec], // intentionally ignored — v1 bridge is text-only (tool-disabled)
-        on_text: &mut TextSink<'_>,
+        _tools: &[ToolSpec], // Phase 1: the CLI uses its OWN tools (Forge-tool MCP bridge is Phase 2)
+        on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
         let prompt = render_prompt(messages);
         let args = build_args(self.kind, bare_model(model), &prompt);
@@ -327,23 +399,32 @@ impl Provider for CliProvider {
         let mut final_text: Option<String> = None;
         let mut usage = Usage::default();
         let mut in_band_error: Option<String> = None;
+        // tool_use id → name, so a later tool_result can be labelled.
+        let mut tool_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         let read = tokio::time::timeout(self.timeout, async {
             let mut lines = BufReader::new(stdout).lines();
             while let Some(line) = lines.next_line().await? {
-                let o = parse_line(self.kind, &line);
-                if let Some(d) = o.delta {
-                    content.push_str(&d);
-                    on_text(&d);
-                }
-                if let Some(u) = o.usage {
-                    usage = u;
-                }
-                if let Some(f) = o.final_text {
-                    final_text = Some(f);
-                }
-                if let Some(e) = o.error {
-                    in_band_error = Some(e);
+                for item in parse_line(self.kind, &line) {
+                    match item {
+                        Parsed::Reasoning(t) => on_event(StreamEvent::Reasoning(t)),
+                        Parsed::Text(t) => {
+                            content.push_str(&t);
+                            on_event(StreamEvent::Text(t));
+                        }
+                        Parsed::ToolStarted { id, name, args } => {
+                            tool_names.insert(id, name.clone());
+                            on_event(StreamEvent::ToolStarted { name, args });
+                        }
+                        Parsed::ToolFinished { id, ok, summary } => {
+                            let name = tool_names.get(&id).cloned().unwrap_or_default();
+                            on_event(StreamEvent::ToolFinished { name, ok, summary });
+                        }
+                        Parsed::Usage(u) => usage = u,
+                        Parsed::Final(f) => final_text = Some(f),
+                        Parsed::Error(e) => in_band_error = Some(e),
+                    }
                 }
             }
             Ok::<(), std::io::Error>(())
@@ -467,12 +548,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_args_are_tool_disabled_and_carry_no_secret() {
+    fn claude_args_run_a_full_agent_and_carry_no_secret() {
         let args = build_args(CliKind::ClaudeCode, "sonnet", "hi there");
-        assert!(args.contains(&"--tools".to_string()));
-        // tool list is the empty string right after the flag → all tools disabled
-        let i = args.iter().position(|a| a == "--tools").unwrap();
-        assert_eq!(args[i + 1], "");
+        // Phase 1: NOT tool-disabled — a full agent with acceptEdits.
+        assert!(!args.iter().any(|a| a == "--tools"));
+        let i = args.iter().position(|a| a == "--permission-mode").unwrap();
+        assert_eq!(args[i + 1], "acceptEdits");
         assert!(args.contains(&"stream-json".to_string()));
         assert_eq!(args.iter().filter(|a| *a == "hi there").count(), 1);
         assert!(args.contains(&"--model".to_string()) && args.contains(&"sonnet".to_string()));
@@ -509,95 +590,121 @@ mod tests {
         assert!(p.ends_with("User: explain x"));
     }
 
-    // --- Parser fixtures: real lines captured from claude 2.1.177 / codex-cli 0.130.0 ---
+    // --- Parser fixtures: real-shaped lines from claude 2.1.177 / codex-cli 0.130.0 ---
+
+    fn texts(items: &[Parsed]) -> String {
+        items
+            .iter()
+            .filter_map(|p| match p {
+                Parsed::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
-    fn claude_assistant_line_yields_streamed_text() {
-        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}],"usage":{"input_tokens":10,"output_tokens":2}}}"#;
-        let o = parse_claude_line(line);
-        assert_eq!(o.delta.as_deref(), Some("hello world"));
-        assert!(o.error.is_none());
+    fn claude_assistant_text_block_yields_text() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}]}}"#;
+        assert_eq!(texts(&parse_claude_line(line)), "hello world");
+    }
+
+    #[test]
+    fn claude_thinking_block_yields_reasoning() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"let me think"}]}}"#;
+        assert_eq!(
+            parse_claude_line(line),
+            vec![Parsed::Reasoning("let me think".into())]
+        );
+    }
+
+    #[test]
+    fn claude_tool_use_and_result_round_trip() {
+        let use_line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"x"}}]}}"#;
+        match &parse_claude_line(use_line)[0] {
+            Parsed::ToolStarted { id, name, args } => {
+                assert_eq!(id, "t1");
+                assert_eq!(name, "Read");
+                assert!(args.contains("\"path\""));
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+        let res_line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"file body"}]}}"#;
+        assert_eq!(
+            parse_claude_line(res_line),
+            vec![Parsed::ToolFinished {
+                id: "t1".into(),
+                ok: true,
+                summary: "file body".into()
+            }]
+        );
     }
 
     #[test]
     fn claude_result_line_yields_usage_and_final_text_zero_cost() {
         let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"hello","total_cost_usd":0.125,"usage":{"input_tokens":16612,"output_tokens":4}}"#;
-        let o = parse_claude_line(line);
-        let u = o.usage.expect("usage");
-        assert_eq!(u.input_tokens, 16612);
-        assert_eq!(u.output_tokens, 4);
-        assert_eq!(u.cost_usd, 0.0, "subscription-billed: $0 to Forge");
-        assert_eq!(o.final_text.as_deref(), Some("hello"));
-        assert!(o.error.is_none());
+        let items = parse_claude_line(line);
+        assert!(items.contains(&Parsed::Usage(Usage {
+            input_tokens: 16612,
+            output_tokens: 4,
+            cost_usd: 0.0
+        })));
+        assert!(items.contains(&Parsed::Final("hello".into())));
     }
 
     #[test]
     fn claude_system_and_noise_lines_are_ignored() {
-        assert_eq!(
-            parse_claude_line(r#"{"type":"system","subtype":"init"}"#),
-            LineOutcome::default()
-        );
-        assert_eq!(
-            parse_claude_line(r#"{"type":"rate_limit_event"}"#),
-            LineOutcome::default()
-        );
-        assert_eq!(parse_claude_line("not json at all"), LineOutcome::default());
+        assert!(parse_claude_line(r#"{"type":"system","subtype":"init"}"#).is_empty());
+        assert!(parse_claude_line(r#"{"type":"rate_limit_event"}"#).is_empty());
+        assert!(parse_claude_line("not json at all").is_empty());
     }
 
     #[test]
     fn claude_error_result_is_surfaced() {
         let line = r#"{"type":"result","is_error":true,"api_error_status":"overloaded"}"#;
-        let o = parse_claude_line(line);
-        assert_eq!(o.error.as_deref(), Some("overloaded"));
+        assert!(parse_claude_line(line).contains(&Parsed::Error("overloaded".into())));
     }
 
     #[test]
-    fn codex_agent_message_yields_text() {
-        let line = r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hello"}}"#;
-        let o = parse_codex_line(line);
-        assert_eq!(o.delta.as_deref(), Some("hello"));
+    fn codex_agent_message_yields_text_and_reasoning() {
+        let msg = r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hello"}}"#;
+        assert_eq!(texts(&parse_codex_line(msg)), "hello");
+        let reasoning =
+            r#"{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}"#;
+        assert_eq!(
+            parse_codex_line(reasoning),
+            vec![Parsed::Reasoning("thinking".into())]
+        );
     }
 
     #[test]
     fn codex_turn_completed_yields_usage_zero_cost() {
-        let line = r#"{"type":"turn.completed","usage":{"input_tokens":16927,"cached_input_tokens":3456,"output_tokens":23}}"#;
-        let o = parse_codex_line(line);
-        let u = o.usage.expect("usage");
-        assert_eq!(u.input_tokens, 16927);
-        assert_eq!(u.output_tokens, 23);
-        assert_eq!(u.cost_usd, 0.0);
+        let line = r#"{"type":"turn.completed","usage":{"input_tokens":16927,"output_tokens":23}}"#;
+        assert_eq!(
+            parse_codex_line(line),
+            vec![Parsed::Usage(Usage {
+                input_tokens: 16927,
+                output_tokens: 23,
+                cost_usd: 0.0
+            })]
+        );
     }
 
     #[test]
-    fn codex_non_message_items_and_lifecycle_are_ignored() {
-        assert_eq!(
-            parse_codex_line(r#"{"type":"thread.started","thread_id":"x"}"#),
-            LineOutcome::default()
-        );
-        assert_eq!(
-            parse_codex_line(r#"{"type":"turn.started"}"#),
-            LineOutcome::default()
-        );
-        // reasoning items carry text but aren't the assistant message → ignored
-        assert_eq!(
-            parse_codex_line(
-                r#"{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}"#
-            ),
-            LineOutcome::default()
-        );
+    fn codex_lifecycle_lines_are_ignored() {
+        assert!(parse_codex_line(r#"{"type":"thread.started","thread_id":"x"}"#).is_empty());
+        assert!(parse_codex_line(r#"{"type":"turn.started"}"#).is_empty());
     }
 
     #[tokio::test]
     async fn missing_binary_is_a_clean_error_not_a_hang() {
         let provider = CliProvider::claude_code().with_binary("forge-no-such-cli-xyz");
-        let mut sink = String::new();
-        let mut on_text = |s: &str| sink.push_str(s);
+        let mut on_event = |_: StreamEvent| {};
         let err = provider
             .complete(
                 "claude-cli::sonnet",
                 &[Message::user("hi")],
                 &[],
-                &mut on_text,
+                &mut on_event,
             )
             .await
             .expect_err("missing binary must error");
@@ -611,26 +718,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn streams_and_parses_a_faked_claude_stream() {
-        // A fake `claude` that emits two real-shaped NDJSON lines, ignoring its args.
+    async fn streams_thinking_text_and_tools_from_a_faked_claude_stream() {
+        // A fake `claude` emitting thinking + a tool use/result + text, ignoring its args.
         let fake = make_fake_cli(
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"streamed "}]}}
-{"type":"result","is_error":false,"result":"streamed answer","usage":{"input_tokens":5,"output_tokens":3}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"planning"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"x"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"body"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"the answer"}]}}
+{"type":"result","is_error":false,"result":"the answer","usage":{"input_tokens":5,"output_tokens":3}}"#,
         );
         let provider = CliProvider::claude_code().with_binary(&fake);
-        let mut sink = String::new();
-        let mut on_text = |s: &str| sink.push_str(s);
+        let mut events: Vec<StreamEvent> = Vec::new();
+        let mut on_event = |ev: StreamEvent| events.push(ev);
         let res = provider
             .complete(
                 "claude-cli::sonnet",
                 &[Message::user("hi")],
                 &[],
-                &mut on_text,
+                &mut on_event,
             )
             .await
             .expect("fake stream parses");
-        assert_eq!(sink, "streamed ", "assistant text streamed to the sink");
-        assert_eq!(res.content, "streamed ");
+
+        assert!(events.contains(&StreamEvent::Reasoning("planning".into())));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolStarted { name, .. } if name == "Read")));
+        assert!(events.iter().any(
+            |e| matches!(e, StreamEvent::ToolFinished { name, ok, .. } if name == "Read" && *ok)
+        ));
+        assert!(events.contains(&StreamEvent::Text("the answer".into())));
+        assert_eq!(res.content, "the answer", "content is the answer text only");
         assert_eq!(res.usage.input_tokens, 5);
         assert_eq!(res.usage.cost_usd, 0.0);
         assert!(res.tool_calls.is_empty());
@@ -641,14 +759,13 @@ mod tests {
     async fn nonzero_exit_with_no_output_reports_auth_hint() {
         let fake = make_fake_cli_exit("", 1);
         let provider = CliProvider::codex().with_binary(&fake);
-        let mut sink = String::new();
-        let mut on_text = |s: &str| sink.push_str(s);
+        let mut on_event = |_: StreamEvent| {};
         let err = provider
             .complete(
                 "codex-cli::gpt-5",
                 &[Message::user("hi")],
                 &[],
-                &mut on_text,
+                &mut on_event,
             )
             .await
             .expect_err("nonzero exit, no output → error");

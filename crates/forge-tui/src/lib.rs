@@ -29,6 +29,8 @@ pub enum PresenterEvent {
     AssistantText(String),
     /// A streamed fragment of the assistant's reply (tokens as they arrive).
     AssistantDelta(String),
+    /// A streamed fragment of the model's reasoning/thinking (shown live, dim; not the answer).
+    Reasoning(String),
     /// The assistant's streamed reply for this step is complete.
     AssistantDone,
     /// A non-fatal advisory (e.g. budget threshold reached).
@@ -101,6 +103,11 @@ impl Presenter for HeadlessPresenter {
             }
             PresenterEvent::AssistantDelta(delta) => {
                 print!("{delta}");
+                let _ = std::io::stdout().flush();
+            }
+            PresenterEvent::Reasoning(delta) => {
+                // Dim so reasoning is visually distinct from the answer.
+                print!("\x1b[2m{delta}\x1b[0m");
                 let _ = std::io::stdout().flush();
             }
             PresenterEvent::AssistantDone => {

@@ -4,7 +4,7 @@
 //! leaves the machine. This exercises the streaming/usage/tool-call branches that the
 //! `MockProvider` tests cannot reach.
 
-use forge_provider::{GenAiProvider, Provider, ProviderError, ToolSpec};
+use forge_provider::{GenAiProvider, Provider, ProviderError, StreamEvent, ToolSpec};
 use forge_types::Message;
 use genai::resolver::{AuthData, Endpoint};
 use genai::{Client, ServiceTarget};
@@ -46,7 +46,11 @@ async fn streaming_accumulates_deltas_and_usage() {
             "openai::gpt-4o-mini",
             &[Message::user("hi")],
             &[],
-            &mut |d| sink.push_str(d),
+            &mut |ev| {
+                if let StreamEvent::Text(t) = ev {
+                    sink.push_str(&t)
+                }
+            },
         )
         .await
         .expect("complete should succeed against the mock");

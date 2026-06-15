@@ -12,7 +12,7 @@ use genai::chat::{
 };
 use genai::Client;
 
-use crate::{ModelResponse, Provider, ProviderError, TextSink, ToolSpec};
+use crate::{EventSink, ModelResponse, Provider, ProviderError, StreamEvent, ToolSpec};
 
 #[derive(Default)]
 pub struct GenAiProvider {
@@ -100,7 +100,7 @@ impl Provider for GenAiProvider {
         model: &str,
         messages: &[Message],
         tools: &[ToolSpec],
-        on_text: &mut TextSink<'_>,
+        on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
         let model_name = to_genai_model(model);
 
@@ -130,7 +130,11 @@ impl Provider for GenAiProvider {
             match event.map_err(|e| ProviderError::Request(e.to_string()))? {
                 ChatStreamEvent::Chunk(chunk) => {
                     content.push_str(&chunk.content);
-                    on_text(&chunk.content);
+                    on_event(StreamEvent::Text(chunk.content.clone()));
+                }
+                ChatStreamEvent::ReasoningChunk(chunk) => {
+                    // Extended-thinking delta: streamed for display, not part of the answer.
+                    on_event(StreamEvent::Reasoning(chunk.content.clone()));
                 }
                 ChatStreamEvent::End(end) => {
                     if let Some(u) = &end.captured_usage {
@@ -144,7 +148,7 @@ impl Provider for GenAiProvider {
                     if content.is_empty() {
                         if let Some(text) = end.captured_first_text() {
                             content.push_str(text);
-                            on_text(text);
+                            on_event(StreamEvent::Text(text.to_string()));
                         }
                     }
                     if let Some(tcs) = end.captured_into_tool_calls() {

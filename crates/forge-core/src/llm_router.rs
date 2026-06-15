@@ -55,7 +55,7 @@ fn parse_tier(text: &str) -> Option<TaskTier> {
 impl Router for LlmRouter {
     async fn route(&self, prompt: &str, budget: BudgetState) -> RoutingDecision {
         let messages = [Message::system(CLASSIFY_SYSTEM), Message::user(prompt)];
-        let mut sink = |_: &str| {}; // classification output isn't streamed to the user
+        let mut sink = |_: forge_provider::StreamEvent| {}; // classifier output isn't shown
 
         let tier = match tokio::time::timeout(
             CLASSIFY_TIMEOUT,
@@ -89,7 +89,7 @@ impl Router for LlmRouter {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use forge_provider::{ModelResponse, ProviderError, TextSink, ToolSpec};
+    use forge_provider::{EventSink, ModelResponse, ProviderError, ToolSpec};
 
     /// A provider that returns a fixed classification reply, or an error.
     struct FakeProvider(Result<String, ()>);
@@ -101,7 +101,7 @@ mod tests {
             _model: &str,
             _messages: &[Message],
             _tools: &[ToolSpec],
-            _on_text: &mut TextSink<'_>,
+            _on_event: &mut EventSink<'_>,
         ) -> Result<ModelResponse, ProviderError> {
             match &self.0 {
                 Ok(text) => Ok(ModelResponse {

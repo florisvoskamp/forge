@@ -68,6 +68,8 @@ pub struct App {
     pub input: String,
     /// The current *partial* (un-flushed, newline-free) line of the streaming reply.
     pub streaming: String,
+    /// Accumulated reasoning/thinking text, flushed as a dim block before the answer.
+    reasoning: String,
     /// True once the `⚒ forge` header for the in-flight reply has been flushed.
     streaming_active: bool,
     /// True while a turn is running (drives the thinking spinner).
@@ -139,8 +141,10 @@ impl App {
                 self.flush.extend(crate::render::markdown_to_lines(&text));
                 self.flush.push(TextLine::default());
             }
+            PresenterEvent::Reasoning(delta) => self.reasoning.push_str(&delta),
             PresenterEvent::AssistantDelta(delta) => {
                 if !self.streaming_active {
+                    self.flush_reasoning();
                     self.flush.push(header_line("⚒ forge", ORANGE));
                     self.streaming_active = true;
                 }
@@ -157,6 +161,9 @@ impl App {
                     }
                     self.flush.push(TextLine::default());
                     self.streaming_active = false;
+                } else {
+                    // Reasoning arrived but no answer text streamed — still show the thinking.
+                    self.flush_reasoning();
                 }
             }
             PresenterEvent::Warning(msg) => self.flush.push(warning_line(&msg)),
@@ -173,6 +180,22 @@ impl App {
             }
             PresenterEvent::Done { .. } => self.done = true,
         }
+    }
+
+    /// Flush accumulated reasoning into scrollback as a dim "thinking" block (once), if any.
+    fn flush_reasoning(&mut self) {
+        if self.reasoning.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.reasoning);
+        let dim = Style::default().fg(DIM);
+        self.flush
+            .push(TextLine::from(Span::styled("✱ thinking", dim)));
+        for l in text.lines() {
+            self.flush
+                .push(TextLine::from(Span::styled(l.to_string(), dim)));
+        }
+        self.flush.push(TextLine::default());
     }
 
     /// Echo a just-submitted user message into scrollback.

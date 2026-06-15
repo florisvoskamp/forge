@@ -8,16 +8,15 @@ use async_trait::async_trait;
 use forge_types::{new_id, Message, Role, ToolCall, Usage};
 use serde_json::json;
 
-use crate::{ModelResponse, Provider, ProviderError, TextSink, ToolSpec};
+use crate::{EventSink, ModelResponse, Provider, ProviderError, StreamEvent, ToolSpec};
 
 #[derive(Debug, Default)]
 pub struct MockProvider;
 
 /// Emit `text` to the sink word by word, simulating streaming.
-fn stream_words(text: &str, on_text: &mut TextSink<'_>) {
-    for (i, word) in text.split_inclusive(' ').enumerate() {
-        let _ = i;
-        on_text(word);
+fn stream_words(text: &str, on_event: &mut EventSink<'_>) {
+    for word in text.split_inclusive(' ') {
+        on_event(StreamEvent::Text(word.to_string()));
     }
 }
 
@@ -28,13 +27,13 @@ impl Provider for MockProvider {
         _model: &str,
         messages: &[Message],
         _tools: &[ToolSpec],
-        on_text: &mut TextSink<'_>,
+        on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
         let already_used_tool = messages.iter().any(|m| m.role == Role::Tool);
 
         if already_used_tool {
             let content = "Done — I read the project manifest and the workspace looks healthy.";
-            stream_words(content, on_text);
+            stream_words(content, on_event);
             Ok(ModelResponse {
                 content: content.to_string(),
                 tool_calls: vec![],
@@ -46,7 +45,7 @@ impl Provider for MockProvider {
             })
         } else {
             let content = "Let me inspect the project manifest.";
-            stream_words(content, on_text);
+            stream_words(content, on_event);
             Ok(ModelResponse {
                 content: content.to_string(),
                 tool_calls: vec![ToolCall {
@@ -102,14 +101,16 @@ mod tests {
         let p = MockProvider;
         let mut streamed = String::new();
         let res = p
-            .complete("mock", &[Message::user("check it")], &[], &mut |d| {
-                streamed.push_str(d)
+            .complete("mock", &[Message::user("check it")], &[], &mut |ev| {
+                if let StreamEvent::Text(t) = ev {
+                    streamed.push_str(&t)
+                }
             })
             .await
             .unwrap();
         assert_eq!(
             streamed, res.content,
-            "streamed deltas reconstruct the full content"
+            "streamed text deltas reconstruct the full content"
         );
     }
 }

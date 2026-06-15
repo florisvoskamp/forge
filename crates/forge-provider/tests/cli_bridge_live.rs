@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use forge_provider::{CliProvider, Provider};
+use forge_provider::{CliProvider, Provider, StreamEvent};
 use forge_types::Message;
 
 fn enabled() -> bool {
@@ -24,7 +24,11 @@ async fn claude_cli_round_trips_text() {
     }
     let provider = CliProvider::claude_code().with_timeout(Duration::from_secs(120));
     let mut streamed = String::new();
-    let mut on_text = |s: &str| streamed.push_str(s);
+    let mut on_text = |ev: StreamEvent| {
+        if let StreamEvent::Text(t) = ev {
+            streamed.push_str(&t)
+        }
+    };
     let res = provider
         .complete(
             "claude-cli::",
@@ -53,7 +57,11 @@ async fn codex_cli_round_trips_text() {
     }
     let provider = CliProvider::codex().with_timeout(Duration::from_secs(120));
     let mut streamed = String::new();
-    let mut on_text = |s: &str| streamed.push_str(s);
+    let mut on_text = |ev: StreamEvent| {
+        if let StreamEvent::Text(t) = ev {
+            streamed.push_str(&t)
+        }
+    };
     let res = provider
         .complete(
             "codex-cli::",

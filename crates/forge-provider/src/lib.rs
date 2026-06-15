@@ -44,21 +44,40 @@ impl ModelResponse {
     }
 }
 
-/// A sink for streamed assistant text deltas (lets the UI animate tokens as they arrive).
-pub type TextSink<'a> = dyn FnMut(&str) + Send + 'a;
+/// A streamed event produced by a provider during a completion. Lets the UI animate not just
+/// the answer but the model's *reasoning* and (for the agentic CLI bridge) its tool activity.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamEvent {
+    /// A delta of the assistant's answer text (accumulates into [`ModelResponse::content`]).
+    Text(String),
+    /// A delta of the model's reasoning/thinking — shown live but NOT part of the final answer.
+    Reasoning(String),
+    /// The agent started a tool call. Emitted by the CLI bridge, whose agent loop runs tools
+    /// itself; genai providers leave tool execution to forge-core and don't emit this.
+    ToolStarted { name: String, args: String },
+    /// A tool call finished (CLI bridge only).
+    ToolFinished {
+        name: String,
+        ok: bool,
+        summary: String,
+    },
+}
+
+/// A sink for [`StreamEvent`]s as they arrive (text, reasoning, tool activity).
+pub type EventSink<'a> = dyn FnMut(StreamEvent) + Send + 'a;
 
 /// A model backend. Implement this trait (and nothing in the core) to add a provider.
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Run one completion against `model` given the transcript and the available tools.
-    /// Streamed text is delivered to `on_text` as it arrives; the full text is also
-    /// returned in [`ModelResponse::content`].
+    /// Streamed events (text, reasoning, tool activity) are delivered to `on_event` as they
+    /// arrive; the full answer text is also returned in [`ModelResponse::content`].
     async fn complete(
         &self,
         model: &str,
         messages: &[Message],
         tools: &[ToolSpec],
-        on_text: &mut TextSink<'_>,
+        on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError>;
 }
 
@@ -108,20 +127,20 @@ impl Provider for DispatchProvider {
         model: &str,
         messages: &[Message],
         tools: &[ToolSpec],
-        on_text: &mut TextSink<'_>,
+        on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
         if model.starts_with("claude-cli::") {
             self.cli_notice();
             self.claude_cli
-                .complete(model, messages, tools, on_text)
+                .complete(model, messages, tools, on_event)
                 .await
         } else if model.starts_with("codex-cli::") {
             self.cli_notice();
             self.codex_cli
-                .complete(model, messages, tools, on_text)
+                .complete(model, messages, tools, on_event)
                 .await
         } else {
-            self.genai.complete(model, messages, tools, on_text).await
+            self.genai.complete(model, messages, tools, on_event).await
         }
     }
 }

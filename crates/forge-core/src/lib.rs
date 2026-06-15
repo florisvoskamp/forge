@@ -6,7 +6,7 @@
 use forge_config::Config;
 use forge_mesh::pricing::Pricing;
 use forge_mesh::{BudgetState, BudgetStatus, Router};
-use forge_provider::{Provider, ToolSpec};
+use forge_provider::{Provider, StreamEvent, ToolSpec};
 use forge_store::Store;
 use forge_tools::ToolRegistry;
 use forge_tui::{Presenter, PresenterEvent};
@@ -261,8 +261,19 @@ impl Session {
                         &decision.model,
                         &self.transcript,
                         &specs,
-                        &mut |delta: &str| {
-                            presenter.emit(PresenterEvent::AssistantDelta(delta.to_string()));
+                        &mut |ev: StreamEvent| match ev {
+                            StreamEvent::Text(t) => {
+                                presenter.emit(PresenterEvent::AssistantDelta(t))
+                            }
+                            StreamEvent::Reasoning(t) => {
+                                presenter.emit(PresenterEvent::Reasoning(t))
+                            }
+                            StreamEvent::ToolStarted { name, args } => {
+                                presenter.emit(PresenterEvent::ToolStart { name, args })
+                            }
+                            StreamEvent::ToolFinished { name, ok, summary } => {
+                                presenter.emit(PresenterEvent::ToolResult { name, ok, summary })
+                            }
                         },
                     )
                     .await?;
