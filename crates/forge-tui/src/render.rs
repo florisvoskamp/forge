@@ -243,6 +243,62 @@ pub fn task_list_lines(tasks: &[forge_types::TodoItem]) -> Vec<Line<'static>> {
     out
 }
 
+/// Render the MCP server listing (`/mcp`) as styled scrollback lines: a status glyph per server,
+/// its transport, and tool/resource/prompt counts (mcp-client.md §5.7).
+pub fn mcp_status_lines(servers: &[forge_types::McpServerLine]) -> Vec<Line<'static>> {
+    if servers.is_empty() {
+        return vec![Line::from(Span::styled(
+            "  ⚒ no MCP servers configured — declare them in .forge/mcp.toml (or `forge mcp import`)"
+                .to_string(),
+            Style::default().fg(DIM),
+        ))];
+    }
+    let mut out = vec![Line::from(Span::styled(
+        format!("  ⚒ MCP servers  ({} configured)", servers.len()),
+        Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+    ))];
+    for s in servers {
+        let (glyph, color) = match s.status.as_str() {
+            "connected" => ("●", OKGREEN),
+            "slow" => ("●", ORANGE),
+            "reconnecting" => ("↻", ORANGE),
+            "failed" | "unauthorized" => ("○", ERRRED),
+            _ => ("○", DIM), // disabled / unknown
+        };
+        let mut spans = vec![
+            Span::styled(format!("    {glyph} "), Style::default().fg(color)),
+            Span::styled(
+                format!("{:<12}", s.name),
+                Style::default().fg(CODEFG).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<13}{:<6}", s.status, s.transport),
+                Style::default().fg(color),
+            ),
+            Span::styled(
+                format!(
+                    "{} tools · {} resources · {} prompts",
+                    s.tools, s.resources, s.prompts
+                ),
+                Style::default().fg(DIM),
+            ),
+        ];
+        if let Some(detail) = &s.detail {
+            spans.push(Span::styled(
+                format!("   {detail}"),
+                Style::default().fg(ERRRED),
+            ));
+        }
+        out.push(Line::from(spans));
+    }
+    out.push(Line::from(Span::styled(
+        "    tools load on demand — mcp_search_tools finds one, then it's exposed to the model."
+            .to_string(),
+        Style::default().fg(DIM),
+    )));
+    out
+}
+
 /// Render an [`AssayReport`](forge_types::AssayReport) as styled lines for the TUI scrollback:
 /// a colored summary header, then each ranked finding with severity-colored gutter, location,
 /// title, why, and suggested fix.

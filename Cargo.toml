@@ -16,6 +16,7 @@ description = "Fast, model-agnostic AI coding harness and CLI in Rust."
 forge-types = { path = "crates/forge-types", version = "0.1.0" }
 forge-config = { path = "crates/forge-config", version = "0.1.0" }
 forge-core = { path = "crates/forge-core", version = "0.1.0" }
+forge-mcp = { path = "crates/forge-mcp", version = "0.1.0" }
 forge-mesh = { path = "crates/forge-mesh", version = "0.1.0" }
 forge-provider = { path = "crates/forge-provider", version = "0.1.0" }
 forge-store = { path = "crates/forge-store", version = "0.1.0" }

@@ -278,6 +278,10 @@ impl App {
                 self.flush.extend(crate::render::task_list_lines(&tasks));
                 self.flush.push(TextLine::default());
             }
+            PresenterEvent::McpStatus(servers) => {
+                self.flush.extend(crate::render::mcp_status_lines(&servers));
+                self.flush.push(TextLine::default());
+            }
             PresenterEvent::Done { .. } => self.done = true,
         }
     }

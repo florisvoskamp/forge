@@ -29,6 +29,9 @@ a budget; Forge stays under it.
 - **Model Mesh** — automatic cost × capability routing with live cost metering.
 - **Native Rust** — sub-millisecond startup, single static binary, no runtime.
 - **Beautiful TUI** — `ratatui`-based live agent progress, cost meter, routing decisions.
+- **MCP client** — connect external MCP servers (stdio + HTTP/SSE) and drive their tools
+  through Forge's permission gate; declare them in `.forge/mcp.toml` or `forge mcp import`
+  a Claude-Code `.mcp.json`. `forge mcp` / `/mcp` list status; tools load on demand.
 - **Local-first** — SQLite session state, no cloud account required to run.
 
 The full vision (semantic code memory, multi-agent orchestration, MCP, marketplace,

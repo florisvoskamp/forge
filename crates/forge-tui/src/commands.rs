@@ -49,6 +49,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/config",
     },
     Command {
+        name: "mcp",
+        desc: "list connected MCP servers (or one server's tools: /mcp <server>)",
+        usage: "/mcp [server]",
+    },
+    Command {
         name: "new",
         desc: "start a fresh session",
         usage: "/new",
@@ -91,6 +96,8 @@ pub enum CommandAction {
     ListModels,
     /// Open the interactive config wizard (`/config`) — set provider/search keys + plans.
     Config,
+    /// List connected MCP servers (`/mcp`), or one server's full tool list (`/mcp <server>`).
+    Mcp(Option<String>),
     New,
     ClearScreen,
     /// Open the operating-mode (temper) picker.
@@ -128,6 +135,7 @@ pub fn parse_command(line: &str) -> CommandAction {
         }
         "models" | "mc" => CommandAction::ListModels,
         "config" | "cfg" | "settings" => CommandAction::Config,
+        "mcp" => CommandAction::Mcp((!arg.is_empty()).then_some(arg)),
         "new" | "n" => CommandAction::New,
         "mode" | "m" | "temper" => CommandAction::Mode,
         "assay" | "analyze" | "analyse" => CommandAction::Assay,
@@ -389,6 +397,11 @@ mod tests {
         assert_eq!(parse_command("/config"), CommandAction::Config);
         assert_eq!(parse_command("/cfg"), CommandAction::Config);
         assert_eq!(parse_command("/settings"), CommandAction::Config);
+        assert_eq!(parse_command("/mcp"), CommandAction::Mcp(None));
+        assert_eq!(
+            parse_command("/mcp gitlab"),
+            CommandAction::Mcp(Some("gitlab".into()))
+        );
     }
 
     #[test]

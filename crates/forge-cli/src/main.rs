@@ -97,6 +97,26 @@ enum Command {
     /// Interactive first-run setup: enable providers (enter API keys) and declare which
     /// subscription plan backs each installed CLI bridge, so the mesh knows your usage headroom.
     Init,
+    /// Connect to the configured MCP servers and show their status (or one server's tools, or
+    /// import a Claude-Code `.mcp.json`).
+    Mcp {
+        #[command(subcommand)]
+        cmd: Option<McpCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Show the full discovered tool list for one connected server.
+    Tools {
+        /// Server name (as declared in `.forge/mcp.toml`).
+        server: String,
+    },
+    /// Import a Claude-Code-style `.mcp.json` into `.forge/mcp.toml` (secrets are NOT copied).
+    Import {
+        /// Path to the `.mcp.json` (default: `./.mcp.json`).
+        path: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -198,6 +218,7 @@ async fn main() -> Result<()> {
         Command::Models { probe } => models(probe).await,
         Command::Auth { provider } => auth(&provider),
         Command::Init => init(),
+        Command::Mcp { cmd } => mcp_cmd(cmd).await,
         Command::McpServe => mcp_serve::run().await,
     }
 }
@@ -780,6 +801,76 @@ async fn probe_models(
     Ok(())
 }
 
+/// `forge mcp [tools <server> | import [path]]` — connect to the configured MCP servers and show
+/// their status, list one server's tools, or import a Claude-Code `.mcp.json`.
+async fn mcp_cmd(cmd: Option<McpCmd>) -> Result<()> {
+    // Import doesn't need any connection — translate the JSON and write `.forge/mcp.toml`.
+    if let Some(McpCmd::Import { path }) = &cmd {
+        let src = path.clone().unwrap_or_else(|| ".mcp.json".to_string());
+        let (imported, warnings) = forge_config::import_mcp_json(std::path::Path::new(&src))
+            .with_context(|| format!("importing {src}"))?;
+        let out = std::path::Path::new(".forge/mcp.toml");
+        forge_config::write_mcp_toml(out, &imported).context("writing .forge/mcp.toml")?;
+        println!(
+            "✓ imported {} server(s) from {src} → {}",
+            imported.servers.len(),
+            out.display()
+        );
+        for w in &warnings {
+            println!("  ⚠ {w}");
+        }
+        if !warnings.is_empty() {
+            println!("  (secrets are never written to TOML — set token_env/keyring per ADR-0007)");
+        }
+        return Ok(());
+    }
+
+    forge_config::inject_provider_keys();
+    let config = forge_config::load().unwrap_or_default();
+    if let Err(e) = config.mcp.validate() {
+        anyhow::bail!("{e}");
+    }
+    if config.mcp.active_servers().next().is_none() {
+        println!("no MCP servers configured. Declare them in .forge/mcp.toml, or run `forge mcp import`.");
+        return Ok(());
+    }
+
+    let manager = forge_mcp::McpManager::connect_all(&config.mcp).await;
+    match cmd {
+        Some(McpCmd::Tools { server }) => {
+            let tools = manager.tool_lines(&server);
+            if tools.is_empty() {
+                println!("no tools for server '{server}' (not connected, or it exposes none)");
+            } else {
+                println!("{} tool(s) on '{server}':", tools.len());
+                for (name, desc) in tools {
+                    println!("  {name} — {desc}");
+                }
+            }
+        }
+        _ => {
+            let lines = manager.status_lines();
+            println!("MCP servers ({} configured)", lines.len());
+            for s in &lines {
+                let detail = s
+                    .detail
+                    .as_deref()
+                    .map(|d| format!("  {d}"))
+                    .unwrap_or_default();
+                println!(
+                    "  {:<12} {:<13} {:<6} {} tools · {} resources · {} prompts{detail}",
+                    s.name, s.status, s.transport, s.tools, s.resources, s.prompts
+                );
+            }
+            println!(
+                "\ntools load on demand — `forge mcp tools <server>` to see a server's full list."
+            );
+        }
+    }
+    manager.shutdown().await;
+    Ok(())
+}
+
 async fn build_session_with(
     presenter: Box<dyn Presenter>,
     mock: bool,
@@ -796,6 +887,10 @@ async fn build_session_with(
     if let Some(m) = mode {
         config.permission_mode = m.into();
     }
+    // Capture the MCP config before `config` is moved into the Session; connect after the session
+    // is built so its presenter can show the connection status.
+    let mcp_config = config.mcp.clone();
+    let config_has_mcp = mcp_config.active_servers().next().is_some();
 
     let store = Arc::new(open_store()?);
     // Startup hint: if models are benched from a prior run/probe, tell the user how to recheck
@@ -833,6 +928,15 @@ async fn build_session_with(
         }
     };
     session.set_catalog(catalog);
+
+    // Connect external MCP servers (mcp-client.md). Skipped for the offline mock. Per-server
+    // failures are isolated inside connect_all (each lands `failed` with a reason); we surface the
+    // whole listing once so connection state — including failures — is visible at startup.
+    if !mock && config_has_mcp {
+        let manager = std::sync::Arc::new(forge_mcp::McpManager::connect_all(&mcp_config).await);
+        session.set_mcp(Some(manager));
+        session.announce_mcp();
+    }
     Ok(session)
 }
 
@@ -1453,6 +1557,23 @@ async fn dispatch_command(
                     outcome.keys.len(),
                     outcome.plans.len()
                 ));
+            }
+        }
+        CommandAction::Mcp(server) => {
+            let s = session.lock().await;
+            match server {
+                Some(srv) => {
+                    let tools = s.mcp_tool_lines(&srv);
+                    if tools.is_empty() {
+                        app.note(&format!("no tools for MCP server '{srv}' (not connected?)"));
+                    } else {
+                        app.note(&format!("{} tool(s) on '{srv}':", tools.len()));
+                        for (name, desc) in tools {
+                            app.note(&format!("  {name} — {desc}"));
+                        }
+                    }
+                }
+                None => app.apply(forge_tui::PresenterEvent::McpStatus(s.mcp_status())),
             }
         }
         // `/undo` and `/checkpoints` both open the same interactive picker over the per-turn

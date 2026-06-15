@@ -71,6 +71,9 @@ pub struct Session {
     catalog: Option<ModelCatalog>,
     /// The agent's task list (the `update_tasks` tool), rehydrated from the store on resume.
     tasks: Vec<forge_types::TodoItem>,
+    /// Connected external MCP servers (mcp-client.md). `None` when no servers are configured —
+    /// the whole MCP path is then inert (zero overhead for non-MCP users).
+    mcp: Option<Arc<forge_mcp::McpManager>>,
 }
 
 impl Session {
@@ -170,6 +173,7 @@ impl Session {
             current_turn_seq: 0,
             catalog: None,
             tasks,
+            mcp: None,
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -188,6 +192,39 @@ impl Session {
     /// The discovered model catalog, if auto-discovery ran for this session.
     pub fn catalog(&self) -> Option<&ModelCatalog> {
         self.catalog.as_ref()
+    }
+
+    /// Attach connected MCP servers (composition root). Their tools become advertisable via
+    /// `tool_specs` and callable through `invoke_tool`, gated by the permission broker.
+    pub fn set_mcp(&mut self, mcp: Option<Arc<forge_mcp::McpManager>>) {
+        // An empty manager (no servers connected) adds nothing — keep it `None` so the path stays
+        // fully inert and `tool_specs` is byte-for-byte unchanged.
+        self.mcp = mcp.filter(|m| !m.is_empty());
+    }
+
+    /// Per-server MCP status for the `/mcp` listing (empty when no servers are configured).
+    pub fn mcp_status(&self) -> Vec<forge_types::McpServerLine> {
+        self.mcp
+            .as_ref()
+            .map(|m| m.status_lines())
+            .unwrap_or_default()
+    }
+
+    /// Emit the current MCP server listing to the presenter (called once at startup so connection
+    /// status — including any failures — is visible). No-op when no servers are configured.
+    pub fn announce_mcp(&mut self) {
+        if self.mcp.is_some() {
+            let lines = self.mcp_status();
+            self.presenter.emit(PresenterEvent::McpStatus(lines));
+        }
+    }
+
+    /// The full discovered tool list for one MCP server (`forge mcp --tools <server>`).
+    pub fn mcp_tool_lines(&self, server: &str) -> Vec<(String, String)> {
+        self.mcp
+            .as_ref()
+            .map(|m| m.tool_lines(server))
+            .unwrap_or_default()
     }
 
     /// The pricing table in effect (bundled defaults + config overrides), for cost display.
@@ -449,6 +486,15 @@ impl Session {
         specs.push(ask_user_spec());
         // The task-tracking tool — always advertised so the model can keep a live todo list.
         specs.push(update_tasks_spec());
+        // External MCP servers: the meta-tools (search/expose/resources/prompt) + any exposed
+        // server tools (deferred loading keeps this bounded). Empty unless servers are connected.
+        if let Some(mcp) = &self.mcp {
+            specs.extend(mcp.advertised_specs().into_iter().map(|s| ToolSpec {
+                name: s.name,
+                description: s.description,
+                schema: s.schema,
+            }));
+        }
         specs
     }
 
@@ -728,6 +774,11 @@ impl Session {
         if call.name == UPDATE_TASKS_TOOL {
             return self.update_tasks(msg_id, call);
         }
+        // External MCP tools (meta-tools + exposed server tools) are owned by the manager, not the
+        // built-in registry. Route them here, still through the permission broker (mcp-client.md).
+        if self.mcp.as_ref().is_some_and(|m| m.knows_tool(&call.name)) {
+            return self.invoke_mcp(msg_id, call).await;
+        }
 
         let args_json = serde_json::to_string(&call.args)?;
 
@@ -814,6 +865,55 @@ impl Session {
             if ok { "ok" } else { "error" },
         )?;
 
+        Ok(result)
+    }
+
+    /// Run an MCP (meta-)tool call through the permission broker and the manager. Every MCP call
+    /// is `SideEffect::External` (the local catalog meta-tools are `ReadOnly`); the broker decides
+    /// allow/ask/deny exactly as for built-in tools, and the call is recorded for audit.
+    async fn invoke_mcp(
+        &mut self,
+        msg_id: &str,
+        call: &forge_types::ToolCall,
+    ) -> Result<String, CoreError> {
+        let mcp = self
+            .mcp
+            .clone()
+            .expect("invoke_mcp only called when mcp is Some");
+        let args_json = serde_json::to_string(&call.args)?;
+        let side_effect = mcp.side_effect_of(&call.name);
+        self.presenter.emit(PresenterEvent::ToolStart {
+            name: call.name.clone(),
+            args: args_json.clone(),
+        });
+        let allowed =
+            match permission::decide(self.mode, side_effect, &call.name, &call.args, &self.rules) {
+                PermissionDecision::Allow => true,
+                PermissionDecision::Deny => false,
+                PermissionDecision::Ask => self.presenter.confirm(&call.name, side_effect),
+            };
+        let permission_label = if allowed { "allowed" } else { "denied" };
+
+        let (result, ok) = if allowed {
+            let out = mcp.call(&call.name, &call.args).await;
+            (out.text, out.ok)
+        } else {
+            ("permission denied by policy".to_string(), false)
+        };
+
+        self.presenter.emit(PresenterEvent::ToolResult {
+            name: call.name.clone(),
+            ok,
+            summary: summarize(&result),
+        });
+        self.store.record_tool_call(
+            msg_id,
+            &call.name,
+            &args_json,
+            &result,
+            permission_label,
+            if ok { "ok" } else { "error" },
+        )?;
         Ok(result)
     }
 
@@ -1285,6 +1385,119 @@ mod tests {
             tool_msgs.iter().any(|m| m.content == "Postgres"),
             "ask_user answer fed back as tool result: {tool_msgs:?}"
         );
+    }
+
+    /// A provider that calls the namespaced MCP tool `test__echo` once, then answers.
+    #[derive(Default)]
+    struct McpProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for McpProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            let usage = Usage::default();
+            if messages.iter().any(|m| m.role == Role::Tool) {
+                return Ok(ModelResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                    usage,
+                    quota: None,
+                });
+            }
+            Ok(ModelResponse {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "test__echo".into(),
+                    args: serde_json::json!({ "msg": "hi" }),
+                }],
+                usage,
+                quota: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_are_advertised_and_routed_through_the_broker() {
+        // A config that allowlists `test__echo` so it's eagerly exposed (advertised), in Bypass
+        // mode so the External call auto-allows without a prompt.
+        let mcp = forge_config::McpConfig {
+            allow: forge_config::McpAllowlist {
+                servers: vec!["test".into()],
+                tools: vec!["test__echo".into()],
+            },
+            ..Default::default()
+        };
+        let config = Config {
+            permission_mode: PermissionMode::Bypass,
+            mcp: mcp.clone(),
+            ..Config::default()
+        };
+        let mgr = std::sync::Arc::new(forge_mcp::testsupport::manager_with_echo(&mcp).await);
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(McpProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            config,
+            ".",
+        )
+        .unwrap();
+        session.set_mcp(Some(mgr));
+
+        // tool_specs advertises the meta-tools + the exposed server tool.
+        let names: Vec<String> = session.tool_specs().into_iter().map(|s| s.name).collect();
+        assert!(names.iter().any(|n| n == "mcp_search_tools"));
+        assert!(
+            names.iter().any(|n| n == "test__echo"),
+            "exposed tool advertised: {names:?}"
+        );
+        // …and built-ins are still there (additive, no regression).
+        assert!(names.iter().any(|n| n == "read_file"));
+
+        let id = session.id().to_string();
+        let answer = session.run_turn("echo something").await.unwrap();
+        assert_eq!(answer, "done");
+        let tool_msgs: Vec<_> = store
+            .load_messages(&id)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert!(
+            tool_msgs.iter().any(|m| m.content == "echo: hi"),
+            "MCP tool result fed back into the turn: {tool_msgs:?}"
+        );
+    }
+
+    #[test]
+    fn no_mcp_means_tool_specs_unchanged() {
+        // Regression guard: with no manager attached, the advertised set has zero MCP entries.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let session = Session::start(
+            store,
+            Arc::new(McpProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+        let names: Vec<String> = session.tool_specs().into_iter().map(|s| s.name).collect();
+        assert!(names
+            .iter()
+            .all(|n| !n.starts_with("mcp_") && !n.contains("__")));
     }
 
     /// A provider that calls `update_tasks` once with a 2-item list, then finishes.

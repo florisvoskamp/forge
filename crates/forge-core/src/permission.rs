@@ -31,12 +31,14 @@ pub fn decide_mode(mode: PermissionMode, side_effect: SideEffect) -> PermissionD
         PermissionMode::Plan => Deny,
         // Explicit, deliberate "do anything".
         PermissionMode::Bypass => Allow,
-        // Auto-allow edits, still gate shell. A network read is low-risk → allow.
+        // Auto-allow edits, still gate shell. A network read is low-risk → allow. An external
+        // (untrusted MCP) call is at least as risky as shell → still ask, even in accept-edits.
         PermissionMode::AcceptEdits => match side_effect {
             SideEffect::Write => Allow,
             SideEffect::Shell => Ask,
             SideEffect::ReadOnly => Allow,
             SideEffect::Network => Allow,
+            SideEffect::External => Ask,
         },
         // Safe default: confirm any side effect.
         PermissionMode::Default => Ask,
@@ -417,6 +419,17 @@ mod tests {
         assert_eq!(decide_mode(Default, SideEffect::Network), Ask);
         assert_eq!(decide_mode(AcceptEdits, SideEffect::Network), Allow);
         assert_eq!(decide_mode(Bypass, SideEffect::Network), Allow);
+    }
+
+    #[test]
+    fn external_mcp_is_gated_per_mode() {
+        // An MCP call is untrusted: denied in plan, asked in default AND accept-edits (unlike a
+        // benign network read), only auto-allowed by the explicit bypass temper (mcp-client.md §6).
+        use PermissionMode::*;
+        assert_eq!(decide_mode(Plan, SideEffect::External), Deny);
+        assert_eq!(decide_mode(Default, SideEffect::External), Ask);
+        assert_eq!(decide_mode(AcceptEdits, SideEffect::External), Ask);
+        assert_eq!(decide_mode(Bypass, SideEffect::External), Allow);
     }
 
     // ---- helpers ----

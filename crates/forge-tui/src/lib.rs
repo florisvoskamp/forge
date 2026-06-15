@@ -163,6 +163,8 @@ pub enum PresenterEvent {
     AssayReport(forge_types::AssayReport),
     /// The agent's task list changed (`update_tasks`); render the checklist into scrollback.
     Tasks(Vec<forge_types::TodoItem>),
+    /// MCP server connection status changed / was requested (`/mcp`); render the listing.
+    McpStatus(Vec<forge_types::McpServerLine>),
     Done {
         final_text: String,
     },
@@ -279,6 +281,24 @@ impl Presenter for HeadlessPresenter {
                 println!("  tasks ({done}/{} done):", tasks.len());
                 for t in &tasks {
                     println!("    {} {}", t.status.marker(), t.title);
+                }
+            }
+            PresenterEvent::McpStatus(servers) => {
+                if servers.is_empty() {
+                    println!("  no MCP servers configured");
+                } else {
+                    println!("  MCP servers ({} configured)", servers.len());
+                    for s in &servers {
+                        let detail = s
+                            .detail
+                            .as_deref()
+                            .map(|d| format!("  {d}"))
+                            .unwrap_or_default();
+                        println!(
+                            "    {} {} {} — {} tools · {} resources · {} prompts{detail}",
+                            s.name, s.status, s.transport, s.tools, s.resources, s.prompts
+                        );
+                    }
                 }
             }
             // The final answer was already streamed via AssistantText; Done is a

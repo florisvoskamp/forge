@@ -11,7 +11,12 @@ use forge_types::{PermissionDecision, PermissionMode, PermissionRule, RuleSource
 use serde::{Deserialize, Serialize};
 
 pub mod agents;
+pub mod mcp;
 pub use agents::{load_agents, AgentDef};
+pub use mcp::{
+    import_mcp_json, write_mcp_toml, McpAllowlist, McpAuth, McpConfig, McpServerConfig,
+    McpTransport,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -43,6 +48,9 @@ pub struct Config {
     /// Fine-grained allow/ask/deny rules layered on top of the mode (FR-10).
     #[serde(default)]
     pub permissions: PermissionsConfig,
+    /// External MCP servers Forge connects to as a client (mcp-client.md). Empty = inert.
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 /// Fine-grained permission rules (FR-10). Resolution is by specificity/precedence, not file
@@ -424,6 +432,7 @@ impl Default for Config {
                 subscriptions: HashMap::new(),
             },
             permissions: PermissionsConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -480,7 +489,18 @@ pub fn load() -> Result<Config, ConfigError> {
     fig = fig.merge(Toml::file("./.forge/config.toml"));
     fig = fig.merge(Env::prefixed("FORGE_").split("__"));
 
-    Ok(fig.extract()?)
+    let mut config: Config = fig.extract()?;
+    // Project-local `.forge/mcp.toml` is the dedicated home for MCP server declarations; when
+    // present it sets the whole `[mcp]` section (overriding any `[mcp]` in config.toml). Keeping
+    // it a separate file matches Claude-Code's `.mcp.json` convention and keeps server lists out
+    // of the main config.
+    if let Ok(text) = std::fs::read_to_string("./.forge/mcp.toml") {
+        match toml::from_str::<McpConfig>(&text) {
+            Ok(mcp) => config.mcp = mcp,
+            Err(e) => tracing::warn!("ignoring malformed .forge/mcp.toml: {e}"),
+        }
+    }
+    Ok(config)
 }
 
 /// Whether the user has a persisted config file (the onboarding "first run" signal — combined

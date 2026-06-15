@@ -474,6 +474,27 @@ pub enum SideEffect {
     /// Reaches the network (web fetch/search) — distinct from a local read: egress can
     /// leak context or hit internal hosts, so it is gated separately from `ReadOnly`.
     Network,
+    /// A call into an external MCP server (untrusted third-party tool). Gated like a side
+    /// effect even when "read-shaped": the server is untrusted code and its result enters the
+    /// agent loop, so MCP tool calls always go through the permission broker (mcp-client.md §6).
+    External,
+}
+
+/// One line of `forge mcp` / `/mcp` server-status output. A dependency-free DTO so both
+/// `forge-mcp` (which produces it) and `forge-tui` (which renders it) can share it without a
+/// crate dependency between them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerLine {
+    pub name: String,
+    /// Human status word: connected / reconnecting / unauthorized / slow / failed / disabled.
+    pub status: String,
+    /// Transport label: "stdio" or "http".
+    pub transport: String,
+    pub tools: usize,
+    pub resources: usize,
+    pub prompts: usize,
+    /// Extra detail for non-healthy states (the failure reason, retry attempt, latency, …).
+    pub detail: Option<String>,
 }
 
 /// A single tracked task in the agent's todo list (the `update_tasks` tool). Mirrors the

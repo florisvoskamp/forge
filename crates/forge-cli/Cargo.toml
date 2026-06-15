@@ -15,6 +15,7 @@ path = "src/main.rs"
 forge-types.workspace = true
 forge-config.workspace = true
 forge-core.workspace = true
+forge-mcp.workspace = true
 forge-mesh.workspace = true
 forge-provider.workspace = true
 forge-tools.workspace = true
