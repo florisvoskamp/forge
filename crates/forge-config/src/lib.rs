@@ -195,6 +195,14 @@ pub struct MeshConfig {
     /// Fraction of a cap that triggers a warning (default 0.8).
     #[serde(default = "default_warn_threshold")]
     pub warn_threshold: f64,
+    /// Which task classifier the mesh uses (ADR-0006). Default = deterministic heuristic.
+    #[serde(default)]
+    pub classifier: ClassifierKind,
+    /// Model id the `llm` classifier calls to label the tier (a cheap/$0 model, e.g. a local
+    /// `ollama::` or a `claude-cli::`/`codex-cli::` subscription bridge). Ignored for the
+    /// heuristic classifier. Falls back to the trivial-tier model when unset.
+    #[serde(default)]
+    pub classifier_model: Option<String>,
     /// Enforcement behavior once a cap is reached.
     #[serde(default)]
     pub budget: BudgetBehavior,
@@ -210,6 +218,18 @@ fn default_warn_threshold() -> f64 {
 
 fn default_prefer_subscription() -> bool {
     true
+}
+
+/// How the mesh decides a task's tier (ADR-0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ClassifierKind {
+    /// Deterministic weighted-signal heuristic — zero added cost/latency (default).
+    #[default]
+    Heuristic,
+    /// Opt-in: ask a cheap model to label the tier (one extra call per turn), falling back
+    /// to the heuristic on any error. Off by default (A-2).
+    Llm,
 }
 
 /// What Forge does once a budget cap is reached (FR-5).
@@ -257,6 +277,8 @@ impl Default for Config {
             mesh: MeshConfig {
                 models,
                 prefer_subscription: default_prefer_subscription(),
+                classifier: ClassifierKind::default(),
+                classifier_model: None,
                 daily_budget_usd: None,
                 monthly_cap_usd: None,
                 warn_threshold: default_warn_threshold(),

@@ -6,13 +6,17 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use forge_core::Session;
-use forge_mesh::HeuristicRouter;
+use std::sync::Arc;
+
+use forge_config::ClassifierKind;
+use forge_core::{LlmRouter, Session};
+use forge_mesh::{HeuristicRouter, Router};
 use forge_provider::{DispatchProvider, MockProvider, Provider};
 use forge_store::Store;
 use forge_tools::ToolRegistry;
 use forge_tui::{HeadlessPresenter, Presenter, TuiPresenter};
 use forge_types::PermissionMode;
+use forge_types::TaskTier;
 
 #[derive(Parser)]
 #[command(
@@ -210,7 +214,29 @@ fn build_session_with(
         // CLI bridge (provider-integrations Part B).
         Box::new(DispatchProvider::new())
     };
-    let router = Box::new(HeuristicRouter::new(config.clone()).with_pin(pin));
+    let heuristic = HeuristicRouter::new(config.clone()).with_pin(pin);
+    let router: Box<dyn Router> = if config.mesh.classifier == ClassifierKind::Llm {
+        // Opt-in cheap-LLM classifier: a separate (stateless) provider labels the tier, then
+        // the heuristic router does the cost-aware selection; any failure falls back to it.
+        let classifier_model = config
+            .mesh
+            .classifier_model
+            .clone()
+            .or_else(|| config.model_for(TaskTier::Trivial).map(String::from))
+            .unwrap_or_default();
+        let classify_provider: Arc<dyn Provider> = if mock {
+            Arc::new(MockProvider)
+        } else {
+            Arc::new(DispatchProvider::new())
+        };
+        Box::new(LlmRouter::new(
+            classify_provider,
+            classifier_model,
+            heuristic,
+        ))
+    } else {
+        Box::new(heuristic)
+    };
     let tools = ToolRegistry::with_core_tools();
 
     match resume {

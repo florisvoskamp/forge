@@ -12,7 +12,10 @@ use forge_tools::ToolRegistry;
 use forge_tui::{Presenter, PresenterEvent};
 use forge_types::{Message, PermissionDecision, PermissionMode, PermissionRule, Role};
 
+pub mod llm_router;
 pub mod permission;
+
+pub use llm_router::LlmRouter;
 
 /// Hard cap on model<->tool round trips within a single turn.
 const MAX_STEPS: usize = 8;
@@ -231,7 +234,7 @@ impl Session {
             BudgetStatus::Ok => {}
         }
 
-        let decision = self.router.route(prompt, budget);
+        let decision = self.router.route(prompt, budget).await;
         self.presenter.emit(PresenterEvent::Routing {
             tier: decision.tier.as_str().to_string(),
             model: decision.model.clone(),
