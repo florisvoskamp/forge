@@ -392,6 +392,7 @@ impl Provider for GenAiProvider {
             content,
             tool_calls,
             usage,
+            quota: None,
         })
     }
 }

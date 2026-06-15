@@ -32,6 +32,7 @@ impl Provider for WriteOnceProvider {
                 content: "done".into(),
                 tool_calls: vec![],
                 usage,
+                quota: None,
             });
         }
         Ok(ModelResponse {
@@ -42,6 +43,7 @@ impl Provider for WriteOnceProvider {
                 args: serde_json::json!({ "path": self.path, "content": self.content }),
             }],
             usage,
+            quota: None,
         })
     }
 }

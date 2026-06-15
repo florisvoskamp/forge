@@ -88,11 +88,28 @@ fn code_prior(provider: &str, code_heavy: bool, tier: TaskTier) -> f64 {
     0.0
 }
 
-/// The full routing score for one model: capability fit + cost-class preference + the mild prior.
-fn route_score(id: &str, tier: TaskTier, cost: f64, code_heavy: bool) -> f64 {
-    capability_score(id, tier)
+/// The full routing score for one model: capability fit + cost-class preference + the mild prior,
+/// minus a quota penalty so a near-limit subscription drops below its alternatives (L3). The
+/// penalty is applied in the SCORE (not just a post-sort) so non-subscription alternatives make it
+/// into the truncated shortlist — otherwise the top picks are all the (pressured) subscription.
+fn route_score(
+    id: &str,
+    tier: TaskTier,
+    cost: f64,
+    code_heavy: bool,
+    quota: &forge_types::SubscriptionQuota,
+) -> f64 {
+    let base = capability_score(id, tier)
         + cost_pref(tier, cost_class(id, cost))
-        + code_prior(provider_of(id), code_heavy, tier)
+        + code_prior(provider_of(id), code_heavy, tier);
+    if is_subscription(id) {
+        match quota.status_for(provider_of(id)) {
+            forge_types::QuotaStatus::Exhausted => return base - 100.0, // effectively last
+            forge_types::QuotaStatus::Warning => return base - 5.0,     // below any plausible alt
+            forge_types::QuotaStatus::Ok => {}
+        }
+    }
+    base
 }
 
 /// A per-prompt provider ordering key: hashing `seed:provider` means different prompts rotate
@@ -246,7 +263,14 @@ impl ModelCatalog {
     /// router uses [`ranked_seeded`](Self::ranked_seeded) so genuine ties spread across providers
     /// per prompt instead of always picking the alphabetically-first one.
     pub fn ranked_for(&self, tier: TaskTier, pricing: &Pricing, top: usize) -> Vec<String> {
-        self.ranked_seeded(tier, pricing, top, false, 0)
+        self.ranked_seeded(
+            tier,
+            pricing,
+            top,
+            false,
+            0,
+            &forge_types::SubscriptionQuota::default(),
+        )
     }
 
     /// Prompt-aware ranking: cost-tiered capability score, with genuine ties broken by a
@@ -259,6 +283,7 @@ impl ModelCatalog {
         top: usize,
         code_heavy: bool,
         seed: u64,
+        quota: &forge_types::SubscriptionQuota,
     ) -> Vec<String> {
         let mut scored: Vec<(f64, u8, u64, f64, &String)> = self
             .models
@@ -266,7 +291,7 @@ impl ModelCatalog {
             .map(|m| {
                 let cost = pricing.estimated_cost(m);
                 (
-                    route_score(m, tier, cost, code_heavy),
+                    route_score(m, tier, cost, code_heavy, quota),
                     cost_class(m, cost),
                     provider_rotation(provider_of(m), seed),
                     fine_capability(m),

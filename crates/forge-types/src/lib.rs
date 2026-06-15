@@ -560,6 +560,71 @@ impl ModelHealth {
     }
 }
 
+/// How a subscription is sitting relative to its rolling usage window (quota-aware routing, L3,
+/// provider-cost-routing.md). Ordered so the stricter wins with `.max()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum QuotaStatus {
+    /// Comfortably within the window.
+    #[default]
+    Ok,
+    /// Near the window limit (or using overage) — demote the subscription below alternatives.
+    Warning,
+    /// At/over the limit — skip the subscription entirely (route around it), like a benched model.
+    Exhausted,
+}
+
+/// One observation of a CLI-bridge subscription's quota, surfaced by the bridge's event stream
+/// (e.g. Claude Code's `rate_limit_event`) alongside a completion. Recorded by the store so the
+/// router can avoid overrunning a near-limit plan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaHint {
+    /// Bridge provider prefix the quota belongs to (`claude-cli` / `codex-cli`).
+    pub provider: String,
+    /// The rolling-window kind the provider reported (`five_hour`, `weekly`, …); `""` if unknown.
+    pub window: String,
+    pub status: QuotaStatus,
+    /// Epoch seconds when the window resets, if the provider told us.
+    pub resets_at: Option<i64>,
+    /// Fraction of the window consumed (0.0–1.0), if the provider told us.
+    pub fraction_used: Option<f64>,
+}
+
+/// A snapshot of every subscription's current quota pressure, built by the store from the
+/// `subscription_usage` table (rows whose window hasn't reset). Consulted by the mesh router to
+/// demote or skip a pressured subscription. Carries no clock/I/O (filtering happens at build).
+#[derive(Debug, Default, Clone)]
+pub struct SubscriptionQuota {
+    by_provider: std::collections::HashMap<String, QuotaStatus>,
+}
+
+impl SubscriptionQuota {
+    pub fn new(by_provider: std::collections::HashMap<String, QuotaStatus>) -> Self {
+        Self { by_provider }
+    }
+
+    /// The pressure for a provider prefix (defaults to `Ok` when unknown/unconstrained).
+    pub fn status_for(&self, provider: &str) -> QuotaStatus {
+        self.by_provider
+            .get(provider)
+            .copied()
+            .unwrap_or(QuotaStatus::Ok)
+    }
+
+    /// At/over the limit — route around it.
+    pub fn is_exhausted(&self, provider: &str) -> bool {
+        self.status_for(provider) == QuotaStatus::Exhausted
+    }
+
+    /// Near or over the limit — usable but demoted below alternatives.
+    pub fn is_pressured(&self, provider: &str) -> bool {
+        self.status_for(provider) >= QuotaStatus::Warning
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_provider.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

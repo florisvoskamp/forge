@@ -364,6 +364,62 @@ impl Store {
         Ok(rows)
     }
 
+    /// Record the latest subscription quota observation (quota-aware routing, L3). One row per
+    /// bridge provider, upserted — the most recent `rate_limit_event` wins.
+    pub fn record_quota(&self, hint: &forge_types::QuotaHint) -> Result<()> {
+        let status = match hint.status {
+            forge_types::QuotaStatus::Ok => "ok",
+            forge_types::QuotaStatus::Warning => "warning",
+            forge_types::QuotaStatus::Exhausted => "exhausted",
+        };
+        self.lock()?.execute(
+            "INSERT INTO subscription_usage (provider, window_kind, status, resets_at, fraction, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))
+             ON CONFLICT(provider) DO UPDATE SET
+               window_kind = excluded.window_kind, status = excluded.status,
+               resets_at = excluded.resets_at, fraction = excluded.fraction,
+               updated_at = excluded.updated_at",
+            (
+                hint.provider.as_str(),
+                hint.window.as_str(),
+                status,
+                hint.resets_at,
+                hint.fraction_used,
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Snapshot of currently-constraining subscription quotas (rows whose window hasn't reset),
+    /// for the router. Only `Warning`/`Exhausted` providers are carried — `Ok` is the default.
+    pub fn current_quota(&self) -> Result<forge_types::SubscriptionQuota> {
+        self.quota_at(chrono::Utc::now().timestamp())
+    }
+
+    /// [`current_quota`](Self::current_quota) at an explicit `now` (epoch secs) — testable clock.
+    pub fn quota_at(&self, now: i64) -> Result<forge_types::SubscriptionQuota> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT provider, status FROM subscription_usage
+             WHERE resets_at IS NULL OR resets_at > ?1",
+        )?;
+        let map = stmt
+            .query_map([now], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(std::result::Result::ok)
+            .filter_map(|(provider, status)| {
+                let st = match status.as_str() {
+                    "warning" => forge_types::QuotaStatus::Warning,
+                    "exhausted" => forge_types::QuotaStatus::Exhausted,
+                    _ => forge_types::QuotaStatus::Ok,
+                };
+                (st != forge_types::QuotaStatus::Ok).then_some((provider, st))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        Ok(forge_types::SubscriptionQuota::new(map))
+    }
+
     /// Number of messages in a session.
     pub fn message_count(&self, session_id: &str) -> Result<i64> {
         Ok(self.lock()?.query_row(
@@ -905,6 +961,41 @@ mod tests {
             .benched_models(1001)
             .unwrap()
             .is_benched("gemini::antigravity"));
+    }
+
+    #[test]
+    fn quota_is_upserted_and_expires_when_the_window_resets() {
+        let store = Store::open_in_memory().unwrap();
+        let hint = |status, resets_at| forge_types::QuotaHint {
+            provider: "claude-cli".into(),
+            window: "five_hour".into(),
+            status,
+            resets_at,
+            fraction_used: None,
+        };
+        // A warning that resets at t=1000.
+        store
+            .record_quota(&hint(forge_types::QuotaStatus::Warning, Some(1000)))
+            .unwrap();
+        assert!(store.quota_at(500).unwrap().is_pressured("claude-cli"));
+        // Past the reset → no longer constraining.
+        assert!(!store.quota_at(2000).unwrap().is_pressured("claude-cli"));
+
+        // Upsert to exhausted; an Ok provider isn't carried at all.
+        store
+            .record_quota(&hint(forge_types::QuotaStatus::Exhausted, Some(3000)))
+            .unwrap();
+        assert!(store.quota_at(500).unwrap().is_exhausted("claude-cli"));
+        store
+            .record_quota(&forge_types::QuotaHint {
+                provider: "codex-cli".into(),
+                window: String::new(),
+                status: forge_types::QuotaStatus::Ok,
+                resets_at: Some(9999),
+                fraction_used: None,
+            })
+            .unwrap();
+        assert!(!store.quota_at(500).unwrap().is_pressured("codex-cli"));
     }
 
     #[test]

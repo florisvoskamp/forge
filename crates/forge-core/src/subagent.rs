@@ -235,7 +235,8 @@ pub async fn run_subagent(
         // model the parent just rate-limited.
         None => {
             let health = ctx.store.current_benched().unwrap_or_default();
-            ctx.router.route(task, budget, &health).await
+            let quota = ctx.store.current_quota().unwrap_or_default();
+            ctx.router.route(task, budget, &health, &quota).await
         }
     };
 
@@ -680,6 +681,7 @@ mod tests {
                 content: "child done".into(),
                 tool_calls: vec![],
                 usage: forge_types::Usage::default(),
+                quota: None,
             })
         }
     }
@@ -695,6 +697,7 @@ mod tests {
             _p: &str,
             _b: BudgetState,
             _h: &forge_types::ModelHealth,
+            _q: &forge_types::SubscriptionQuota,
         ) -> RoutingDecision {
             RoutingDecision {
                 tier: TaskTier::Standard,

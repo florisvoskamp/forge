@@ -5,7 +5,7 @@
 //! walking skeleton.
 
 use async_trait::async_trait;
-use forge_types::{Message, ToolCall, Usage};
+use forge_types::{Message, QuotaHint, ToolCall, Usage};
 
 mod cli_provider;
 mod genai_provider;
@@ -86,6 +86,10 @@ pub struct ModelResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
+    /// A subscription quota observation surfaced by a CLI bridge this turn (Claude's
+    /// `rate_limit_event`), for quota-aware routing (L3). `None` for API providers / when the
+    /// bridge reported nothing.
+    pub quota: Option<QuotaHint>,
 }
 
 impl ModelResponse {

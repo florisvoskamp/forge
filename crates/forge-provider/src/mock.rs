@@ -42,6 +42,7 @@ impl Provider for MockProvider {
                     output_tokens: 18,
                     cost_usd: 0.0,
                 },
+                quota: None,
             })
         } else {
             let content = "Let me inspect the project manifest.";
@@ -58,6 +59,7 @@ impl Provider for MockProvider {
                     output_tokens: 12,
                     cost_usd: 0.0,
                 },
+                quota: None,
             })
         }
     }

@@ -345,9 +345,45 @@ enum Parsed {
         summary: String,
     },
     Usage(Usage),
+    /// A subscription quota observation (Claude's `rate_limit_event`) — window/status/reset, for
+    /// quota-aware routing (L3). The provider prefix is filled in by `complete`.
+    Quota {
+        window: String,
+        status: forge_types::QuotaStatus,
+        resets_at: Option<i64>,
+        fraction: Option<f64>,
+    },
     /// Authoritative final answer (Claude's `result.result`); used if nothing streamed.
     Final(String),
     Error(String),
+}
+
+/// Map a Claude `rate_limit_info` into a coarse [`QuotaStatus`], defensively (the schema is
+/// version-volatile). We read the live `status` + `isUsingOverage` (NOT `overageStatus`, which is
+/// a setting, not the current state) plus a usage fraction when present. Unknown → `Ok`.
+fn quota_status_from(
+    status: &str,
+    using_overage: bool,
+    fraction: Option<f64>,
+) -> forge_types::QuotaStatus {
+    use forge_types::QuotaStatus;
+    let s = status.to_lowercase();
+    if s.contains("reject") || s.contains("block") || s.contains("exceed") || s.contains("exhaust")
+    {
+        return QuotaStatus::Exhausted;
+    }
+    if let Some(f) = fraction {
+        if f >= 0.98 {
+            return QuotaStatus::Exhausted;
+        }
+        if f >= 0.80 {
+            return QuotaStatus::Warning;
+        }
+    }
+    if using_overage || s.contains("warn") || s.contains("approach") {
+        return QuotaStatus::Warning;
+    }
+    QuotaStatus::Ok
 }
 
 fn usage_from(v: &Value) -> Usage {
@@ -447,6 +483,38 @@ fn parse_claude_line(line: &str) -> Vec<Parsed> {
                         .or(result_text)
                         .unwrap_or_else(|| "claude reported an error".into()),
                 ));
+            }
+        }
+        // Subscription quota window (Claude Code stream-json, L3). Defensive: any missing field
+        // degrades to Ok / None. `resetsAt` may arrive as secs or ms — normalise ms→secs.
+        Some("rate_limit_event") => {
+            if let Some(info) = v.get("rate_limit_info") {
+                let status = info.get("status").and_then(Value::as_str).unwrap_or("");
+                let using_overage = info
+                    .get("isUsingOverage")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let fraction = info
+                    .get("usedFraction")
+                    .or_else(|| info.get("fractionUsed"))
+                    .and_then(Value::as_f64);
+                let resets_at = info.get("resetsAt").and_then(Value::as_i64).map(|t| {
+                    if t > 100_000_000_000 {
+                        t / 1000
+                    } else {
+                        t
+                    }
+                });
+                out.push(Parsed::Quota {
+                    window: info
+                        .get("rateLimitType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    status: quota_status_from(status, using_overage, fraction),
+                    resets_at,
+                    fraction,
+                });
             }
         }
         _ => {}
@@ -684,6 +752,7 @@ impl Provider for CliProvider {
         let mut content = String::new();
         let mut final_text: Option<String> = None;
         let mut usage = Usage::default();
+        let mut quota: Option<forge_types::QuotaHint> = None;
         let mut in_band_error: Option<String> = None;
         // tool_use id → name, so a later tool_result can be labelled.
         let mut tool_names: std::collections::HashMap<String, String> =
@@ -713,6 +782,20 @@ impl Provider for CliProvider {
                                     on_event(StreamEvent::ToolFinished { name, ok, summary });
                                 }
                                 Parsed::Usage(u) => usage = u,
+                                Parsed::Quota {
+                                    window,
+                                    status,
+                                    resets_at,
+                                    fraction,
+                                } => {
+                                    quota = Some(forge_types::QuotaHint {
+                                        provider: self.kind.prefix().to_string(),
+                                        window,
+                                        status,
+                                        resets_at,
+                                        fraction_used: fraction,
+                                    });
+                                }
                                 Parsed::Final(f) => final_text = Some(f),
                                 Parsed::Error(e) => in_band_error = Some(e),
                             }
@@ -795,6 +878,7 @@ impl Provider for CliProvider {
             content: text,
             tool_calls: Vec::new(),
             usage,
+            quota,
         })
     }
 }
@@ -1136,6 +1220,44 @@ mod tests {
         assert!(parse_claude_line(r#"{"type":"system","subtype":"init"}"#).is_empty());
         assert!(parse_claude_line(r#"{"type":"rate_limit_event"}"#).is_empty());
         assert!(parse_claude_line("not json at all").is_empty());
+    }
+
+    #[test]
+    fn claude_rate_limit_event_parses_into_a_quota_hint() {
+        use forge_types::QuotaStatus;
+        // The documented shape: status "allowed", overage not in use → Ok.
+        let ok = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1781485800,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false}}"#;
+        match &parse_claude_line(ok)[0] {
+            Parsed::Quota {
+                window,
+                status,
+                resets_at,
+                ..
+            } => {
+                assert_eq!(window, "five_hour");
+                assert_eq!(*status, QuotaStatus::Ok);
+                assert_eq!(*resets_at, Some(1781485800));
+            }
+            other => panic!("expected Quota, got {other:?}"),
+        }
+        // Using overage → Warning (near/over the included limit).
+        let warn = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"weekly","isUsingOverage":true}}"#;
+        assert!(matches!(
+            &parse_claude_line(warn)[0],
+            Parsed::Quota {
+                status: QuotaStatus::Warning,
+                ..
+            }
+        ));
+        // A high used-fraction → Exhausted.
+        let full = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","usedFraction":0.99}}"#;
+        assert!(matches!(
+            &parse_claude_line(full)[0],
+            Parsed::Quota {
+                status: QuotaStatus::Exhausted,
+                ..
+            }
+        ));
     }
 
     #[test]

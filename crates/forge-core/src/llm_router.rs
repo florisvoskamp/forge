@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use forge_mesh::{BudgetState, HeuristicRouter, RouteHints, Router, RoutingDecision};
 use forge_provider::Provider;
-use forge_types::{Message, ModelHealth, TaskTier};
+use forge_types::{Message, ModelHealth, SubscriptionQuota, TaskTier};
 
 /// Hard ceiling on the classification call so a slow/hung model degrades to the heuristic.
 const CLASSIFY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -58,6 +58,7 @@ impl Router for LlmRouter {
         prompt: &str,
         budget: BudgetState,
         health: &ModelHealth,
+        quota: &SubscriptionQuota,
     ) -> RoutingDecision {
         let messages = [Message::system(CLASSIFY_SYSTEM), Message::user(prompt)];
         let mut sink = |_: forge_provider::StreamEvent| {}; // classifier output isn't shown
@@ -80,10 +81,11 @@ impl Router for LlmRouter {
                 budget,
                 health,
                 RouteHints::from_prompt(prompt),
+                quota,
             ),
             None => {
                 // Couldn't classify → deterministic heuristic, noted in the rationale.
-                let mut d = self.fallback.route(prompt, budget, health).await;
+                let mut d = self.fallback.route(prompt, budget, health, quota).await;
                 d.rationale
                     .push_str(" (llm classify unavailable → heuristic)");
                 d
@@ -115,6 +117,7 @@ mod tests {
                     content: text.clone(),
                     tool_calls: Vec::new(),
                     usage: Default::default(),
+                    quota: None,
                 }),
                 Err(()) => Err(ProviderError::Request("boom".into())),
             }
@@ -143,7 +146,12 @@ mod tests {
     async fn uses_the_llm_label() {
         // A short prompt the heuristic would call Trivial, but the LLM says complex.
         let d = llm_router(Ok("complex"))
-            .route("tweak it", BudgetState::default(), &ModelHealth::default())
+            .route(
+                "tweak it",
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Complex); // AC-B1
         assert!(d.rationale.contains("classified by"), "{}", d.rationale);
@@ -156,6 +164,7 @@ mod tests {
                 "design a lock-free queue",
                 BudgetState::default(),
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         // heuristic catches the hard prompt
@@ -166,7 +175,12 @@ mod tests {
     #[tokio::test]
     async fn falls_back_on_provider_error() {
         let d = llm_router(Err(()))
-            .route("fix typo", BudgetState::default(), &ModelHealth::default())
+            .route(
+                "fix typo",
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Trivial);
         assert!(d.rationale.contains("heuristic"), "{}", d.rationale); // AC-B2

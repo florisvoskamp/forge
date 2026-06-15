@@ -103,4 +103,16 @@ CREATE TABLE IF NOT EXISTS model_health (
     reason         TEXT NOT NULL,      -- "rate-limited", "auth failed", "probe: quota 0", …
     updated_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
+
+-- Subscription quota windows (quota-aware routing, L3). One row per bridge provider; the latest
+-- observation from the CLI stream (Claude's `rate_limit_event`). The row stops constraining once
+-- `resets_at` passes (the window rolled over).
+CREATE TABLE IF NOT EXISTS subscription_usage (
+    provider    TEXT PRIMARY KEY,      -- bridge prefix: claude-cli / codex-cli
+    window_kind TEXT NOT NULL,         -- five_hour / weekly / … ("" if unknown)
+    status      TEXT NOT NULL,         -- ok / warning / exhausted
+    resets_at   INTEGER,               -- epoch secs; row is stale once now > resets_at
+    fraction    REAL,                  -- 0.0–1.0 window used, if reported
+    updated_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
 "#;

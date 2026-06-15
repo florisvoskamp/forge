@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use forge_config::Config;
-use forge_types::{ModelHealth, TaskTier};
+use forge_types::{ModelHealth, SubscriptionQuota, TaskTier};
 
 pub mod capability;
 pub mod catalog;
@@ -93,6 +93,7 @@ pub trait Router: Send + Sync {
         prompt: &str,
         budget: BudgetState,
         health: &ModelHealth,
+        quota: &SubscriptionQuota,
     ) -> RoutingDecision;
 }
 
@@ -361,7 +362,12 @@ impl HeuristicRouter {
     /// Candidate models for a tier: the auto-discovered, capability-ranked shortlist when
     /// [`auto_active`](Self::auto_active); otherwise the configured `[mesh.models]` candidates
     /// (the manual/override path, and the offline/no-catalog default).
-    fn candidates_for_tier(&self, tier: TaskTier, hints: RouteHints) -> Vec<String> {
+    fn candidates_for_tier(
+        &self,
+        tier: TaskTier,
+        hints: RouteHints,
+        quota: &SubscriptionQuota,
+    ) -> Vec<String> {
         if self.auto_active() {
             let ranked = self.catalog.as_ref().unwrap().ranked_seeded(
                 tier,
@@ -369,6 +375,7 @@ impl HeuristicRouter {
                 5,
                 hints.code_heavy,
                 hints.seed,
+                quota,
             );
             if !ranked.is_empty() {
                 return ranked;
@@ -391,8 +398,11 @@ impl HeuristicRouter {
 
     /// A model is usable if its provider key is present (or it's keyless) AND it isn't
     /// currently benched (rate-limited / unavailable — failover).
-    fn is_usable(&self, m: &str, health: &ModelHealth) -> bool {
-        (self.model_available)(m) && !health.is_benched(m)
+    fn is_usable(&self, m: &str, health: &ModelHealth, quota: &SubscriptionQuota) -> bool {
+        (self.model_available)(m)
+            && !health.is_benched(m)
+            // An exhausted subscription is routed around entirely (L3), like a benched model.
+            && !(is_subscription(m) && quota.is_exhausted(forge_config::provider_of(m)))
     }
 
     /// Pick the cheapest *usable* model from `candidates` (L1). Ranking key:
@@ -403,10 +413,11 @@ impl HeuristicRouter {
     /// cost-ranking unit tests.
     #[cfg(test)]
     fn cheapest_usable(&self, candidates: &[String], health: &ModelHealth) -> Option<String> {
+        let quota = SubscriptionQuota::default();
         candidates
             .iter()
             .enumerate()
-            .filter(|(_, m)| self.is_usable(m, health))
+            .filter(|(_, m)| self.is_usable(m, health, &quota))
             .min_by(|(ia, a), (ib, b)| self.cost_rank(a).cmp(&self.cost_rank(b)).then(ia.cmp(ib)))
             .map(|(_, m)| m.clone())
     }
@@ -421,10 +432,15 @@ impl HeuristicRouter {
     }
 
     /// Count usable candidates (for the rationale).
-    fn usable_count(&self, candidates: &[String], health: &ModelHealth) -> usize {
+    fn usable_count(
+        &self,
+        candidates: &[String],
+        health: &ModelHealth,
+        quota: &SubscriptionQuota,
+    ) -> usize {
         candidates
             .iter()
-            .filter(|m| self.is_usable(m, health))
+            .filter(|m| self.is_usable(m, health, quota))
             .count()
     }
 
@@ -436,17 +452,21 @@ impl HeuristicRouter {
         tier: TaskTier,
         health: &ModelHealth,
         hints: RouteHints,
+        quota: &SubscriptionQuota,
     ) -> Vec<String> {
-        let candidates = self.candidates_for_tier(tier, hints);
+        let candidates = self.candidates_for_tier(tier, hints, quota);
         let mut usable: Vec<String> = candidates
             .iter()
-            .filter(|m| self.is_usable(m, health))
+            .filter(|m| self.is_usable(m, health, quota))
             .cloned()
             .collect();
         if !self.auto_active() {
             // Configured path: cost-aware order (auto path keeps the ranked order verbatim).
             usable.sort_by_key(|m| self.cost_rank(m));
         }
+        // Demote a near-limit subscription (Warning, L3) to the back — still a fallback, but the
+        // mesh tries everything else first. Stable, so it preserves the order within each group.
+        usable.sort_by_key(|m| quota.is_pressured(forge_config::provider_of(m)));
         usable
     }
 
@@ -457,13 +477,14 @@ impl HeuristicRouter {
         routed: TaskTier,
         health: &ModelHealth,
         hints: RouteHints,
+        quota: &SubscriptionQuota,
     ) -> Vec<String> {
-        let mut chain = self.ordered_usable_for_tier(routed, health, hints);
+        let mut chain = self.ordered_usable_for_tier(routed, health, hints, quota);
         for tier in [TaskTier::Complex, TaskTier::Standard, TaskTier::Trivial] {
             if tier == routed {
                 continue;
             }
-            for m in self.ordered_usable_for_tier(tier, health, hints) {
+            for m in self.ordered_usable_for_tier(tier, health, hints, quota) {
                 if !chain.contains(&m) {
                     chain.push(m);
                 }
@@ -500,6 +521,7 @@ impl HeuristicRouter {
         budget: BudgetState,
         health: &ModelHealth,
         hints: RouteHints,
+        quota: &SubscriptionQuota,
     ) -> RoutingDecision {
         let exhausted = budget.status() == BudgetStatus::Exhausted;
         let cap_overrides_pin = self.config.mesh.budget.cap_overrides_pin;
@@ -513,8 +535,8 @@ impl HeuristicRouter {
             let mut why = "pinned via --model".to_string();
             // Fallbacks even for a pin: if the pinned model is rate-limited/down mid-turn we
             // still want to keep working.
-            let mut chain = self.build_chain(classified_tier, health, hints);
-            let model = if self.is_usable(pin, health) {
+            let mut chain = self.build_chain(classified_tier, health, hints, quota);
+            let model = if self.is_usable(pin, health, quota) {
                 pin.clone()
             } else {
                 match chain.first().cloned() {
@@ -556,12 +578,16 @@ impl HeuristicRouter {
         // `routed_usable` lets us tell a same-tier pick (normal rationale) from a cross-tier
         // fallback ("fell back …") for the message.
         let auto = self.auto_active();
-        let routed_usable = self.ordered_usable_for_tier(tier, health, hints);
-        let mut chain = self.build_chain(tier, health, hints);
+        let routed_usable = self.ordered_usable_for_tier(tier, health, hints, quota);
+        let mut chain = self.build_chain(tier, health, hints, quota);
         match chain.first().cloned() {
             Some(model) => {
                 if routed_usable.contains(&model) {
-                    let n = self.usable_count(&self.candidates_for_tier(tier, hints), health);
+                    let n = self.usable_count(
+                        &self.candidates_for_tier(tier, hints, quota),
+                        health,
+                        quota,
+                    );
                     if auto {
                         why.push_str(&format!(
                             " — auto-selected best of {n} usable {} models: {model}",
@@ -575,7 +601,7 @@ impl HeuristicRouter {
                     }
                 } else {
                     let original = self
-                        .candidates_for_tier(tier, hints)
+                        .candidates_for_tier(tier, hints, quota)
                         .first()
                         .cloned()
                         .unwrap_or_else(|| "unknown".into());
@@ -596,7 +622,7 @@ impl HeuristicRouter {
             }
             None => {
                 let original = self
-                    .candidates_for_tier(tier, hints)
+                    .candidates_for_tier(tier, hints, quota)
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "unknown".into());
@@ -621,6 +647,7 @@ impl Router for HeuristicRouter {
         prompt: &str,
         budget: BudgetState,
         health: &ModelHealth,
+        quota: &SubscriptionQuota,
     ) -> RoutingDecision {
         let (tier, reason) = Self::classify(prompt);
         self.decide(
@@ -629,6 +656,7 @@ impl Router for HeuristicRouter {
             budget,
             health,
             RouteHints::from_prompt(prompt),
+            quota,
         )
     }
 }
@@ -672,9 +700,14 @@ mod tests {
     }
 
     async fn route_model(r: &HeuristicRouter, prompt: &str) -> String {
-        r.route(prompt, BudgetState::default(), &ModelHealth::default())
-            .await
-            .model
+        r.route(
+            prompt,
+            BudgetState::default(),
+            &ModelHealth::default(),
+            &SubscriptionQuota::default(),
+        )
+        .await
+        .model
     }
 
     #[tokio::test]
@@ -701,7 +734,12 @@ mod tests {
             "refactor the auth module to use the new token store",
         ] {
             let d = r
-                .route(p, BudgetState::default(), &ModelHealth::default())
+                .route(
+                    p,
+                    BudgetState::default(),
+                    &ModelHealth::default(),
+                    &SubscriptionQuota::default(),
+                )
                 .await;
             assert_eq!(d.tier, TaskTier::Complex, "{p}");
             assert!(
@@ -766,6 +804,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn exhausted_subscription_is_routed_around() {
+        // L3: a subscription at its limit is skipped entirely, like a benched model.
+        let r = mixed_router();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "claude-cli".to_string(),
+            forge_types::QuotaStatus::Exhausted,
+        );
+        map.insert("codex-cli".to_string(), forge_types::QuotaStatus::Exhausted);
+        let quota = SubscriptionQuota::new(map);
+        let d = r
+            .route(
+                "design a lock-free queue and prove it is correct",
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &quota,
+            )
+            .await;
+        assert!(
+            !is_subscription(&d.model),
+            "both subs exhausted → {}",
+            d.model
+        );
+        assert!(
+            !d.fallbacks.iter().any(|m| is_subscription(m)),
+            "exhausted subs absent from the chain too: {:?}",
+            d.fallbacks
+        );
+    }
+
+    #[tokio::test]
+    async fn near_limit_subscription_is_demoted_below_alternatives() {
+        // L3: a Warning subscription is still usable but ranks behind everything else.
+        let r = mixed_router();
+        let mut map = std::collections::HashMap::new();
+        map.insert("claude-cli".to_string(), forge_types::QuotaStatus::Warning);
+        map.insert("codex-cli".to_string(), forge_types::QuotaStatus::Warning);
+        let quota = SubscriptionQuota::new(map);
+        let d = r
+            .route(
+                "design a lock-free queue and prove it is correct",
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &quota,
+            )
+            .await;
+        // Complex normally picks the subscription flagship; under quota pressure a non-subscription
+        // model leads instead, with the subscription kept only as a later fallback.
+        assert!(
+            !is_subscription(&d.model),
+            "near-limit subs demoted below alternatives: got {}",
+            d.model
+        );
+    }
+
     // DIAGNOSTIC (ignored): print what the mesh routes to across a realistic catalog.
     // Run: cargo test -p forge-mesh routing_distribution_diagnostic -- --nocapture --ignored
     #[ignore]
@@ -815,7 +909,12 @@ mod tests {
         println!("\n=== route() per prompt ===");
         for p in prompts {
             let d = r
-                .route(p, BudgetState::default(), &ModelHealth::default())
+                .route(
+                    p,
+                    BudgetState::default(),
+                    &ModelHealth::default(),
+                    &SubscriptionQuota::default(),
+                )
                 .await;
             println!("[{:?}] {} -> {}", d.tier, &p[..p.len().min(46)], d.model);
         }
@@ -825,7 +924,12 @@ mod tests {
     #[tokio::test]
     async fn short_prompt_is_trivial() {
         let d = router()
-            .route("fix typo", BudgetState::default(), &ModelHealth::default())
+            .route(
+                "fix typo",
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Trivial);
     }
@@ -928,6 +1032,7 @@ mod tests {
                 "refactor the auth module",
                 BudgetState::default(),
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert_eq!(d.tier, TaskTier::Complex);
@@ -937,7 +1042,12 @@ mod tests {
     async fn medium_prompt_is_standard() {
         let prompt = "add a new endpoint that returns the list of users as json".repeat(2);
         let d = router()
-            .route(&prompt, BudgetState::default(), &ModelHealth::default())
+            .route(
+                &prompt,
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Standard);
     }
@@ -954,6 +1064,7 @@ mod tests {
                 "refactor the whole architecture",
                 budget,
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert_eq!(d.tier, TaskTier::Trivial);
@@ -969,6 +1080,7 @@ mod tests {
                 "rename x; but think hard about edge cases",
                 BudgetState::default(),
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert_eq!(d.tier, TaskTier::Complex); // AC-6
@@ -981,6 +1093,7 @@ mod tests {
                 "```rust\nlet x=1;\n```",
                 BudgetState::default(),
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert_eq!(d.tier, TaskTier::Standard); // AC-5
@@ -993,6 +1106,7 @@ mod tests {
                 "integrate the parser",
                 BudgetState::default(),
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert_eq!(d.tier, TaskTier::Standard);
@@ -1001,7 +1115,12 @@ mod tests {
     #[tokio::test]
     async fn fix_typo_stays_trivial_no_regression() {
         let d = router()
-            .route("fix typo", BudgetState::default(), &ModelHealth::default())
+            .route(
+                "fix typo",
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Trivial); // AC-7
     }
@@ -1014,7 +1133,12 @@ mod tests {
             .with_availability(|_| true)
             .with_pin(Some("openai::gpt-4o".into()));
         let d = r
-            .route("fix typo", BudgetState::default(), &ModelHealth::default())
+            .route(
+                "fix typo",
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+            )
             .await;
         assert_eq!(d.model, "openai::gpt-4o"); // AC-1
         assert!(d.rationale.contains("pinned"));
@@ -1034,7 +1158,12 @@ mod tests {
             ..Default::default()
         };
         let d = r
-            .route("design a system", budget, &ModelHealth::default())
+            .route(
+                "design a system",
+                budget,
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+            )
             .await;
         // pin ignored; trivial-tier model chosen (AC-2)
         assert_eq!(
@@ -1056,6 +1185,7 @@ mod tests {
                 "design the architecture",
                 BudgetState::default(),
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert_eq!(d.tier, TaskTier::Complex, "tier still reflects difficulty");
@@ -1076,6 +1206,7 @@ mod tests {
                 "design the architecture",
                 BudgetState::default(),
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert_eq!(
@@ -1134,7 +1265,12 @@ mod tests {
         let r = HeuristicRouter::new(c).with_availability(|_| true);
         let prompt = "add a new endpoint that returns the list of users as json".repeat(2);
         let d = r
-            .route(&prompt, BudgetState::default(), &ModelHealth::default())
+            .route(
+                &prompt,
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Standard);
         assert_eq!(d.model, "openai::gpt-4o-mini");
@@ -1154,7 +1290,12 @@ mod tests {
             .with_catalog(cat);
         let prompt = "design and architect a complex concurrency refactor across modules";
         let d = r
-            .route(prompt, BudgetState::default(), &ModelHealth::default())
+            .route(
+                prompt,
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Complex);
         assert_eq!(d.model, "anthropic::claude-opus-4-8", "{}", d.rationale);
@@ -1171,7 +1312,12 @@ mod tests {
             .with_availability(|_| true)
             .with_catalog(cat);
         let d = r
-            .route("fix typo", BudgetState::default(), &ModelHealth::default())
+            .route(
+                "fix typo",
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Trivial);
         assert_eq!(d.model, "groq::llama-3.1-8b-instant", "{}", d.rationale);
@@ -1194,6 +1340,7 @@ mod tests {
                 "design and architect a complex concurrency refactor across modules",
                 BudgetState::default(),
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert_eq!(d.model, "openai::gpt-4o-mini", "{}", d.rationale);
@@ -1211,7 +1358,12 @@ mod tests {
         let r = HeuristicRouter::new(c).with_availability(|_| true);
         let prompt = "add a new endpoint that returns the list of users as json".repeat(2);
         let d = r
-            .route(&prompt, BudgetState::default(), &ModelHealth::default())
+            .route(
+                &prompt,
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+            )
             .await;
         assert_eq!(d.model, "openai::gpt-4o-mini");
     }
@@ -1229,6 +1381,7 @@ mod tests {
                 "design the system architecture carefully",
                 BudgetState::default(),
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert_eq!(d.model, "claude-cli::");
@@ -1247,6 +1400,7 @@ mod tests {
                 "design the system architecture carefully",
                 BudgetState::default(),
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert_eq!(d.model, "claude-cli::");
@@ -1275,6 +1429,7 @@ mod tests {
                 prompt,
                 BudgetState::default(),
                 &benched(&["anthropic::claude-opus-4-8"]),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert_eq!(d.tier, TaskTier::Complex);
@@ -1304,6 +1459,7 @@ mod tests {
                 "design and architect a complex concurrency refactor across modules",
                 BudgetState::default(),
                 &ModelHealth::default(),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert!(
@@ -1320,16 +1476,20 @@ mod tests {
     async fn all_benched_falls_through_to_the_no_fallback_warning() {
         // Every model benched → behaves like nothing usable (AC-6 surfaces downstream).
         let r = HeuristicRouter::new(Config::default()).with_availability(|_| true);
-        let everything = HeuristicRouter::new(Config::default())
-            .candidates_for_tier(TaskTier::Complex, RouteHints::default());
+        let everything = HeuristicRouter::new(Config::default()).candidates_for_tier(
+            TaskTier::Complex,
+            RouteHints::default(),
+            &SubscriptionQuota::default(),
+        );
         let refs: Vec<&str> = everything.iter().map(String::as_str).collect();
         // Bench the complex candidates AND the cross-tier ones by benching all configured tiers.
         let mut all: Vec<String> = Vec::new();
         for t in [TaskTier::Complex, TaskTier::Standard, TaskTier::Trivial] {
-            all.extend(
-                HeuristicRouter::new(Config::default())
-                    .candidates_for_tier(t, RouteHints::default()),
-            );
+            all.extend(HeuristicRouter::new(Config::default()).candidates_for_tier(
+                t,
+                RouteHints::default(),
+                &SubscriptionQuota::default(),
+            ));
         }
         let all_refs: Vec<&str> = all.iter().map(String::as_str).collect();
         let _ = refs; // (kept for clarity; all_refs is the superset used below)
@@ -1338,6 +1498,7 @@ mod tests {
                 "design the architecture",
                 BudgetState::default(),
                 &benched(&all_refs),
+                &SubscriptionQuota::default(),
             )
             .await;
         assert!(d.fallbacks.is_empty());

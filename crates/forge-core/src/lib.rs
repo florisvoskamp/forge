@@ -492,7 +492,10 @@ impl Session {
         // Route around any currently-benched models (failover): the snapshot excludes models
         // whose cooldown hasn't elapsed, even across restarts (model-health-failover).
         let health = self.store.current_benched().unwrap_or_default();
-        let decision = self.router.route(prompt, budget, &health).await;
+        // Quota-aware routing (L3): demote/skip a subscription that the bridge reported is near or
+        // over its plan limit (recorded after earlier turns from the CLI's rate-limit events).
+        let quota = self.store.current_quota().unwrap_or_default();
+        let decision = self.router.route(prompt, budget, &health, &quota).await;
         self.presenter.emit(PresenterEvent::Routing {
             tier: decision.tier.as_str().to_string(),
             model: decision.model.clone(),
@@ -643,6 +646,11 @@ impl Session {
                 )?;
             }
             self.store.record_usage(&self.id, &msg_id, &resp.usage)?;
+            // Quota-aware routing (L3): if a CLI bridge reported its subscription window this turn,
+            // persist it so the next route() can demote/skip a near-limit subscription.
+            if let Some(hint) = &resp.quota {
+                let _ = self.store.record_quota(hint);
+            }
 
             if !resp.wants_tools() {
                 final_text = resp.content;
@@ -1097,6 +1105,7 @@ mod tests {
                     content: "done".into(),
                     tool_calls: vec![],
                     usage,
+                    quota: None,
                 });
             }
             Ok(ModelResponse {
@@ -1110,6 +1119,7 @@ mod tests {
                     }),
                 }],
                 usage,
+                quota: None,
             })
         }
     }
@@ -1463,6 +1473,7 @@ mod tests {
                         content: content.into(),
                         tool_calls: vec![],
                         usage,
+                        quota: None,
                     });
                 }
                 return Ok(ModelResponse {
@@ -1473,6 +1484,7 @@ mod tests {
                         args: serde_json::json!({"path": "Cargo.toml"}),
                     }],
                     usage,
+                    quota: None,
                 });
             }
             // Parent: fan out, then synthesize once results return.
@@ -1483,6 +1495,7 @@ mod tests {
                     content: content.into(),
                     tool_calls: vec![],
                     usage,
+                    quota: None,
                 });
             }
             Ok(ModelResponse {
@@ -1496,6 +1509,7 @@ mod tests {
                     ]}),
                 }],
                 usage,
+                quota: None,
             })
         }
     }
@@ -1647,6 +1661,7 @@ mod tests {
                     content: "leaf answer".into(),
                     tool_calls: vec![],
                     usage,
+                    quota: None,
                 });
             }
             Ok(ModelResponse {
@@ -1657,6 +1672,7 @@ mod tests {
                     args: serde_json::json!({"agents": [{"task": "go deeper"}]}),
                 }],
                 usage,
+                quota: None,
             })
         }
     }
@@ -1786,6 +1802,7 @@ mod tests {
             _prompt: &str,
             _budget: BudgetState,
             _health: &forge_types::ModelHealth,
+            _quota: &forge_types::SubscriptionQuota,
         ) -> forge_mesh::RoutingDecision {
             forge_mesh::RoutingDecision {
                 tier: forge_types::TaskTier::Trivial,
@@ -1818,6 +1835,7 @@ mod tests {
                 content: "recovered".into(),
                 tool_calls: vec![],
                 usage: forge_types::Usage::default(),
+                quota: None,
             })
         }
     }
@@ -2001,6 +2019,7 @@ mod tests {
                     content: "done".into(),
                     tool_calls: vec![],
                     usage,
+                    quota: None,
                 });
             }
             Ok(ModelResponse {
@@ -2011,6 +2030,7 @@ mod tests {
                     args: serde_json::json!({ "path": self.path, "content": self.content }),
                 }],
                 usage,
+                quota: None,
             })
         }
     }
@@ -2127,6 +2147,7 @@ mod tests {
                 content: "too late".into(),
                 tool_calls: vec![],
                 usage: forge_types::Usage::default(),
+                quota: None,
             })
         }
     }
@@ -2204,6 +2225,7 @@ mod tests {
                 content,
                 tool_calls: vec![],
                 usage: forge_types::Usage::default(),
+                quota: None,
             })
         }
     }
