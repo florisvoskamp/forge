@@ -103,6 +103,41 @@ fn provider_rotation(provider: &str, seed: u64) -> u64 {
     stable_hash(&format!("{seed}:{provider}"))
 }
 
+/// A fine within-family capability key (the first version number in the id: `gpt-5.5`→5.5,
+/// `claude-opus-4-8`→4.8, `gpt-4o-mini`→4.0). Used as a LATE tiebreak — after the provider
+/// rotation — so it only orders models of the *same* provider/class: never pick `gpt-5.2` over
+/// `gpt-5.5` when both are the same $0 subscription. It never competes across providers (the
+/// rotation already separated those), so a higher raw number can't make one provider always win.
+fn fine_capability(id: &str) -> f64 {
+    let bytes = id.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && !bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    let mut major: u32 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        major = major * 10 + (bytes[i] - b'0') as u32;
+        i += 1;
+    }
+    // An immediately-following `.` or `-` then digits is the minor version (`5.4`, `4-8`).
+    let mut frac = 0.0;
+    if i < bytes.len()
+        && (bytes[i] == b'.' || bytes[i] == b'-')
+        && i + 1 < bytes.len()
+        && bytes[i + 1].is_ascii_digit()
+    {
+        i += 1;
+        let (mut minor, mut digits) = (0u32, 0i32);
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            minor = minor * 10 + (bytes[i] - b'0') as u32;
+            digits += 1;
+            i += 1;
+        }
+        frac = minor as f64 / 10f64.powi(digits);
+    }
+    major as f64 + frac
+}
+
 /// A small deterministic FNV-1a hash (no external deps); used for the seed and provider rotation.
 pub fn stable_hash(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -225,7 +260,7 @@ impl ModelCatalog {
         code_heavy: bool,
         seed: u64,
     ) -> Vec<String> {
-        let mut scored: Vec<(f64, u8, u64, &String)> = self
+        let mut scored: Vec<(f64, u8, u64, f64, &String)> = self
             .models
             .iter()
             .map(|m| {
@@ -234,22 +269,25 @@ impl ModelCatalog {
                     route_score(m, tier, cost, code_heavy),
                     cost_class(m, cost),
                     provider_rotation(provider_of(m), seed),
+                    fine_capability(m),
                     m,
                 )
             })
             .collect();
         // Best score first; then cheaper cost-class; then the per-prompt provider rotation
-        // (spreads ties across providers); then id for a fully deterministic order.
+        // (spreads ties ACROSS providers); then — within one provider — the higher-version model
+        // (never a lesser sibling); then id for a fully deterministic order.
         scored.sort_by(|a, b| {
             b.0.total_cmp(&a.0)
                 .then_with(|| a.1.cmp(&b.1))
                 .then_with(|| a.2.cmp(&b.2))
-                .then_with(|| a.3.cmp(b.3))
+                .then_with(|| b.3.total_cmp(&a.3))
+                .then_with(|| a.4.cmp(b.4))
         });
         scored
             .into_iter()
             .take(top)
-            .map(|(_, _, _, m)| m.clone())
+            .map(|(_, _, _, _, m)| m.clone())
             .collect()
     }
 
@@ -419,6 +457,42 @@ mod tests {
         assert_eq!(s.subscription, 1); // claude-cli
         assert_eq!(s.free, 4); // groq-8b, groq-70b, ollama, or-deepseek-r1:free
         assert_eq!(s.paid, 3); // anthropic-opus, gpt-4o-mini, or-opus
+    }
+
+    #[test]
+    fn within_a_subscription_family_the_higher_version_wins() {
+        // The gpt-5.2-over-5.5 bug: among same-provider, same-class $0 models, never pick the
+        // lesser sibling. fine_capability orders 5.5 > 5.4 > 5.2 (and the mini stays a small/
+        // trivial model, not a complex pick).
+        let cat = ModelCatalog::new(vec![
+            "codex-cli::gpt-5.2".into(),
+            "codex-cli::gpt-5.4".into(),
+            "codex-cli::gpt-5.5".into(),
+            "codex-cli::gpt-5.4-mini".into(),
+        ]);
+        let r = cat.ranked_for(TaskTier::Complex, &Pricing::default(), 4);
+        assert_eq!(
+            r[0], "codex-cli::gpt-5.5",
+            "highest version leads complex: {r:?}"
+        );
+        assert!(
+            r.iter().position(|m| m == "codex-cli::gpt-5.5").unwrap()
+                < r.iter().position(|m| m == "codex-cli::gpt-5.2").unwrap(),
+            "5.5 must rank above 5.2: {r:?}"
+        );
+        // The mini is small-class → it is NOT the complex pick.
+        assert_ne!(r[0], "codex-cli::gpt-5.4-mini");
+    }
+
+    #[test]
+    fn fine_capability_parses_versions() {
+        assert!(fine_capability("codex-cli::gpt-5.5") > fine_capability("codex-cli::gpt-5.4"));
+        assert!(fine_capability("codex-cli::gpt-5.4") > fine_capability("codex-cli::gpt-5.2"));
+        assert!(
+            (fine_capability("anthropic::claude-opus-4-8") - 4.8).abs() < 1e-9,
+            "4-8 → 4.8"
+        );
+        assert_eq!(fine_capability("ollama::llama3"), 3.0);
     }
 
     #[test]
