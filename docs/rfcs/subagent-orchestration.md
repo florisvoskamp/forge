@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | Phase 1 + 2 + 3a + 3b SHIPPED (parallel, agent types, live TUI w/ nested streaming, CLI-bridge exposure); recursion + bridge-panel remain |
+| Status | FULLY SHIPPED — Phases 1–3c (parallel, agent types, live TUI w/ nested streaming, CLI-bridge exposure + visibility, bounded recursion) |
 | Author | Floris (with Claude) |
 | Created | 2026-06-15 |
 | Last updated | 2026-06-15 |
@@ -330,13 +330,24 @@ classify each). Store mutex is not a bottleneck at these write volumes.
   shows the trailing edge of that activity in the child's live panel row (falling back to the
   task before it streams). Bounded to the last ~80 chars per row; no interleaving since each
   child writes only its own row.
-- **Phase 3c (future) — true recursion (depth >1) + cross-agent sequencing + a native per-child
-  panel for *CLI-bridge*-spawned subagents.** Still out of scope. The bridge panel is blocked by
-  process topology: bridge subagent events live in a grandchild process
-  (forge → claude → `mcp-serve`) whose only channel back to Forge is claude's stream-json, which
-  doesn't carry Forge's structured `Subagent*` events — so CLI-bridge subagent activity still
-  surfaces as a single `mcp__forge__spawn_agents` tool call in the bridge stream. Recursion stays
-  deferred as a deliberate fork-bomb guard.
+- **Phase 3c — bridge-subagent TUI visibility + bounded recursion. ✅ SHIPPED.**
+  - *Visibility:* the process-topology block (events in forge → claude → `mcp-serve`, claude's
+    stream-json can't carry Forge events) is solved with an **out-of-band JSONL sink**.
+    `CliProvider` creates a temp file, passes its path to the bridge via the `FORGE_SUBAGENT_SINK`
+    env var (inherited forge → claude → mcp-serve), and **tails it concurrently** with claude's
+    stdout (`tokio::select!`, so events drain live while claude is silent awaiting the tool
+    result). mcp-serve writes `start`/`progress`/`done` JSONL there; `CliProvider` parses each
+    into a new `StreamEvent::Subagent*`, which core maps to the same `PresenterEvent::Subagent*`
+    as native turns — so bridge-spawned subagents render in the **native TUI panel** (verified
+    live: mcp-serve emitted start + live progress deltas + done to the sink).
+  - *Recursion:* `mesh.subagents.max_depth` (default 2). `AgentCtx` carries `depth`/`max_depth`;
+    a native child advertises + intercepts `spawn_agents` while `depth < max_depth` and recurses
+    via a boxed (`Pin<Box<dyn Future + Send>>`) `run_nested_spawn` (breaks the async opaque-type
+    cycle). Across processes the depth rides the `FORGE_SUBAGENT_DEPTH` env var (replaces the
+    old boolean guard): each `mcp-serve` advertises `spawn_agents` only while `depth < max_depth`
+    and bumps it for anything it spawns. Bounded + terminating (verified: a self-recursing
+    provider stops at exactly `max_depth` generations). Per-call `max_agents`/`max_concurrency`
+    caps still apply at every level.
 
 ### Spike checklist (before Phase 2)
 1. Confirm `Box`→`Arc` compiles cleanly across `forge-cli` construction sites and tests.

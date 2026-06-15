@@ -11,7 +11,7 @@ mod cli_provider;
 mod genai_provider;
 mod mock;
 
-pub use cli_provider::{CliKind, CliProvider};
+pub use cli_provider::{CliKind, CliProvider, SUBAGENT_SINK_ENV};
 pub use genai_provider::GenAiProvider;
 pub use mock::MockProvider;
 
@@ -60,6 +60,24 @@ pub enum StreamEvent {
         name: String,
         ok: bool,
         summary: String,
+    },
+    /// A subagent was spawned. Emitted by the CLI bridge by tailing the out-of-band event sink
+    /// that `forge mcp-serve` writes (so bridge-spawned subagents are visible in the TUI just
+    /// like native ones — RFC subagent-orchestration Phase 3c).
+    SubagentStarted {
+        id: String,
+        agent: String,
+        task: String,
+    },
+    /// A live activity snippet from a still-running subagent (CLI bridge only).
+    SubagentProgress { id: String, snippet: String },
+    /// A subagent finished (CLI bridge only).
+    SubagentFinished {
+        id: String,
+        agent: String,
+        ok: bool,
+        summary: String,
+        cost_usd: f64,
     },
 }
 

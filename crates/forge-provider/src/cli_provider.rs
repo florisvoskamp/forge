@@ -563,12 +563,29 @@ impl Provider for CliProvider {
             &forge_exe,
         );
 
+        // Harness turns can spawn subagents inside `forge mcp-serve`; give it an out-of-band
+        // JSONL sink to report their lifecycle so we can surface them in the TUI (Phase 3c).
+        let sink_path: Option<std::path::PathBuf> = if self.harness {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir()
+                .join(format!("forge-subagents-{}-{n}.jsonl", std::process::id()));
+            // Create it empty so the tailer can open it immediately.
+            let _ = std::fs::File::create(&p);
+            Some(p)
+        } else {
+            None
+        };
+
         let mut cmd = Command::new(&self.binary);
         cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(p) = &sink_path {
+            cmd.env(SUBAGENT_SINK_ENV, p);
+        }
         put_in_own_process_group(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|e| {
@@ -588,6 +605,17 @@ impl Provider for CliProvider {
         let stderr = child.stderr.take().expect("piped stderr");
         let err_task = tokio::spawn(read_to_cap(stderr));
 
+        // Tail the subagent sink concurrently (only in harness mode). Events arrive while the
+        // CLI is silent waiting on the spawn_agents tool result, so they must be drained live.
+        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+        let tailer = match &sink_path {
+            Some(p) => Some(tokio::spawn(tail_subagent_sink(p.clone(), sub_tx))),
+            None => {
+                drop(sub_tx); // no sink → close the channel so its select arm is disabled
+                None
+            }
+        };
+
         let mut content = String::new();
         let mut final_text: Option<String> = None;
         let mut usage = Usage::default();
@@ -598,31 +626,50 @@ impl Provider for CliProvider {
 
         let read = tokio::time::timeout(self.timeout, async {
             let mut lines = BufReader::new(stdout).lines();
-            while let Some(line) = lines.next_line().await? {
-                for item in parse_line(self.kind, &line) {
-                    match item {
-                        Parsed::Reasoning(t) => on_event(StreamEvent::Reasoning(t)),
-                        Parsed::Text(t) => {
-                            content.push_str(&t);
-                            on_event(StreamEvent::Text(t));
+            loop {
+                tokio::select! {
+                    // Bias toward the CLI's own output; subagent events are supplementary.
+                    biased;
+                    line = lines.next_line() => {
+                        let Some(line) = line? else { break };
+                        for item in parse_line(self.kind, &line) {
+                            match item {
+                                Parsed::Reasoning(t) => on_event(StreamEvent::Reasoning(t)),
+                                Parsed::Text(t) => {
+                                    content.push_str(&t);
+                                    on_event(StreamEvent::Text(t));
+                                }
+                                Parsed::ToolStarted { id, name, args } => {
+                                    tool_names.insert(id, name.clone());
+                                    on_event(StreamEvent::ToolStarted { name, args });
+                                }
+                                Parsed::ToolFinished { id, ok, summary } => {
+                                    let name = tool_names.get(&id).cloned().unwrap_or_default();
+                                    on_event(StreamEvent::ToolFinished { name, ok, summary });
+                                }
+                                Parsed::Usage(u) => usage = u,
+                                Parsed::Final(f) => final_text = Some(f),
+                                Parsed::Error(e) => in_band_error = Some(e),
+                            }
                         }
-                        Parsed::ToolStarted { id, name, args } => {
-                            tool_names.insert(id, name.clone());
-                            on_event(StreamEvent::ToolStarted { name, args });
-                        }
-                        Parsed::ToolFinished { id, ok, summary } => {
-                            let name = tool_names.get(&id).cloned().unwrap_or_default();
-                            on_event(StreamEvent::ToolFinished { name, ok, summary });
-                        }
-                        Parsed::Usage(u) => usage = u,
-                        Parsed::Final(f) => final_text = Some(f),
-                        Parsed::Error(e) => in_band_error = Some(e),
                     }
+                    Some(ev) = sub_rx.recv() => on_event(ev),
                 }
+            }
+            // Drain any subagent events that landed just before the CLI's stdout closed.
+            while let Ok(ev) = sub_rx.try_recv() {
+                on_event(ev);
             }
             Ok::<(), std::io::Error>(())
         })
         .await;
+
+        if let Some(t) = tailer {
+            t.abort();
+        }
+        if let Some(p) = &sink_path {
+            let _ = std::fs::remove_file(p);
+        }
 
         match read {
             Err(_elapsed) => {
@@ -687,6 +734,68 @@ impl Provider for CliProvider {
     }
 }
 
+/// Env var naming the out-of-band JSONL sink that `forge mcp-serve` writes subagent lifecycle
+/// events to; the bridge sets it on the spawned CLI (inherited forge → claude → mcp-serve) and
+/// tails it so bridge-spawned subagents surface in the TUI (RFC subagent-orchestration 3c).
+pub const SUBAGENT_SINK_ENV: &str = "FORGE_SUBAGENT_SINK";
+
+/// Parse one line of the subagent sink into a [`StreamEvent`]. Field-tolerant.
+fn parse_sink_line(line: &str) -> Option<StreamEvent> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    match v.get("k").and_then(Value::as_str)? {
+        "start" => Some(StreamEvent::SubagentStarted {
+            id: s("id"),
+            agent: s("agent"),
+            task: s("task"),
+        }),
+        "progress" => Some(StreamEvent::SubagentProgress {
+            id: s("id"),
+            snippet: s("snippet"),
+        }),
+        "done" => Some(StreamEvent::SubagentFinished {
+            id: s("id"),
+            agent: s("agent"),
+            ok: v.get("ok").and_then(Value::as_bool).unwrap_or(true),
+            summary: s("summary"),
+            cost_usd: v.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
+        }),
+        _ => None,
+    }
+}
+
+/// Tail the subagent sink file, forwarding each event over `tx` as it is appended. Runs until
+/// aborted by the caller (after the CLI process exits). Tolerant of the file not existing yet.
+async fn tail_subagent_sink(
+    path: std::path::PathBuf,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+) {
+    use tokio::io::AsyncBufReadExt;
+    // Wait for the file to appear (mcp-serve creates/opens it on first write).
+    let file = loop {
+        match tokio::fs::File::open(&path).await {
+            Ok(f) => break f,
+            Err(_) => tokio::time::sleep(Duration::from_millis(40)).await,
+        }
+    };
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut buf = String::new();
+    loop {
+        match reader.read_line(&mut buf).await {
+            Ok(0) => tokio::time::sleep(Duration::from_millis(40)).await, // EOF: await more
+            Ok(_) => {
+                if let Some(ev) = parse_sink_line(buf.trim()) {
+                    if tx.send(ev).is_err() {
+                        break;
+                    }
+                }
+                buf.clear();
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 async fn read_to_cap<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -732,6 +841,41 @@ async fn terminate(child: &mut Child, pgid: Option<i32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sink_lines_parse_into_subagent_events() {
+        match parse_sink_line(r#"{"k":"start","id":"x1","agent":"reviewer","task":"review"}"#) {
+            Some(StreamEvent::SubagentStarted { id, agent, task }) => {
+                assert_eq!(
+                    (id.as_str(), agent.as_str(), task.as_str()),
+                    ("x1", "reviewer", "review")
+                );
+            }
+            other => panic!("expected SubagentStarted, got {other:?}"),
+        }
+        assert_eq!(
+            parse_sink_line(r#"{"k":"progress","id":"x1","snippet":"reading"}"#),
+            Some(StreamEvent::SubagentProgress {
+                id: "x1".into(),
+                snippet: "reading".into()
+            })
+        );
+        match parse_sink_line(
+            r#"{"k":"done","id":"x1","agent":"reviewer","ok":true,"summary":"2 issues","cost":0.01}"#,
+        ) {
+            Some(StreamEvent::SubagentFinished {
+                ok,
+                cost_usd,
+                summary,
+                ..
+            }) => {
+                assert!(ok && (cost_usd - 0.01).abs() < 1e-9 && summary == "2 issues");
+            }
+            other => panic!("expected SubagentFinished, got {other:?}"),
+        }
+        assert!(parse_sink_line("not json").is_none());
+        assert!(parse_sink_line(r#"{"k":"unknown"}"#).is_none());
+    }
 
     #[test]
     fn bare_model_strips_cli_prefix() {

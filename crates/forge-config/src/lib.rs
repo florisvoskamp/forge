@@ -235,6 +235,11 @@ pub struct SubagentsConfig {
     /// Max child agents running concurrently (parallel fan-out is Phase 2).
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: usize,
+    /// How deep subagents may nest (1 = a top-level turn may spawn children, but those children
+    /// may not spawn their own). Bounds total fan-out; the per-call `max_agents`/`max_concurrency`
+    /// caps still apply at every level (RFC subagent-orchestration Phase 3c).
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
     /// Directory holding named agent-type files (`<name>.md`), relative to the cwd.
     #[serde(default = "default_agents_dir")]
     pub agents_dir: String,
@@ -249,6 +254,9 @@ fn default_max_agents() -> usize {
 fn default_max_concurrency() -> usize {
     4
 }
+fn default_max_depth() -> usize {
+    2
+}
 fn default_agents_dir() -> String {
     ".forge/agents".to_string()
 }
@@ -259,6 +267,7 @@ impl Default for SubagentsConfig {
             enabled: default_subagents_enabled(),
             max_agents: default_max_agents(),
             max_concurrency: default_max_concurrency(),
+            max_depth: default_max_depth(),
             agents_dir: default_agents_dir(),
         }
     }

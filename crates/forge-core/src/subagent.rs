@@ -167,6 +167,12 @@ pub struct AgentCtx {
     pub pricing: Pricing,
     pub mode: PermissionMode,
     pub rules: Vec<PermissionRule>,
+    /// Nesting level of *this* context's children (0 = the top-level turn's children). Children
+    /// may themselves spawn iff `depth < max_depth` (RFC subagent-orchestration Phase 3c).
+    pub depth: usize,
+    pub max_depth: usize,
+    /// Loaded agent types, shared so a recursing child can resolve named agents too.
+    pub agents: Arc<HashMap<String, AgentDef>>,
 }
 
 /// The result of running one child agent.
@@ -186,10 +192,11 @@ pub async fn run_subagent(
     on_delta: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<SubagentOutcome, CoreError> {
     let task = agent.task.as_str();
-    // Registry WITHOUT spawn_agents — children can't recurse (depth-1 guard). The agent type
-    // may widen the toolset beyond read-only, but never to the spawn tool, and writes/shell
-    // still pass the permission gate (where Ask→Deny in a child).
+    // The agent type may widen the toolset beyond read-only; writes/shell still pass the
+    // permission gate (where Ask→Deny in a child). The child can itself spawn subagents only
+    // while there is depth budget left (RFC subagent-orchestration Phase 3c).
     let full = ToolRegistry::with_core_tools();
+    let can_recurse = ctx.depth < ctx.max_depth;
     let allowed: Vec<&str> = if agent.tools.is_empty() {
         SUBAGENT_TOOLS.to_vec()
     } else {
@@ -200,7 +207,7 @@ pub async fn run_subagent(
             .filter(|t| *t != SPAWN_AGENTS_TOOL)
             .collect()
     };
-    let specs: Vec<ToolSpec> = allowed
+    let mut specs: Vec<ToolSpec> = allowed
         .iter()
         .filter_map(|name| full.get(name))
         .map(|t| ToolSpec {
@@ -209,6 +216,9 @@ pub async fn run_subagent(
             schema: t.schema(),
         })
         .collect();
+    if can_recurse {
+        specs.push(spawn_agents_spec(ctx.config.mesh.subagents.max_agents));
+    }
 
     // Routing: an agent type may pin a tier; otherwise route the task through the mesh.
     let decision = match agent
@@ -279,7 +289,13 @@ pub async fn run_subagent(
         }
 
         for call in &resp.tool_calls {
-            let result = execute_tool(ctx, &full, &msg_id, call).await?;
+            let result = if call.name == SPAWN_AGENTS_TOOL && can_recurse {
+                // The child delegates further: recurse one level deeper (bounded by max_depth).
+                // Grandchildren aren't shown in the live panel — they roll up into this result.
+                run_nested_spawn(ctx.clone(), child_id.to_string(), call.args.clone(), budget).await
+            } else {
+                execute_tool(ctx, &full, &msg_id, call).await?
+            };
             if result.starts_with("error:") || result.starts_with("permission denied") {
                 ok = false;
             }
@@ -297,6 +313,46 @@ pub async fn run_subagent(
     }
 
     Ok(SubagentOutcome { final_text, ok })
+}
+
+/// A child agent delegating further: recurse one level deeper. Grandchildren are not surfaced
+/// to the live UI (no-op lifecycle) — their results roll up into this child's tool result.
+/// `Box::pin` breaks the orchestrate→run_subagent→orchestrate async-recursion type cycle.
+/// Returns a **boxed** (concrete, non-opaque) future so it does not participate in the
+/// orchestrate→run_subagent async-`impl Future` opaque-type cycle; `+ Send` asserts Send at the
+/// boundary. Owned args so the future is `'static`.
+fn run_nested_spawn(
+    ctx: AgentCtx,
+    parent_id: String,
+    args: serde_json::Value,
+    budget: BudgetState,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>> {
+    Box::pin(async move {
+        let max = ctx.config.mesh.subagents.max_agents;
+        let requests = match parse_requests(&args, max) {
+            Ok(r) => r,
+            Err(e) => return format!("error: {e}"),
+        };
+        let deeper = AgentCtx {
+            depth: ctx.depth + 1,
+            ..ctx.clone()
+        };
+        let concurrency = ctx.config.mesh.subagents.max_concurrency;
+        let mut noop = |_: Lifecycle| {};
+        match orchestrate(
+            &deeper,
+            &parent_id,
+            requests,
+            budget,
+            concurrency,
+            &mut noop,
+        )
+        .await
+        {
+            Ok((combined, _)) => combined,
+            Err(e) => format!("error: nested subagents failed: {e}"),
+        }
+    })
 }
 
 /// A message from a child task to the orchestrator's drain loop: a live activity delta, or the
@@ -344,7 +400,6 @@ pub async fn orchestrate(
     ctx: &AgentCtx,
     parent_id: &str,
     requests: Vec<AgentRequest>,
-    agents: &HashMap<String, AgentDef>,
     budget: BudgetState,
     max_concurrency: usize,
     on_event: &mut (dyn FnMut(Lifecycle) + Send),
@@ -360,7 +415,7 @@ pub async fn orchestrate(
     // Create each child session + announce Start up front (so a UI shows the whole batch as
     // running immediately), then spawn the work bounded by a concurrency permit.
     for (i, req) in requests.into_iter().enumerate() {
-        let resolved = resolve(&req, agents);
+        let resolved = resolve(&req, &ctx.agents);
         let child_id = ctx
             .store
             .create_child_session(".", &mode_label, parent_id)?;
