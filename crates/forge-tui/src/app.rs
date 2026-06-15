@@ -90,6 +90,8 @@ struct SubRow {
     id: String,
     agent: String,
     task: String,
+    /// Trailing edge of the child's streamed activity (RFC subagent-orchestration Phase 3b).
+    last: String,
     done: bool,
     cost: f64,
 }
@@ -197,9 +199,20 @@ impl App {
                     id,
                     agent,
                     task,
+                    last: String::new(),
                     done: false,
                     cost: 0.0,
                 });
+            }
+            PresenterEvent::SubagentProgress { id, snippet } => {
+                if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id && !r.done) {
+                    // Keep only the trailing edge of the child's activity for its row.
+                    row.last.push_str(snippet.replace('\n', " ").as_str());
+                    let n = row.last.chars().count();
+                    if n > 80 {
+                        row.last = row.last.chars().skip(n - 80).collect();
+                    }
+                }
             }
             PresenterEvent::SubagentResult {
                 id,
@@ -326,12 +339,14 @@ fn subagent_footer_line(n: usize, total_usd: f64) -> TextLine<'static> {
     ))
 }
 
-/// A still-running subagent row for the live preview (animated spinner).
-fn subagent_running_line(spin: &str, agent: &str, task: &str) -> TextLine<'static> {
+/// A still-running subagent row for the live preview (animated spinner). Shows the child's live
+/// activity tail once it starts streaming, falling back to the task before then.
+fn subagent_running_line(spin: &str, agent: &str, task: &str, last: &str) -> TextLine<'static> {
+    let detail = if last.trim().is_empty() { task } else { last };
     TextLine::from(vec![
         Span::styled(format!("  {spin} "), Style::default().fg(TOOLCYAN)),
         Span::styled(format!("[{agent}] "), Style::default().fg(TOOLCYAN).bold()),
-        Span::styled(truncate(task, 50), Style::default().fg(DIM)),
+        Span::styled(truncate(detail, 50), Style::default().fg(DIM)),
     ])
 }
 
@@ -433,7 +448,7 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<TextLine> = running
         .iter()
         .take(h)
-        .map(|r| subagent_running_line(spin, &r.agent, &r.task))
+        .map(|r| subagent_running_line(spin, &r.agent, &r.task, &r.last))
         .collect();
     if running.len() > h {
         lines.pop();
@@ -584,6 +599,16 @@ mod tests {
         assert!(
             live.contains("reviewer"),
             "running child shown live: {live}"
+        );
+
+        // A streamed activity delta shows in that child's row (Phase 3b live streaming).
+        app.apply(PresenterEvent::SubagentProgress {
+            id: "a".into(),
+            snippet: "inspecting auth".into(),
+        });
+        assert!(
+            screen(&app).contains("inspecting auth"),
+            "child's live activity tail shows in its row"
         );
 
         app.apply(PresenterEvent::SubagentResult {

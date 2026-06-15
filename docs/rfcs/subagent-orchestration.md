@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | Phase 1 + 2 + 3a SHIPPED (parallel, agent types, live TUI, CLI-bridge exposure); nested streaming + recursion remain |
+| Status | Phase 1 + 2 + 3a + 3b SHIPPED (parallel, agent types, live TUI w/ nested streaming, CLI-bridge exposure); recursion + bridge-panel remain |
 | Author | Floris (with Claude) |
 | Created | 2026-06-15 |
 | Last updated | 2026-06-15 |
@@ -324,10 +324,19 @@ classify each). Store mutex is not a bottleneck at these write volumes.
   spawn_agents` ran a mesh-routed ollama child end-to-end at $0). The presenter-agnostic
   `orchestrate(ctx, parent_id, requests, agents, budget, max_concurrency, on_event)` is shared
   by `Session` (TUI events) and mcp-serve (headless logging).
-- **Phase 3b (future) — nested live token streaming + true recursion (depth >1) + cross-agent
-  sequencing.** Out of scope here. (CLI-bridge subagent activity currently surfaces as a single
-  `mcp__forge__spawn_agents` tool call in the bridge's stream, not the native per-child TUI
-  panel.)
+- **Phase 3b — nested live token streaming (native turns). ✅ SHIPPED.** Each child's streamed
+  text/reasoning is forwarded from its task over the orchestrator channel
+  (`ChildMsg::Progress` → `Lifecycle::Progress` → `PresenterEvent::SubagentProgress`); the TUI
+  shows the trailing edge of that activity in the child's live panel row (falling back to the
+  task before it streams). Bounded to the last ~80 chars per row; no interleaving since each
+  child writes only its own row.
+- **Phase 3c (future) — true recursion (depth >1) + cross-agent sequencing + a native per-child
+  panel for *CLI-bridge*-spawned subagents.** Still out of scope. The bridge panel is blocked by
+  process topology: bridge subagent events live in a grandchild process
+  (forge → claude → `mcp-serve`) whose only channel back to Forge is claude's stream-json, which
+  doesn't carry Forge's structured `Subagent*` events — so CLI-bridge subagent activity still
+  surfaces as a single `mcp__forge__spawn_agents` tool call in the bridge stream. Recursion stays
+  deferred as a deliberate fork-bomb guard.
 
 ### Spike checklist (before Phase 2)
 1. Confirm `Box`→`Arc` compiles cleanly across `forge-cli` construction sites and tests.

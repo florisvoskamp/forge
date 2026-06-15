@@ -53,6 +53,11 @@ pub enum PresenterEvent {
         agent: String,
         task: String,
     },
+    /// A live activity snippet from a still-running subagent (streamed text/reasoning).
+    SubagentProgress {
+        id: String,
+        snippet: String,
+    },
     /// A subagent finished, with its one-line result summary and its cost.
     SubagentResult {
         id: String,
@@ -143,6 +148,9 @@ impl Presenter for HeadlessPresenter {
             PresenterEvent::SubagentStart { agent, task, .. } => {
                 println!("  ⤷ spawn [{agent}]: {task}");
             }
+            // Live per-child deltas are for the interactive TUI row; the line-based renderer
+            // stays quiet and shows the final SubagentResult.
+            PresenterEvent::SubagentProgress { .. } => {}
             PresenterEvent::SubagentResult {
                 agent,
                 ok,
