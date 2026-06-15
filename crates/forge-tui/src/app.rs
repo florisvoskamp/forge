@@ -12,7 +12,7 @@ use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::PresenterEvent;
+use crate::{PresenterEvent, QChoice};
 
 // Palette.
 const ORANGE: Color = Color::Rgb(255, 145, 60); // brand accent
@@ -64,6 +64,9 @@ pub struct App {
     pub done: bool,
     /// The active operating temper label (e.g. "Guarded"), shown in the statusline.
     pub temper: String,
+    /// An in-flight AskUserQuestion: the choices + whether free text is allowed. The question
+    /// text + options are already in scrollback; the input line collects the answer.
+    question: Option<(Vec<QChoice>, bool)>,
     /// A pending permission question shown while the loop blocks on the user's y/n.
     pub prompt: Option<String>,
     /// The current input-line buffer (shown in the input box).
@@ -257,6 +260,53 @@ impl App {
             Span::styled("  temper → ", Style::default().fg(DIM)),
             Span::styled(label.to_string(), Style::default().fg(ORANGE).bold()),
         ]));
+    }
+
+    /// Begin an AskUserQuestion: render the question + numbered options into scrollback and arm
+    /// the input line to collect the answer (a number picks an option; free text if allowed).
+    pub fn set_question(&mut self, question: &str, options: &[QChoice], allow_other: bool) {
+        self.flush.push(TextLine::from(vec![
+            Span::styled("❓ ", Style::default().fg(ORANGE).bold()),
+            Span::styled(question.to_string(), Style::default().fg(USER).bold()),
+        ]));
+        for (i, o) in options.iter().enumerate() {
+            let mut spans = vec![
+                Span::styled(format!("  {}) ", i + 1), Style::default().fg(ORANGE)),
+                Span::raw(o.label.clone()),
+            ];
+            if !o.description.is_empty() {
+                spans.push(Span::styled(
+                    format!("  — {}", o.description),
+                    Style::default().fg(DIM),
+                ));
+            }
+            self.flush.push(TextLine::from(spans));
+        }
+        self.prompt = Some(if allow_other {
+            "type a number, or your own answer".to_string()
+        } else {
+            "type the number of your choice".to_string()
+        });
+        self.question = Some((options.to_vec(), allow_other));
+    }
+
+    /// True while a question is awaiting an answer.
+    pub fn awaiting_question(&self) -> bool {
+        self.question.is_some()
+    }
+
+    /// Try to resolve a submitted line against the active question. `Some(answer)` clears the
+    /// question; `None` means invalid input — keep the question open and re-prompt.
+    pub fn resolve_question(&mut self, line: &str) -> Option<String> {
+        let (opts, allow_other) = self.question.as_ref()?;
+        let ans = crate::resolve_answer(line, opts, *allow_other)?;
+        self.question = None;
+        self.prompt = None;
+        self.flush.push(TextLine::from(vec![
+            Span::styled("  ↳ ", Style::default().fg(DIM)),
+            Span::styled(ans.clone(), Style::default().fg(OKGREEN)),
+        ]));
+        Some(ans)
     }
 
     /// Flush accumulated reasoning into scrollback as a dim "thinking" block (once), if any.
@@ -690,6 +740,41 @@ mod tests {
         assert!(
             flush_text(&mut app).contains("temper → Auto-edit"),
             "a switch note is queued to scrollback"
+        );
+    }
+
+    #[test]
+    fn question_renders_options_to_scrollback_and_resolves_an_answer() {
+        let mut app = App::default();
+        let options = vec![
+            QChoice {
+                label: "Postgres".into(),
+                description: "relational".into(),
+            },
+            QChoice {
+                label: "SQLite".into(),
+                description: String::new(),
+            },
+        ];
+        app.set_question("which database?", &options, true);
+        assert!(app.awaiting_question());
+        let sb = flush_text(&mut app);
+        assert!(sb.contains("which database?"), "question shown: {sb}");
+        assert!(
+            sb.contains("1) Postgres") && sb.contains("2) SQLite"),
+            "options numbered: {sb}"
+        );
+
+        // A number selects; the question clears.
+        assert_eq!(app.resolve_question("2").as_deref(), Some("SQLite"));
+        assert!(!app.awaiting_question());
+
+        // Invalid input keeps the question open (None).
+        app.set_question("again?", &options, false);
+        assert_eq!(app.resolve_question("not-a-number"), None);
+        assert!(
+            app.awaiting_question(),
+            "invalid answer keeps the question open"
         );
     }
 
