@@ -75,6 +75,22 @@ impl OneOrMany {
             OneOrMany::Many(v) => v,
         }
     }
+
+    /// The first entry (the single value, or the head of the list). Empty `Many` → `""`.
+    pub fn first(&self) -> &str {
+        match self {
+            OneOrMany::One(s) => s,
+            OneOrMany::Many(v) => v.first().map(String::as_str).unwrap_or(""),
+        }
+    }
+
+    /// All entries as owned strings (one-element vec for the single form).
+    pub fn all(&self) -> Vec<String> {
+        match self {
+            OneOrMany::One(s) => vec![s.clone()],
+            OneOrMany::Many(v) => v.clone(),
+        }
+    }
 }
 
 impl RuleConfig {
@@ -161,8 +177,14 @@ pub fn builtin_deny_rules() -> Vec<PermissionRule> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeshConfig {
-    /// Tier -> model id. The heuristic router maps a classified task to one of these.
-    pub models: HashMap<String, String>,
+    /// Tier -> model id, or an ordered list of candidate model ids for that tier. With a
+    /// list, the router picks the cheapest *usable* candidate (cost-aware routing); a single
+    /// string behaves as a one-element list (back-compat).
+    pub models: HashMap<String, OneOrMany>,
+    /// Prefer an already-paid subscription (the `claude-cli::`/`codex-cli::` bridges, $0
+    /// marginal cost) over a metered API model when both are usable candidates. Default true.
+    #[serde(default = "default_prefer_subscription")]
+    pub prefer_subscription: bool,
     /// Daily spend cap in USD across all sessions (FR-5). `daily_cap_usd` is the preferred
     /// key; `daily_budget_usd` is kept as a backward-compatible alias.
     #[serde(alias = "daily_cap_usd")]
@@ -184,6 +206,10 @@ pub struct MeshConfig {
 
 fn default_warn_threshold() -> f64 {
     0.8
+}
+
+fn default_prefer_subscription() -> bool {
+    true
 }
 
 /// What Forge does once a budget cap is reached (FR-5).
@@ -216,19 +242,21 @@ pub struct PriceOverride {
 impl Default for Config {
     fn default() -> Self {
         let mut models = HashMap::new();
-        models.insert(TaskTier::Trivial.as_str().into(), "ollama::llama3.2".into());
+        let one = |s: &str| OneOrMany::One(s.to_string());
+        models.insert(TaskTier::Trivial.as_str().into(), one("ollama::llama3.2"));
         models.insert(
             TaskTier::Standard.as_str().into(),
-            "openai::gpt-4o-mini".into(),
+            one("openai::gpt-4o-mini"),
         );
         models.insert(
             TaskTier::Complex.as_str().into(),
-            "anthropic::claude-opus-4-8".into(),
+            one("anthropic::claude-opus-4-8"),
         );
         Self {
             permission_mode: PermissionMode::default(),
             mesh: MeshConfig {
                 models,
+                prefer_subscription: default_prefer_subscription(),
                 daily_budget_usd: None,
                 monthly_cap_usd: None,
                 warn_threshold: default_warn_threshold(),
@@ -241,13 +269,25 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Resolve the model id configured for a tier, falling back to the standard tier.
+    /// Resolve the primary model id for a tier (the single value, or the first candidate),
+    /// falling back to the standard tier.
     pub fn model_for(&self, tier: TaskTier) -> Option<&str> {
         self.mesh
             .models
             .get(tier.as_str())
             .or_else(|| self.mesh.models.get(TaskTier::Standard.as_str()))
-            .map(String::as_str)
+            .map(OneOrMany::first)
+    }
+
+    /// All candidate model ids configured for a tier (one element for the single-string form),
+    /// falling back to the standard tier. The cost-aware router ranks these.
+    pub fn candidates_for(&self, tier: TaskTier) -> Vec<String> {
+        self.mesh
+            .models
+            .get(tier.as_str())
+            .or_else(|| self.mesh.models.get(TaskTier::Standard.as_str()))
+            .map(OneOrMany::all)
+            .unwrap_or_default()
     }
 
     /// The full ordered rule set the broker resolves against: built-in safety denies first,

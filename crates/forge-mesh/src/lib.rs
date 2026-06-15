@@ -130,18 +130,27 @@ pub struct HeuristicRouter {
     /// Whether `model`'s provider has a usable key (for provider fallback). Injectable so
     /// tests are deterministic; defaults to a real env/keyring check.
     model_available: fn(&str) -> bool,
+    /// Bundled+configured rates, used to rank candidate models by relative cost.
+    pricing: pricing::Pricing,
 }
 
 fn default_model_available(model: &str) -> bool {
     forge_config::has_api_key(forge_config::provider_of(model))
 }
 
+/// A model billed to an already-paid subscription (the CLI bridges) — $0 marginal cost.
+fn is_subscription(model: &str) -> bool {
+    matches!(forge_config::provider_of(model), "claude-cli" | "codex-cli")
+}
+
 impl HeuristicRouter {
     pub fn new(config: Config) -> Self {
+        let pricing = pricing::Pricing::from_config(&config);
         Self {
             config,
             pin: None,
             model_available: default_model_available,
+            pricing,
         }
     }
 
@@ -188,26 +197,55 @@ impl HeuristicRouter {
         }
     }
 
-    /// If `model`'s provider has no usable key, fall back to the most capable configured tier
-    /// model whose provider does (or needs none). Appends the reason to `why`. Returns the
-    /// original model unchanged when nothing usable is configured (it errors downstream with
+    /// Pick the cheapest *usable* model from `candidates` (L1). Usable = the injected
+    /// availability predicate passes (key present, or keyless). Ranking key:
+    /// `(prefer_subscription && subscription ? 0 : 1, estimated_cost, config_order)` — so a
+    /// paid subscription (the $0 CLI bridges) wins when preferred, then lowest est. cost, then
+    /// the order the user listed candidates. `None` when none are usable.
+    fn cheapest_usable(&self, candidates: &[String]) -> Option<String> {
+        let prefer = self.config.mesh.prefer_subscription;
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| (self.model_available)(m))
+            .min_by(|(ia, a), (ib, b)| {
+                let rank = |m: &str| u8::from(!(prefer && is_subscription(m)));
+                rank(a)
+                    .cmp(&rank(b))
+                    .then(
+                        self.pricing
+                            .estimated_cost(a)
+                            .total_cmp(&self.pricing.estimated_cost(b)),
+                    )
+                    .then(ia.cmp(ib))
+            })
+            .map(|(_, m)| m.clone())
+    }
+
+    /// Count usable candidates (for the rationale).
+    fn usable_count(&self, candidates: &[String]) -> usize {
+        candidates
+            .iter()
+            .filter(|m| (self.model_available)(m))
+            .count()
+    }
+
+    /// Cross-tier fallback: the cheapest usable candidate across tiers, most capable first.
+    /// Returns `original` unchanged if nothing anywhere is usable (it errors downstream with
     /// the actionable MissingKey message — same as today).
-    fn apply_fallback(&self, model: String, why: &mut String) -> String {
-        if (self.model_available)(&model) {
-            return model;
-        }
+    fn cross_tier_cheapest(&self, original: &str, why: &mut String) -> String {
         for tier in [TaskTier::Complex, TaskTier::Standard, TaskTier::Trivial] {
-            if let Some(candidate) = self.config.model_for(tier) {
-                if candidate != model && (self.model_available)(candidate) {
-                    why.push_str(&format!(" — fell back to {candidate} (no key for {model})"));
-                    return candidate.to_string();
-                }
+            if let Some(m) = self.cheapest_usable(&self.config.candidates_for(tier)) {
+                why.push_str(&format!(
+                    " — fell back to {m} (no usable key for {original})"
+                ));
+                return m;
             }
         }
         why.push_str(&format!(
-            " — warning: no usable key for {model} and no fallback"
+            " — warning: no usable key for {original} and no fallback"
         ));
-        model
+        original.to_string()
     }
 }
 
@@ -216,29 +254,64 @@ impl Router for HeuristicRouter {
         let exhausted = budget.status() == BudgetStatus::Exhausted;
         let cap_overrides_pin = self.config.mesh.budget.cap_overrides_pin;
 
-        // Base selection: a pin wins unless an exhausted budget is allowed to override it.
-        let (tier, base_model, mut why) = match &self.pin {
-            Some(pin) if !(exhausted && cap_overrides_pin) => {
-                let (tier, _) = Self::classify(prompt); // recorded for stats only
-                (tier, pin.clone(), "pinned via --model".to_string())
-            }
-            _ => {
-                let (mut tier, rationale) = Self::classify(prompt);
-                let mut why = rationale.to_string();
-                // Budget pressure downshifts to the cheapest tier (FR-5).
-                if exhausted && tier != TaskTier::Trivial {
-                    tier = TaskTier::Trivial;
-                    why = "budget cap reached — downshifted to trivial tier".to_string();
-                } else if self.pin.is_some() {
-                    // pin existed but budget overrode it
-                    why = "budget cap reached — pin overridden, trivial tier".to_string();
+        // A pin bypasses classification unless an exhausted budget may override it.
+        if let Some(pin) = self
+            .pin
+            .as_ref()
+            .filter(|_| !(exhausted && cap_overrides_pin))
+        {
+            let (tier, _) = Self::classify(prompt); // recorded for stats only
+            let mut why = "pinned via --model".to_string();
+            let model = if (self.model_available)(pin) {
+                pin.clone()
+            } else {
+                self.cross_tier_cheapest(pin, &mut why)
+            };
+            return RoutingDecision {
+                tier,
+                model,
+                rationale: why,
+            };
+        }
+
+        // Classify, then apply budget pressure (FR-5).
+        let (mut tier, base_reason) = Self::classify(prompt);
+        let mut why = if self.pin.is_some() {
+            // pin was set but an exhausted budget overrode it (see filter above)
+            tier = TaskTier::Trivial;
+            "budget cap reached — pin overridden, trivial tier".to_string()
+        } else if exhausted && tier != TaskTier::Trivial {
+            tier = TaskTier::Trivial;
+            "budget cap reached — downshifted to trivial tier".to_string()
+        } else {
+            base_reason.to_string()
+        };
+
+        // Cost-aware selection among the tier's usable candidates (L1/L2).
+        let candidates = self.config.candidates_for(tier);
+        let model = match self.cheapest_usable(&candidates) {
+            Some(m) => {
+                let n = self.usable_count(&candidates);
+                if n > 1 {
+                    why.push_str(&format!(
+                        " — cheapest of {n} usable {} models: {m}",
+                        tier.as_str()
+                    ));
                 }
-                let model = self.config.model_for(tier).unwrap_or("unknown").to_string();
-                (tier, model, why)
+                if self.config.mesh.prefer_subscription && is_subscription(&m) {
+                    why.push_str(" (paid subscription)");
+                }
+                m
+            }
+            None => {
+                let original = candidates
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".into());
+                self.cross_tier_cheapest(&original, &mut why)
             }
         };
 
-        let model = self.apply_fallback(base_model, &mut why);
         RoutingDecision {
             tier,
             model,
@@ -415,5 +488,92 @@ mod tests {
             Config::default().model_for(TaskTier::Complex).unwrap()
         ); // AC-4
         assert!(d.rationale.contains("no usable key"));
+    }
+
+    // --- Cost-aware selection (L1) + subscription-first (L2) ---
+
+    fn list_config(tier: &str, models: &[&str]) -> Config {
+        let mut c = Config::default();
+        c.mesh.models.insert(
+            tier.to_string(),
+            forge_config::OneOrMany::Many(models.iter().map(|s| s.to_string()).collect()),
+        );
+        c
+    }
+
+    #[test]
+    fn cheapest_usable_picks_lowest_estimated_cost() {
+        // gpt-4o-mini (~$0.00045/turn) is cheaper than deepseek-chat (~$0.00082/turn).
+        let r = HeuristicRouter::new(Config::default()).with_availability(|_| true);
+        let cands = vec![
+            "deepseek::deepseek-chat".to_string(),
+            "openai::gpt-4o-mini".to_string(),
+        ];
+        assert_eq!(r.cheapest_usable(&cands).unwrap(), "openai::gpt-4o-mini"); // AC-L1a
+    }
+
+    #[test]
+    fn cheapest_usable_skips_models_without_a_key() {
+        // ollama is "cheapest" ($0) but unavailable here → the usable openai wins.
+        let r =
+            HeuristicRouter::new(Config::default()).with_availability(|m| !m.starts_with("ollama"));
+        let cands = vec![
+            "ollama::free".to_string(),
+            "openai::gpt-4o-mini".to_string(),
+        ];
+        assert_eq!(r.cheapest_usable(&cands).unwrap(), "openai::gpt-4o-mini"); // AC-L1b
+    }
+
+    #[test]
+    fn route_picks_cheapest_standard_candidate_with_rationale() {
+        let c = list_config(
+            "standard",
+            &["deepseek::deepseek-chat", "openai::gpt-4o-mini"],
+        );
+        let r = HeuristicRouter::new(c).with_availability(|_| true);
+        let prompt = "add a new endpoint that returns the list of users as json".repeat(2);
+        let d = r.route(&prompt, BudgetState::default());
+        assert_eq!(d.tier, TaskTier::Standard);
+        assert_eq!(d.model, "openai::gpt-4o-mini");
+        assert!(d.rationale.contains("cheapest of 2"), "{}", d.rationale);
+    }
+
+    #[test]
+    fn legacy_single_string_tier_routes_unchanged() {
+        // AC-L1c: the single-string form behaves as a one-candidate list.
+        let prompt = "add a new endpoint that returns the list of users as json".repeat(2);
+        let d = router().route(&prompt, BudgetState::default());
+        assert_eq!(d.model, "openai::gpt-4o-mini");
+    }
+
+    #[test]
+    fn subscription_is_preferred_when_enabled() {
+        // AC-L2a: a $0 paid subscription (CLI bridge) wins over a metered API model.
+        let r = HeuristicRouter::new(list_config(
+            "complex",
+            &["anthropic::claude-opus-4-8", "claude-cli::"],
+        ))
+        .with_availability(|_| true);
+        let d = r.route(
+            "design the system architecture carefully",
+            BudgetState::default(),
+        );
+        assert_eq!(d.model, "claude-cli::");
+        assert!(d.rationale.contains("paid subscription"), "{}", d.rationale);
+    }
+
+    #[test]
+    fn subscription_still_cheapest_when_preference_disabled() {
+        // prefer_subscription off → pure cost ranking; the $0 bridge is still cheapest, but the
+        // rationale no longer flags it as a subscription.
+        let mut c = list_config("complex", &["anthropic::claude-opus-4-8", "claude-cli::"]);
+        c.mesh.prefer_subscription = false;
+        let r = HeuristicRouter::new(c).with_availability(|_| true);
+        let d = r.route(
+            "design the system architecture carefully",
+            BudgetState::default(),
+        );
+        assert_eq!(d.model, "claude-cli::");
+        assert!(!d.rationale.contains("paid subscription"));
     }
 }

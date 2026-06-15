@@ -92,7 +92,18 @@ impl Pricing {
             None => 0.0,
         }
     }
+
+    /// A *relative* cost comparator for routing: the price of a nominal turn (1000 in / 500
+    /// out). Not a forecast — only used to rank candidate models against each other. Unpriced
+    /// models (local, gateways) compare as 0.0 (cheapest).
+    pub fn estimated_cost(&self, model: &str) -> f64 {
+        self.cost_for(model, NOMINAL_INPUT_TOKENS, NOMINAL_OUTPUT_TOKENS)
+    }
 }
+
+/// Nominal token mix used only to rank candidate models by relative cost.
+const NOMINAL_INPUT_TOKENS: u64 = 1000;
+const NOMINAL_OUTPUT_TOKENS: u64 = 500;
 
 #[cfg(test)]
 mod tests {
