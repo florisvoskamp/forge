@@ -208,6 +208,9 @@ impl Session {
                 self.config.mesh.subagents.max_agents,
             ));
         }
+        // The interactive question tool (AskUserQuestion) — always advertised so the model can
+        // ask the user a focused question with suggested answers (docs/features/ask-user-question.md).
+        specs.push(ask_user_spec());
         specs
     }
 
@@ -403,6 +406,10 @@ impl Session {
         if call.name == subagent::SPAWN_AGENTS_TOOL {
             return self.spawn_agents(msg_id, call).await;
         }
+        // The interactive question tool is core-owned too (it needs the presenter).
+        if call.name == ASK_USER_TOOL {
+            return self.ask_user(msg_id, call);
+        }
 
         let args_json = serde_json::to_string(&call.args)?;
 
@@ -568,6 +575,99 @@ impl Session {
         )?;
         Ok(combined)
     }
+
+    /// Handle an `ask_user` call: parse the question + options, ask the user through the
+    /// presenter (interactive multi-choice / open-ended), and return their answer as the tool
+    /// result (docs/features/ask-user-question.md).
+    fn ask_user(
+        &mut self,
+        msg_id: &str,
+        call: &forge_types::ToolCall,
+    ) -> Result<String, CoreError> {
+        let args_json = serde_json::to_string(&call.args)?;
+        let question = call
+            .args
+            .get("question")
+            .and_then(|q| q.as_str())
+            .unwrap_or("")
+            .to_string();
+        if question.trim().is_empty() {
+            let result = "error: ask_user requires a non-empty `question`".to_string();
+            self.store
+                .record_tool_call(msg_id, &call.name, &args_json, &result, "allowed", "error")?;
+            return Ok(result);
+        }
+        let options: Vec<forge_tui::QChoice> = call
+            .args
+            .get("options")
+            .and_then(|o| o.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|o| {
+                        let label = o.get("label").and_then(|l| l.as_str())?;
+                        Some(forge_tui::QChoice {
+                            label: label.to_string(),
+                            description: o
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Default to allowing a free-text answer (and force it when there are no options).
+        let allow_other = call
+            .args
+            .get("allow_other")
+            .and_then(|a| a.as_bool())
+            .unwrap_or(true)
+            || options.is_empty();
+
+        let answer = self.presenter.ask(&question, &options, allow_other);
+        self.store
+            .record_tool_call(msg_id, &call.name, &args_json, &answer, "allowed", "ok")?;
+        Ok(answer)
+    }
+}
+
+/// The interactive-question virtual tool name (AskUserQuestion).
+const ASK_USER_TOOL: &str = "ask_user";
+
+/// The `ToolSpec` advertised to the model for [`ASK_USER_TOOL`].
+fn ask_user_spec() -> ToolSpec {
+    ToolSpec {
+        name: ASK_USER_TOOL.to_string(),
+        description: "Ask the user a single focused question when you hit a real decision only \
+            they can make (a value choice, a missing requirement). Provide 2–4 suggested \
+            `options` with short labels (+ optional descriptions); set `allow_other` (default \
+            true) to also accept a free-text answer. Returns the user's choice. Don't use it for \
+            things you can decide yourself."
+            .to_string(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question": { "type": "string", "description": "the question to ask" },
+                "options": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": { "type": "string" },
+                            "description": { "type": "string" }
+                        },
+                        "required": ["label"]
+                    }
+                },
+                "allow_other": {
+                    "type": "boolean",
+                    "description": "allow a free-text answer beyond the options (default true)"
+                }
+            },
+            "required": ["question"]
+        }),
+    }
 }
 
 /// True if the per-process budget override is set (lets one over-budget run proceed).
@@ -624,9 +724,84 @@ mod tests {
         fn confirm(&mut self, _tool: &str, _side_effect: SideEffect) -> bool {
             false
         }
+        fn ask(&mut self, _q: &str, options: &[forge_tui::QChoice], _allow_other: bool) -> String {
+            // Deterministic: pick the first option (or empty) so tests don't block on input.
+            options.first().map(|o| o.label.clone()).unwrap_or_default()
+        }
         fn read_line(&mut self) -> Option<String> {
             None
         }
+    }
+
+    /// A provider that calls `ask_user` once, then answers using whatever came back.
+    #[derive(Default)]
+    struct AskingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for AskingProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            let usage = Usage::default();
+            if messages.iter().any(|m| m.role == Role::Tool) {
+                return Ok(ModelResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                    usage,
+                });
+            }
+            Ok(ModelResponse {
+                content: "asking".into(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "ask_user".into(),
+                    args: serde_json::json!({
+                        "question": "which database?",
+                        "options": [{"label": "Postgres"}, {"label": "SQLite"}]
+                    }),
+                }],
+                usage,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_user_round_trips_the_answer_into_the_turn() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(AskingProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            // CapturePresenter::ask returns the first option ("Postgres").
+            Box::new(CapturePresenter::default()),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+        let id = session.id().to_string();
+        let answer = session.run_turn("set up the db").await.unwrap();
+        assert_eq!(
+            answer, "done",
+            "turn completes after the question is answered"
+        );
+        // The chosen answer was fed back as the tool result.
+        let tool_msgs: Vec<_> = store
+            .load_messages(&id)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert!(
+            tool_msgs.iter().any(|m| m.content == "Postgres"),
+            "ask_user answer fed back as tool result: {tool_msgs:?}"
+        );
     }
 
     #[tokio::test]

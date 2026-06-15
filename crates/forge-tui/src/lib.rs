@@ -7,6 +7,32 @@ use std::io::{IsTerminal, Write};
 
 use forge_types::SideEffect;
 
+/// One choice in an [`Presenter::ask`] question (AskUserQuestion). `description` may be empty.
+#[derive(Debug, Clone)]
+pub struct QChoice {
+    pub label: String,
+    pub description: String,
+}
+
+/// Sentinel returned when a question can't be answered interactively (piped / no tty).
+pub const NO_ANSWER: &str = "(no answer — non-interactive)";
+
+/// Resolve a typed answer line against the options: a number `1..=N` picks that option's label;
+/// otherwise, if `allow_other`, the trimmed line is a free-text answer. `None` = invalid input
+/// (not a valid number and free text not allowed) → the caller should re-prompt.
+pub fn resolve_answer(line: &str, options: &[QChoice], allow_other: bool) -> Option<String> {
+    let t = line.trim();
+    if let Ok(n) = t.parse::<usize>() {
+        if n >= 1 && n <= options.len() {
+            return Some(options[n - 1].label.clone());
+        }
+    }
+    if allow_other && !t.is_empty() {
+        return Some(t.to_string());
+    }
+    None
+}
+
 pub mod app;
 mod driver;
 mod render;
@@ -14,6 +40,60 @@ mod tui;
 pub use app::{banner_lines, handle_key, App, InputOutcome, KeyKind};
 pub use driver::{ChannelPresenter, Tui, UiMsg};
 pub use tui::TuiPresenter;
+
+// `QChoice`, `resolve_answer`, `NO_ANSWER` are defined above and re-exported at crate root.
+
+#[cfg(test)]
+mod ask_tests {
+    use super::*;
+
+    fn opts() -> Vec<QChoice> {
+        vec![
+            QChoice {
+                label: "Postgres".into(),
+                description: "relational".into(),
+            },
+            QChoice {
+                label: "SQLite".into(),
+                description: String::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_number_picks_that_option() {
+        assert_eq!(
+            resolve_answer("2", &opts(), true).as_deref(),
+            Some("SQLite")
+        );
+        assert_eq!(
+            resolve_answer(" 1 ", &opts(), false).as_deref(),
+            Some("Postgres")
+        );
+    }
+
+    #[test]
+    fn free_text_allowed_only_when_open() {
+        assert_eq!(
+            resolve_answer("use mysql", &opts(), true).as_deref(),
+            Some("use mysql")
+        );
+        assert_eq!(resolve_answer("use mysql", &opts(), false), None);
+    }
+
+    #[test]
+    fn out_of_range_number_is_invalid() {
+        assert_eq!(resolve_answer("9", &opts(), false), None);
+        // ...but a free-text fallback accepts it as text when open.
+        assert_eq!(resolve_answer("9", &opts(), true).as_deref(), Some("9"));
+    }
+
+    #[test]
+    fn non_interactive_headless_returns_the_sentinel() {
+        let mut p = HeadlessPresenter::new(false);
+        assert_eq!(p.ask("which db?", &opts(), true), NO_ANSWER);
+    }
+}
 
 /// Things the core wants to show the user as a turn progresses.
 #[derive(Debug, Clone)]
@@ -80,6 +160,10 @@ pub trait Presenter: Send {
     fn emit(&mut self, event: PresenterEvent);
     /// Ask the user to confirm a side-effecting tool. Returns true to allow.
     fn confirm(&mut self, tool: &str, side_effect: SideEffect) -> bool;
+    /// Ask the user a question with suggested `options` (AskUserQuestion). Returns the chosen
+    /// option's label, or — when `allow_other` — a free-text answer; [`NO_ANSWER`] if it can't
+    /// be asked interactively.
+    fn ask(&mut self, question: &str, options: &[QChoice], allow_other: bool) -> String;
     /// Read the next prompt line from the user. `None` means quit / end-of-input.
     fn read_line(&mut self) -> Option<String>;
 }
@@ -184,6 +268,37 @@ impl Presenter for HeadlessPresenter {
             return false;
         }
         matches!(line.trim(), "y" | "Y" | "yes")
+    }
+
+    fn ask(&mut self, question: &str, options: &[QChoice], allow_other: bool) -> String {
+        if !self.interactive {
+            return NO_ANSWER.to_string();
+        }
+        // Re-prompt a couple of times on invalid input, then give up gracefully.
+        for _ in 0..3 {
+            println!("\n❓ {question}");
+            for (i, o) in options.iter().enumerate() {
+                if o.description.is_empty() {
+                    println!("  {}) {}", i + 1, o.label);
+                } else {
+                    println!("  {}) {} — {}", i + 1, o.label, o.description);
+                }
+            }
+            if allow_other {
+                print!("  choose a number, or type your own answer: ");
+            } else {
+                print!("  choose a number: ");
+            }
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                return NO_ANSWER.to_string();
+            }
+            if let Some(ans) = resolve_answer(&line, options, allow_other) {
+                return ans;
+            }
+        }
+        NO_ANSWER.to_string()
     }
 
     fn read_line(&mut self) -> Option<String> {

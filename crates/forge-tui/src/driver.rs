@@ -26,6 +26,14 @@ pub enum UiMsg {
         side_effect: SideEffect,
         reply: Sender<bool>,
     },
+    /// An interactive question (AskUserQuestion): the loop shows it + the options and replies
+    /// with the chosen label or a free-text answer.
+    Question {
+        question: String,
+        options: Vec<crate::QChoice>,
+        allow_other: bool,
+        reply: Sender<String>,
+    },
 }
 
 /// A presenter that forwards everything over a channel; safe to move onto a task.
@@ -58,6 +66,25 @@ impl Presenter for ChannelPresenter {
             return false;
         }
         answer.recv().unwrap_or(false) // blocks this turn task until the loop answers
+    }
+
+    fn ask(&mut self, question: &str, options: &[crate::QChoice], allow_other: bool) -> String {
+        let (reply, answer) = std::sync::mpsc::channel();
+        if self
+            .tx
+            .send(UiMsg::Question {
+                question: question.to_string(),
+                options: options.to_vec(),
+                allow_other,
+                reply,
+            })
+            .is_err()
+        {
+            return crate::NO_ANSWER.to_string();
+        }
+        answer
+            .recv()
+            .unwrap_or_else(|_| crate::NO_ANSWER.to_string()) // blocks the turn task until answered
     }
 
     fn read_line(&mut self) -> Option<String> {

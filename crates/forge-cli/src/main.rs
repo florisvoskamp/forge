@@ -479,6 +479,7 @@ async fn run_chat_tui(
     app.temper = session.lock().await.temper().label().to_string();
     let mut busy = false;
     let mut pending: Option<std::sync::mpsc::Sender<bool>> = None;
+    let mut pending_question: Option<std::sync::mpsc::Sender<String>> = None;
     // Baseline for the spinner: deriving the tick from elapsed time keeps the animation
     // speed independent of the loop frequency (one frame per 60ms, exactly as before).
     let mut busy_since = Instant::now();
@@ -506,6 +507,25 @@ async fn run_chat_tui(
                 );
                 let _ = reply.send(yes);
                 app.prompt = None;
+            } else if app.awaiting_question() {
+                // Answering an AskUserQuestion (the turn task is blocked in `ask()`): the input
+                // line collects a number or free-text answer; submit resolves + replies.
+                match handle_key(&mut app.input, key) {
+                    InputOutcome::Submit(line) => {
+                        if let Some(ans) = app.resolve_question(&line) {
+                            if let Some(tx) = pending_question.take() {
+                                let _ = tx.send(ans);
+                            }
+                        } else {
+                            app.input.clear(); // invalid → re-prompt (question stays open)
+                        }
+                    }
+                    InputOutcome::Quit => {
+                        quit = true;
+                        break;
+                    }
+                    InputOutcome::Editing => {}
+                }
             } else if busy {
                 if matches!(key, KeyKind::Esc) {
                     quit = true;
@@ -561,6 +581,15 @@ async fn run_chat_tui(
                 } => {
                     app.prompt = Some(format!("allow {tool} ({side_effect:?})"));
                     pending = Some(reply);
+                }
+                UiMsg::Question {
+                    question,
+                    options,
+                    allow_other,
+                    reply,
+                } => {
+                    app.set_question(&question, &options, allow_other);
+                    pending_question = Some(reply);
                 }
             }
         }

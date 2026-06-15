@@ -115,6 +115,41 @@ impl Presenter for TuiPresenter {
         allowed
     }
 
+    fn ask(&mut self, question: &str, options: &[crate::QChoice], allow_other: bool) -> String {
+        self.app.set_question(question, options, allow_other);
+        self.app.input.clear();
+        self.flush();
+        self.draw();
+        loop {
+            match event::read() {
+                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                    let key = match k.code {
+                        KeyCode::Char(c) => KeyKind::Char(c),
+                        KeyCode::Backspace => KeyKind::Backspace,
+                        KeyCode::Enter => KeyKind::Enter,
+                        _ => continue,
+                    };
+                    match handle_key(&mut self.app.input, key) {
+                        InputOutcome::Submit(line) => {
+                            if let Some(ans) = self.app.resolve_question(&line) {
+                                self.flush();
+                                self.draw();
+                                return ans;
+                            }
+                            // Invalid → keep the question open, clear the line, re-prompt.
+                            self.app.input.clear();
+                            self.draw();
+                        }
+                        InputOutcome::Quit => return crate::NO_ANSWER.to_string(),
+                        InputOutcome::Editing => self.draw(),
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return crate::NO_ANSWER.to_string(),
+            }
+        }
+    }
+
     fn read_line(&mut self) -> Option<String> {
         self.app.input.clear();
         self.draw();
