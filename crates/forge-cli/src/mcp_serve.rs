@@ -11,10 +11,12 @@
 //!
 //! Subagents (RFC subagent-orchestration Phase 3): when subagents are enabled this server also
 //! exposes the `spawn_agents` virtual tool, so a subscription model can fan work out to
-//! mesh-routed child agents. The children run in *this* process (it builds its own
-//! provider/router/store), and we set `FORGE_NO_SPAWN_AGENTS=1` before running them so any
-//! nested CLI-bridge child inherits it and does NOT re-expose `spawn_agents` — a depth-1
-//! recursion guard that holds across the process boundary via env inheritance.
+//! mesh-routed child agents that run in *this* process (it builds its own provider/router/store).
+//! Two cross-process mechanisms ride env vars inherited forge → claude/codex → mcp-serve:
+//! - `FORGE_SUBAGENT_DEPTH` bounds recursion: this server advertises `spawn_agents` only while
+//!   `depth < max_depth`, and bumps the var for anything it spawns (Phase 3c).
+//! - `FORGE_SUBAGENT_SINK` names a JSONL file we append child lifecycle to, which the parent
+//!   Forge process tails so bridge-spawned subagents are visible in the TUI (Phase 3c).
 
 use std::sync::Arc;
 
@@ -36,17 +38,14 @@ use rmcp::transport::io::stdio;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use serde_json::Value;
 
-/// Env var that disables the `spawn_agents` tool. Set in a subagent's environment so a nested
-/// CLI-bridge child inherits it and can't recurse (RFC subagent-orchestration depth-1 guard).
-const NO_SPAWN_ENV: &str = "FORGE_NO_SPAWN_AGENTS";
-
-/// Everything a `spawn_agents` call needs, built once if subagents are enabled here.
+/// Everything a `spawn_agents` call needs, built once if subagents are enabled here. `ctx`
+/// already carries the loaded agent types, the nesting depth, and `max_depth`.
 struct SubagentSupport {
     ctx: AgentCtx,
-    agents: std::collections::HashMap<String, forge_config::AgentDef>,
     parent_id: String,
     max_agents: usize,
     max_concurrency: usize,
+    depth: usize,
 }
 
 struct ForgeMcp {
@@ -54,7 +53,7 @@ struct ForgeMcp {
     mode: PermissionMode,
     rules: Vec<PermissionRule>,
     config: Config,
-    /// Present when subagents are enabled and not suppressed by [`NO_SPAWN_ENV`].
+    /// Present when subagents are enabled here (subagents on + `depth < max_depth`).
     subagents: Option<SubagentSupport>,
 }
 
@@ -155,30 +154,51 @@ impl ForgeMcp {
             warn_fraction: self.config.mesh.warn_threshold,
         };
 
-        // Mark this process (and anything it spawns) as a subagent context so a nested CLI
-        // bridge won't re-expose spawn_agents — the depth-1 guard across the process boundary.
-        std::env::set_var(NO_SPAWN_ENV, "1");
+        // Mark anything we spawn as a deeper subagent level so recursion is bounded (Phase 3c).
+        std::env::set_var(crate::FORGE_SUBAGENT_DEPTH_ENV, (s.depth + 1).to_string());
 
-        let mut on_event = |ev: subagent::Lifecycle| match ev {
-            subagent::Lifecycle::Start { agent, task, .. } => {
-                tracing::info!(agent, task, "subagent started")
+        // Report subagent lifecycle to the out-of-band sink (if the bridge gave us one) so the
+        // parent Forge TUI shows these children natively (RFC subagent-orchestration Phase 3c).
+        let mut sink = std::env::var(forge_provider::SUBAGENT_SINK_ENV)
+            .ok()
+            .and_then(|p| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .ok()
+            });
+        let mut write = move |v: serde_json::Value| {
+            if let Some(f) = sink.as_mut() {
+                use std::io::Write;
+                let _ = writeln!(f, "{v}");
+                let _ = f.flush();
             }
-            // Live deltas have nowhere to go over the MCP boundary; the bridge sees the final
-            // combined result. (Streaming them to the parent TUI is Phase 3b-bridge, deferred.)
-            subagent::Lifecycle::Progress { .. } => {}
+        };
+        let mut on_event = |ev: subagent::Lifecycle| match ev {
+            subagent::Lifecycle::Start { id, agent, task } => {
+                write(serde_json::json!({"k":"start","id":id,"agent":agent,"task":task}));
+            }
+            subagent::Lifecycle::Progress { id, snippet } => {
+                write(serde_json::json!({"k":"progress","id":id,"snippet":snippet}));
+            }
             subagent::Lifecycle::Done {
+                id,
                 agent,
                 ok,
+                summary,
                 cost_usd,
-                ..
-            } => tracing::info!(agent, ok, cost_usd, "subagent done"),
+            } => {
+                write(
+                    serde_json::json!({"k":"done","id":id,"agent":agent,"ok":ok,"summary":summary,"cost":cost_usd}),
+                );
+            }
         };
 
         match subagent::orchestrate(
             &s.ctx,
             &s.parent_id,
             requests,
-            &s.agents,
             budget,
             s.max_concurrency,
             &mut on_event,
@@ -197,12 +217,20 @@ pub async fn run() -> Result<()> {
     forge_config::inject_provider_keys();
     let config = forge_config::load().unwrap_or_else(|_| Config::default());
 
-    // Subagents are exposed here only when enabled AND not suppressed (a nested bridge child
-    // inherits FORGE_NO_SPAWN_AGENTS=1 and must not re-expose the tool).
-    let subagents = if config.mesh.subagents.enabled && std::env::var(NO_SPAWN_ENV).is_err() {
+    // Current nesting depth, carried across the process boundary. Subagents are exposed here
+    // only when enabled AND there is depth budget left — a nested bridge child inherits a
+    // higher FORGE_SUBAGENT_DEPTH and stops advertising the tool once it reaches max_depth.
+    let depth: usize = std::env::var(crate::FORGE_SUBAGENT_DEPTH_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let subagents = if config.mesh.subagents.enabled && depth < config.mesh.subagents.max_depth {
         let store = Arc::new(Store::open(std::path::Path::new(".forge/forge.db"))?);
         let (provider, router) = crate::build_provider_and_router(&config, false, None);
         let parent_id = store.create_session(".", &format!("{:?}", config.permission_mode))?;
+        let agents = Arc::new(forge_config::load_agents(std::path::Path::new(
+            &config.mesh.subagents.agents_dir,
+        )));
         let ctx = AgentCtx {
             provider,
             router,
@@ -211,15 +239,16 @@ pub async fn run() -> Result<()> {
             pricing: Pricing::from_config(&config),
             mode: config.permission_mode,
             rules: config.permission_rules(),
+            depth,
+            max_depth: config.mesh.subagents.max_depth,
+            agents,
         };
         Some(SubagentSupport {
             ctx,
-            agents: forge_config::load_agents(std::path::Path::new(
-                &config.mesh.subagents.agents_dir,
-            )),
             parent_id,
             max_agents: config.mesh.subagents.max_agents,
             max_concurrency: config.mesh.subagents.max_concurrency,
+            depth,
         })
     } else {
         None

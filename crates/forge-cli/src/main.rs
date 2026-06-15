@@ -20,6 +20,11 @@ use forge_types::TaskTier;
 
 mod mcp_serve;
 
+/// Env var carrying the current subagent nesting depth across the process boundary (forge →
+/// claude/codex → `forge mcp-serve`). mcp-serve advertises `spawn_agents` only while
+/// `depth < max_depth`, and bumps it for any children it spawns (RFC subagent-orchestration 3c).
+pub(crate) const FORGE_SUBAGENT_DEPTH_ENV: &str = "FORGE_SUBAGENT_DEPTH";
+
 #[derive(Parser)]
 #[command(
     name = "forge",

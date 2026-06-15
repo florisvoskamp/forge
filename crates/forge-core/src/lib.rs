@@ -266,35 +266,53 @@ impl Session {
         // 3. Model <-> tool loop.
         for step in 0..MAX_STEPS {
             // Stream the reply: deltas flow to the presenter as the model produces them.
-            let mut resp = {
-                let provider = &self.provider;
-                let presenter = &mut self.presenter;
-                let r = provider
-                    .complete(
-                        &decision.model,
-                        &self.transcript,
-                        &specs,
-                        &mut |ev: StreamEvent| match ev {
-                            StreamEvent::Text(t) => {
-                                presenter.emit(PresenterEvent::AssistantDelta(t))
-                            }
-                            StreamEvent::Reasoning(t) => {
-                                presenter.emit(PresenterEvent::Reasoning(t))
-                            }
-                            StreamEvent::ToolStarted { name, args } => {
-                                presenter.emit(PresenterEvent::ToolStart { name, args })
-                            }
-                            StreamEvent::ToolFinished { name, ok, summary } => {
-                                presenter.emit(PresenterEvent::ToolResult { name, ok, summary })
-                            }
-                        },
-                    )
-                    .await?;
-                if !r.content.is_empty() {
-                    presenter.emit(PresenterEvent::AssistantDone);
-                }
-                r
-            };
+            let mut resp =
+                {
+                    let provider = &self.provider;
+                    let presenter = &mut self.presenter;
+                    let r =
+                        provider
+                            .complete(
+                                &decision.model,
+                                &self.transcript,
+                                &specs,
+                                &mut |ev: StreamEvent| match ev {
+                                    StreamEvent::Text(t) => {
+                                        presenter.emit(PresenterEvent::AssistantDelta(t))
+                                    }
+                                    StreamEvent::Reasoning(t) => {
+                                        presenter.emit(PresenterEvent::Reasoning(t))
+                                    }
+                                    StreamEvent::ToolStarted { name, args } => {
+                                        presenter.emit(PresenterEvent::ToolStart { name, args })
+                                    }
+                                    StreamEvent::ToolFinished { name, ok, summary } => presenter
+                                        .emit(PresenterEvent::ToolResult { name, ok, summary }),
+                                    StreamEvent::SubagentStarted { id, agent, task } => presenter
+                                        .emit(PresenterEvent::SubagentStart { id, agent, task }),
+                                    StreamEvent::SubagentProgress { id, snippet } => presenter
+                                        .emit(PresenterEvent::SubagentProgress { id, snippet }),
+                                    StreamEvent::SubagentFinished {
+                                        id,
+                                        agent,
+                                        ok,
+                                        summary,
+                                        cost_usd,
+                                    } => presenter.emit(PresenterEvent::SubagentResult {
+                                        id,
+                                        agent,
+                                        ok,
+                                        summary,
+                                        cost_usd,
+                                    }),
+                                },
+                            )
+                            .await?;
+                    if !r.content.is_empty() {
+                        presenter.emit(PresenterEvent::AssistantDone);
+                    }
+                    r
+                };
 
             // Compute the real cost from token counts and the model's price (FR-5, A-7).
             resp.usage.cost_usd = self.pricing.cost_for(
@@ -466,8 +484,9 @@ impl Session {
             warn_fraction: self.config.mesh.warn_threshold,
         };
 
-        let agents =
-            forge_config::load_agents(std::path::Path::new(&self.config.mesh.subagents.agents_dir));
+        let agents = Arc::new(forge_config::load_agents(std::path::Path::new(
+            &self.config.mesh.subagents.agents_dir,
+        )));
         let ctx = subagent::AgentCtx {
             provider: Arc::clone(&self.provider),
             router: Arc::clone(&self.router),
@@ -476,6 +495,9 @@ impl Session {
             pricing: self.pricing.clone(),
             mode: self.mode,
             rules: self.rules.clone(),
+            depth: 0,
+            max_depth: self.config.mesh.subagents.max_depth,
+            agents,
         };
         let parent_id = self.id.clone();
         let max_concurrency = self.config.mesh.subagents.max_concurrency;
@@ -515,7 +537,6 @@ impl Session {
             &ctx,
             &parent_id,
             requests,
-            &agents,
             budget,
             max_concurrency,
             &mut on_event,
@@ -1062,6 +1083,85 @@ mod tests {
         assert!(
             child_models.iter().any(|m| m == "ollama::small"),
             "a trivial child routed to the cheap tier independently: {child_models:?}"
+        );
+    }
+
+    /// A provider where EVERY agent (top or subagent) tries to `spawn_agents` once, then answers.
+    /// Used to prove recursion is bounded by `max_depth` (the registry refuses `spawn_agents`
+    /// once depth is exhausted, so the chain terminates).
+    #[derive(Default)]
+    struct AlwaysRecurseProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for AlwaysRecurseProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            let used_tool = messages.iter().any(|m| m.role == Role::Tool);
+            let usage = Usage {
+                input_tokens: 5,
+                output_tokens: 2,
+                cost_usd: 0.0,
+            };
+            if used_tool {
+                return Ok(ModelResponse {
+                    content: "leaf answer".into(),
+                    tool_calls: vec![],
+                    usage,
+                });
+            }
+            Ok(ModelResponse {
+                content: "delegating deeper".into(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "spawn_agents".into(),
+                    args: serde_json::json!({"agents": [{"task": "go deeper"}]}),
+                }],
+                usage,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn recursion_is_bounded_by_max_depth() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut config = tiered_config();
+        config.mesh.subagents.max_depth = 2;
+        config.mesh.subagents.max_concurrency = 2;
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(AlwaysRecurseProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            ".",
+        )
+        .unwrap();
+        let parent_id = session.id().to_string();
+
+        // Must terminate (not infinite-recurse / stack-overflow).
+        session
+            .run_turn("kick off a delegating turn")
+            .await
+            .unwrap();
+
+        // Walk the parent→child tree; with max_depth=2 the chain is child→grandchild→
+        // great-grandchild (depths 0,1,2) and stops — never a 4th generation.
+        fn max_gen(store: &Store, id: &str) -> usize {
+            let kids = store.child_sessions(id).unwrap();
+            1 + kids.iter().map(|k| max_gen(store, k)).max().unwrap_or(0)
+        }
+        let generations = max_gen(&store, &parent_id);
+        assert_eq!(
+            generations, 4,
+            "parent + 3 nested generations (depths 0,1,2), bounded by max_depth"
         );
     }
 
