@@ -145,10 +145,39 @@ fn to_genai_tool(spec: &ToolSpec) -> Tool {
         .with_schema(spec.schema.clone())
 }
 
+/// How long to wait for the model to start responding before treating it as down.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a started stream may go silent before we treat it as stalled. This is per-chunk:
+/// a long generation keeps resetting it, so only a genuinely hung stream trips it.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Build the retryable error for a connect/stream stall (so the mesh fails over).
+fn stall_error(what: &str, after: std::time::Duration) -> ProviderError {
+    ProviderError::Unavailable(format!("{what} (no data for {}s)", after.as_secs()))
+}
+
+/// Collapse a provider error to a short, single-line message — providers (esp. Gemini) return
+/// a multi-line JSON body that would otherwise flood the TUI / logs. Keeps the first line, caps
+/// length, strips the noisy `Body: {…}` tail.
+fn short(s: &str) -> String {
+    let head = s.split("\nBody:").next().unwrap_or(s);
+    let line = head.lines().next().unwrap_or(head).trim();
+    let line = line
+        .strip_prefix("Web stream error for model ")
+        .unwrap_or(line);
+    if line.chars().count() > 160 {
+        let cut: String = line.chars().take(157).collect();
+        format!("{cut}…")
+    } else {
+        line.to_string()
+    }
+}
+
 /// Map a `genai::Error` to a classified [`ProviderError`] so the mesh can decide whether to
 /// bench the model + fail over (429 / 5xx / auth) or fail the turn (everything else). Uses the
 /// typed `StatusCode`/`HeaderMap` where genai exposes them (`HttpError`, `WebModelCall`); for
-/// the *streaming* path Forge uses, genai only carries a string, so we scan it.
+/// the *streaming* path Forge uses, genai only carries a string, so we scan it. Messages are
+/// shortened (`short`) so a multi-line JSON body never reaches the UI.
 fn classify_genai_error(err: &genai::Error) -> ProviderError {
     use genai::webc::Error as WebcError;
     match err {
@@ -178,7 +207,7 @@ fn classify_genai_error(err: &genai::Error) -> ProviderError {
                     .or_else(|| parse_retry_after_body(body));
                 classify_status(status.as_u16(), err.to_string(), retry_after)
             }
-            other => ProviderError::Unavailable(other.to_string()),
+            other => ProviderError::Unavailable(short(&other.to_string())),
         },
         // Streaming path: status lives only in the message string (`...Status: 429...`).
         genai::Error::WebStream { cause, .. } => classify_text(cause, err.to_string()),
@@ -186,21 +215,32 @@ fn classify_genai_error(err: &genai::Error) -> ProviderError {
             classify_text(&body.to_string(), err.to_string())
         }
         // A bad/truncated stream chunk — transient, worth trying elsewhere.
-        genai::Error::StreamParse { .. } => ProviderError::Unavailable(err.to_string()),
-        other => ProviderError::Request(other.to_string()),
+        genai::Error::StreamParse { .. } => ProviderError::Unavailable(short(&err.to_string())),
+        other => ProviderError::Request(short(&other.to_string())),
     }
 }
 
-/// Classify from an HTTP status code.
+/// A 429 whose quota is per-day or flat-out zero (a free-tier model that's disabled, like
+/// Gemini's `limit: 0`). The server still hands back a tiny `retryDelay` (e.g. 7s), but retrying
+/// in 7s just fails again and thrashes — so we drop that hint and let the longer default bench
+/// apply. Genuine per-minute limits (no such marker) keep their short delay.
+fn quota_is_exhausted(s: &str) -> bool {
+    let l = s.to_lowercase();
+    l.contains("limit: 0") || l.contains("perday") || l.contains("per day") || l.contains("per-day")
+}
+
+/// Classify from an HTTP status code. `message` is shortened to a single line for the UI.
 fn classify_status(
     code: u16,
     message: String,
     retry_after: Option<std::time::Duration>,
 ) -> ProviderError {
+    let exhausted = quota_is_exhausted(&message);
+    let message = short(&message);
     match code {
         429 => ProviderError::RateLimited {
             message,
-            retry_after,
+            retry_after: retry_after.filter(|_| !exhausted),
         },
         401 | 403 => ProviderError::Auth(message),
         500..=599 => ProviderError::Unavailable(message),
@@ -212,10 +252,14 @@ fn classify_status(
 fn classify_text(text: &str, message: String) -> ProviderError {
     let lower = text.to_lowercase();
     let has = |needle: &str| lower.contains(needle);
+    // retry_after is parsed from the full `text` before the message is shortened; a per-day /
+    // zero quota drops the (useless) tiny delay so the longer default bench applies.
+    let retry_after = parse_retry_after_body(text).filter(|_| !quota_is_exhausted(text));
+    let message = short(&message);
     if has("429") || has("resource_exhausted") || has("rate limit") || has("quota") {
         ProviderError::RateLimited {
             message,
-            retry_after: parse_retry_after_body(text),
+            retry_after,
         }
     } else if has(" 401") || has(" 403") || has("unauthorized") || has("permission denied") {
         ProviderError::Auth(message)
@@ -282,18 +326,29 @@ impl Provider for GenAiProvider {
             .with_capture_content(true)
             .with_capture_tool_calls(true);
 
-        let res = self
-            .client
-            .exec_chat_stream(model_name.as_str(), req, Some(&options))
-            .await
-            .map_err(|e| classify_genai_error(&e))?;
+        // Stall guards: a hung connection or a stream that goes silent must not freeze the
+        // turn forever. A timeout surfaces as `Unavailable` (retryable), so the mesh fails over
+        // to the next model instead of spinning indefinitely (model-health-failover).
+        let res = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            self.client
+                .exec_chat_stream(model_name.as_str(), req, Some(&options)),
+        )
+        .await
+        .map_err(|_| stall_error("no response while connecting", CONNECT_TIMEOUT))?
+        .map_err(|e| classify_genai_error(&e))?;
 
         let mut stream = res.stream;
         let mut content = String::new();
         let mut usage = Usage::default();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
 
-        while let Some(event) = stream.next().await {
+        // An *idle* timeout (per chunk), not a total cap: a long generation keeps emitting and
+        // resets the clock; only a genuinely stalled stream trips it.
+        while let Some(event) = tokio::time::timeout(IDLE_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| stall_error("stream stalled", IDLE_TIMEOUT))?
+        {
             match event.map_err(|e| classify_genai_error(&e))? {
                 ChatStreamEvent::Chunk(chunk) => {
                     content.push_str(&chunk.content);
@@ -458,16 +513,27 @@ mod tests {
     const GEMINI_429: &str = r#"{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details. Quota exceeded for metric: ... limit: 0, model: antigravity. Please retry in 37.047405996s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"37s"}]}}"#;
 
     #[test]
-    fn classify_text_429_is_rate_limited_with_server_cooldown() {
+    fn exhausted_quota_429_drops_the_useless_short_delay() {
+        // GEMINI_429 is `limit: 0` (free tier disabled) — its 37s retryDelay would just thrash,
+        // so retry_after is dropped and the caller's longer default bench applies.
         let e = classify_text(GEMINI_429, "stream err".into());
         match e {
-            ProviderError::RateLimited { retry_after, .. } => {
-                // `retryDelay":"37s"` is matched before the looser "retry in 37.04s".
-                assert_eq!(retry_after, Some(std::time::Duration::from_secs(37)));
-            }
+            ProviderError::RateLimited { retry_after, .. } => assert_eq!(retry_after, None),
             other => panic!("expected RateLimited, got {other:?}"),
         }
         assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn transient_per_minute_429_keeps_its_server_delay() {
+        // A genuine per-minute limit (no limit:0 / per-day) honors the short retryDelay.
+        let body = r#"{"error":{"code":429,"message":"rate limit, retry soon","status":"RESOURCE_EXHAUSTED","details":[{"@type":"...RetryInfo","retryDelay":"12s"}]}}"#;
+        match classify_text(body, "stream err".into()) {
+            ProviderError::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(12)));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     #[test]
@@ -479,6 +545,30 @@ mod tests {
         let d = parse_retry_after_body("Please retry in 37.047405996s.").unwrap();
         assert!((d.as_secs_f64() - 37.047405996).abs() < 1e-6, "{d:?}");
         assert_eq!(parse_retry_after_body("no cooldown here"), None);
+    }
+
+    #[test]
+    fn short_keeps_first_line_and_drops_the_json_body() {
+        // The real failure: the whole HTTP body was flooding the UI. `short` must cut it.
+        let s = classify_text(
+            GEMINI_429,
+            format!("Web stream error for model 'gemini'.\nBody: {GEMINI_429}"),
+        );
+        let msg = s.to_string();
+        assert!(!msg.contains('{'), "no JSON body in the message: {msg}");
+        assert!(
+            msg.chars().count() < 200,
+            "message is short: {} chars",
+            msg.chars().count()
+        );
+    }
+
+    #[test]
+    fn stall_error_is_retryable_unavailable() {
+        let e = stall_error("stream stalled", std::time::Duration::from_secs(90));
+        assert!(matches!(e, ProviderError::Unavailable(_)));
+        assert!(e.is_retryable(), "a stall must fail over");
+        assert!(e.to_string().contains("90s"));
     }
 
     #[test]
