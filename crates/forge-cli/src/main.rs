@@ -94,6 +94,9 @@ enum Command {
         /// Provider: anthropic, openai, gemini, xai, deepseek, or openrouter.
         provider: String,
     },
+    /// Interactive first-run setup: enable providers (enter API keys) and declare which
+    /// subscription plan backs each installed CLI bridge, so the mesh knows your usage headroom.
+    Init,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -194,6 +197,7 @@ async fn main() -> Result<()> {
         Command::Sessions => sessions(),
         Command::Models { probe } => models(probe).await,
         Command::Auth { provider } => auth(&provider),
+        Command::Init => init(),
         Command::McpServe => mcp_serve::run().await,
     }
 }
@@ -223,6 +227,132 @@ fn auth(provider: &str) -> Result<()> {
         format!("storing {provider} key (is an OS keyring / secret service available?)")
     })?;
     println!("stored {provider} key in the OS keyring");
+    Ok(())
+}
+
+/// A human label + free/paid hint for a key-based provider, shown in `forge init`.
+fn provider_label(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "Anthropic (Claude API) — paid",
+        "openai" => "OpenAI (GPT API) — paid",
+        "gemini" => "Google Gemini — free tier + paid",
+        "xai" => "xAI (Grok) — paid",
+        "deepseek" => "DeepSeek — paid",
+        "openrouter" => "OpenRouter (gateway, many models) — paid + some :free",
+        "groq" => "Groq — free tier (fast)",
+        "opencode_go" => "OpenCode Zen — free curated coding models",
+        "github_copilot" => "GitHub Models — free inference",
+        "mimo" => "Xiaomi MiMo — free",
+        "minimax" => "MiniMax — free tier",
+        "cerebras" => "Cerebras — free tier (fast)",
+        _ => "provider",
+    }
+}
+
+/// The subscription plans a CLI bridge can be backed by: `(human label, stored slug)`. Captured
+/// by `forge init` so the mesh knows the usage headroom (quota-aware routing, L3). The exact
+/// quota numbers aren't asserted here — only which plan the user holds.
+fn bridge_plans(kind: forge_provider::CliKind) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        forge_provider::CliKind::ClaudeCode => &[
+            ("Free", "free"),
+            ("Pro", "pro"),
+            ("Max 5×", "max-5x"),
+            ("Max 20×", "max-20x"),
+            ("API credits / unsure", "unknown"),
+        ],
+        forge_provider::CliKind::Codex => &[
+            ("Plus", "plus"),
+            ("Pro", "pro"),
+            ("Team", "team"),
+            ("Enterprise", "enterprise"),
+            ("API credits / unsure", "unknown"),
+        ],
+    }
+}
+
+/// Whether the user looks un-onboarded: no provider key, no installed bridge, and no saved
+/// config. Pure so it's testable; the caller adds the tty check before auto-launching `init`.
+fn needs_onboarding(has_any_key: bool, any_bridge: bool, config_exists: bool) -> bool {
+    !has_any_key && !any_bridge && !config_exists
+}
+
+/// Read one trimmed line from stdin with a prompt (no echo suppression — same as `auth`).
+fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading stdin")?;
+    Ok(line.trim().to_string())
+}
+
+/// `forge init`: interactive first-run setup. Walks the key-based providers (offering to store a
+/// key for each), then each installed CLI bridge (asking which subscription plan backs it), and
+/// writes the plans to the user config. Keys go to the OS keyring, never the config (ADR-0007).
+fn init() -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("`forge init` is interactive — run it in a terminal");
+    }
+    println!("⚒ Forge setup\n");
+    println!("Enable providers by entering an API key (press Enter to skip each).");
+    println!("Keys are stored in your OS keyring, never in a config file.\n");
+
+    let mut enabled = 0usize;
+    for provider in forge_config::known_key_providers() {
+        let have = forge_config::has_api_key(provider);
+        let status = if have { "  [already set]" } else { "" };
+        println!("• {} ({provider}){status}", provider_label(provider));
+        let prompt = if have {
+            "    new key to replace it (Enter to keep): "
+        } else {
+            "    API key (Enter to skip): "
+        };
+        let key = prompt_line(prompt)?;
+        if !key.is_empty() {
+            forge_config::store_api_key(provider, &key)
+                .with_context(|| format!("storing {provider} key"))?;
+            println!("    ✓ stored");
+            enabled += 1;
+        } else if have {
+            enabled += 1;
+        }
+    }
+
+    println!("\nSubscription bridges (use your Claude/ChatGPT plan at $0 marginal cost):");
+    let mut subs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for kind in forge_provider::CliKind::all() {
+        let prefix = kind.prefix();
+        if !kind.available() {
+            println!("• {prefix}: not installed — skipping");
+            continue;
+        }
+        let plans = bridge_plans(kind);
+        println!("• {prefix} is installed. Which plan do you have?");
+        for (i, (label, _)) in plans.iter().enumerate() {
+            println!("    {}) {label}", i + 1);
+        }
+        let choice = prompt_line("    choose [1-5, Enter to skip]: ")?;
+        if let Some(slug) = choice
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| plans.get(n.wrapping_sub(1)))
+            .map(|(_, slug)| *slug)
+        {
+            subs.insert(prefix.to_string(), slug.to_string());
+            println!("    ✓ {prefix} → {slug}");
+        }
+    }
+
+    let path = forge_config::write_subscriptions(&subs).context("writing config")?;
+    println!("\n✓ Setup written to {}", path.display());
+    println!(
+        "  {enabled} provider(s) enabled, {} bridge plan(s) recorded.",
+        subs.len()
+    );
+    println!("  The mesh will route across these by task tier and cost. Try `forge models`.");
     Ok(())
 }
 
@@ -752,6 +882,30 @@ fn chat_action(line: &str) -> ChatAction {
     }
 }
 
+/// On a fresh machine (no keys, no bridge, no config) offer the `forge init` wizard before the
+/// first chat. Skipped for `--mock`, non-interactive shells, and once anything is configured.
+/// Declining writes an (empty) config so we don't nag on every launch.
+fn maybe_first_run_setup(mock: bool) -> Result<()> {
+    if mock || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(());
+    }
+    let has_any_key = forge_config::known_key_providers().any(forge_config::has_api_key);
+    let any_bridge = forge_provider::CliKind::all().iter().any(|k| k.available());
+    if !needs_onboarding(has_any_key, any_bridge, forge_config::user_config_exists()) {
+        return Ok(());
+    }
+    println!("⚒ Welcome to Forge — no providers are configured yet.");
+    let yes = prompt_line("Run interactive setup now? [Y/n]: ")?;
+    if yes.is_empty() || yes.eq_ignore_ascii_case("y") || yes.eq_ignore_ascii_case("yes") {
+        init()?;
+    } else {
+        // Mark onboarded so we don't ask again; the user can re-run `forge init` anytime.
+        let _ = forge_config::write_subscriptions(&std::collections::HashMap::new());
+        println!("Skipped. Run `forge init` anytime, or `forge auth <provider>` to add a key.");
+    }
+    Ok(())
+}
+
 async fn chat(
     mock: bool,
     mode: Option<Mode>,
@@ -759,6 +913,7 @@ async fn chat(
     plain: bool,
     pin: Option<String>,
 ) -> Result<()> {
+    maybe_first_run_setup(mock)?;
     // Default to the interactive (animated) TUI on a real terminal.
     if !plain && std::io::stdout().is_terminal() {
         return run_chat_tui(mock, mode, resume, pin).await;
@@ -1637,6 +1792,28 @@ mod tests {
         let (_, sub) = models_for_provider(&cat, &pricing, &Default::default(), "claude-cli");
         assert_eq!(sub[0].title, "(default model)");
         assert!(sub[0].subtitle.contains("subscription"));
+    }
+
+    #[test]
+    fn onboarding_only_when_nothing_is_configured() {
+        // Fresh machine: no key, no bridge, no config → onboard.
+        assert!(needs_onboarding(false, false, false));
+        // Any one signal of prior setup suppresses it.
+        assert!(!needs_onboarding(true, false, false)); // has a key
+        assert!(!needs_onboarding(false, true, false)); // a bridge is installed
+        assert!(!needs_onboarding(false, false, true)); // a saved config exists
+    }
+
+    #[test]
+    fn bridge_plans_cover_both_clis_with_stored_slugs() {
+        let claude = bridge_plans(forge_provider::CliKind::ClaudeCode);
+        assert!(claude.iter().any(|(_, slug)| *slug == "max-20x"));
+        let codex = bridge_plans(forge_provider::CliKind::Codex);
+        assert!(codex.iter().any(|(_, slug)| *slug == "plus"));
+        // Every plan has a non-empty human label + slug.
+        for (label, slug) in claude.iter().chain(codex) {
+            assert!(!label.is_empty() && !slug.is_empty());
+        }
     }
 
     #[test]

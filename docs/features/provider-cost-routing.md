@@ -131,6 +131,15 @@ token usage. So Forge can observe remaining headroom without extra calls.
 CLI rate-limit schemas are version-volatile (parse defensively, like the bridge parsers).
 Meaningful surface; worth its own PR once L1/L2 are in.
 
+**Input now captured (PR: `forge init`).** The static half of L3 — *which plan the user holds*
+— is collected by the interactive `forge init` onboarding and stored in
+`mesh.subscriptions` (`claude-cli` → e.g. `"max-20x"`, `codex-cli` → `"plus"`). This is the
+headroom signal the L3 router will combine with the live `rate_limit_event` usage to demote a
+near-limit subscription. Until L3 lands it is informational. Routing today is cost-tiered with
+fair provider spread (the `route_score` policy): Trivial→free, Standard→cheap subscription,
+Complex→subscription flagship, with within-family ties resolved to the higher-version model
+(never a lesser sibling at equal $0 cost).
+
 ## Impact (L1 + L2)
 | Layer | File | Change |
 |---|---|---|

@@ -21,6 +21,10 @@ pub enum ConfigError {
     MissingKey(String, String),
     #[error("keyring error: {0}")]
     Keyring(String),
+    #[error("no per-user config directory available on this platform")]
+    NoConfigDir,
+    #[error("writing config failed: {0}")]
+    Write(String),
 }
 
 impl From<figment::Error> for ConfigError {
@@ -235,6 +239,12 @@ pub struct MeshConfig {
     /// Default bench duration (seconds) when a rate-limited provider gives no `Retry-After`.
     #[serde(default = "default_failover_cooldown_secs")]
     pub failover_cooldown_secs: u64,
+    /// Which subscription plan backs each CLI bridge (`claude-cli` → "max-20x", `codex-cli` →
+    /// "plus"), captured by `forge init`. Records the usage headroom the user has so the mesh can
+    /// (in the quota-aware layer, provider-cost-routing.md L3) avoid overrunning a plan. Currently
+    /// informational + shown by `forge init`/`forge models`.
+    #[serde(default)]
+    pub subscriptions: HashMap<String, String>,
     /// Override which models a CLI bridge exposes to auto-discovery, keyed by bridge prefix
     /// (`claude-cli` / `codex-cli`); each value is a list of model aliases/ids the CLI's `--model`
     /// flag accepts (e.g. `["opus","sonnet","haiku"]`). Empty/absent → the bridge's built-in
@@ -411,6 +421,7 @@ impl Default for Config {
                 failover: default_failover(),
                 failover_cooldown_secs: default_failover_cooldown_secs(),
                 bridge_models: HashMap::new(),
+                subscriptions: HashMap::new(),
             },
             permissions: PermissionsConfig::default(),
         }
@@ -470,6 +481,51 @@ pub fn load() -> Result<Config, ConfigError> {
     fig = fig.merge(Env::prefixed("FORGE_").split("__"));
 
     Ok(fig.extract()?)
+}
+
+/// Whether the user has a persisted config file (the onboarding "first run" signal — combined
+/// with "no provider keys / no bridges" by the caller).
+pub fn user_config_exists() -> bool {
+    config_dir().is_some_and(|d| d.join("config.toml").exists())
+}
+
+/// Persist the CLI-bridge subscription plans into the user `config.toml`, preserving every other
+/// key already in the file (`forge init`). Returns the path written. Set `[mesh.subscriptions]`
+/// without disturbing the rest of the config — secrets are NEVER written here (keys go to the
+/// keyring; ADR-0007).
+pub fn write_subscriptions(subs: &HashMap<String, String>) -> Result<PathBuf, ConfigError> {
+    let dir = config_dir().ok_or(ConfigError::NoConfigDir)?;
+    std::fs::create_dir_all(&dir).map_err(|e| ConfigError::Write(e.to_string()))?;
+    let path = dir.join("config.toml");
+    write_subscriptions_at(&path, subs)?;
+    Ok(path)
+}
+
+/// The file half of [`write_subscriptions`] against an explicit path: set `[mesh.subscriptions]`
+/// in the TOML at `path`, preserving every other key. Split out so it can be tested without
+/// touching the real per-user config directory.
+fn write_subscriptions_at(
+    path: &std::path::Path,
+    subs: &HashMap<String, String>,
+) -> Result<(), ConfigError> {
+    let mut root: toml::Table = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+
+    let mesh = root
+        .entry("mesh".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let toml::Value::Table(mesh_t) = mesh {
+        let sub_t: toml::Table = subs
+            .iter()
+            .map(|(k, v)| (k.clone(), toml::Value::String(v.clone())))
+            .collect();
+        mesh_t.insert("subscriptions".to_string(), toml::Value::Table(sub_t));
+    }
+    let body = toml::to_string_pretty(&root).map_err(|e| ConfigError::Write(e.to_string()))?;
+    std::fs::write(path, body).map_err(|e| ConfigError::Write(e.to_string()))?;
+    Ok(())
 }
 
 const KEYRING_SERVICE: &str = "forge";
@@ -622,6 +678,43 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("DEEPSEEK_API_KEY"), "got: {msg}");
         assert!(msg.contains("forge auth deepseek"), "got: {msg}");
+    }
+
+    #[test]
+    fn write_subscriptions_sets_the_section_and_preserves_other_keys() {
+        let dir = std::env::temp_dir().join(format!("forge-cfg-{}", forge_types::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        // A pre-existing config with an unrelated key that must survive the write.
+        std::fs::write(&path, "[mesh]\nprefer_subscription = true\n").unwrap();
+
+        let mut subs = HashMap::new();
+        subs.insert("claude-cli".to_string(), "max-20x".to_string());
+        subs.insert("codex-cli".to_string(), "plus".to_string());
+        write_subscriptions_at(&path, &subs).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Table = written.parse().unwrap();
+        let mesh = parsed["mesh"].as_table().unwrap();
+        assert_eq!(
+            mesh["prefer_subscription"].as_bool(),
+            Some(true),
+            "existing key preserved"
+        );
+        let s = mesh["subscriptions"].as_table().unwrap();
+        assert_eq!(s["claude-cli"].as_str(), Some("max-20x"));
+        assert_eq!(s["codex-cli"].as_str(), Some("plus"));
+
+        // And it round-trips through the typed config.
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::file(&path))
+            .extract()
+            .unwrap();
+        assert_eq!(
+            cfg.mesh.subscriptions.get("claude-cli").map(String::as_str),
+            Some("max-20x")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
