@@ -11,7 +11,7 @@ mod cli_provider;
 mod genai_provider;
 mod mock;
 
-pub use cli_provider::{CliKind, CliProvider, SUBAGENT_SINK_ENV};
+pub use cli_provider::{available_bridge_models, CliKind, CliProvider, SUBAGENT_SINK_ENV};
 pub use genai_provider::{list_models, GenAiProvider};
 pub use mock::MockProvider;
 

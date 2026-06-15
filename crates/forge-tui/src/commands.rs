@@ -34,6 +34,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/mode",
     },
     Command {
+        name: "assay",
+        desc: "analyze code quality (AI-slop, dead/unsafe/untested) — or full cleanup",
+        usage: "/assay",
+    },
+    Command {
         name: "new",
         desc: "start a fresh session",
         usage: "/new",
@@ -76,6 +81,8 @@ pub enum CommandAction {
     ClearScreen,
     /// Open the operating-mode (temper) picker.
     Mode,
+    /// Enter Assay mode — pick analysis-only vs full cleanup, then run the critic crew.
+    Assay,
     /// Rewind the last turn (conversation + file edits).
     Undo,
     /// Save a checkpoint at the current point; `None` = an auto/unnamed checkpoint.
@@ -107,6 +114,7 @@ pub fn parse_command(line: &str) -> CommandAction {
         }
         "new" | "n" => CommandAction::New,
         "mode" | "m" | "temper" => CommandAction::Mode,
+        "assay" | "analyze" | "analyse" => CommandAction::Assay,
         "undo" | "u" => CommandAction::Undo,
         "checkpoint" | "cp" => CommandAction::Checkpoint((!arg.is_empty()).then_some(arg)),
         "checkpoints" => CommandAction::ListCheckpoints,
@@ -226,6 +234,8 @@ pub enum PickerKind {
     Checkpoints,
     /// Pick the operating mode / temper (`/mode`).
     Tempers,
+    /// Pick the Assay action: analysis-only vs full cleanup (`/assay`).
+    AssayChoice,
 }
 
 /// One row in an interactive picker: an opaque `id` the loop acts on, plus two display strings.

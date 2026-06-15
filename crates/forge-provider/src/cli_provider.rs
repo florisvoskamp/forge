@@ -60,6 +60,24 @@ impl CliKind {
         }
     }
 
+    /// All bridge kinds.
+    pub fn all() -> [CliKind; 2] {
+        [CliKind::ClaudeCode, CliKind::Codex]
+    }
+
+    /// Whether this bridge's CLI is installed (its binary resolves on `PATH`). A subscription
+    /// bridge that's present is treated as always-available — it doesn't rate-limit like the free
+    /// API tiers — so the mesh can fall back to it when metered providers are throttled.
+    pub fn available(self) -> bool {
+        binary_on_path(self.default_binary())
+    }
+
+    /// The bare Forge model id for this bridge (`claude-cli::` / `codex-cli::`), which resolves to
+    /// the CLI's own default model.
+    pub fn default_model_id(self) -> String {
+        format!("{}::", self.prefix())
+    }
+
     /// How to tell the user to make this CLI usable.
     fn setup_hint(self) -> &'static str {
         match self {
@@ -69,6 +87,23 @@ impl CliKind {
             CliKind::Codex => "install Codex and run `codex login` (ChatGPT subscription)",
         }
     }
+}
+
+/// Whether `bin` resolves to a file on `PATH` (a lightweight `which`, no spawning).
+fn binary_on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
+/// Forge model ids for every CLI bridge whose CLI is installed — the always-available
+/// subscription models the mesh should fall back to (and prefer, being $0). Empty if none.
+pub fn available_bridge_models() -> Vec<String> {
+    CliKind::all()
+        .into_iter()
+        .filter(|k| k.available())
+        .map(|k| k.default_model_id())
+        .collect()
 }
 
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
@@ -841,6 +876,20 @@ async fn terminate(child: &mut Child, pgid: Option<i32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_on_path_detects_present_and_absent() {
+        // A ubiquitous binary resolves; a nonsense one does not. (PATH-based, no spawning.)
+        let real = if cfg!(windows) { "cmd.exe" } else { "sh" };
+        assert!(binary_on_path(real), "{real} should be on PATH");
+        assert!(!binary_on_path("forge-definitely-not-a-real-binary-zzz"));
+    }
+
+    #[test]
+    fn default_model_id_is_the_bare_prefix() {
+        assert_eq!(CliKind::ClaudeCode.default_model_id(), "claude-cli::");
+        assert_eq!(CliKind::Codex.default_model_id(), "codex-cli::");
+    }
 
     #[test]
     fn sink_lines_parse_into_subagent_events() {

@@ -1,10 +1,15 @@
 # Feature: Assay — `forge assay` (AI-slop / quality analysis mode)
 
-> Status: **MVP shipped** (2026-06-15) — `forge assay [PATH]` runs the parallel, mesh-routed,
-> adversarially-verified critic crew and prints a ranked, persisted plain-text report (U1, U3–U7).
-> **Deferred:** git scopes `--diff/--branch/--since` (U2), the live `⚒ ASSAY` TUI view (U9
-> interactive), `/assay` in chat (U10), fix hand-off (U11), report diff `--since-last` (U12),
-> `--only/--skip` (U13), budget pre-estimate scope-down (U8 — the daily cap still applies).
+> Status: **interactive mode shipped** (2026-06-15). Assay is now a **chat mode**, not a CLI
+> subcommand (the `forge assay` command was removed): `/assay` opens an interactive picker —
+> **Analysis only** vs **Full cleanup (Refine)** — then runs the parallel, mesh-routed (health-
+> aware), adversarially-verified critic crew, renders a ranked report inline, persists it, and on
+> **Full cleanup** runs **Refine**: a permission-gated, **undoable** fix turn (reuses the agent
+> loop, so edits go through the temper + are shadow-snapshotted; `/undo` reverts them). Covers
+> U1, U3–U7, U9 (interactive), U10, U11.
+> **Deferred:** git scopes `--diff/--branch/--since` (U2), per-critic live progress rows (U9 full),
+> report diff `--since-last` (U12), `--only/--skip` (U13), budget pre-estimate scope-down (U8 —
+> the daily cap still applies), fan-out fixing (Refine currently fixes via one seeded turn).
 > Original design below.
 >
 > Status: **DRAFT — design only** (2026-06-15). No Rust written yet.

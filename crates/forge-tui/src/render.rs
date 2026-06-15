@@ -199,6 +199,149 @@ pub fn diff_to_plain(diff: &FileDiff) -> String {
     s
 }
 
+/// Color for a finding's severity (most→least): critical=red, high=orange, medium=yellow, low=dim.
+fn severity_color(sev: forge_types::Severity) -> Color {
+    use forge_types::Severity;
+    match sev {
+        Severity::Critical => ERRRED,
+        Severity::High => ORANGE,
+        Severity::Medium => Color::Rgb(235, 200, 110), // warn-yellow
+        Severity::Low => DIM,
+    }
+}
+
+/// Render an [`AssayReport`](forge_types::AssayReport) as styled lines for the TUI scrollback:
+/// a colored summary header, then each ranked finding with severity-colored gutter, location,
+/// title, why, and suggested fix.
+pub fn assay_report_lines(r: &forge_types::AssayReport) -> Vec<Line<'static>> {
+    let [crit, high, med, low] = r.severity_counts();
+    let id8: String = r.run_id.chars().take(8).collect();
+    let mut out = vec![
+        Line::from(Span::styled(
+            format!(
+                "{INDENT}⚒ ASSAY REPORT  run {id8}  scope: {}",
+                r.scope.label()
+            ),
+            Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled(
+                format!("{INDENT}{} findings  ", r.findings.len()),
+                Style::default().fg(CODEFG),
+            ),
+            Span::styled(format!("{crit} crit "), Style::default().fg(ERRRED)),
+            Span::styled(format!("{high} high "), Style::default().fg(ORANGE)),
+            Span::styled(
+                format!("{med} med "),
+                Style::default().fg(Color::Rgb(235, 200, 110)),
+            ),
+            Span::styled(format!("{low} low"), Style::default().fg(DIM)),
+            Span::styled(
+                format!("  ·  ${:.4}", r.cost_usd),
+                Style::default().fg(OKGREEN),
+            ),
+        ]),
+    ];
+    if !r.skipped_lenses.is_empty() {
+        let sk: Vec<String> = r
+            .skipped_lenses
+            .iter()
+            .map(|(l, why)| format!("{l} ({why})"))
+            .collect();
+        out.push(Line::from(Span::styled(
+            format!("{INDENT}skipped: {}", sk.join(", ")),
+            Style::default().fg(DIM),
+        )));
+    }
+    if r.findings.is_empty() {
+        out.push(Line::from(Span::styled(
+            format!("{INDENT}no findings — clean, or the scope had no analyzable source."),
+            Style::default().fg(DIM),
+        )));
+        return out;
+    }
+    for (i, f) in r.findings.iter().enumerate() {
+        let color = severity_color(f.severity);
+        let loc = match f.line {
+            Some(l) => format!("{}:{l}", f.file),
+            None => f.file.clone(),
+        };
+        out.push(Line::from(vec![
+            Span::styled(format!("{INDENT}{:>2}. ", i + 1), Style::default().fg(DIM)),
+            Span::styled(
+                format!("{} ", f.severity.as_str().to_uppercase()),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} ", f.category.as_str()),
+                Style::default().fg(CODEFG),
+            ),
+            Span::styled(loc, Style::default().fg(DIM)),
+        ]));
+        out.push(Line::from(Span::styled(
+            format!("{INDENT}    {}", f.title),
+            Style::default().fg(CODEFG),
+        )));
+        if !f.suggested_fix.is_empty() {
+            out.push(Line::from(Span::styled(
+                format!(
+                    "{INDENT}    fix: {} ({})",
+                    f.suggested_fix,
+                    f.effort.as_str()
+                ),
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+    out
+}
+
+/// Plain (no-ANSI) rendering of an assay report, for the headless/piped presenter.
+pub fn assay_report_plain(r: &forge_types::AssayReport) -> String {
+    let [crit, high, med, low] = r.severity_counts();
+    let id8: String = r.run_id.chars().take(8).collect();
+    let mut s = format!("\n⚒ ASSAY REPORT  run {id8}  scope: {}\n", r.scope.label());
+    s.push_str(&format!(
+        "{} findings · {crit} critical · {high} high · {med} medium · {low} low · ${:.4}\n",
+        r.findings.len(),
+        r.cost_usd
+    ));
+    if !r.skipped_lenses.is_empty() {
+        let sk: Vec<String> = r
+            .skipped_lenses
+            .iter()
+            .map(|(l, why)| format!("{l} ({why})"))
+            .collect();
+        s.push_str(&format!("skipped: {}\n", sk.join(", ")));
+    }
+    if r.findings.is_empty() {
+        s.push_str("no findings — clean, or the scope had no analyzable source.\n");
+        return s;
+    }
+    for (i, f) in r.findings.iter().enumerate() {
+        let loc = match f.line {
+            Some(l) => format!("{}:{l}", f.file),
+            None => f.file.clone(),
+        };
+        s.push_str(&format!(
+            "{:>2}. [{} · {}] {} — {loc}\n    {}\n",
+            i + 1,
+            f.severity.as_str().to_uppercase(),
+            f.confidence.as_str(),
+            f.category.as_str(),
+            f.title,
+        ));
+        if !f.suggested_fix.is_empty() {
+            s.push_str(&format!(
+                "    fix: {} ({})\n",
+                f.suggested_fix,
+                f.effort.as_str()
+            ));
+        }
+    }
+    s
+}
+
 /// Render a markdown document to styled lines, indented to match the conversation body.
 pub fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
     let mut r = Renderer::default();
@@ -594,6 +737,44 @@ mod tests {
         let t = text_of(&diff_to_lines(&diff));
         assert!(t.contains("binary file"), "{t:?}");
         assert!(!t.contains("@@"), "no textual diff for binary");
+    }
+
+    #[test]
+    fn assay_report_renders_summary_and_ranked_findings() {
+        use forge_types::{
+            AssayReport, AssayScope, Confidence, Effort, Finding, FindingCategory, Severity,
+        };
+        let report = AssayReport {
+            run_id: "abcdef123456".into(),
+            scope: AssayScope::Repo,
+            findings: vec![Finding {
+                id: "f1".into(),
+                category: FindingCategory::Correctness,
+                severity: Severity::Critical,
+                confidence: Confidence::High,
+                file: "core/lib.rs".into(),
+                line: Some(204),
+                title: "unwrap panics the turn".into(),
+                rationale: "a 5xx aborts the session".into(),
+                suggested_fix: "propagate via ?".into(),
+                effort: Effort::Small,
+                lens: "correctness".into(),
+                verified: true,
+            }],
+            cost_usd: 0.118,
+            skipped_lenses: vec![("design".into(), "timeout".into())],
+        };
+        let t = text_of(&assay_report_lines(&report));
+        assert!(t.contains("run abcdef12"), "short run id: {t}");
+        assert!(t.contains("1 findings"), "summary count");
+        assert!(t.contains("skipped: design (timeout)"), "degradation noted");
+        assert!(t.contains("CRITICAL") && t.contains("core/lib.rs:204"));
+        assert!(t.contains("fix: propagate via ?"));
+
+        // Plain form is ANSI-free for pipes.
+        let plain = assay_report_plain(&report);
+        assert!(!plain.contains('\u{1b}'), "no ANSI in plain report");
+        assert!(plain.contains("CRITICAL"));
     }
 
     #[test]

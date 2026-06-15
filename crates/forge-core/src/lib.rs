@@ -309,6 +309,70 @@ impl Session {
         self.mode
     }
 
+    /// Run an Assay analysis over `source` (the bundled scope content), emit + persist the report,
+    /// and — when `cleanup` — run a permission-gated, **undoable** fix turn (Refine) over the
+    /// findings. The crew is read-only; Refine reuses the normal agent loop so its edits go through
+    /// the permission broker and are shadow-snapshotted (so `/undo` reverts them).
+    pub async fn assay(
+        &mut self,
+        source: Arc<str>,
+        models: assay::TierModels,
+        cleanup: bool,
+    ) -> Result<(), CoreError> {
+        let pricing = Arc::new(self.pricing.clone());
+        let lenses = forge_types::FindingCategory::crew().to_vec();
+        let cooldown = std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
+        let provider = Arc::clone(&self.provider);
+        let store = Arc::clone(&self.store);
+        // Surface each critic/verifier as it finishes so the run shows live activity.
+        let presenter = &mut self.presenter;
+        let mut on_progress = |p: assay::AssayProgress| {
+            presenter.emit(PresenterEvent::AssayProgress(assay::progress_line(&p)));
+        };
+        let mut report = assay::run_assay(
+            forge_types::AssayScope::Repo,
+            source,
+            lenses,
+            models,
+            provider,
+            pricing,
+            store,
+            cooldown,
+            &mut on_progress,
+        )
+        .await;
+        if let Ok(run_id) = self
+            .store
+            .create_assay_run(&report.scope.label(), report.cost_usd)
+        {
+            report.run_id = run_id.clone();
+            for f in &report.findings {
+                let _ = self.store.add_finding(&run_id, f);
+            }
+        }
+        self.presenter
+            .emit(PresenterEvent::AssayReport(report.clone()));
+
+        if cleanup && !report.findings.is_empty() {
+            self.presenter.emit(PresenterEvent::Warning(format!(
+                "⚒ Refine — fixing {} finding(s); edits are permission-gated, /undo to revert",
+                report.findings.len()
+            )));
+            let prompt = refine_prompt(&report);
+            self.run_turn(&prompt).await?; // emits its own Done
+        } else {
+            if cleanup {
+                self.presenter.emit(PresenterEvent::Warning(
+                    "nothing to clean up — no findings".into(),
+                ));
+            }
+            self.presenter.emit(PresenterEvent::Done {
+                final_text: String::new(),
+            });
+        }
+        Ok(())
+    }
+
     /// Read the next user prompt from the attached surface. `None` ends the session.
     pub fn read_line(&mut self) -> Option<String> {
         self.presenter.read_line()
@@ -911,6 +975,33 @@ fn over_budget_message(b: &BudgetState) -> String {
         b.spent_month_usd,
         cap(b.monthly_cap_usd)
     )
+}
+
+/// Build the Refine (cleanup) task prompt from an assay report: instruct the agent loop to fix
+/// each finding by editing files (gated + snapshotted via the normal turn path).
+fn refine_prompt(report: &forge_types::AssayReport) -> String {
+    let mut s = String::from(
+        "You are Refine, a cleanup crew. An Assay analysis found the issues below in this \
+         codebase. Fix each one by editing the relevant files (edit_file/write_file). Be surgical \
+         — fix exactly the issue without breaking working code or changing unrelated behavior. If \
+         a finding is a false positive, skip it and briefly say why.\n\nIssues:\n",
+    );
+    for (i, f) in report.findings.iter().enumerate() {
+        let loc = match f.line {
+            Some(l) => format!("{}:{l}", f.file),
+            None => f.file.clone(),
+        };
+        s.push_str(&format!(
+            "{}. [{}] {} — {}\n   why: {}\n   suggested fix: {}\n",
+            i + 1,
+            f.severity.as_str(),
+            loc,
+            f.title,
+            f.rationale,
+            f.suggested_fix
+        ));
+    }
+    s
 }
 
 /// A short single-line label for an auto-checkpoint: the prompt's first line, char-truncated.
@@ -2062,6 +2153,80 @@ mod tests {
                 .any(|(r, c)| matches!(r, Role::User) && c == "a slow request"),
             "the interrupted turn's prompt was recorded before the abort"
         );
+    }
+
+    // --- Assay mode (docs/features/analysis-mode.md) ---
+
+    /// A provider that plays the critic + verifier roles for an in-session assay run.
+    struct AssayProvider;
+    #[async_trait::async_trait]
+    impl Provider for AssayProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            let sys = messages
+                .iter()
+                .find(|m| m.role == Role::System)
+                .map(|m| m.content.as_str())
+                .unwrap_or("");
+            let content = if sys.contains("ASSAY-VERIFIER") {
+                r#"{"verdict":"uphold","confidence":"high"}"#.to_string()
+            } else if sys.contains("ASSAY-CRITIC") && sys.contains("'correctness'") {
+                r#"[{"severity":"high","file":"a.rs","line":1,"title":"bug","why":"w","fix":"f","effort":"small"}]"#.to_string()
+            } else {
+                "[]".to_string()
+            };
+            Ok(ModelResponse {
+                content,
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn assay_analysis_emits_a_report_and_persists_the_run() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(AssayProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        session
+            .assay(
+                Arc::from("fn main() {}"),
+                assay::TierModels {
+                    trivial: vec!["m".into()],
+                    complex: vec!["m".into()],
+                },
+                false, // analysis-only
+            )
+            .await
+            .unwrap();
+
+        let ev = events.lock().unwrap();
+        let report = ev.iter().find_map(|e| match e {
+            PresenterEvent::AssayReport(r) => Some(r.clone()),
+            _ => None,
+        });
+        let report = report.expect("an AssayReport was emitted");
+        assert_eq!(report.findings.len(), 1, "the upheld finding is reported");
+        assert!(!report.run_id.is_empty(), "the run was persisted");
+        assert_eq!(store.list_assay_runs().unwrap().len(), 1);
+        assert_eq!(store.load_findings(&report.run_id).unwrap().len(), 1);
     }
 
     // --- In-TUI session swap (RFC session-management-and-commands, PR1) ---

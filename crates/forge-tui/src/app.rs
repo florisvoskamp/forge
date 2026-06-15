@@ -260,6 +260,17 @@ impl App {
                 self.flush.extend(crate::render::diff_to_lines(&diff));
                 self.flush.push(TextLine::default());
             }
+            PresenterEvent::AssayProgress(msg) => {
+                self.flush.push(TextLine::from(Span::styled(
+                    format!("  {msg}"),
+                    Style::default().fg(DIM),
+                )));
+            }
+            PresenterEvent::AssayReport(report) => {
+                self.flush
+                    .extend(crate::render::assay_report_lines(&report));
+                self.flush.push(TextLine::default());
+            }
             PresenterEvent::Done { .. } => self.done = true,
         }
     }

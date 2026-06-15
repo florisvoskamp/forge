@@ -1,14 +1,8 @@
-//! On-demand TUI end-to-end smoke over a real PTY (RFC session-management-and-commands).
+//! On-demand TUI end-to-end smokes over a real PTY. Drives the actual `forge chat --mock` binary
+//! through a pseudo-terminal — answering the terminal's cursor-position (DSR) query so the inline
+//! viewport initializes (a CI runner's null terminal won't, hence `#[ignore]`).
 //!
-//! Drives the actual `forge chat --mock` binary through a pseudo-terminal: runs a turn (which
-//! auto-checkpoints), opens the `/undo` "rewind to a message" picker, rewinds, and quits —
-//! asserting the binary renders the expected feedback and exits cleanly with no panic. This is the
-//! one test that exercises the render-loop key wiring + auto-checkpoint + rewind end to end.
-//!
-//! `#[ignore]` by default: it needs to *answer* the terminal's cursor-position (DSR) query for the
-//! inline viewport to initialize, which a CI runner's null terminal won't do — this test supplies
-//! that answer itself. Run locally with:
-//!   cargo test -p forge-cli --test tui_e2e -- --ignored --nocapture
+//! Run locally: `cargo test -p forge-cli --test tui_e2e -- --ignored --nocapture`
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -17,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-#[test]
-#[ignore = "needs a DSR-answering pty; run locally with --ignored"]
-fn tui_autocheckpoints_then_undo_picker_rewinds_over_a_pty() {
+/// Launch `forge chat --mock` on a PTY in a throwaway cwd, answer DSR queries, then feed the
+/// `(keys, sleep_ms_after)` script. Returns `(clean_exit, plain_output)`.
+fn drive_pty(script: &[(&str, u64)]) -> (bool, String) {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -29,9 +23,9 @@ fn tui_autocheckpoints_then_undo_picker_rewinds_over_a_pty() {
         })
         .expect("openpty");
 
-    // Run in an isolated cwd so the test never touches the repo's `.forge/`.
     let dir = std::env::temp_dir().join(format!("forge-e2e-{}", forge_id()));
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("sample.rs"), "fn main() { let x = 1; }\n").unwrap();
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_forge"));
     cmd.arg("chat");
     cmd.arg("--mock");
@@ -44,8 +38,6 @@ fn tui_autocheckpoints_then_undo_picker_rewinds_over_a_pty() {
     let writer = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
     let captured = Arc::new(Mutex::new(String::new()));
 
-    // Reader thread: accumulate output and answer every DSR cursor query so the inline viewport
-    // initializes (and re-initializes on the resize it does at startup).
     let w_reader = Arc::clone(&writer);
     let cap = Arc::clone(&captured);
     let reader_thread = thread::spawn(move || {
@@ -67,23 +59,17 @@ fn tui_autocheckpoints_then_undo_picker_rewinds_over_a_pty() {
         }
     });
 
-    // Give the TUI time to initialize (banner + first DSR round-trip), then drive the script.
-    // Palette opens on `/`; typing the command name + Enter dispatches it.
     let send = |s: &str| {
         let mut w = writer.lock().unwrap();
         let _ = w.write_all(s.as_bytes());
         let _ = w.flush();
     };
-    thread::sleep(Duration::from_millis(1500));
-    send("say hi\r"); // a real turn → auto-checkpoint is created at the turn boundary
-    thread::sleep(Duration::from_millis(1200));
-    send("/undo\r"); // palette → /undo opens the interactive "rewind to a message" picker
-    thread::sleep(Duration::from_millis(800));
-    send("\r"); // Enter: rewind to the selected (only) past message
-    thread::sleep(Duration::from_millis(800));
-    send("\x1b"); // Esc (idle): quit
+    thread::sleep(Duration::from_millis(1500)); // init + first DSR round-trip
+    for (keys, after_ms) in script {
+        send(keys);
+        thread::sleep(Duration::from_millis(*after_ms));
+    }
 
-    // Wait for a clean exit (kill if it wedges).
     let start = Instant::now();
     let status = loop {
         if let Some(s) = child.try_wait().expect("try_wait") {
@@ -99,21 +85,41 @@ fn tui_autocheckpoints_then_undo_picker_rewinds_over_a_pty() {
     let _ = reader_thread.join();
     std::fs::remove_dir_all(&dir).ok();
 
-    let out = captured.lock().unwrap().clone();
-    let plain = strip_ansi(&out);
+    let plain = strip_ansi(&captured.lock().unwrap());
+    let clean = status.map(|s| s.success()).unwrap_or(false);
+    (clean, plain)
+}
 
-    assert!(status.is_some(), "the TUI should exit (not hang): {plain}");
-    assert!(
-        status.unwrap().success(),
-        "clean exit (Esc quit), no panic: {plain}"
-    );
-    assert!(
-        !plain.to_lowercase().contains("panic"),
-        "no panic in output: {plain}"
-    );
+#[test]
+#[ignore = "needs a DSR-answering pty; run locally with --ignored"]
+fn tui_autocheckpoints_then_undo_picker_rewinds_over_a_pty() {
+    // A real turn auto-checkpoints; /undo opens the rewind picker; Enter rewinds.
+    let (clean, plain) = drive_pty(&[
+        ("say hi\r", 1200),
+        ("/undo\r", 800),
+        ("\r", 800),
+        ("\x1b", 0),
+    ]);
+    assert!(clean, "clean exit, no panic: {plain}");
+    assert!(!plain.to_lowercase().contains("panic"), "no panic: {plain}");
     assert!(
         plain.contains("rewound to that point"),
         "auto-checkpoint → /undo picker → rewind worked end to end: {plain}"
+    );
+}
+
+#[test]
+#[ignore = "needs a DSR-answering pty; run locally with --ignored"]
+fn tui_assay_mode_opens_choice_picker_and_runs_without_crashing() {
+    // /assay opens the analysis-vs-cleanup picker; selecting a choice runs the flow. Under --mock
+    // with no provider keys there are no live models, so it degrades gracefully (a note) rather
+    // than crashing — this smoke proves the palette → AssayChoice picker → spawn_assay wiring.
+    let (clean, plain) = drive_pty(&[("/assay\r", 800), ("\r", 1200), ("\x1b", 0)]);
+    assert!(clean, "clean exit, no panic: {plain}");
+    assert!(!plain.to_lowercase().contains("panic"), "no panic: {plain}");
+    assert!(
+        plain.to_lowercase().contains("assay"),
+        "the assay choice picker was reached: {plain}"
     );
 }
 
@@ -127,7 +133,6 @@ fn strip_ansi(s: &str) -> String {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\u{1b}' {
-            // Skip an escape sequence: ESC [ ... <final byte 0x40..=0x7e>, or ESC <single>.
             if chars.peek() == Some(&'[') {
                 chars.next();
                 for d in chars.by_ref() {

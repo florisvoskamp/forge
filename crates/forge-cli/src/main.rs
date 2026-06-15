@@ -85,15 +85,6 @@ enum Command {
         #[arg(long)]
         probe: bool,
     },
-    /// Assay — a critical multi-agent analysis of code quality (AI-slop, dead weight, unsafe,
-    /// untested, design/architecture problems). Prints a ranked findings report; never edits.
-    Assay {
-        /// File or directory to analyze. Default: the whole repo (cwd).
-        path: Option<String>,
-        /// Use the offline mock provider (no keys/network) — for smoke-testing the pipeline.
-        #[arg(long)]
-        mock: bool,
-    },
     /// Internal: run Forge's tool registry as an MCP server on stdio (spawned by the CLI
     /// bridge so claude/codex use Forge's tools under Forge's permission gate). Not for direct use.
     #[command(hide = true)]
@@ -202,7 +193,6 @@ async fn main() -> Result<()> {
         } => chat(mock, mode, resume, plain, model).await,
         Command::Sessions => sessions(),
         Command::Models { probe } => models(probe).await,
-        Command::Assay { path, mock } => assay(path, mock).await,
         Command::Auth { provider } => auth(&provider),
         Command::McpServe => mcp_serve::run().await,
     }
@@ -272,84 +262,78 @@ fn sessions() -> Result<()> {
     Ok(())
 }
 
-/// `forge assay [PATH]`: run the critic crew over the repo (or a path) and print a ranked report
-/// (docs/features/analysis-mode.md). Read-only — Assay never edits; fixing is a separate turn.
-async fn assay(path: Option<String>, mock: bool) -> Result<()> {
-    use forge_core::assay::{run_assay, TierModels};
-    use forge_types::{AssayScope, FindingCategory};
-
-    forge_config::inject_provider_keys();
-    let config = forge_config::load().unwrap_or_default();
-    let store = open_store()?;
-    let pricing = Arc::new(forge_mesh::pricing::Pricing::from_config(&config));
-
-    let root = path.clone().unwrap_or_else(|| ".".to_string());
-    let scope = match &path {
-        Some(p) => AssayScope::Path(p.clone()),
-        None => AssayScope::Repo,
-    };
-    let source = bundle_source(Path::new(&root), 200_000);
+/// Resolve health-aware tier models from the discovery catalog, then spawn the Assay task (like
+/// `spawn_turn`): the crew runs in the background while the spinner ticks, emits its report to the
+/// TUI, and — when `cleanup` — runs a permission-gated, undoable Refine fix turn. Returns the task
+/// handle (so Esc can interrupt it), or `None` if it couldn't start (no source / no live models).
+#[allow(clippy::too_many_arguments)]
+async fn spawn_assay(
+    cleanup: bool,
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    done_tx: &std::sync::mpsc::Sender<u64>,
+    gen: u64,
+    app: &mut forge_tui::App,
+    busy: &mut bool,
+    busy_since: &mut std::time::Instant,
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
+    let source = bundle_source(Path::new("."), 200_000);
     if source.trim().is_empty() {
-        anyhow::bail!("no analyzable source files found under '{root}'");
+        app.note("assay: no analyzable source files under the working directory");
+        return Ok(None);
     }
-
-    let provider: Arc<dyn Provider> = if mock {
-        Arc::new(MockProvider)
-    } else {
-        Arc::new(DispatchProvider::new(false))
-    };
-    let (trivial, complex) = if mock {
-        ("mock::cheap".to_string(), "mock::frontier".to_string())
-    } else {
-        let cat = discover_catalog().await;
-        if cat.is_empty() {
-            anyhow::bail!("no models available — `forge auth <provider>` or run ollama");
-        }
-        // Route critics around rate-limited / down models (model-health): pick the best ranked
-        // model per tier that ISN'T currently benched, so a critic isn't sent to a dead model.
-        let benched = store.current_benched().unwrap_or_default();
-        let pick = |tier| {
-            cat.ranked_for(tier, &pricing, 8)
-                .into_iter()
-                .find(|m| !benched.is_benched(m))
-                .or_else(|| config.model_for(tier).map(String::from))
-                .unwrap_or_default()
-        };
-        let (t, c) = (pick(TaskTier::Trivial), pick(TaskTier::Complex));
-        if t.is_empty() && c.is_empty() {
-            anyhow::bail!(
-                "every discovered model is rate-limited / benched — `forge models --probe` to recheck"
-            );
-        }
-        (t, c)
-    };
-
-    println!(
-        "⚒ assay — scope: {} · {} critics · models [{trivial}] / [{complex}]",
-        scope.label(),
-        FindingCategory::crew().len()
-    );
-
-    let mut report = run_assay(
-        scope.clone(),
-        Arc::from(source.as_str()),
-        FindingCategory::crew().to_vec(),
-        TierModels { trivial, complex },
-        provider,
-        pricing,
-    )
-    .await;
-
-    let run_id = store
-        .create_assay_run(&scope.label(), report.cost_usd)
-        .context("persisting assay run")?;
-    report.run_id = run_id.clone();
-    for f in &report.findings {
-        store.add_finding(&run_id, f).ok();
+    let config = forge_config::load().unwrap_or_default();
+    let pricing = forge_mesh::pricing::Pricing::from_config(&config);
+    let store = open_store()?;
+    let cat = discover_catalog().await;
+    if cat.is_empty() {
+        app.note("assay: no models available — `forge auth <provider>` or run ollama");
+        return Ok(None);
     }
+    // Route critics around rate-limited / benched models, like the agent loop does.
+    let benched = store.current_benched().unwrap_or_default();
+    // Build a CHAIN per tier (ranked, health-filtered): the crew tries them in order and fails
+    // over when one rate-limits, instead of giving up on a single dead model.
+    let chain = |tier| {
+        let mut models: Vec<String> = cat
+            .ranked_for(tier, &pricing, 8)
+            .into_iter()
+            .filter(|m| !benched.is_benched(m))
+            .collect();
+        if models.is_empty() {
+            if let Some(m) = config.model_for(tier) {
+                models.push(m.to_string());
+            }
+        }
+        models
+    };
+    let (trivial, complex) = (chain(TaskTier::Trivial), chain(TaskTier::Complex));
+    if trivial.is_empty() && complex.is_empty() {
+        app.note(
+            "assay: every model is rate-limited/benched — try /mode or `forge models --probe`",
+        );
+        return Ok(None);
+    }
+    let models = forge_core::assay::TierModels { trivial, complex };
 
-    print!("{}", render_report_plain(&report));
-    Ok(())
+    app.submit_user(if cleanup {
+        "/assay → full cleanup (Refine)"
+    } else {
+        "/assay → analysis"
+    });
+    app.done = false;
+    app.tick = 0;
+    *busy = true;
+    *busy_since = std::time::Instant::now();
+    let s = session.clone();
+    let dt = done_tx.clone();
+    let src: Arc<str> = Arc::from(source.as_str());
+    Ok(Some(tokio::spawn(async move {
+        let _done = DoneGuard(dt, gen);
+        let mut sess = s.lock().await;
+        if let Err(e) = sess.assay(src, models, cleanup).await {
+            sess.notify_error(&format!("assay failed: {e}"));
+        }
+    })))
 }
 
 /// Concatenate the analyzable source under `root` (capped) with `// FILE:` headers, for the crew
@@ -444,57 +428,6 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
     i
 }
 
-/// Render a finished [`AssayReport`] as a ranked plain-text report (no ANSI), for the CLI/pipe.
-fn render_report_plain(r: &forge_types::AssayReport) -> String {
-    let [crit, high, med, low] = r.severity_counts();
-    let id8: String = r.run_id.chars().take(8).collect();
-    let mut s = format!("\n⚒ ASSAY REPORT  run {id8}  scope: {}\n", r.scope.label());
-    s.push_str(&format!(
-        "{} findings · {crit} critical · {high} high · {med} medium · {low} low · ${:.4}\n",
-        r.findings.len(),
-        r.cost_usd
-    ));
-    if !r.skipped_lenses.is_empty() {
-        let sk: Vec<String> = r
-            .skipped_lenses
-            .iter()
-            .map(|(l, why)| format!("{l} ({why})"))
-            .collect();
-        s.push_str(&format!("skipped: {}\n", sk.join(", ")));
-    }
-    s.push_str(&"─".repeat(60));
-    s.push('\n');
-    if r.findings.is_empty() {
-        s.push_str("no findings — clean, or the scope had no analyzable source.\n");
-        return s;
-    }
-    for (i, f) in r.findings.iter().enumerate() {
-        let loc = match f.line {
-            Some(l) => format!("{}:{l}", f.file),
-            None => f.file.clone(),
-        };
-        s.push_str(&format!(
-            "{:>2}. [{} · {}] {} — {loc}\n",
-            i + 1,
-            f.severity.as_str().to_uppercase(),
-            f.confidence.as_str(),
-            f.category.as_str(),
-        ));
-        s.push_str(&format!("    {}\n", f.title));
-        if !f.rationale.is_empty() {
-            s.push_str(&format!("    why: {}\n", f.rationale));
-        }
-        if !f.suggested_fix.is_empty() {
-            s.push_str(&format!(
-                "    fix: {} (effort: {})\n",
-                f.suggested_fix,
-                f.effort.as_str()
-            ));
-        }
-    }
-    s
-}
-
 /// Construct the model backend + router from config. Shared by interactive sessions and the
 /// `mcp-serve` subagent path (RFC subagent-orchestration Phase 3), so both route identically.
 pub(crate) fn build_provider_and_router(
@@ -562,6 +495,11 @@ async fn discover_catalog() -> forge_mesh::ModelCatalog {
             Err(_) => tracing::debug!("model discovery timed out for {p}"),
         }
     }
+    // Always-available subscription bridges (claude-cli/codex-cli) if their CLI is installed.
+    // They don't rate-limit like the free API tiers, so the mesh can rely on them — and being
+    // $0 subscriptions they rank first (prefer_subscription), so routing reaches a working model
+    // instead of erroring out when metered providers are throttled.
+    models.extend(forge_provider::available_bridge_models());
     forge_mesh::ModelCatalog::new(models)
 }
 
@@ -936,7 +874,23 @@ async fn run_chat_tui(
                         let kind = app.picker.kind;
                         app.picker.close();
                         if let (Some(row), Some(kind)) = (chosen, kind) {
-                            picker_accept(kind, &row, &session, &mut tui, &mut app).await?;
+                            if kind == forge_tui::PickerKind::AssayChoice {
+                                // Assay runs as a background task (like a turn) so the spinner
+                                // ticks while critics + verification run.
+                                turn_gen += 1;
+                                turn_handle = spawn_assay(
+                                    row.id == "cleanup",
+                                    &session,
+                                    &done_tx,
+                                    turn_gen,
+                                    &mut app,
+                                    &mut busy,
+                                    &mut busy_since,
+                                )
+                                .await?;
+                            } else {
+                                picker_accept(kind, &row, &session, &mut tui, &mut app).await?;
+                            }
                         }
                     }
                     KeyKind::Char(c) => {
@@ -1224,6 +1178,25 @@ async fn dispatch_command(
                 rows,
             );
         }
+        // `/assay` enters Assay mode: pick analysis-only vs full cleanup; the crew then runs as a
+        // background task (spawned in the picker-Enter handler so the spinner ticks).
+        CommandAction::Assay => {
+            let rows = vec![
+                forge_tui::PickerRow {
+                    id: "analysis".into(),
+                    title: "Analysis only".into(),
+                    subtitle: "review & ranked report — no edits".into(),
+                },
+                forge_tui::PickerRow {
+                    id: "cleanup".into(),
+                    title: "Full cleanup (Refine)".into(),
+                    subtitle: "analyze, then auto-fix findings — permission-gated, /undo to revert"
+                        .into(),
+                },
+            ];
+            app.picker
+                .open_with(forge_tui::PickerKind::AssayChoice, "⚒ assay — choose", rows);
+        }
         // `/resume [prefix]` and `/sessions` both open the interactive picker; a prefix pre-fills
         // its filter. Resolving + swapping the session happens on Enter (picker_accept).
         CommandAction::Resume(prefix) => open_sessions_picker(app, &prefix)?,
@@ -1368,6 +1341,8 @@ async fn picker_accept(
                 app.note(&format!("◆ mode → {label}"));
             }
         }
+        // Assay's choice is handled in the render loop (it spawns a background task), never here.
+        forge_tui::PickerKind::AssayChoice => {}
     }
     Ok(())
 }
@@ -1429,39 +1404,6 @@ mod tests {
         assert!(!out.contains("GENERATED"), "target/ skipped");
         assert!(!out.contains("ignored ext"), "non-source ext skipped");
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn render_report_plain_shows_summary_and_ranked_findings() {
-        use forge_types::{
-            AssayReport, AssayScope, Confidence, Effort, Finding, FindingCategory, Severity,
-        };
-        let report = AssayReport {
-            run_id: "abcdef123456".into(),
-            scope: AssayScope::Repo,
-            findings: vec![Finding {
-                id: "f1".into(),
-                category: FindingCategory::Correctness,
-                severity: Severity::Critical,
-                confidence: Confidence::High,
-                file: "core/lib.rs".into(),
-                line: Some(204),
-                title: "unwrap panics the turn".into(),
-                rationale: "a 5xx aborts the session".into(),
-                suggested_fix: "propagate via ?".into(),
-                effort: Effort::Small,
-                lens: "correctness".into(),
-                verified: true,
-            }],
-            cost_usd: 0.118,
-            skipped_lenses: vec![("design".into(), "timeout".into())],
-        };
-        let s = render_report_plain(&report);
-        assert!(s.contains("run abcdef12"), "short run id: {s}");
-        assert!(s.contains("1 findings · 1 critical"), "summary counts");
-        assert!(s.contains("skipped: design (timeout)"), "degradation noted");
-        assert!(s.contains("CRITICAL") && s.contains("core/lib.rs:204"));
-        assert!(s.contains("fix: propagate via ? (effort: small)"));
     }
 
     #[test]
