@@ -685,6 +685,34 @@ async fn run_chat_tui(
                 continue;
             }
 
+            // The session/checkpoint picker is modal too: arrows navigate, typing filters, Enter
+            // acts on the selection (resume / rewind), Esc cancels.
+            if app.picker.open {
+                match key {
+                    KeyKind::Esc => app.picker.close(),
+                    KeyKind::Up => app.picker.move_up(),
+                    KeyKind::Down => app.picker.move_down(),
+                    KeyKind::Enter => {
+                        let chosen = app.picker.selected_row().cloned();
+                        let kind = app.picker.kind;
+                        app.picker.close();
+                        if let (Some(row), Some(kind)) = (chosen, kind) {
+                            picker_accept(kind, &row, &session, &mut tui, &mut app).await?;
+                        }
+                    }
+                    KeyKind::Char(c) => {
+                        app.picker.query.push(c);
+                        app.picker.clamp();
+                    }
+                    KeyKind::Backspace => {
+                        app.picker.query.pop();
+                        app.picker.clamp();
+                    }
+                    KeyKind::Tab | KeyKind::CycleTemper => {}
+                }
+                continue;
+            }
+
             // Esc / Ctrl-C ALWAYS quit — checked before any prompt handling, so the user can
             // never get wedged at a permission/question prompt with no way out. A pending reply
             // is dropped (its sender closes → the blocked turn task unblocks and the process exits).
@@ -810,9 +838,13 @@ async fn run_chat_tui(
                 dirty = true;
             }
         }
-        // Animate the command palette's ease-in reveal while it's open.
+        // Animate the command palette's / picker's ease-in reveal while open.
         if app.palette.open && app.palette.anim < 1.0 {
             app.palette.tick_anim();
+            dirty = true;
+        }
+        if app.picker.open && app.picker.anim < 1.0 {
+            app.picker.tick_anim();
             dirty = true;
         }
 
@@ -868,9 +900,16 @@ async fn dispatch_command(
 ) -> Result<bool> {
     use forge_tui::CommandAction;
     let action = forge_tui::parse_command(line);
-    let mutates = matches!(
+    // Everything that touches the live `Session` (lock().await) or swaps it is gated while a turn
+    // holds the Mutex — opening the read-only `/sessions` picker is the one exception.
+    let mutates = !matches!(
         action,
-        CommandAction::Resume(_) | CommandAction::New | CommandAction::ClearScreen
+        CommandAction::Help
+            | CommandAction::Quit
+            | CommandAction::Unknown(_)
+            | CommandAction::ListSessions
+            | CommandAction::Resume(_)
+            | CommandAction::ClearScreen
     );
     if busy && mutates {
         app.note("⚠ finish or Esc the current turn first");
@@ -892,50 +931,171 @@ async fn dispatch_command(
             tui.clear_screen();
             app.note("● new session");
         }
-        CommandAction::Resume(prefix) => {
-            let store = open_store()?;
-            match store.matching_session_ids(&prefix) {
-                Ok(ids) if ids.len() == 1 => {
-                    let id = ids.into_iter().next().unwrap();
+        // `/resume [prefix]` and `/sessions` both open the interactive picker; a prefix pre-fills
+        // its filter. Resolving + swapping the session happens on Enter (picker_accept).
+        CommandAction::Resume(prefix) => open_sessions_picker(app, &prefix)?,
+        CommandAction::ListSessions => open_sessions_picker(app, "")?,
+        CommandAction::ListCheckpoints => {
+            let rows = {
+                let s = session.lock().await;
+                checkpoint_rows(&s.checkpoints().map_err(|e| anyhow::anyhow!("{e}"))?)
+            };
+            if rows.is_empty() {
+                app.note("no checkpoints yet — /checkpoint [name] to save one");
+            } else {
+                app.picker.open_with(
+                    forge_tui::PickerKind::Checkpoints,
+                    "restore a checkpoint",
+                    rows,
+                );
+            }
+        }
+        CommandAction::Undo => {
+            let outcome = {
+                let mut s = session.lock().await;
+                s.undo().map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+            match outcome {
+                None => app.note("nothing to undo"),
+                Some(report) => {
                     let history = {
-                        let mut s = session.lock().await;
-                        s.reset_resumed(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let s = session.lock().await;
                         s.history()
                     };
                     tui.clear_screen();
-                    app.note(&format!(
-                        "● resumed {}",
-                        id.chars().take(8).collect::<String>()
-                    ));
+                    app.note("↶ undid the last turn");
                     app.replay_history(&history);
+                    note_restore(app, &report);
                 }
-                Ok(ids) if ids.is_empty() => app.note(&format!("no session matching '{prefix}'")),
-                Ok(_) => app.note(&format!("'{prefix}' is ambiguous — use more characters")),
-                Err(e) => app.note(&format!("resume failed: {e}")),
             }
         }
-        CommandAction::ListSessions => {
-            let store = open_store()?;
-            match store.list_sessions() {
-                Ok(list) if list.is_empty() => app.note("no past sessions yet"),
-                Ok(list) => {
-                    app.note("past sessions — /resume <id>:");
-                    for s in list.into_iter().take(15) {
-                        let id: String = s.id.chars().take(8).collect();
-                        let preview: String =
-                            s.preview.unwrap_or_default().chars().take(48).collect();
-                        app.note(&format!(
-                            "  {id}  ${:>7.4}  {:>3} msgs  {preview}",
-                            s.total_cost_usd, s.message_count
-                        ));
-                    }
-                }
-                Err(e) => app.note(&format!("list failed: {e}")),
+        CommandAction::Checkpoint(name) => {
+            {
+                let mut s = session.lock().await;
+                s.checkpoint(name.as_deref())
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            match name {
+                Some(n) => app.note(&format!("✓ checkpoint saved: {n}")),
+                None => app.note("✓ checkpoint saved"),
             }
         }
         CommandAction::Unknown(x) => app.note(&format!("unknown command: /{x} — try /help")),
     }
     Ok(false)
+}
+
+/// Populate + open the session picker from the store (newest first). `query` pre-fills the filter.
+fn open_sessions_picker(app: &mut forge_tui::App, query: &str) -> Result<()> {
+    let store = open_store()?;
+    let list = store.list_sessions().context("listing sessions")?;
+    if list.is_empty() {
+        app.note("no past sessions yet");
+        return Ok(());
+    }
+    let rows = list
+        .into_iter()
+        .take(50)
+        .map(|s| {
+            let id8: String = s.id.chars().take(8).collect();
+            let preview: String = s.preview.unwrap_or_default().chars().take(60).collect();
+            forge_tui::PickerRow {
+                title: format!(
+                    "{id8}  ${:>7.4}  {:>3} msgs  {}",
+                    s.total_cost_usd,
+                    s.message_count,
+                    fmt_age(s.created_at)
+                ),
+                subtitle: preview,
+                id: s.id,
+            }
+        })
+        .collect();
+    app.picker
+        .open_with(forge_tui::PickerKind::Sessions, "resume a session", rows);
+    app.picker.query = query.to_string();
+    app.picker.clamp();
+    Ok(())
+}
+
+fn checkpoint_rows(cps: &[forge_store::CheckpointRow]) -> Vec<forge_tui::PickerRow> {
+    cps.iter()
+        .map(|c| forge_tui::PickerRow {
+            id: c.seq.to_string(),
+            title: format!("#{}  {}", c.seq, fmt_age(c.created_at)),
+            subtitle: c.label.clone().unwrap_or_else(|| "auto".into()),
+        })
+        .collect()
+}
+
+/// Act on the picker's selected row: resume the chosen session, or rewind to the chosen
+/// checkpoint — then redraw the surviving transcript into scrollback.
+async fn picker_accept(
+    kind: forge_tui::PickerKind,
+    row: &forge_tui::PickerRow,
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    tui: &mut forge_tui::Tui,
+    app: &mut forge_tui::App,
+) -> Result<()> {
+    match kind {
+        forge_tui::PickerKind::Sessions => {
+            let history = {
+                let mut s = session.lock().await;
+                s.reset_resumed(&row.id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                s.history()
+            };
+            tui.clear_screen();
+            app.note(&format!(
+                "● resumed {}",
+                row.id.chars().take(8).collect::<String>()
+            ));
+            app.replay_history(&history);
+        }
+        forge_tui::PickerKind::Checkpoints => {
+            let seq: i64 = row.id.parse().unwrap_or(0);
+            let (history, report) = {
+                let mut s = session.lock().await;
+                let report = s.rewind_to(seq).map_err(|e| anyhow::anyhow!("{e}"))?;
+                (s.history(), report)
+            };
+            tui.clear_screen();
+            app.note("● restored checkpoint");
+            app.replay_history(&history);
+            note_restore(app, &report);
+        }
+    }
+    Ok(())
+}
+
+/// Surface what an undo/restore did to the user's files.
+fn note_restore(app: &mut forge_tui::App, report: &forge_core::snapshot::RestoreReport) {
+    if !report.restored.is_empty() {
+        app.note(&format!("↺ restored {} file(s)", report.restored.len()));
+    }
+    for w in &report.warnings {
+        app.note(&format!(
+            "⚠ {w} changed since Forge wrote it — overwrote your edit"
+        ));
+    }
+}
+
+/// A short relative age like "3m ago" / "2h ago" / "5d ago" from an epoch-second timestamp.
+fn fmt_age(created_at: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = (now - created_at).max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
 }
 
 #[cfg(test)]

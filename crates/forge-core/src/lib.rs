@@ -16,6 +16,7 @@ use forge_types::{Message, PermissionDecision, PermissionMode, PermissionRule, R
 
 pub mod llm_router;
 pub mod permission;
+pub mod snapshot;
 pub mod subagent;
 
 pub use llm_router::LlmRouter;
@@ -52,6 +53,10 @@ pub struct Session {
     rules: Vec<PermissionRule>,
     transcript: Vec<Message>,
     seq: i64,
+    /// Where code shadow-snapshots live (RFC PR3); defaults to `.forge/checkpoints`.
+    checkpoint_root: std::path::PathBuf,
+    /// The seq that began the current turn (its user message), keying this turn's snapshot dir.
+    current_turn_seq: i64,
 }
 
 impl Session {
@@ -145,6 +150,8 @@ impl Session {
             rules,
             transcript,
             seq,
+            checkpoint_root: std::path::PathBuf::from(".forge/checkpoints"),
+            current_turn_seq: 0,
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -153,6 +160,52 @@ impl Session {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Override where code shadow-snapshots are stored (default `.forge/checkpoints`). Used by the
+    /// composition root to anchor them under the project `.forge/`, and by tests for isolation.
+    pub fn set_checkpoint_root(&mut self, root: impl Into<std::path::PathBuf>) {
+        self.checkpoint_root = root.into();
+    }
+
+    /// Rewind the conversation to a transcript boundary (`seq`): soft-delete the messages at/after
+    /// it, restore any files those turns wrote (PR3 shadow snapshots), and truncate the live
+    /// transcript. Returns what the file-restore did, for the UI. Powers `/undo` and `/checkpoints`.
+    pub fn rewind_to(&mut self, boundary: i64) -> Result<snapshot::RestoreReport, CoreError> {
+        let boundary = boundary.max(0);
+        let mut report = snapshot::RestoreReport::default();
+        // Turns are keyed by their user-message seq. Restore every snapshotted turn at/after the
+        // boundary, newest first so an earlier turn's blob (pre-turn bytes) wins the final state.
+        for seq in (boundary..self.seq).rev() {
+            if let Ok(r) = snapshot::restore_turn(&self.checkpoint_root, &self.id, seq) {
+                report.restored.extend(r.restored);
+                report.warnings.extend(r.warnings);
+            }
+        }
+        self.store.deactivate_messages_from(&self.id, boundary)?;
+        self.transcript.truncate(boundary as usize);
+        self.seq = boundary;
+        Ok(report)
+    }
+
+    /// Undo the last user turn: rewind to (and including) the most recent user message, dropping
+    /// that prompt and everything after it. `Ok(None)` if there's nothing to undo.
+    pub fn undo(&mut self) -> Result<Option<snapshot::RestoreReport>, CoreError> {
+        let Some(idx) = self.transcript.iter().rposition(|m| m.role == Role::User) else {
+            return Ok(None);
+        };
+        Ok(Some(self.rewind_to(idx as i64)?))
+    }
+
+    /// Save a conversation checkpoint at the current boundary. `label` None = an auto checkpoint.
+    pub fn checkpoint(&mut self, label: Option<&str>) -> Result<(), CoreError> {
+        self.store.add_checkpoint(&self.id, label, self.seq)?;
+        Ok(())
+    }
+
+    /// This session's saved checkpoints, newest first.
+    pub fn checkpoints(&self) -> Result<Vec<forge_store::CheckpointRow>, CoreError> {
+        Ok(self.store.list_checkpoints(&self.id)?)
     }
 
     /// Visible conversation history (user + non-empty assistant messages), oldest first, for
@@ -327,8 +380,10 @@ impl Session {
             rationale: decision.rationale.clone(),
         });
 
-        // 2. Persist + record the user message.
+        // 2. Persist + record the user message. Its seq keys this turn's code-snapshot dir
+        // (PR3): files written during the turn are restorable by rewinding to this boundary.
         let seq = self.next_seq();
+        self.current_turn_seq = seq;
         self.store
             .add_message(&self.id, seq, Role::User, prompt, None)?;
         self.transcript.push(Message::user(prompt));
@@ -544,9 +599,35 @@ impl Session {
             };
         let permission_label = if allowed { "allowed" } else { "denied" };
 
+        // Snapshot the target's pre-edit bytes BEFORE a permitted write, so `/undo` can restore
+        // it (PR3 shadow snapshots; first touch per path per turn wins).
+        let write_path = (allowed && side_effect == forge_types::SideEffect::Write)
+            .then(|| call.args.get("path").and_then(|v| v.as_str()))
+            .flatten()
+            .map(std::path::PathBuf::from);
+        if let Some(path) = &write_path {
+            let _ = snapshot::snapshot_before_write(
+                &self.checkpoint_root,
+                &self.id,
+                self.current_turn_seq,
+                path,
+            );
+        }
+
         let (result, ok) = if allowed {
             match tool.run(&call.args).await {
-                Ok(out) => (out, true),
+                Ok(out) => {
+                    // Record what we wrote, so a later restore can warn on a manual edit.
+                    if let Some(path) = &write_path {
+                        let _ = snapshot::record_post_write(
+                            &self.checkpoint_root,
+                            &self.id,
+                            self.current_turn_seq,
+                            path,
+                        );
+                    }
+                    (out, true)
+                }
                 Err(e) => (format!("error: {e}"), false),
             }
         } else {
@@ -1662,6 +1743,138 @@ mod tests {
             session.run_turn("hi").await,
             Err(CoreError::NoHealthyModel)
         ));
+    }
+
+    // --- Conversation checkpoints + /undo (RFC session-management-and-commands, PR2) ---
+
+    #[tokio::test]
+    async fn undo_rewinds_the_last_user_turn() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = fresh_session(Arc::clone(&store), Config::default());
+        let id = session.id().to_string();
+
+        session
+            .run_turn("check the project manifest")
+            .await
+            .unwrap();
+        assert!(
+            store.load_messages(&id).unwrap().len() >= 2,
+            "the turn persisted messages"
+        );
+
+        // Undo drops the whole turn (the user prompt + its replies/tools).
+        assert!(session.undo().unwrap().is_some(), "a turn was undone");
+        assert!(
+            store.load_messages(&id).unwrap().is_empty(),
+            "rewound turn is excluded from the active transcript"
+        );
+        assert!(session.undo().unwrap().is_none(), "nothing left to undo");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_then_turn_then_rewind_to_it() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = fresh_session(Arc::clone(&store), Config::default());
+        let id = session.id().to_string();
+
+        session
+            .run_turn("check the project manifest")
+            .await
+            .unwrap();
+        session.checkpoint(Some("after first turn")).unwrap();
+        let boundary = session.checkpoints().unwrap()[0].seq;
+        session.run_turn("check the manifest again").await.unwrap();
+        let after_two = store.load_messages(&id).unwrap().len();
+
+        session.rewind_to(boundary).unwrap();
+        let after_rewind = store.load_messages(&id).unwrap().len();
+        assert!(
+            after_rewind < after_two && after_rewind == boundary as usize,
+            "rewind drops the second turn back to the checkpoint boundary"
+        );
+    }
+
+    /// A provider that writes a file once (via `write_file`), then answers.
+    struct WritingProvider {
+        path: String,
+        content: String,
+    }
+    #[async_trait::async_trait]
+    impl Provider for WritingProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            let usage = Usage::default();
+            if messages.iter().any(|m| m.role == Role::Tool) {
+                return Ok(ModelResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                    usage,
+                });
+            }
+            Ok(ModelResponse {
+                content: "writing".into(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "write_file".into(),
+                    args: serde_json::json!({ "path": self.path, "content": self.content }),
+                }],
+                usage,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn undo_restores_files_written_during_the_turn() {
+        let dir = std::env::temp_dir().join(format!("forge-undo-{}", forge_types::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("edited.txt");
+        std::fs::write(&file, "original bytes").unwrap();
+
+        let config = Config {
+            permission_mode: PermissionMode::Bypass, // allow the write without a prompt
+            ..Config::default()
+        };
+        let mut session = Session::start(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(WritingProvider {
+                path: file.to_string_lossy().to_string(),
+                content: "the model overwrote this".into(),
+            }),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            ".",
+        )
+        .unwrap();
+        session.set_checkpoint_root(dir.join("snaps"));
+
+        session.run_turn("rewrite the file").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "the model overwrote this",
+            "the turn wrote the file"
+        );
+
+        let report = session.undo().unwrap().unwrap();
+        assert!(
+            report.restored.iter().any(|p| p.contains("edited.txt")),
+            "the written file was restored: {report:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "original bytes",
+            "undo restored the pre-turn bytes"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // --- In-TUI session swap (RFC session-management-and-commands, PR1) ---

@@ -15,6 +15,7 @@ forge-provider.workspace = true
 forge-tools.workspace = true
 forge-store.workspace = true
 forge-tui.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

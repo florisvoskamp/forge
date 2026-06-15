@@ -39,7 +39,10 @@ mod driver;
 mod render;
 mod tui;
 pub use app::{banner_lines, handle_key, App, InputOutcome, KeyKind};
-pub use commands::{filter_commands, parse_command, Command, CommandAction, Palette, COMMANDS};
+pub use commands::{
+    filter_commands, parse_command, Command, CommandAction, Palette, Picker, PickerKind, PickerRow,
+    COMMANDS,
+};
 pub use driver::{ChannelPresenter, Tui, UiMsg};
 pub use tui::TuiPresenter;
 

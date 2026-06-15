@@ -90,6 +90,9 @@ pub struct App {
     /// The inline slash-command palette (RFC session-management-and-commands). Open while the
     /// input line starts with `/`.
     pub palette: crate::commands::Palette,
+    /// The interactive session/checkpoint picker (RFC session-management-and-commands). Modal
+    /// while open; reused for `/sessions`, `/resume`, and `/checkpoints`.
+    pub picker: crate::commands::Picker,
 }
 
 /// One subagent's live row in the TUI.
@@ -513,6 +516,8 @@ pub fn render_live(frame: &mut Frame, app: &App) {
 
     if app.palette.open {
         render_palette(frame, areas[0], app);
+    } else if app.picker.open {
+        render_picker(frame, areas[0], app);
     } else {
         render_preview(frame, areas[0], app);
     }
@@ -564,6 +569,70 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
             ])
         })
         .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The interactive session/checkpoint picker: a heading + a scrolling, filter-narrowed window of
+/// rows, the selected one highlighted, revealed by the same ease-in as the palette. Constrained
+/// to the (fixed-height) inline live region, so it scrolls rather than growing.
+fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 {
+        return; // degenerate viewport — never clamp(1, 0).
+    }
+    let p = &app.picker;
+    let matches = p.matches();
+    let h = area.height as usize;
+    let mut lines: Vec<TextLine> = Vec::with_capacity(h);
+
+    // Heading: title · live filter (or hint) · position.
+    let mut head = vec![Span::styled(
+        format!("  {} ", p.heading),
+        Style::default().fg(ORANGE).bold(),
+    )];
+    if p.query.is_empty() {
+        head.push(Span::styled("(type to filter)", Style::default().fg(DIM)));
+    } else {
+        head.push(Span::styled(
+            format!("/{}", p.query),
+            Style::default().fg(USER),
+        ));
+    }
+    if !matches.is_empty() {
+        head.push(Span::styled(
+            format!("  {}/{}", p.selected + 1, matches.len()),
+            Style::default().fg(DIM),
+        ));
+    }
+    lines.push(TextLine::from(head));
+
+    if matches.is_empty() {
+        lines.push(TextLine::from(Span::styled(
+            "  no matches",
+            Style::default().fg(DIM),
+        )));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let list_h = h.saturating_sub(1); // rows below the heading
+    let revealed = ((p.anim * list_h as f32).ceil() as usize).clamp(1, list_h.max(1));
+    let start = p.selected.saturating_sub(list_h.saturating_sub(1));
+    for (i, row) in matches.iter().enumerate().skip(start).take(revealed) {
+        let selected = i == p.selected;
+        let marker = if selected { "▸ " } else { "  " };
+        let title_style = if selected {
+            Style::default().fg(ORANGE).bold()
+        } else {
+            Style::default().fg(USER)
+        };
+        lines.push(TextLine::from(vec![
+            Span::styled(format!("  {marker}{}", row.title), title_style),
+            Span::styled(
+                format!("  {}", truncate(&row.subtitle, 44)),
+                Style::default().fg(DIM),
+            ),
+        ]));
+    }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1005,6 +1074,37 @@ mod tests {
         let text = screen(&app);
         assert!(text.contains("/help"), "palette shows commands: {text}");
         assert!(text.contains("▸"), "selected row marked");
+    }
+
+    #[test]
+    fn picker_renders_heading_rows_and_selection() {
+        use crate::commands::{PickerKind, PickerRow};
+        let mut app = App::default();
+        app.picker.open_with(
+            PickerKind::Sessions,
+            "resume a session",
+            vec![PickerRow {
+                id: "aaa".into(),
+                title: "aaa  $0.01  2 msgs".into(),
+                subtitle: "fix the auth bug".into(),
+            }],
+        );
+        app.picker.anim = 1.0;
+        let text = screen(&app);
+        assert!(text.contains("resume a session"), "heading shown: {text}");
+        assert!(text.contains("fix the auth bug"), "row subtitle shown");
+        assert!(text.contains('▸'), "selected row marked");
+    }
+
+    #[test]
+    fn picker_zero_height_does_not_panic() {
+        use crate::commands::PickerKind;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::default();
+        app.picker.open_with(PickerKind::Sessions, "resume", vec![]);
+        let mut term = Terminal::new(TestBackend::new(80, 0)).unwrap();
+        let _ = term.draw(|f| render_live(f, &app));
     }
 
     #[test]

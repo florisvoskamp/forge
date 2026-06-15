@@ -34,6 +34,21 @@ pub const COMMANDS: &[Command] = &[
         usage: "/new",
     },
     Command {
+        name: "undo",
+        desc: "rewind the last turn (chat + file edits)",
+        usage: "/undo",
+    },
+    Command {
+        name: "checkpoint",
+        desc: "save a named checkpoint here",
+        usage: "/checkpoint [name]",
+    },
+    Command {
+        name: "checkpoints",
+        desc: "browse & restore checkpoints",
+        usage: "/checkpoints",
+    },
+    Command {
         name: "clear",
         desc: "clear the screen (keep the session)",
         usage: "/clear",
@@ -54,6 +69,12 @@ pub enum CommandAction {
     Resume(String),
     New,
     ClearScreen,
+    /// Rewind the last turn (conversation + file edits).
+    Undo,
+    /// Save a checkpoint at the current point; `None` = an auto/unnamed checkpoint.
+    Checkpoint(Option<String>),
+    /// Open the checkpoint picker.
+    ListCheckpoints,
     Quit,
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
@@ -78,6 +99,9 @@ pub fn parse_command(line: &str) -> CommandAction {
             }
         }
         "new" | "n" => CommandAction::New,
+        "undo" | "u" => CommandAction::Undo,
+        "checkpoint" | "cp" => CommandAction::Checkpoint((!arg.is_empty()).then_some(arg)),
+        "checkpoints" => CommandAction::ListCheckpoints,
         "clear" | "cls" => CommandAction::ClearScreen,
         "quit" | "exit" | "q" => CommandAction::Quit,
         other => CommandAction::Unknown(other.to_string()),
@@ -185,9 +209,174 @@ impl Palette {
     }
 }
 
+/// What an open [`Picker`] is selecting, so the render loop knows what `Enter` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerKind {
+    /// Pick a past session to resume (`/sessions`, `/resume`).
+    Sessions,
+    /// Pick a checkpoint to rewind to (`/checkpoints`).
+    Checkpoints,
+}
+
+/// One row in an interactive picker: an opaque `id` the loop acts on, plus two display strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerRow {
+    /// What the loop resolves on Enter (a session id, or a checkpoint boundary seq as a string).
+    pub id: String,
+    pub title: String,
+    pub subtitle: String,
+}
+
+/// A full-width, animated, filterable selection list (RFC session-management-and-commands).
+/// Reused for `/sessions`, `/resume`, and `/checkpoints` — the loop populates `rows` from the
+/// store, then drives it with the same keys as the command palette. Filter narrows as you type.
+#[derive(Debug, Clone, Default)]
+pub struct Picker {
+    pub open: bool,
+    pub kind: Option<PickerKind>,
+    rows: Vec<PickerRow>,
+    pub query: String,
+    pub selected: usize,
+    pub anim: f32,
+    /// A one-line title shown above the list (e.g. "resume a session").
+    pub heading: String,
+}
+
+impl Picker {
+    pub fn open_with(&mut self, kind: PickerKind, heading: &str, rows: Vec<PickerRow>) {
+        self.open = true;
+        self.kind = Some(kind);
+        self.rows = rows;
+        self.heading = heading.to_string();
+        self.query.clear();
+        self.selected = 0;
+        self.anim = 0.0;
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.kind = None;
+        self.rows.clear();
+        self.query.clear();
+        self.heading.clear();
+        self.selected = 0;
+        self.anim = 0.0;
+    }
+
+    /// Rows matching the current query (case-insensitive substring over id/title/subtitle).
+    pub fn matches(&self) -> Vec<&PickerRow> {
+        if self.query.is_empty() {
+            return self.rows.iter().collect();
+        }
+        let q = self.query.to_lowercase();
+        self.rows
+            .iter()
+            .filter(|r| {
+                r.id.to_lowercase().contains(&q)
+                    || r.title.to_lowercase().contains(&q)
+                    || r.subtitle.to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn move_down(&mut self) {
+        let n = self.matches().len();
+        if n > 0 {
+            self.selected = (self.selected + 1).min(n - 1);
+        }
+    }
+
+    /// Re-clamp the selection after the filtered list shrinks.
+    pub fn clamp(&mut self) {
+        let n = self.matches().len();
+        if n == 0 {
+            self.selected = 0;
+        } else if self.selected >= n {
+            self.selected = n - 1;
+        }
+    }
+
+    /// The selected row, if any (after filtering).
+    pub fn selected_row(&self) -> Option<&PickerRow> {
+        self.matches().into_iter().nth(self.selected)
+    }
+
+    pub fn tick_anim(&mut self) {
+        if self.open && self.anim < 1.0 {
+            self.anim = (self.anim + 0.34).min(1.0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rows() -> Vec<PickerRow> {
+        vec![
+            PickerRow {
+                id: "aaa".into(),
+                title: "aaa  $0.01  2 msgs".into(),
+                subtitle: "fix the auth bug".into(),
+            },
+            PickerRow {
+                id: "bbb".into(),
+                title: "bbb  $0.02  5 msgs".into(),
+                subtitle: "refactor the mesh".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn parses_new_commands() {
+        assert_eq!(parse_command("/undo"), CommandAction::Undo);
+        assert_eq!(
+            parse_command("/checkpoints"),
+            CommandAction::ListCheckpoints
+        );
+        assert_eq!(
+            parse_command("/checkpoint"),
+            CommandAction::Checkpoint(None)
+        );
+        assert_eq!(
+            parse_command("/checkpoint before refactor"),
+            CommandAction::Checkpoint(Some("before refactor".into()))
+        );
+    }
+
+    #[test]
+    fn picker_filters_navigates_and_resolves_a_row() {
+        let mut p = Picker::default();
+        p.open_with(PickerKind::Sessions, "resume", rows());
+        assert_eq!(p.matches().len(), 2);
+        assert_eq!(p.selected_row().unwrap().id, "aaa");
+
+        p.move_down();
+        assert_eq!(p.selected_row().unwrap().id, "bbb");
+        p.move_up();
+        assert_eq!(p.selected_row().unwrap().id, "aaa");
+
+        // Filter narrows the list; selection re-clamps.
+        p.query = "mesh".into();
+        p.clamp();
+        let m = p.matches();
+        assert_eq!(m.len(), 1, "only the mesh session matches");
+        assert_eq!(p.selected_row().unwrap().id, "bbb");
+    }
+
+    #[test]
+    fn closing_a_picker_clears_it() {
+        let mut p = Picker::default();
+        p.open_with(PickerKind::Checkpoints, "restore", rows());
+        p.close();
+        assert!(!p.open);
+        assert!(p.kind.is_none());
+        assert!(p.matches().is_empty());
+    }
 
     #[test]
     fn parses_commands_and_args() {
