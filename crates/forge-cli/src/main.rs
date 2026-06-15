@@ -575,12 +575,13 @@ async fn chat(
     Ok(())
 }
 
-/// Sends the turn-complete signal on drop — so `busy` is released even if the turn task
-/// panics. Without this, a panic would skip the send and freeze the UI on the spinner.
-struct DoneGuard(std::sync::mpsc::Sender<()>);
+/// Sends the turn-complete signal (carrying the turn's generation) on drop — so `busy` is released
+/// even if the turn task panics or is aborted. The loop only acts on a signal whose generation
+/// matches the current turn, so an interrupted turn's late signal can't end a *later* turn.
+struct DoneGuard(std::sync::mpsc::Sender<u64>, u64);
 impl Drop for DoneGuard {
     fn drop(&mut self) {
-        let _ = self.0.send(());
+        let _ = self.0.send(self.1);
     }
 }
 
@@ -598,7 +599,7 @@ async fn run_chat_tui(
     use std::time::{Duration, Instant};
 
     let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<u64>();
     let session =
         build_session_with(Box::new(ChannelPresenter::new(tx)), mock, mode, resume, pin).await?;
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
@@ -609,6 +610,11 @@ async fn run_chat_tui(
     let mut app = App::default();
     app.temper = session.lock().await.temper().label().to_string();
     let mut busy = false;
+    // Each turn gets a monotonic generation; the abort handle lets Esc interrupt it (RFC
+    // session-management). The current gen gates the done-signal so an aborted turn's late
+    // signal is ignored once a new turn has started.
+    let mut turn_gen: u64 = 0;
+    let mut turn_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut pending: Option<std::sync::mpsc::Sender<bool>> = None;
     let mut pending_question: Option<std::sync::mpsc::Sender<String>> = None;
     // Baseline for the spinner: deriving the tick from elapsed time keeps the animation
@@ -713,10 +719,25 @@ async fn run_chat_tui(
                 continue;
             }
 
-            // Esc / Ctrl-C ALWAYS quit — checked before any prompt handling, so the user can
-            // never get wedged at a permission/question prompt with no way out. A pending reply
-            // is dropped (its sender closes → the blocked turn task unblocks and the process exits).
+            // Esc / Ctrl-C: while a turn is running it INTERRUPTS the AI (stops the response,
+            // keeps Forge alive); while idle it quits. Checked before any prompt handling so the
+            // user can never get wedged — interrupting also clears a pending permission/question.
             if matches!(key, KeyKind::Esc) {
+                if busy {
+                    if let Some(h) = turn_handle.take() {
+                        h.abort(); // cancel the turn task; its DoneGuard drop releases the lock
+                    }
+                    turn_gen += 1; // discard the aborted turn's (now stale) done-signal
+                    busy = false;
+                    pending = None;
+                    pending_question = None;
+                    app.prompt = None;
+                    app.clear_question();
+                    app.apply(forge_tui::PresenterEvent::AssistantDone); // flush any partial reply
+                    app.note("⏹ interrupted — stopped responding");
+                    dirty = true;
+                    continue;
+                }
                 quit = true;
                 break;
             }
@@ -762,28 +783,32 @@ async fn run_chat_tui(
                         // `//foo` escapes to a literal prompt `/foo`; a bare `/cmd` typed without
                         // the palette still dispatches as a command; everything else is a prompt.
                         if let Some(rest) = line.strip_prefix("//") {
-                            spawn_turn(
+                            turn_gen += 1;
+                            turn_handle = Some(spawn_turn(
                                 &format!("/{rest}"),
                                 &session,
                                 &done_tx,
+                                turn_gen,
                                 &mut app,
                                 &mut busy,
                                 &mut busy_since,
-                            );
+                            ));
                         } else if line.starts_with('/') {
                             if dispatch_command(&line, &session, &mut tui, &mut app, busy).await? {
                                 quit = true;
                                 break;
                             }
                         } else {
-                            spawn_turn(
+                            turn_gen += 1;
+                            turn_handle = Some(spawn_turn(
                                 &line,
                                 &session,
                                 &done_tx,
+                                turn_gen,
                                 &mut app,
                                 &mut busy,
                                 &mut busy_since,
-                            );
+                            ));
                         }
                     }
                     InputOutcome::Quit => {
@@ -827,9 +852,14 @@ async fn run_chat_tui(
             }
         }
 
-        if busy && done_rx.try_recv().is_ok() {
-            busy = false;
-            dirty = true;
+        // Clear busy only on the *current* turn's done-signal; a stale signal from an interrupted
+        // (aborted) turn carries an older generation and is ignored.
+        while let Ok(g) = done_rx.try_recv() {
+            if busy && g == turn_gen {
+                busy = false;
+                turn_handle = None;
+                dirty = true;
+            }
         }
         if busy {
             let t = (busy_since.elapsed().as_millis() / 60) as usize;
@@ -860,14 +890,16 @@ async fn run_chat_tui(
 }
 
 /// Echo a prompt + spawn the turn task (shared by normal submit and the `//` literal escape).
+#[allow(clippy::too_many_arguments)]
 fn spawn_turn(
     prompt: &str,
     session: &Arc<tokio::sync::Mutex<Session>>,
-    done_tx: &std::sync::mpsc::Sender<()>,
+    done_tx: &std::sync::mpsc::Sender<u64>,
+    gen: u64,
     app: &mut forge_tui::App,
     busy: &mut bool,
     busy_since: &mut std::time::Instant,
-) {
+) -> tokio::task::JoinHandle<()> {
     app.submit_user(prompt);
     app.done = false;
     app.tick = 0;
@@ -877,14 +909,14 @@ fn spawn_turn(
     let dt = done_tx.clone();
     let prompt = prompt.to_string();
     tokio::spawn(async move {
-        // DoneGuard fires on the way out — normal return OR panic unwind — so a panicking turn
-        // can never leave the UI stuck "working".
-        let _done = DoneGuard(dt);
+        // DoneGuard fires on the way out — normal return, panic unwind, OR abort (interrupt) —
+        // so the UI can never stay stuck "working". It carries this turn's generation.
+        let _done = DoneGuard(dt, gen);
         let mut sess = s.lock().await;
         if let Err(e) = sess.run_turn(&prompt).await {
             sess.notify_error(&format!("turn failed: {e}"));
         }
-    });
+    })
 }
 
 /// Execute a slash command (RFC session-management-and-commands, PR1). Returns `Ok(true)` to
@@ -935,39 +967,12 @@ async fn dispatch_command(
         // its filter. Resolving + swapping the session happens on Enter (picker_accept).
         CommandAction::Resume(prefix) => open_sessions_picker(app, &prefix)?,
         CommandAction::ListSessions => open_sessions_picker(app, "")?,
+        // `/undo` and `/checkpoints` both open the same interactive picker over the per-turn
+        // checkpoints — pick any past message to rewind (chat + files) to. Enter acts in
+        // picker_accept.
+        CommandAction::Undo => open_checkpoint_picker(session, app, "rewind to a message").await?,
         CommandAction::ListCheckpoints => {
-            let rows = {
-                let s = session.lock().await;
-                checkpoint_rows(&s.checkpoints().map_err(|e| anyhow::anyhow!("{e}"))?)
-            };
-            if rows.is_empty() {
-                app.note("no checkpoints yet — /checkpoint [name] to save one");
-            } else {
-                app.picker.open_with(
-                    forge_tui::PickerKind::Checkpoints,
-                    "restore a checkpoint",
-                    rows,
-                );
-            }
-        }
-        CommandAction::Undo => {
-            let outcome = {
-                let mut s = session.lock().await;
-                s.undo().map_err(|e| anyhow::anyhow!("{e}"))?
-            };
-            match outcome {
-                None => app.note("nothing to undo"),
-                Some(report) => {
-                    let history = {
-                        let s = session.lock().await;
-                        s.history()
-                    };
-                    tui.clear_screen();
-                    app.note("↶ undid the last turn");
-                    app.replay_history(&history);
-                    note_restore(app, &report);
-                }
-            }
+            open_checkpoint_picker(session, app, "restore a checkpoint").await?
         }
         CommandAction::Checkpoint(name) => {
             {
@@ -1018,12 +1023,36 @@ fn open_sessions_picker(app: &mut forge_tui::App, query: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read the session's checkpoints (one per turn, newest first) and open the rewind picker.
+async fn open_checkpoint_picker(
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    app: &mut forge_tui::App,
+    heading: &str,
+) -> Result<()> {
+    let rows = {
+        let s = session.lock().await;
+        checkpoint_rows(&s.checkpoints().map_err(|e| anyhow::anyhow!("{e}"))?)
+    };
+    if rows.is_empty() {
+        app.note("nothing to undo yet");
+    } else {
+        app.picker
+            .open_with(forge_tui::PickerKind::Checkpoints, heading, rows);
+    }
+    Ok(())
+}
+
+/// One picker row per checkpoint, reading as a message list: the prompt preview is the title,
+/// with the turn index + age as the subtitle.
 fn checkpoint_rows(cps: &[forge_store::CheckpointRow]) -> Vec<forge_tui::PickerRow> {
     cps.iter()
         .map(|c| forge_tui::PickerRow {
             id: c.seq.to_string(),
-            title: format!("#{}  {}", c.seq, fmt_age(c.created_at)),
-            subtitle: c.label.clone().unwrap_or_else(|| "auto".into()),
+            title: c
+                .label
+                .clone()
+                .unwrap_or_else(|| format!("turn @ {}", c.seq)),
+            subtitle: format!("#{} · {}", c.seq, fmt_age(c.created_at)),
         })
         .collect()
 }
@@ -1054,15 +1083,19 @@ async fn picker_accept(
         }
         forge_tui::PickerKind::Checkpoints => {
             let seq: i64 = row.id.parse().unwrap_or(0);
-            let (history, report) = {
+            let (history, outcome) = {
                 let mut s = session.lock().await;
-                let report = s.rewind_to(seq).map_err(|e| anyhow::anyhow!("{e}"))?;
-                (s.history(), report)
+                let outcome = s.rewind_to(seq).map_err(|e| anyhow::anyhow!("{e}"))?;
+                (s.history(), outcome)
             };
             tui.clear_screen();
-            app.note("● restored checkpoint");
+            app.note("● rewound to that point");
             app.replay_history(&history);
-            note_restore(app, &report);
+            note_restore(app, &outcome.restore);
+            // Put the rewound-to message back in the input box so it can be edited/resubmitted.
+            if let Some(prompt) = outcome.rewound_prompt {
+                app.input = prompt;
+            }
         }
     }
     Ok(())

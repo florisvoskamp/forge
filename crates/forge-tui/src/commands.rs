@@ -35,7 +35,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "undo",
-        desc: "rewind the last turn (chat + file edits)",
+        desc: "pick a past message to rewind to (chat + file edits)",
         usage: "/undo",
     },
     Command {

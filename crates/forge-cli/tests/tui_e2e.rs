@@ -1,9 +1,9 @@
 //! On-demand TUI end-to-end smoke over a real PTY (RFC session-management-and-commands).
 //!
-//! Drives the actual `forge chat --mock` binary through a pseudo-terminal: opens the command
-//! palette, saves a checkpoint, opens the interactive checkpoint picker, restores it, and quits —
+//! Drives the actual `forge chat --mock` binary through a pseudo-terminal: runs a turn (which
+//! auto-checkpoints), opens the `/undo` "rewind to a message" picker, rewinds, and quits —
 //! asserting the binary renders the expected feedback and exits cleanly with no panic. This is the
-//! one test that exercises the render-loop key wiring + Session swap end to end.
+//! one test that exercises the render-loop key wiring + auto-checkpoint + rewind end to end.
 //!
 //! `#[ignore]` by default: it needs to *answer* the terminal's cursor-position (DSR) query for the
 //! inline viewport to initialize, which a CI runner's null terminal won't do — this test supplies
@@ -19,7 +19,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 #[test]
 #[ignore = "needs a DSR-answering pty; run locally with --ignored"]
-fn tui_saves_and_restores_a_checkpoint_over_a_pty() {
+fn tui_autocheckpoints_then_undo_picker_rewinds_over_a_pty() {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -75,13 +75,13 @@ fn tui_saves_and_restores_a_checkpoint_over_a_pty() {
         let _ = w.flush();
     };
     thread::sleep(Duration::from_millis(1500));
-    send("/checkpoint\r"); // save an (unnamed) checkpoint at the current point
-    thread::sleep(Duration::from_millis(700));
-    send("/checkpoints\r"); // open the interactive checkpoint picker
-    thread::sleep(Duration::from_millis(700));
-    send("\r"); // Enter: restore the selected checkpoint
-    thread::sleep(Duration::from_millis(700));
-    send("\x1b"); // Esc: quit
+    send("say hi\r"); // a real turn → auto-checkpoint is created at the turn boundary
+    thread::sleep(Duration::from_millis(1200));
+    send("/undo\r"); // palette → /undo opens the interactive "rewind to a message" picker
+    thread::sleep(Duration::from_millis(800));
+    send("\r"); // Enter: rewind to the selected (only) past message
+    thread::sleep(Duration::from_millis(800));
+    send("\x1b"); // Esc (idle): quit
 
     // Wait for a clean exit (kill if it wedges).
     let start = Instant::now();
@@ -112,12 +112,8 @@ fn tui_saves_and_restores_a_checkpoint_over_a_pty() {
         "no panic in output: {plain}"
     );
     assert!(
-        plain.contains("checkpoint saved"),
-        "/checkpoint feedback shown: {plain}"
-    );
-    assert!(
-        plain.contains("restored checkpoint"),
-        "picker restore feedback shown: {plain}"
+        plain.contains("rewound to that point"),
+        "auto-checkpoint → /undo picker → rewind worked end to end: {plain}"
     );
 }
 
