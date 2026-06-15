@@ -22,9 +22,21 @@ CREATE TABLE IF NOT EXISTS message (
     model           TEXT,
     tool_calls_json TEXT,
     tool_call_id    TEXT,
+    active          INTEGER NOT NULL DEFAULT 1,   -- 0 = soft-deleted by /undo (kept for audit/redo)
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id, seq);
+
+-- A labeled rewind point: messages with seq < this boundary are kept on restore
+-- (RFC session-management-and-commands, PR2). label NULL = an auto per-turn checkpoint.
+CREATE TABLE IF NOT EXISTS checkpoint (
+    id          TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    label       TEXT,
+    seq         INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoint_session ON checkpoint(session_id, seq);
 
 CREATE TABLE IF NOT EXISTS tool_call (
     id          TEXT PRIMARY KEY,

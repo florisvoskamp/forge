@@ -84,6 +84,7 @@ impl Store {
         for stmt in [
             "ALTER TABLE message ADD COLUMN tool_calls_json TEXT",
             "ALTER TABLE message ADD COLUMN tool_call_id TEXT",
+            "ALTER TABLE message ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE session ADD COLUMN parent_session_id TEXT",
         ] {
             let _ = conn.execute(stmt, []);
@@ -416,12 +417,13 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// All messages of a session, in turn order (by seq).
+    /// All *active* messages of a session, in turn order (by seq). Soft-deleted rows (those a
+    /// `/undo` rewound past) are excluded — they remain in the table for audit/redo.
     pub fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT role, content, model, tool_calls_json, tool_call_id
-             FROM message WHERE session_id = ?1 ORDER BY seq",
+             FROM message WHERE session_id = ?1 AND active = 1 ORDER BY seq",
         )?;
         let rows = stmt.query_map([session_id], |row| {
             let role: String = row.get(0)?;
@@ -440,6 +442,52 @@ impl Store {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
+
+    // --- Conversation checkpoints / undo (RFC session-management-and-commands, PR2) ---
+
+    /// Soft-delete every message of a session with `seq >= from_seq` (an `/undo` / checkpoint
+    /// rewind). The rows stay in the table (`active = 0`) for audit/redo; [`load_messages`]
+    /// excludes them. Returns the number of messages deactivated.
+    pub fn deactivate_messages_from(&self, session_id: &str, from_seq: i64) -> Result<usize> {
+        Ok(self.lock()?.execute(
+            "UPDATE message SET active = 0 WHERE session_id = ?1 AND seq >= ?2 AND active = 1",
+            (session_id, from_seq),
+        )?)
+    }
+
+    /// Save a checkpoint (rewind point) at `seq`. `label` NULL = an auto per-turn checkpoint.
+    pub fn add_checkpoint(
+        &self,
+        session_id: &str,
+        label: Option<&str>,
+        seq: i64,
+    ) -> Result<String> {
+        let id = forge_types::new_id();
+        self.lock()?.execute(
+            "INSERT INTO checkpoint (id, session_id, label, seq) VALUES (?1, ?2, ?3, ?4)",
+            (&id, session_id, label, seq),
+        )?;
+        Ok(id)
+    }
+
+    /// A session's named checkpoints, newest first.
+    pub fn list_checkpoints(&self, session_id: &str) -> Result<Vec<CheckpointRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, label, seq, created_at FROM checkpoint
+             WHERE session_id = ?1 ORDER BY seq DESC, created_at DESC",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok(CheckpointRow {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                seq: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
 }
 
 /// A persisted message, as read back from the store.
@@ -450,6 +498,17 @@ pub struct StoredMessage {
     pub model: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
+}
+
+/// A persisted checkpoint (rewind point) of a session.
+#[derive(Debug, Clone)]
+pub struct CheckpointRow {
+    pub id: String,
+    /// User-given name, or `None` for an auto per-turn checkpoint.
+    pub label: Option<String>,
+    /// Transcript boundary: messages with `seq < this` survive a rewind to here.
+    pub seq: i64,
+    pub created_at: i64,
 }
 
 /// A one-line summary of a past session, for `forge sessions`.
@@ -663,6 +722,54 @@ mod tests {
         let matches = store.matching_session_ids(&prefix).unwrap();
         assert_eq!(matches, vec![id]);
         assert!(store.matching_session_ids("zzzzzzzz").unwrap().is_empty());
+    }
+
+    // --- Conversation checkpoints / undo (PR2) ---
+
+    #[test]
+    fn deactivate_excludes_messages_from_load_but_keeps_earlier_ones() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("/tmp", "default").unwrap();
+        store
+            .add_message(&sid, 0, Role::User, "turn 1", None)
+            .unwrap();
+        store
+            .add_message(&sid, 1, Role::Assistant, "reply 1", Some("m"))
+            .unwrap();
+        store
+            .add_message(&sid, 2, Role::User, "turn 2", None)
+            .unwrap();
+        store
+            .add_message(&sid, 3, Role::Assistant, "reply 2", Some("m"))
+            .unwrap();
+
+        // Rewind to the start of turn 2 (seq 2): turn 2's two messages drop out.
+        let n = store.deactivate_messages_from(&sid, 2).unwrap();
+        assert_eq!(n, 2, "two messages deactivated");
+
+        let msgs = store.load_messages(&sid).unwrap();
+        let contents: Vec<_> = msgs.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["turn 1", "reply 1"],
+            "only the surviving turn loads"
+        );
+    }
+
+    #[test]
+    fn checkpoints_round_trip_newest_first() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("/tmp", "default").unwrap();
+        store
+            .add_checkpoint(&sid, Some("before refactor"), 2)
+            .unwrap();
+        store.add_checkpoint(&sid, None, 5).unwrap();
+
+        let cps = store.list_checkpoints(&sid).unwrap();
+        assert_eq!(cps.len(), 2);
+        assert_eq!(cps[0].seq, 5, "newest (highest seq) first");
+        assert_eq!(cps[0].label, None, "auto checkpoint has no label");
+        assert_eq!(cps[1].label.as_deref(), Some("before refactor"));
     }
 
     // --- Model health / failover ---

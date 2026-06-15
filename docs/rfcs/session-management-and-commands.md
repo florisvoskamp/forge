@@ -342,6 +342,24 @@ snapshot only changed files; tests for snapshot/restore round-trip incl create+d
 | 2026-06-15 | Inline palette (not modal) | Matches inline-scrollback TUI. |
 | 2026-06-15 | Soft `active` flag for undo | Enables redo + audit; cheap. |
 | 2026-06-15 | Commands gated while busy | Avoids Session-swap race with the turn task. |
+| 2026-06-15 | PR2 + PR3 shipped together | `/undo` = rewind chat **and** restore files in one action — shipping conversation-undo without code-restore would be a half-undo. Combined in one PR. |
+| 2026-06-15 | `/sessions` `/resume` `/checkpoints` are interactive pickers, not text lists | User: "all commands as interactive as possible." A shared animated, filter-narrowed `Picker` widget replaces the text dump; `Resume(prefix)` pre-fills the filter. Enter resumes/rewinds + redraws the transcript. |
+| 2026-06-15 | Picker lives in the fixed-height inline live region (scrolls, doesn't grow) | ratatui inline viewports can't resize at runtime; the picker scrolls a 3-row window with a heading + position counter. Beauty comes from animation + formatting, not height. |
+
+## Post-build status (2026-06-15)
+
+Built on branch `feat/checkpoints-undo-and-pickers`. **PR2 + PR3 + interactive pickers** complete:
+- Store: `message.active` soft-delete migration + `checkpoint` table; `deactivate_messages_from`,
+  `add_checkpoint`, `list_checkpoints`; `load_messages` filters `active = 1`.
+- Core: `Session::rewind_to(seq)` / `undo()` / `checkpoint(label)` / `checkpoints()`; pre-write
+  shadow snapshots (`snapshot` module) hooked in `invoke_tool`, restored on rewind; hash-mismatch
+  warning when a file changed since Forge wrote it.
+- TUI: shared animated `Picker` (`Sessions` / `Checkpoints` kinds) + `CommandAction::{Undo,
+  Checkpoint, ListCheckpoints}`; `/undo /checkpoint /checkpoints /sessions /resume` wired in the
+  render loop (modal key routing, gated while busy, `lock().await` only — #45 invariant honored).
+- Tests: store soft-delete/checkpoint round-trips; core undo + checkpoint-rewind + a file-restore
+  integration; picker state + render + 0-height guard; a `#[ignore]`d real-pty e2e
+  (`crates/forge-cli/tests/tui_e2e.rs`) that saves + restores a checkpoint through the live TUI.
 
 ## References
 
