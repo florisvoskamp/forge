@@ -561,10 +561,10 @@ mod tests {
     /// and change the cost out from under the test.
     fn priced_complex_config() -> Config {
         let mut config = Config::default();
-        config
-            .mesh
-            .models
-            .insert("complex".to_string(), "ollama::opus-sim".to_string());
+        config.mesh.models.insert(
+            "complex".to_string(),
+            forge_config::OneOrMany::One("ollama::opus-sim".to_string()),
+        );
         config.mesh.pricing.insert(
             "ollama::opus-sim".to_string(),
             forge_config::PriceOverride {

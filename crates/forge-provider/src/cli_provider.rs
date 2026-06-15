@@ -673,10 +673,33 @@ mod tests {
         writeln!(f, "#!/bin/sh").unwrap();
         write!(f, "cat <<'FORGE_EOF'\n{stdout}\nFORGE_EOF\n").unwrap();
         writeln!(f, "exit {code}").unwrap();
+        f.sync_all().unwrap();
         drop(f);
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
+
+        // Wait out ETXTBSY: a *concurrent* test's fork can briefly inherit this file's open
+        // write-fd, so exec'ing it would transiently fail with "Text file busy". Probe-exec
+        // (retrying past ETXTBSY) until the OS lets us run it — once it does, no writer holds
+        // the file, so the provider's real spawn won't flake.
+        for _ in 0..200 {
+            match std::process::Command::new(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let _ = child.wait();
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
         path.to_string_lossy().into_owned()
     }
 }
