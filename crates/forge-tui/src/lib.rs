@@ -47,6 +47,20 @@ pub enum PresenterEvent {
     Cost {
         session_total_usd: f64,
     },
+    /// A subagent (child agent) was spawned for a subtask (RFC subagent-orchestration).
+    SubagentStart {
+        id: String,
+        agent: String,
+        task: String,
+    },
+    /// A subagent finished, with its one-line result summary and its cost.
+    SubagentResult {
+        id: String,
+        agent: String,
+        ok: bool,
+        summary: String,
+        cost_usd: f64,
+    },
     /// A proposed file change, emitted by core BEFORE the write is confirmed/applied so the
     /// user reviews the diff before answering the permission prompt.
     Diff(forge_types::FileDiff),
@@ -125,6 +139,19 @@ impl Presenter for HeadlessPresenter {
             }
             PresenterEvent::Cost { session_total_usd } => {
                 println!("  $ session total: ${session_total_usd:.4}");
+            }
+            PresenterEvent::SubagentStart { agent, task, .. } => {
+                println!("  ⤷ spawn [{agent}]: {task}");
+            }
+            PresenterEvent::SubagentResult {
+                agent,
+                ok,
+                summary,
+                cost_usd,
+                ..
+            } => {
+                let mark = if ok { "✓" } else { "✗" };
+                println!("  {mark} agent [{agent}] (${cost_usd:.4}): {summary}");
             }
             PresenterEvent::Diff(diff) => {
                 // Plain unified-diff text for scripting/pipes (no ANSI).

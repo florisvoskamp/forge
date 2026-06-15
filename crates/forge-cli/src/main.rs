@@ -213,17 +213,17 @@ fn build_session_with(
         config.permission_mode = m.into();
     }
 
-    let store = open_store()?;
-    let provider: Box<dyn Provider> = if mock {
-        Box::new(MockProvider)
+    let store = Arc::new(open_store()?);
+    let provider: Arc<dyn Provider> = if mock {
+        Arc::new(MockProvider)
     } else {
         // Routes API models to genai and `claude-cli::`/`codex-cli::` to the subscription CLI
         // bridge. `harness` mode runs the bridge's tools through Forge's MCP server (RFC Phase 2).
         let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
-        Box::new(DispatchProvider::new(harness))
+        Arc::new(DispatchProvider::new(harness))
     };
     let heuristic = HeuristicRouter::new(config.clone()).with_pin(pin);
-    let router: Box<dyn Router> = if config.mesh.classifier == ClassifierKind::Llm {
+    let router: Arc<dyn Router> = if config.mesh.classifier == ClassifierKind::Llm {
         // Opt-in cheap-LLM classifier: a separate (stateless) provider labels the tier, then
         // the heuristic router does the cost-aware selection; any failure falls back to it.
         let classifier_model = config
@@ -237,13 +237,13 @@ fn build_session_with(
         } else {
             Arc::new(DispatchProvider::new(false)) // classification needs no tools/harness
         };
-        Box::new(LlmRouter::new(
+        Arc::new(LlmRouter::new(
             classify_provider,
             classifier_model,
             heuristic,
         ))
     } else {
-        Box::new(heuristic)
+        Arc::new(heuristic)
     };
     let tools = ToolRegistry::with_core_tools();
 

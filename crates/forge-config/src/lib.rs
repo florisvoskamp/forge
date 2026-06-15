@@ -215,6 +215,50 @@ pub struct MeshConfig {
     /// defaults so a price change needs no release (A-7). Keyed by model id.
     #[serde(default)]
     pub pricing: HashMap<String, PriceOverride>,
+    /// Subagent orchestration (RFC subagent-orchestration): the `spawn_agents` tool.
+    #[serde(default)]
+    pub subagents: SubagentsConfig,
+}
+
+/// Subagent orchestration settings (RFC subagent-orchestration).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentsConfig {
+    /// Advertise the `spawn_agents` tool to the top-level model. Default true.
+    #[serde(default = "default_subagents_enabled")]
+    pub enabled: bool,
+    /// Max child agents per `spawn_agents` call (hard cap).
+    #[serde(default = "default_max_agents")]
+    pub max_agents: usize,
+    /// Max child agents running concurrently (parallel fan-out is Phase 2).
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
+    /// Directory holding named agent-type files (`<name>.md`), relative to the cwd.
+    #[serde(default = "default_agents_dir")]
+    pub agents_dir: String,
+}
+
+fn default_subagents_enabled() -> bool {
+    true
+}
+fn default_max_agents() -> usize {
+    8
+}
+fn default_max_concurrency() -> usize {
+    4
+}
+fn default_agents_dir() -> String {
+    ".forge/agents".to_string()
+}
+
+impl Default for SubagentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_subagents_enabled(),
+            max_agents: default_max_agents(),
+            max_concurrency: default_max_concurrency(),
+            agents_dir: default_agents_dir(),
+        }
+    }
 }
 
 fn default_warn_threshold() -> f64 {
@@ -302,6 +346,7 @@ impl Default for Config {
                 warn_threshold: default_warn_threshold(),
                 budget: BudgetBehavior::default(),
                 pricing: HashMap::new(),
+                subagents: SubagentsConfig::default(),
             },
             permissions: PermissionsConfig::default(),
         }

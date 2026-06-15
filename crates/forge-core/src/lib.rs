@@ -3,6 +3,8 @@
 //! wires the Mesh (routing), a Provider (model calls), the tool registry, the store
 //! (persistence) and a presenter (UI) together, depending on each only through its trait.
 
+use std::sync::Arc;
+
 use forge_config::Config;
 use forge_mesh::pricing::Pricing;
 use forge_mesh::{BudgetState, BudgetStatus, Router};
@@ -14,11 +16,12 @@ use forge_types::{Message, PermissionDecision, PermissionMode, PermissionRule, R
 
 pub mod llm_router;
 pub mod permission;
+pub mod subagent;
 
 pub use llm_router::LlmRouter;
 
 /// Hard cap on model<->tool round trips within a single turn.
-const MAX_STEPS: usize = 8;
+pub(crate) const MAX_STEPS: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -35,9 +38,9 @@ pub enum CoreError {
 /// One interactive session. Construct with [`Session::start`], then drive [`Session::run_turn`].
 pub struct Session {
     id: String,
-    store: Store,
-    provider: Box<dyn Provider>,
-    router: Box<dyn Router>,
+    store: Arc<Store>,
+    provider: Arc<dyn Provider>,
+    router: Arc<dyn Router>,
     tools: ToolRegistry,
     presenter: Box<dyn Presenter>,
     config: Config,
@@ -51,9 +54,9 @@ pub struct Session {
 
 impl Session {
     pub fn start(
-        store: Store,
-        provider: Box<dyn Provider>,
-        router: Box<dyn Router>,
+        store: Arc<Store>,
+        provider: Arc<dyn Provider>,
+        router: Arc<dyn Router>,
         tools: ToolRegistry,
         presenter: Box<dyn Presenter>,
         config: Config,
@@ -77,9 +80,9 @@ impl Session {
     /// Resume an existing session: rehydrate its transcript and continue the same row.
     #[allow(clippy::too_many_arguments)]
     pub fn resume(
-        store: Store,
-        provider: Box<dyn Provider>,
-        router: Box<dyn Router>,
+        store: Arc<Store>,
+        provider: Arc<dyn Provider>,
+        router: Arc<dyn Router>,
         tools: ToolRegistry,
         presenter: Box<dyn Presenter>,
         config: Config,
@@ -115,9 +118,9 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     fn build(
         id: String,
-        store: Store,
-        provider: Box<dyn Provider>,
-        router: Box<dyn Router>,
+        store: Arc<Store>,
+        provider: Arc<dyn Provider>,
+        router: Arc<dyn Router>,
         tools: ToolRegistry,
         presenter: Box<dyn Presenter>,
         config: Config,
@@ -172,7 +175,8 @@ impl Session {
     }
 
     fn tool_specs(&self) -> Vec<ToolSpec> {
-        self.tools
+        let mut specs: Vec<ToolSpec> = self
+            .tools
             .names()
             .filter_map(|name| self.tools.get(name))
             .map(|t| ToolSpec {
@@ -180,7 +184,16 @@ impl Session {
                 description: t.description().to_string(),
                 schema: t.schema(),
             })
-            .collect()
+            .collect();
+        // Advertise the subagent virtual tool to the top-level model only (RFC
+        // subagent-orchestration). Children build their own registry without it, so the
+        // depth-1 recursion guard is structural.
+        if self.config.mesh.subagents.enabled {
+            specs.push(subagent::spawn_agents_spec(
+                self.config.mesh.subagents.max_agents,
+            ));
+        }
+        specs
     }
 
     /// Run one full turn: route -> (model -> tools)* -> final answer. Returns the answer.
@@ -352,6 +365,12 @@ impl Session {
         msg_id: &str,
         call: &forge_types::ToolCall,
     ) -> Result<String, CoreError> {
+        // The subagent virtual tool is owned by core (it needs provider/router/store), not the
+        // registry — intercept before the registry lookup (RFC subagent-orchestration).
+        if call.name == subagent::SPAWN_AGENTS_TOOL {
+            return self.spawn_agents(msg_id, call).await;
+        }
+
         let args_json = serde_json::to_string(&call.args)?;
 
         let Some(tool) = self.tools.get(&call.name) else {
@@ -412,6 +431,89 @@ impl Session {
         )?;
 
         Ok(result)
+    }
+
+    /// Handle a `spawn_agents` call: run each requested child agent (Phase 1: sequentially),
+    /// each in its own mesh-routed, read-only, persisted child session, and return their
+    /// combined results to the parent transcript (RFC subagent-orchestration).
+    async fn spawn_agents(
+        &mut self,
+        msg_id: &str,
+        call: &forge_types::ToolCall,
+    ) -> Result<String, CoreError> {
+        let args_json = serde_json::to_string(&call.args)?;
+        let max = self.config.mesh.subagents.max_agents;
+        let requests = match subagent::parse_requests(&call.args, max) {
+            Ok(r) => r,
+            Err(msg) => {
+                let result = format!("error: {msg}");
+                self.store.record_tool_call(
+                    msg_id, &call.name, &args_json, &result, "allowed", "error",
+                )?;
+                return Ok(result);
+            }
+        };
+
+        // Budget snapshot so children also down-tier when the day/month is under pressure.
+        let budget = BudgetState {
+            spent_today_usd: self.store.spend_today_usd()?,
+            daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_month_usd: self.store.spend_this_month_usd()?,
+            monthly_cap_usd: self.config.mesh.monthly_cap_usd,
+            warn_fraction: self.config.mesh.warn_threshold,
+        };
+
+        let ctx = subagent::AgentCtx {
+            provider: Arc::clone(&self.provider),
+            router: Arc::clone(&self.router),
+            store: Arc::clone(&self.store),
+            config: self.config.clone(),
+            pricing: self.pricing.clone(),
+            mode: self.mode,
+            rules: self.rules.clone(),
+        };
+
+        let mut combined = String::new();
+        let mut all_ok = true;
+        for (i, req) in requests.iter().enumerate() {
+            let child_id =
+                self.store
+                    .create_child_session(".", &format!("{:?}", self.mode), &self.id)?;
+            self.presenter.emit(PresenterEvent::SubagentStart {
+                id: child_id.clone(),
+                agent: req.agent.clone(),
+                task: req.task.clone(),
+            });
+
+            let (text, ok) = match subagent::run_subagent(&ctx, &child_id, &req.task, budget).await
+            {
+                Ok(out) => (out.final_text, out.ok),
+                Err(e) => (format!("error: subagent failed: {e}"), false),
+            };
+            all_ok &= ok;
+            let cost = self.store.session_cost(&child_id).unwrap_or(0.0);
+
+            self.presenter.emit(PresenterEvent::SubagentResult {
+                id: child_id,
+                agent: req.agent.clone(),
+                ok,
+                summary: summarize(&text),
+                cost_usd: cost,
+            });
+
+            combined.push_str(&format!("[agent {}: {}]\n{}\n\n", i + 1, req.agent, text));
+        }
+
+        let combined = combined.trim_end().to_string();
+        self.store.record_tool_call(
+            msg_id,
+            &call.name,
+            &args_json,
+            &combined,
+            "allowed",
+            if all_ok { "ok" } else { "error" },
+        )?;
+        Ok(combined)
     }
 }
 
@@ -476,12 +578,12 @@ mod tests {
 
     #[tokio::test]
     async fn full_turn_routes_calls_tool_and_persists() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let config = Config::default();
         let mut session = Session::start(
             store,
-            Box::new(MockProvider),
-            Box::new(HeuristicRouter::new(config.clone())),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
             ToolRegistry::with_core_tools(),
             // non-interactive: side-effect tools would be denied, but the mock uses read_file
             Box::new(HeadlessPresenter::new(false)),
@@ -507,12 +609,12 @@ mod tests {
 
     #[tokio::test]
     async fn cost_accumulates_for_a_priced_model() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let config = priced_complex_config();
         let mut session = Session::start(
             store,
-            Box::new(MockProvider),
-            Box::new(HeuristicRouter::new(config.clone())),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
             ToolRegistry::with_core_tools(),
             Box::new(HeadlessPresenter::new(false)),
             config,
@@ -540,9 +642,9 @@ mod tests {
         let capture = CapturePresenter::default();
         let events = capture.events.clone();
         let mut session = Session::start(
-            Store::open_in_memory().unwrap(),
-            Box::new(MockProvider),
-            Box::new(HeuristicRouter::new(config.clone())),
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
             ToolRegistry::with_core_tools(),
             Box::new(capture),
             config,
@@ -589,11 +691,11 @@ mod tests {
         config
     }
 
-    fn fresh_session(store: Store, config: Config) -> Session {
+    fn fresh_session(store: Arc<Store>, config: Config) -> Session {
         Session::start(
             store,
-            Box::new(MockProvider),
-            Box::new(HeuristicRouter::new(config.clone())),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
             ToolRegistry::with_core_tools(),
             Box::new(HeadlessPresenter::new(false)),
             config,
@@ -626,7 +728,7 @@ mod tests {
         // provider call and records no further spend.
         let mut config = priced_complex_config();
         config.mesh.daily_budget_usd = Some(0.05);
-        let mut session = fresh_session(Store::open_in_memory().unwrap(), config);
+        let mut session = fresh_session(Arc::new(Store::open_in_memory().unwrap()), config);
 
         // Turn 1 sees $0 spent -> proceeds, spends ~$0.102 (over the $0.05 cap).
         session
@@ -662,7 +764,7 @@ mod tests {
         let config = priced_complex_config(); // no cap -> both proceed; complex tier is priced
 
         let day_total_after_a = {
-            let mut a = fresh_session(Store::open(&path).unwrap(), config.clone());
+            let mut a = fresh_session(Arc::new(Store::open(&path).unwrap()), config.clone());
             a.run_turn("refactor the architecture for concurrency")
                 .await
                 .unwrap();
@@ -671,7 +773,7 @@ mod tests {
         assert!(day_total_after_a > 0.0, "session A recorded spend today");
 
         // A brand-new session on the same DB must see A's spend (the bug was a per-session reset).
-        let b = fresh_session(Store::open(&path).unwrap(), config.clone());
+        let b = fresh_session(Arc::new(Store::open(&path).unwrap()), config.clone());
         let seen_by_b = b.store.spend_today_usd().unwrap();
         assert!(
             (seen_by_b - day_total_after_a).abs() < 1e-9,
@@ -688,7 +790,7 @@ mod tests {
 
         // First run on a file-backed store, then drop it.
         let (id, cost1, msgs1) = {
-            let mut s = fresh_session(Store::open(&path).unwrap(), config.clone());
+            let mut s = fresh_session(Arc::new(Store::open(&path).unwrap()), config.clone());
             s.run_turn("refactor the architecture for concurrency")
                 .await
                 .unwrap();
@@ -702,9 +804,9 @@ mod tests {
 
         // Resume on a fresh connection to the same file.
         let mut s2 = Session::resume(
-            Store::open(&path).unwrap(),
-            Box::new(MockProvider),
-            Box::new(HeuristicRouter::new(config.clone())),
+            Arc::new(Store::open(&path).unwrap()),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
             ToolRegistry::with_core_tools(),
             Box::new(HeadlessPresenter::new(false)),
             config,
@@ -739,9 +841,9 @@ mod tests {
     #[tokio::test]
     async fn resume_missing_session_errors() {
         let err = Session::resume(
-            Store::open_in_memory().unwrap(),
-            Box::new(MockProvider),
-            Box::new(HeuristicRouter::new(Config::default())),
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
             ToolRegistry::with_core_tools(),
             Box::new(HeadlessPresenter::new(false)),
             Config::default(),
@@ -750,5 +852,192 @@ mod tests {
         .err()
         .unwrap();
         assert!(matches!(err, CoreError::SessionNotFound(_)));
+    }
+
+    // --- Subagent orchestration (RFC subagent-orchestration) ---
+
+    /// A test provider that, for the TOP-LEVEL agent, calls `spawn_agents` with two inline
+    /// subtasks then synthesizes; for a SUBAGENT (its transcript opens with the subagent system
+    /// prompt) it behaves like the normal mock (read_file → done). Shared via `Arc` by parent
+    /// and children, exactly as in production.
+    #[derive(Default)]
+    struct SpawnThenSynthProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for SpawnThenSynthProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            let is_subagent = messages
+                .iter()
+                .any(|m| m.role == Role::System && m.content.contains("subagent"));
+            let used_tool = messages.iter().any(|m| m.role == Role::Tool);
+            let usage = Usage {
+                input_tokens: 30,
+                output_tokens: 12,
+                cost_usd: 0.0,
+            };
+            if is_subagent {
+                // Child: read a file once, then answer.
+                if used_tool {
+                    let content = "child finding: ok";
+                    on_event(StreamEvent::Text(content.into()));
+                    return Ok(ModelResponse {
+                        content: content.into(),
+                        tool_calls: vec![],
+                        usage,
+                    });
+                }
+                return Ok(ModelResponse {
+                    content: "reading".into(),
+                    tool_calls: vec![ToolCall {
+                        id: new_id(),
+                        name: "read_file".into(),
+                        args: serde_json::json!({"path": "Cargo.toml"}),
+                    }],
+                    usage,
+                });
+            }
+            // Parent: fan out, then synthesize once results return.
+            if used_tool {
+                let content = "synthesized from subagents";
+                on_event(StreamEvent::Text(content.into()));
+                return Ok(ModelResponse {
+                    content: content.into(),
+                    tool_calls: vec![],
+                    usage,
+                });
+            }
+            Ok(ModelResponse {
+                content: "delegating".into(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "spawn_agents".into(),
+                    args: serde_json::json!({"agents": [
+                        {"agent": "reviewer", "task": "review the change"},
+                        {"task": "fix the typo in the readme"}
+                    ]}),
+                }],
+                usage,
+            })
+        }
+    }
+
+    /// A config with three distinct, keyless, priced tiers so routing is deterministic and a
+    /// Trivial child routes to a cheaper model than a Complex parent.
+    fn tiered_config() -> Config {
+        use forge_config::{OneOrMany, PriceOverride};
+        let mut config = Config::default();
+        for (tier, model, price) in [
+            ("trivial", "ollama::small", 0.001),
+            ("standard", "ollama::mid", 0.05),
+            ("complex", "ollama::big", 1.0),
+        ] {
+            config
+                .mesh
+                .models
+                .insert(tier.into(), OneOrMany::One(model.into()));
+            config.mesh.pricing.insert(
+                model.into(),
+                PriceOverride {
+                    input_per_1k: price,
+                    output_per_1k: price,
+                },
+            );
+        }
+        config
+    }
+
+    #[tokio::test]
+    async fn spawn_agents_creates_linked_children_and_returns_results() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let config = tiered_config();
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(SpawnThenSynthProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            config,
+            ".",
+        )
+        .unwrap();
+        let parent_id = session.id().to_string();
+
+        let answer = session
+            .run_turn("design and architect a complex concurrency refactor across modules")
+            .await
+            .unwrap();
+
+        assert!(
+            answer.contains("synthesized"),
+            "parent synthesizes: {answer}"
+        );
+
+        // Two child sessions, both linked to the parent.
+        let children = store.child_sessions(&parent_id).unwrap();
+        assert_eq!(children.len(), 2, "two children persisted with parent link");
+
+        // Coarse lifecycle events surfaced for each child.
+        let ev = events.lock().unwrap();
+        let starts = ev
+            .iter()
+            .filter(|e| matches!(e, PresenterEvent::SubagentStart { .. }))
+            .count();
+        let results = ev
+            .iter()
+            .filter(|e| matches!(e, PresenterEvent::SubagentResult { .. }))
+            .count();
+        assert_eq!((starts, results), (2, 2), "start+result per child");
+
+        // Child usage rolled into the shared day budget (children did real model work).
+        assert!(store.spend_today_usd().unwrap() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn subagents_route_independently_via_the_mesh() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let config = tiered_config();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(SpawnThenSynthProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            ".",
+        )
+        .unwrap();
+        let parent_id = session.id().to_string();
+
+        session
+            .run_turn("design and architect a complex concurrency refactor across modules")
+            .await
+            .unwrap();
+
+        // Parent routed Complex; the "fix the typo" child routed Trivial → different model.
+        let parent_models = store.session_models(&parent_id).unwrap();
+        assert_eq!(
+            parent_models.first().map(String::as_str),
+            Some("ollama::big")
+        );
+
+        let children = store.child_sessions(&parent_id).unwrap();
+        let child_models: Vec<String> = children
+            .iter()
+            .flat_map(|c| store.session_models(c).unwrap())
+            .collect();
+        assert!(
+            child_models.iter().any(|m| m == "ollama::small"),
+            "a trivial child routed to the cheap tier independently: {child_models:?}"
+        );
     }
 }

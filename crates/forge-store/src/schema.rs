@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS session (
     permission_mode TEXT NOT NULL,
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     updated_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    total_cost_usd  REAL NOT NULL DEFAULT 0
+    total_cost_usd  REAL NOT NULL DEFAULT 0,
+    parent_session_id TEXT          -- non-null for subagent child sessions (RFC subagent-orchestration)
 );
 
 CREATE TABLE IF NOT EXISTS message (

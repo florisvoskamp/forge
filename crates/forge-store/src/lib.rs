@@ -84,6 +84,7 @@ impl Store {
         for stmt in [
             "ALTER TABLE message ADD COLUMN tool_calls_json TEXT",
             "ALTER TABLE message ADD COLUMN tool_call_id TEXT",
+            "ALTER TABLE session ADD COLUMN parent_session_id TEXT",
         ] {
             let _ = conn.execute(stmt, []);
         }
@@ -104,6 +105,27 @@ impl Store {
             (&id, cwd, mode),
         )?;
         Ok(id)
+    }
+
+    /// Create a subagent child session linked to `parent_id` (RFC subagent-orchestration).
+    pub fn create_child_session(&self, cwd: &str, mode: &str, parent_id: &str) -> Result<String> {
+        let id = forge_types::new_id();
+        self.lock()?.execute(
+            "INSERT INTO session (id, cwd, permission_mode, total_cost_usd, parent_session_id) \
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            (&id, cwd, mode, parent_id),
+        )?;
+        Ok(id)
+    }
+
+    /// Ids of the subagent child sessions spawned by `parent_id`, oldest first.
+    pub fn child_sessions(&self, parent_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM session WHERE parent_session_id = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([parent_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
     /// Append a message to a session and return its id.
@@ -214,6 +236,19 @@ impl Store {
             [session_id],
             |row| row.get(0),
         )?)
+    }
+
+    /// Models the Mesh routed to within a session (chosen_model per routing_decision), oldest
+    /// first. Used to verify subagents route independently of the parent.
+    pub fn session_models(&self, session_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT r.chosen_model FROM routing_decision r \
+             JOIN message m ON m.id = r.message_id \
+             WHERE m.session_id = ?1 ORDER BY m.seq",
+        )?;
+        let rows = stmt.query_map([session_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
     /// Total spend across ALL sessions whose `usage` rows fall in `[start, end)` epoch secs.

@@ -174,6 +174,18 @@ impl App {
                 self.flush.push(tool_result_line(&name, ok, &summary))
             }
             PresenterEvent::Cost { session_total_usd } => self.cost_usd = session_total_usd,
+            PresenterEvent::SubagentStart { agent, task, .. } => {
+                self.flush.push(subagent_start_line(&agent, &task))
+            }
+            PresenterEvent::SubagentResult {
+                agent,
+                ok,
+                summary,
+                cost_usd,
+                ..
+            } => self
+                .flush
+                .push(subagent_result_line(&agent, ok, &summary, cost_usd)),
             PresenterEvent::Diff(diff) => {
                 self.flush.extend(crate::render::diff_to_lines(&diff));
                 self.flush.push(TextLine::default());
@@ -241,6 +253,30 @@ fn tool_start_line(name: &str, args: &str) -> TextLine<'static> {
             format!("  {}", truncate(args, 48)),
             Style::default().fg(DIM),
         ),
+    ])
+}
+
+fn subagent_start_line(agent: &str, task: &str) -> TextLine<'static> {
+    TextLine::from(vec![
+        Span::styled("  ⤷ spawn ", Style::default().fg(DIM)),
+        Span::styled(format!("[{agent}]  "), Style::default().fg(OKGREEN)),
+        Span::styled(truncate(task, 56), Style::default().fg(DIM)),
+    ])
+}
+
+fn subagent_result_line(agent: &str, ok: bool, summary: &str, cost_usd: f64) -> TextLine<'static> {
+    let (mark, color) = if ok {
+        ("  ✓ agent ", OKGREEN)
+    } else {
+        ("  ✗ agent ", ERRRED)
+    };
+    TextLine::from(vec![
+        Span::styled(mark, Style::default().fg(color)),
+        Span::styled(
+            format!("[{agent}] (${cost_usd:.4})  "),
+            Style::default().fg(color),
+        ),
+        Span::styled(truncate(summary, 48), Style::default().fg(DIM)),
     ])
 }
 
