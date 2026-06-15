@@ -30,7 +30,15 @@ pub struct Pricing {
 const DEFAULT_RATES: &[(&str, f64, f64)] = &[
     ("openai::gpt-4o-mini", 0.00015, 0.0006),
     ("anthropic::claude-opus-4-8", 0.015, 0.075),
-    // Local models (e.g. ollama::*) are intentionally absent -> free.
+    // Additional BYOK providers (approx mid-2026 list prices, USD per 1k tokens).
+    // Override via config [mesh.pricing] if a price changes (A-7).
+    ("gemini::gemini-2.5-flash", 0.0003, 0.0025),
+    ("gemini::gemini-2.5-pro", 0.00125, 0.01),
+    ("deepseek::deepseek-chat", 0.00027, 0.0011),
+    ("xai::grok-4", 0.003, 0.015),
+    // Local models (ollama::*) and gateway/per-model providers (open_router::*, where the
+    // effective price depends on the routed model) are intentionally absent -> free unless
+    // priced via config. cost_for() returns 0.0 for any unlisted model (never panics).
 ];
 
 impl Default for Pricing {
@@ -118,6 +126,25 @@ mod tests {
         let pricing = Pricing::default();
         assert!(pricing.cost_for("openai::gpt-4o-mini", 1000, 1000) > 0.0);
         assert!(pricing.cost_for("anthropic::claude-opus-4-8", 1000, 1000) > 0.0);
+    }
+
+    #[test]
+    fn defaults_price_the_new_byok_providers() {
+        let p = Pricing::default();
+        assert!(p.cost_for("gemini::gemini-2.5-flash", 1000, 1000) > 0.0);
+        assert!(p.cost_for("gemini::gemini-2.5-pro", 1000, 1000) > 0.0);
+        assert!(p.cost_for("deepseek::deepseek-chat", 1000, 1000) > 0.0);
+        assert!(p.cost_for("xai::grok-4", 1000, 1000) > 0.0);
+    }
+
+    #[test]
+    fn unpriced_openrouter_model_is_free_not_a_panic() {
+        // Gateway models aren't bundled; cost falls back to 0.0 rather than panicking.
+        let p = Pricing::default();
+        assert_eq!(
+            p.cost_for("open_router::deepseek/deepseek-chat", 9999, 9999),
+            0.0
+        );
     }
 
     #[test]

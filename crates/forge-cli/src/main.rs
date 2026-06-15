@@ -63,7 +63,7 @@ enum Command {
     Sessions,
     /// Store a provider API key securely in the OS keyring (reads the key from stdin).
     Auth {
-        /// Provider name, e.g. anthropic or openai.
+        /// Provider: anthropic, openai, gemini, xai, deepseek, or openrouter.
         provider: String,
     },
 }
@@ -115,6 +115,13 @@ async fn main() -> Result<()> {
 }
 
 fn auth(provider: &str) -> Result<()> {
+    if !forge_config::known_key_providers().any(|p| p == provider) {
+        let known: Vec<_> = forge_config::known_key_providers().collect();
+        anyhow::bail!(
+            "unknown provider '{provider}' — key-based providers are: {}",
+            known.join(", ")
+        );
+    }
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
         print!("paste {provider} API key (input hidden is not supported; press enter): ");
