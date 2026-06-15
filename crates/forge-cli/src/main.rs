@@ -79,7 +79,12 @@ enum Command {
     /// List past sessions (newest first).
     Sessions,
     /// Show the auto-discovered model catalog and the mesh's best pick per tier.
-    Models,
+    Models {
+        /// Actively ping every discovered model and persist the result: clear healthy ones,
+        /// bench the ones that rate-limit / fail auth (so the mesh routes around them).
+        #[arg(long)]
+        probe: bool,
+    },
     /// Internal: run Forge's tool registry as an MCP server on stdio (spawned by the CLI
     /// bridge so claude/codex use Forge's tools under Forge's permission gate). Not for direct use.
     #[command(hide = true)]
@@ -139,7 +144,7 @@ async fn main() -> Result<()> {
             model,
         } => chat(mock, mode, resume, plain, model).await,
         Command::Sessions => sessions(),
-        Command::Models => models().await,
+        Command::Models { probe } => models(probe).await,
         Command::Auth { provider } => auth(&provider),
         Command::McpServe => mcp_serve::run().await,
     }
@@ -279,8 +284,9 @@ async fn discover_catalog() -> forge_mesh::ModelCatalog {
     forge_mesh::ModelCatalog::new(models)
 }
 
-/// `forge models`: discover the usable models + show the mesh's capability-ranked pick per tier.
-async fn models() -> Result<()> {
+/// `forge models [--probe]`: discover the usable models + show the mesh's capability-ranked pick
+/// per tier. With `--probe`, also ping each model and persist health (the user-driven rescan).
+async fn models(probe: bool) -> Result<()> {
     forge_config::inject_provider_keys();
     let config = forge_config::load().unwrap_or_default();
     let cat = discover_catalog().await;
@@ -290,19 +296,84 @@ async fn models() -> Result<()> {
         );
         return Ok(());
     }
+    let store = open_store()?;
+
+    if probe {
+        probe_models(&cat, &config, &store).await?;
+        println!();
+    }
+
     println!("discovered {} usable models:", cat.models().len());
+    let benched = store.current_benched().unwrap_or_default();
     for m in cat.models() {
-        println!("  {m}");
+        let mark = if benched.is_benched(m) {
+            "  (benched)"
+        } else {
+            ""
+        };
+        println!("  {m}{mark}");
     }
     let pricing = forge_mesh::pricing::Pricing::from_config(&config);
     println!("\nmesh auto-pick per tier:");
     for tier in [TaskTier::Trivial, TaskTier::Standard, TaskTier::Complex] {
+        // Mirror routing: skip benched models so the shown pick is the one the mesh would
+        // actually use right now (model-health-failover).
         let pick = cat
-            .ranked_for(tier, &pricing, 1)
+            .ranked_for(tier, &pricing, 5)
             .into_iter()
-            .next()
+            .find(|m| !benched.is_benched(m))
             .unwrap_or_else(|| "—".into());
         println!("  {:<9} {pick}", tier.as_str());
+    }
+    if !probe {
+        println!("\ntip: `forge models --probe` pings each model and benches the dead ones.");
+    }
+    Ok(())
+}
+
+/// Ping every discovered model with a 1-token request; clear the healthy ones and bench the
+/// ones that rate-limit / fail auth / are down, so the mesh routes around them.
+async fn probe_models(
+    cat: &forge_mesh::ModelCatalog,
+    config: &forge_config::Config,
+    store: &Store,
+) -> Result<()> {
+    use std::time::Duration;
+    let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
+    let provider = DispatchProvider::new(harness);
+    let default_cooldown = Duration::from_secs(config.mesh.failover_cooldown_secs);
+    let ping = [forge_types::Message::user("ping")];
+    let mut sink = |_: forge_provider::StreamEvent| {};
+
+    println!("probing {} models…", cat.models().len());
+    for m in cat.models() {
+        let res = tokio::time::timeout(
+            Duration::from_secs(20),
+            provider.complete(m, &ping, &[], &mut sink),
+        )
+        .await;
+        match res {
+            Ok(Ok(_)) => {
+                store.clear_model_health(m).ok();
+                println!("  ✓ {m}");
+            }
+            Ok(Err(e)) if e.is_retryable() => {
+                let cooldown = e.cooldown(default_cooldown);
+                store.bench_for(m, cooldown, e.reason()).ok();
+                println!("  ✗ {m} — {} (benched {}s)", e.reason(), cooldown.as_secs());
+            }
+            Ok(Err(e)) => {
+                // Non-retryable (e.g. the ping payload upset the model) → don't bench it.
+                println!("  ? {m} — {} (not benched)", e.reason());
+            }
+            Err(_) => {
+                store.bench_for(m, default_cooldown, "probe timeout").ok();
+                println!(
+                    "  ✗ {m} — timeout (benched {}s)",
+                    default_cooldown.as_secs()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -323,6 +394,18 @@ async fn build_session_with(
     }
 
     let store = Arc::new(open_store()?);
+    // Startup hint: if models are benched from a prior run/probe, tell the user how to recheck
+    // (model-health-failover — we never auto-probe, so a stale bench is the user's to clear).
+    let mut presenter = presenter;
+    if let Ok(report) = store.current_benched_report() {
+        if !report.is_empty() {
+            presenter.emit(forge_tui::PresenterEvent::Warning(format!(
+                "{} model(s) benched (rate-limited/unavailable) — `forge models --probe` to recheck",
+                report.len()
+            )));
+        }
+    }
+
     // Auto-discovery: build a live model catalog so the mesh routes to the best usable model
     // (docs/features/auto-discovery-mesh.md). Skipped for the offline mock and when disabled.
     let catalog = if !mock && config.mesh.auto_discover {

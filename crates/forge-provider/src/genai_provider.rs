@@ -145,6 +145,121 @@ fn to_genai_tool(spec: &ToolSpec) -> Tool {
         .with_schema(spec.schema.clone())
 }
 
+/// Map a `genai::Error` to a classified [`ProviderError`] so the mesh can decide whether to
+/// bench the model + fail over (429 / 5xx / auth) or fail the turn (everything else). Uses the
+/// typed `StatusCode`/`HeaderMap` where genai exposes them (`HttpError`, `WebModelCall`); for
+/// the *streaming* path Forge uses, genai only carries a string, so we scan it.
+fn classify_genai_error(err: &genai::Error) -> ProviderError {
+    use genai::webc::Error as WebcError;
+    match err {
+        genai::Error::HttpError { status, body, .. } => classify_status(
+            status.as_u16(),
+            err.to_string(),
+            parse_retry_after_body(body),
+        ),
+        genai::Error::WebModelCall { webc_error, .. }
+        | genai::Error::WebAdapterCall { webc_error, .. } => match webc_error {
+            WebcError::ResponseFailedStatus {
+                status,
+                body,
+                headers,
+            } => {
+                // `Retry-After` header (delta-seconds), else the body's `retryDelay`.
+                let retry_after = headers
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| {
+                        let t = v.trim();
+                        t.parse::<u64>()
+                            .ok()
+                            .map(std::time::Duration::from_secs)
+                            .or_else(|| parse_secs(t).map(std::time::Duration::from_secs_f64))
+                    })
+                    .or_else(|| parse_retry_after_body(body));
+                classify_status(status.as_u16(), err.to_string(), retry_after)
+            }
+            other => ProviderError::Unavailable(other.to_string()),
+        },
+        // Streaming path: status lives only in the message string (`...Status: 429...`).
+        genai::Error::WebStream { cause, .. } => classify_text(cause, err.to_string()),
+        genai::Error::ChatResponse { body, .. } => {
+            classify_text(&body.to_string(), err.to_string())
+        }
+        // A bad/truncated stream chunk — transient, worth trying elsewhere.
+        genai::Error::StreamParse { .. } => ProviderError::Unavailable(err.to_string()),
+        other => ProviderError::Request(other.to_string()),
+    }
+}
+
+/// Classify from an HTTP status code.
+fn classify_status(
+    code: u16,
+    message: String,
+    retry_after: Option<std::time::Duration>,
+) -> ProviderError {
+    match code {
+        429 => ProviderError::RateLimited {
+            message,
+            retry_after,
+        },
+        401 | 403 => ProviderError::Auth(message),
+        500..=599 => ProviderError::Unavailable(message),
+        _ => ProviderError::Request(message),
+    }
+}
+
+/// Classify from a free-text error (the streaming case, where genai gives no typed status).
+fn classify_text(text: &str, message: String) -> ProviderError {
+    let lower = text.to_lowercase();
+    let has = |needle: &str| lower.contains(needle);
+    if has("429") || has("resource_exhausted") || has("rate limit") || has("quota") {
+        ProviderError::RateLimited {
+            message,
+            retry_after: parse_retry_after_body(text),
+        }
+    } else if has(" 401") || has(" 403") || has("unauthorized") || has("permission denied") {
+        ProviderError::Auth(message)
+    } else {
+        // A dropped/5xx stream — treat as a transient provider problem worth failing over.
+        ProviderError::Unavailable(message)
+    }
+}
+
+/// Scan an error body for a cooldown: Gemini's `"retryDelay": "37s"` or a `retry in 37.04s`
+/// phrase. Returns the first match.
+fn parse_retry_after_body(body: &str) -> Option<std::time::Duration> {
+    let lower = body.to_lowercase();
+    for marker in ["retrydelay", "retry in", "retry after", "please retry in"] {
+        if let Some(idx) = lower.find(marker) {
+            if let Some(secs) = parse_secs(&lower[idx + marker.len()..]) {
+                return Some(std::time::Duration::from_secs_f64(secs));
+            }
+        }
+    }
+    None
+}
+
+/// Pull the first floating-point number out of `s` (skipping leading quotes/colons/spaces),
+/// e.g. `": \"37.04s\""` → `37.04`. Stops at the first non-numeric char after digits.
+fn parse_secs(s: &str) -> Option<f64> {
+    let mut num = String::new();
+    let mut started = false;
+    for c in s.chars() {
+        if c.is_ascii_digit() || (c == '.' && started) {
+            num.push(c);
+            started = true;
+        } else if started {
+            break;
+        } else if c == '"' || c == ':' || c == ' ' || c == '=' {
+            continue;
+        } else {
+            // a non-numeric, non-separator char before any digit — give up.
+            return None;
+        }
+    }
+    num.parse::<f64>().ok()
+}
+
 #[async_trait]
 impl Provider for GenAiProvider {
     async fn complete(
@@ -171,7 +286,7 @@ impl Provider for GenAiProvider {
             .client
             .exec_chat_stream(model_name.as_str(), req, Some(&options))
             .await
-            .map_err(|e| ProviderError::Request(e.to_string()))?;
+            .map_err(|e| classify_genai_error(&e))?;
 
         let mut stream = res.stream;
         let mut content = String::new();
@@ -179,7 +294,7 @@ impl Provider for GenAiProvider {
         let mut tool_calls: Vec<ToolCall> = Vec::new();
 
         while let Some(event) = stream.next().await {
-            match event.map_err(|e| ProviderError::Request(e.to_string()))? {
+            match event.map_err(|e| classify_genai_error(&e))? {
                 ChatStreamEvent::Chunk(chunk) => {
                     content.push_str(&chunk.content);
                     on_event(StreamEvent::Text(chunk.content.clone()));
@@ -335,6 +450,73 @@ mod tests {
         )];
         let out = to_genai_messages(&msgs);
         assert_eq!(out.len(), 1, "no empty assistant text message");
+    }
+
+    // --- Error classification + retry-after parsing (model-health-failover) ---
+
+    // The exact 429 body from the bug report (truncated to the parts that matter).
+    const GEMINI_429: &str = r#"{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details. Quota exceeded for metric: ... limit: 0, model: antigravity. Please retry in 37.047405996s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"37s"}]}}"#;
+
+    #[test]
+    fn classify_text_429_is_rate_limited_with_server_cooldown() {
+        let e = classify_text(GEMINI_429, "stream err".into());
+        match e {
+            ProviderError::RateLimited { retry_after, .. } => {
+                // `retryDelay":"37s"` is matched before the looser "retry in 37.04s".
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(37)));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn parse_retry_after_reads_retrydelay_and_retry_in() {
+        assert_eq!(
+            parse_retry_after_body(r#""retryDelay": "37s""#),
+            Some(std::time::Duration::from_secs(37))
+        );
+        let d = parse_retry_after_body("Please retry in 37.047405996s.").unwrap();
+        assert!((d.as_secs_f64() - 37.047405996).abs() < 1e-6, "{d:?}");
+        assert_eq!(parse_retry_after_body("no cooldown here"), None);
+    }
+
+    #[test]
+    fn classify_status_maps_codes() {
+        let none = None;
+        assert!(matches!(
+            classify_status(429, "x".into(), none),
+            ProviderError::RateLimited { .. }
+        ));
+        assert!(matches!(
+            classify_status(401, "x".into(), None),
+            ProviderError::Auth(_)
+        ));
+        assert!(matches!(
+            classify_status(503, "x".into(), None),
+            ProviderError::Unavailable(_)
+        ));
+        // 400 misuse is non-retryable — must not fail over.
+        let bad = classify_status(400, "x".into(), None);
+        assert!(matches!(bad, ProviderError::Request(_)));
+        assert!(!bad.is_retryable());
+    }
+
+    #[test]
+    fn cooldown_prefers_server_value_then_default() {
+        let rl = ProviderError::RateLimited {
+            message: "x".into(),
+            retry_after: Some(std::time::Duration::from_secs(37)),
+        };
+        assert_eq!(
+            rl.cooldown(std::time::Duration::from_secs(300)),
+            std::time::Duration::from_secs(37)
+        );
+        let un = ProviderError::Unavailable("x".into());
+        assert_eq!(
+            un.cooldown(std::time::Duration::from_secs(300)),
+            std::time::Duration::from_secs(300)
+        );
     }
 
     #[test]

@@ -17,8 +17,58 @@ pub use mock::MockProvider;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
+    /// A non-retryable failure: bad request, malformed response, context-length, etc. It
+    /// would fail the same way on any model, so the mesh must NOT fail over on it.
     #[error("provider request failed: {0}")]
     Request(String),
+    /// Rate-limited / out of quota (HTTP 429, `RESOURCE_EXHAUSTED`). Retryable on another
+    /// model; `retry_after` carries the server's cooldown when it told us one.
+    #[error("rate limited: {message}")]
+    RateLimited {
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
+    /// The provider is down / the stream dropped (5xx, connection/timeout). Retryable.
+    #[error("provider unavailable: {0}")]
+    Unavailable(String),
+    /// Authentication failed (HTTP 401/403) — the key is bad or lacks access. Retryable in
+    /// the sense that *another provider* may work; the bad one is benched.
+    #[error("provider auth failed: {0}")]
+    Auth(String),
+}
+
+impl ProviderError {
+    /// Whether the mesh should bench this model and fail over to another. True for
+    /// rate-limit / unavailable / auth; false for [`Request`](Self::Request) (would fail
+    /// identically everywhere).
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::RateLimited { .. } | Self::Unavailable(_) | Self::Auth(_)
+        )
+    }
+
+    /// How long to bench the model: the server-provided `retry_after` when present,
+    /// otherwise `default`.
+    pub fn cooldown(&self, default: std::time::Duration) -> std::time::Duration {
+        match self {
+            Self::RateLimited {
+                retry_after: Some(d),
+                ..
+            } => *d,
+            _ => default,
+        }
+    }
+
+    /// A short reason string for the health record / UI ("rate-limited (429)", …).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::RateLimited { .. } => "rate-limited",
+            Self::Unavailable(_) => "unavailable",
+            Self::Auth(_) => "auth failed",
+            Self::Request(_) => "request error",
+        }
+    }
 }
 
 /// A tool advertised to the model so it can choose to call it.

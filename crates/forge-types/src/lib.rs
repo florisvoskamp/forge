@@ -252,6 +252,31 @@ pub fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// A snapshot of the models that are currently benched (rate-limited / unavailable / failed a
+/// probe) and must not be routed to. Built by the store from the `model_health` table — only
+/// models whose cooldown has not yet elapsed are included — and consulted by the mesh router.
+/// Carries no clock or I/O: the time filtering happens where the snapshot is built.
+#[derive(Debug, Default, Clone)]
+pub struct ModelHealth {
+    benched: std::collections::HashSet<String>,
+}
+
+impl ModelHealth {
+    pub fn new(benched: std::collections::HashSet<String>) -> Self {
+        Self { benched }
+    }
+
+    /// Whether `model` is currently benched and should be skipped by routing.
+    pub fn is_benched(&self, model: &str) -> bool {
+        self.benched.contains(model)
+    }
+
+    /// True when no model is benched (the common case — lets the router skip filtering).
+    pub fn is_empty(&self) -> bool {
+        self.benched.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

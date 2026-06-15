@@ -227,10 +227,26 @@ pub struct MeshConfig {
     /// configured `[mesh.models]` candidates.
     #[serde(default = "default_auto_discover")]
     pub auto_discover: bool,
+    /// Failover (docs/features/model-health-failover.md): when true (default), a model that
+    /// errors with a retryable failure (rate-limit / unavailable / auth) is benched and the
+    /// turn transparently retries on the next-best healthy model. Set false for single-shot.
+    #[serde(default = "default_failover")]
+    pub failover: bool,
+    /// Default bench duration (seconds) when a rate-limited provider gives no `Retry-After`.
+    #[serde(default = "default_failover_cooldown_secs")]
+    pub failover_cooldown_secs: u64,
 }
 
 fn default_auto_discover() -> bool {
     true
+}
+
+fn default_failover() -> bool {
+    true
+}
+
+fn default_failover_cooldown_secs() -> u64 {
+    300
 }
 
 /// Subagent orchestration settings (RFC subagent-orchestration).
@@ -385,6 +401,8 @@ impl Default for Config {
                 pricing: HashMap::new(),
                 subagents: SubagentsConfig::default(),
                 auto_discover: default_auto_discover(),
+                failover: default_failover(),
+                failover_cooldown_secs: default_failover_cooldown_secs(),
             },
             permissions: PermissionsConfig::default(),
         }

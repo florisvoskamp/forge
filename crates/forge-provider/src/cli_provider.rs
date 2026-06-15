@@ -1141,7 +1141,9 @@ mod tests {
             )
             .await
             .expect_err("missing binary must error");
-        let ProviderError::Request(msg) = err;
+        let ProviderError::Request(msg) = err else {
+            panic!("expected Request, got {err:?}");
+        };
         assert!(msg.contains("not found"), "got: {msg}");
         assert!(
             msg.contains("log in"),
@@ -1202,7 +1204,9 @@ mod tests {
             )
             .await
             .expect_err("nonzero exit, no output → error");
-        let ProviderError::Request(msg) = err;
+        let ProviderError::Request(msg) = err else {
+            panic!("expected Request, got {err:?}");
+        };
         assert!(msg.contains("authenticated"), "got: {msg}");
     }
 

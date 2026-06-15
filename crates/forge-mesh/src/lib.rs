@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use forge_config::Config;
-use forge_types::TaskTier;
+use forge_types::{ModelHealth, TaskTier};
 
 pub mod capability;
 pub mod catalog;
@@ -77,13 +77,23 @@ pub struct RoutingDecision {
     pub tier: TaskTier,
     pub model: String,
     pub rationale: String,
+    /// Ordered, already-filtered (available + healthy) alternatives to try if `model` fails
+    /// mid-turn — most-preferred first, the routed tier's runners-up then cross-tier picks.
+    /// Empty when nothing else is usable.
+    pub fallbacks: Vec<String>,
 }
 
 /// A routing strategy. `async` so an implementation may consult a model (e.g. the opt-in
-/// LLM classifier); the default [`HeuristicRouter`] resolves instantly with no I/O.
+/// LLM classifier); the default [`HeuristicRouter`] resolves instantly with no I/O. `health`
+/// is the set of currently-benched models to route around (failover).
 #[async_trait]
 pub trait Router: Send + Sync {
-    async fn route(&self, prompt: &str, budget: BudgetState) -> RoutingDecision;
+    async fn route(
+        &self,
+        prompt: &str,
+        budget: BudgetState,
+        health: &ModelHealth,
+    ) -> RoutingDecision;
 }
 
 // --- Classification signals (weighted scoring; see `classify`). Capability over length. ---
@@ -349,55 +359,93 @@ impl HeuristicRouter {
         (c.tier, c.reasons.join(", "))
     }
 
-    /// Pick the cheapest *usable* model from `candidates` (L1). Usable = the injected
-    /// availability predicate passes (key present, or keyless). Ranking key:
+    /// A model is usable if its provider key is present (or it's keyless) AND it isn't
+    /// currently benched (rate-limited / unavailable — failover).
+    fn is_usable(&self, m: &str, health: &ModelHealth) -> bool {
+        (self.model_available)(m) && !health.is_benched(m)
+    }
+
+    /// Pick the cheapest *usable* model from `candidates` (L1). Ranking key:
     /// `(prefer_subscription && subscription ? 0 : 1, estimated_cost, config_order)` — so a
     /// paid subscription (the $0 CLI bridges) wins when preferred, then lowest est. cost, then
-    /// the order the user listed candidates. `None` when none are usable.
-    fn cheapest_usable(&self, candidates: &[String]) -> Option<String> {
-        let prefer = self.config.mesh.prefer_subscription;
+    /// the order the user listed candidates. `None` when none are usable. The production path
+    /// uses [`ordered_usable_for_tier`](Self::ordered_usable_for_tier); this stays for the
+    /// cost-ranking unit tests.
+    #[cfg(test)]
+    fn cheapest_usable(&self, candidates: &[String], health: &ModelHealth) -> Option<String> {
         candidates
             .iter()
             .enumerate()
-            .filter(|(_, m)| (self.model_available)(m))
-            .min_by(|(ia, a), (ib, b)| {
-                let rank = |m: &str| u8::from(!(prefer && is_subscription(m)));
-                rank(a)
-                    .cmp(&rank(b))
-                    .then(
-                        self.pricing
-                            .estimated_cost(a)
-                            .total_cmp(&self.pricing.estimated_cost(b)),
-                    )
-                    .then(ia.cmp(ib))
-            })
+            .filter(|(_, m)| self.is_usable(m, health))
+            .min_by(|(ia, a), (ib, b)| self.cost_rank(a).cmp(&self.cost_rank(b)).then(ia.cmp(ib)))
             .map(|(_, m)| m.clone())
     }
 
+    /// Comparable cost ranking key for one model: `(not-preferred-subscription, est_cost)`.
+    fn cost_rank(&self, m: &str) -> (u8, CostKey) {
+        let prefer = self.config.mesh.prefer_subscription;
+        (
+            u8::from(!(prefer && is_subscription(m))),
+            CostKey(self.pricing.estimated_cost(m)),
+        )
+    }
+
     /// Count usable candidates (for the rationale).
-    fn usable_count(&self, candidates: &[String]) -> usize {
+    fn usable_count(&self, candidates: &[String], health: &ModelHealth) -> usize {
         candidates
             .iter()
-            .filter(|m| (self.model_available)(m))
+            .filter(|m| self.is_usable(m, health))
             .count()
     }
 
-    /// Cross-tier fallback: the cheapest usable candidate across tiers, most capable first.
-    /// Returns `original` unchanged if nothing anywhere is usable (it errors downstream with
-    /// the actionable MissingKey message — same as today).
-    fn cross_tier_cheapest(&self, original: &str, why: &mut String) -> String {
+    /// Usable candidates for one tier, in preference order: the auto-discovered capability
+    /// ranking (cost folded in) when auto is active, else cheapest-first over the configured
+    /// candidates.
+    fn ordered_usable_for_tier(&self, tier: TaskTier, health: &ModelHealth) -> Vec<String> {
+        let candidates = self.candidates_for_tier(tier);
+        let mut usable: Vec<String> = candidates
+            .iter()
+            .filter(|m| self.is_usable(m, health))
+            .cloned()
+            .collect();
+        if !self.auto_active() {
+            // Configured path: cost-aware order (auto path keeps the ranked order verbatim).
+            usable.sort_by_key(|m| self.cost_rank(m));
+        }
+        usable
+    }
+
+    /// Build the ordered failover chain for the routed tier: that tier's usable models first,
+    /// then the other tiers (Complex → Standard → Trivial) as cross-tier fallbacks, deduped.
+    fn build_chain(&self, routed: TaskTier, health: &ModelHealth) -> Vec<String> {
+        let mut chain = self.ordered_usable_for_tier(routed, health);
         for tier in [TaskTier::Complex, TaskTier::Standard, TaskTier::Trivial] {
-            if let Some(m) = self.cheapest_usable(&self.candidates_for_tier(tier)) {
-                why.push_str(&format!(
-                    " — fell back to {m} (no usable key for {original})"
-                ));
-                return m;
+            if tier == routed {
+                continue;
+            }
+            for m in self.ordered_usable_for_tier(tier, health) {
+                if !chain.contains(&m) {
+                    chain.push(m);
+                }
             }
         }
-        why.push_str(&format!(
-            " — warning: no usable key for {original} and no fallback"
-        ));
-        original.to_string()
+        chain
+    }
+}
+
+/// A `(u8, f64)`-comparable cost key. `f64` isn't `Ord`, so wrap it for use inside tuple
+/// `.cmp()`; NaN (no price → treated as a stable max) can't occur here as costs are finite.
+#[derive(PartialEq)]
+struct CostKey(f64);
+impl Eq for CostKey {}
+impl PartialOrd for CostKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for CostKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -410,6 +458,7 @@ impl HeuristicRouter {
         classified_tier: TaskTier,
         classify_reason: String,
         budget: BudgetState,
+        health: &ModelHealth,
     ) -> RoutingDecision {
         let exhausted = budget.status() == BudgetStatus::Exhausted;
         let cap_overrides_pin = self.config.mesh.budget.cap_overrides_pin;
@@ -421,15 +470,31 @@ impl HeuristicRouter {
             .filter(|_| !(exhausted && cap_overrides_pin))
         {
             let mut why = "pinned via --model".to_string();
-            let model = if (self.model_available)(pin) {
+            // Fallbacks even for a pin: if the pinned model is rate-limited/down mid-turn we
+            // still want to keep working.
+            let mut chain = self.build_chain(classified_tier, health);
+            let model = if self.is_usable(pin, health) {
                 pin.clone()
             } else {
-                self.cross_tier_cheapest(pin, &mut why)
+                match chain.first().cloned() {
+                    Some(m) => {
+                        why.push_str(&format!(" — fell back to {m} (no usable key for {pin})"));
+                        m
+                    }
+                    None => {
+                        why.push_str(&format!(
+                            " — warning: no usable key for {pin} and no fallback"
+                        ));
+                        pin.clone()
+                    }
+                }
             };
+            chain.retain(|m| m != &model);
             return RoutingDecision {
                 tier: classified_tier,
                 model,
                 rationale: why,
+                fallbacks: chain,
             };
         }
 
@@ -446,64 +511,78 @@ impl HeuristicRouter {
             classify_reason
         };
 
+        // The failover chain: usable models for the routed tier first, then cross-tier picks.
+        // `routed_usable` lets us tell a same-tier pick (normal rationale) from a cross-tier
+        // fallback ("fell back …") for the message.
         let auto = self.auto_active();
-        let candidates = self.candidates_for_tier(tier);
-        // Selection. In the **auto-discovery** path the catalog order already encodes capability
-        // *and* cost (the ranker folds both), so we take the first *usable* model in that order —
-        // re-sorting by raw cost here would wrongly pick a tiny cheap model for a Complex task.
-        // In the **configured** path we keep cost-aware selection over the user's candidates.
-        let chosen = if auto {
-            candidates
-                .iter()
-                .find(|m| (self.model_available)(m))
-                .cloned()
-        } else {
-            self.cheapest_usable(&candidates)
-        };
-        let model = match chosen {
-            Some(m) => {
-                if auto {
-                    why.push_str(&format!(
-                        " — auto-selected best of {} usable {} models: {m}",
-                        self.usable_count(&candidates),
-                        tier.as_str()
-                    ));
-                } else {
-                    let n = self.usable_count(&candidates);
-                    if n > 1 {
+        let routed_usable = self.ordered_usable_for_tier(tier, health);
+        let mut chain = self.build_chain(tier, health);
+        match chain.first().cloned() {
+            Some(model) => {
+                if routed_usable.contains(&model) {
+                    let n = self.usable_count(&self.candidates_for_tier(tier), health);
+                    if auto {
                         why.push_str(&format!(
-                            " — cheapest of {n} usable {} models: {m}",
+                            " — auto-selected best of {n} usable {} models: {model}",
+                            tier.as_str()
+                        ));
+                    } else if n > 1 {
+                        why.push_str(&format!(
+                            " — cheapest of {n} usable {} models: {model}",
                             tier.as_str()
                         ));
                     }
+                } else {
+                    let original = self
+                        .candidates_for_tier(tier)
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".into());
+                    why.push_str(&format!(
+                        " — fell back to {model} (no usable key for {original})"
+                    ));
                 }
-                if self.config.mesh.prefer_subscription && is_subscription(&m) {
+                if self.config.mesh.prefer_subscription && is_subscription(&model) {
                     why.push_str(" (paid subscription)");
                 }
-                m
+                chain.retain(|m| m != &model);
+                RoutingDecision {
+                    tier,
+                    model,
+                    rationale: why,
+                    fallbacks: chain,
+                }
             }
             None => {
-                let original = candidates
+                let original = self
+                    .candidates_for_tier(tier)
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "unknown".into());
-                self.cross_tier_cheapest(&original, &mut why)
+                why.push_str(&format!(
+                    " — warning: no usable key for {original} and no fallback"
+                ));
+                RoutingDecision {
+                    tier,
+                    model: original,
+                    rationale: why,
+                    fallbacks: Vec::new(),
+                }
             }
-        };
-
-        RoutingDecision {
-            tier,
-            model,
-            rationale: why,
         }
     }
 }
 
 #[async_trait]
 impl Router for HeuristicRouter {
-    async fn route(&self, prompt: &str, budget: BudgetState) -> RoutingDecision {
+    async fn route(
+        &self,
+        prompt: &str,
+        budget: BudgetState,
+        health: &ModelHealth,
+    ) -> RoutingDecision {
         let (tier, reason) = Self::classify(prompt);
-        self.decide(tier, reason, budget)
+        self.decide(tier, reason, budget, health)
     }
 }
 
@@ -519,7 +598,9 @@ mod tests {
 
     #[tokio::test]
     async fn short_prompt_is_trivial() {
-        let d = router().route("fix typo", BudgetState::default()).await;
+        let d = router()
+            .route("fix typo", BudgetState::default(), &ModelHealth::default())
+            .await;
         assert_eq!(d.tier, TaskTier::Trivial);
     }
 
@@ -617,7 +698,11 @@ mod tests {
     #[tokio::test]
     async fn keyword_forces_complex() {
         let d = router()
-            .route("refactor the auth module", BudgetState::default())
+            .route(
+                "refactor the auth module",
+                BudgetState::default(),
+                &ModelHealth::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Complex);
     }
@@ -625,7 +710,9 @@ mod tests {
     #[tokio::test]
     async fn medium_prompt_is_standard() {
         let prompt = "add a new endpoint that returns the list of users as json".repeat(2);
-        let d = router().route(&prompt, BudgetState::default()).await;
+        let d = router()
+            .route(&prompt, BudgetState::default(), &ModelHealth::default())
+            .await;
         assert_eq!(d.tier, TaskTier::Standard);
     }
 
@@ -637,7 +724,11 @@ mod tests {
             ..Default::default()
         };
         let d = router()
-            .route("refactor the whole architecture", budget)
+            .route(
+                "refactor the whole architecture",
+                budget,
+                &ModelHealth::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Trivial);
         assert!(d.rationale.contains("budget"));
@@ -651,6 +742,7 @@ mod tests {
             .route(
                 "rename x; but think hard about edge cases",
                 BudgetState::default(),
+                &ModelHealth::default(),
             )
             .await;
         assert_eq!(d.tier, TaskTier::Complex); // AC-6
@@ -659,7 +751,11 @@ mod tests {
     #[tokio::test]
     async fn fenced_code_is_at_least_standard_despite_short_length() {
         let d = router()
-            .route("```rust\nlet x=1;\n```", BudgetState::default())
+            .route(
+                "```rust\nlet x=1;\n```",
+                BudgetState::default(),
+                &ModelHealth::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Standard); // AC-5
     }
@@ -667,14 +763,20 @@ mod tests {
     #[tokio::test]
     async fn dev_verb_lifts_short_prompt_to_standard() {
         let d = router()
-            .route("integrate the parser", BudgetState::default())
+            .route(
+                "integrate the parser",
+                BudgetState::default(),
+                &ModelHealth::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Standard);
     }
 
     #[tokio::test]
     async fn fix_typo_stays_trivial_no_regression() {
-        let d = router().route("fix typo", BudgetState::default()).await;
+        let d = router()
+            .route("fix typo", BudgetState::default(), &ModelHealth::default())
+            .await;
         assert_eq!(d.tier, TaskTier::Trivial); // AC-7
     }
 
@@ -685,7 +787,9 @@ mod tests {
         let r = HeuristicRouter::new(Config::default())
             .with_availability(|_| true)
             .with_pin(Some("openai::gpt-4o".into()));
-        let d = r.route("fix typo", BudgetState::default()).await;
+        let d = r
+            .route("fix typo", BudgetState::default(), &ModelHealth::default())
+            .await;
         assert_eq!(d.model, "openai::gpt-4o"); // AC-1
         assert!(d.rationale.contains("pinned"));
     }
@@ -703,7 +807,9 @@ mod tests {
             daily_cap_usd: Some(5.0),
             ..Default::default()
         };
-        let d = r.route("design a system", budget).await;
+        let d = r
+            .route("design a system", budget, &ModelHealth::default())
+            .await;
         // pin ignored; trivial-tier model chosen (AC-2)
         assert_eq!(
             d.model,
@@ -720,7 +826,11 @@ mod tests {
         let r =
             HeuristicRouter::new(Config::default()).with_availability(|m| m.starts_with("ollama"));
         let d = r
-            .route("design the architecture", BudgetState::default())
+            .route(
+                "design the architecture",
+                BudgetState::default(),
+                &ModelHealth::default(),
+            )
             .await;
         assert_eq!(d.tier, TaskTier::Complex, "tier still reflects difficulty");
         assert!(
@@ -736,7 +846,11 @@ mod tests {
         // Nothing available → keep the routed model (errors downstream as today).
         let r = HeuristicRouter::new(Config::default()).with_availability(|_| false);
         let d = r
-            .route("design the architecture", BudgetState::default())
+            .route(
+                "design the architecture",
+                BudgetState::default(),
+                &ModelHealth::default(),
+            )
             .await;
         assert_eq!(
             d.model,
@@ -764,7 +878,10 @@ mod tests {
             "deepseek::deepseek-chat".to_string(),
             "openai::gpt-4o-mini".to_string(),
         ];
-        assert_eq!(r.cheapest_usable(&cands).unwrap(), "openai::gpt-4o-mini"); // AC-L1a
+        assert_eq!(
+            r.cheapest_usable(&cands, &ModelHealth::default()).unwrap(),
+            "openai::gpt-4o-mini"
+        ); // AC-L1a
     }
 
     #[test]
@@ -776,7 +893,10 @@ mod tests {
             "ollama::free".to_string(),
             "openai::gpt-4o-mini".to_string(),
         ];
-        assert_eq!(r.cheapest_usable(&cands).unwrap(), "openai::gpt-4o-mini"); // AC-L1b
+        assert_eq!(
+            r.cheapest_usable(&cands, &ModelHealth::default()).unwrap(),
+            "openai::gpt-4o-mini"
+        ); // AC-L1b
     }
 
     #[tokio::test]
@@ -787,7 +907,9 @@ mod tests {
         );
         let r = HeuristicRouter::new(c).with_availability(|_| true);
         let prompt = "add a new endpoint that returns the list of users as json".repeat(2);
-        let d = r.route(&prompt, BudgetState::default()).await;
+        let d = r
+            .route(&prompt, BudgetState::default(), &ModelHealth::default())
+            .await;
         assert_eq!(d.tier, TaskTier::Standard);
         assert_eq!(d.model, "openai::gpt-4o-mini");
         assert!(d.rationale.contains("cheapest of 2"), "{}", d.rationale);
@@ -805,7 +927,9 @@ mod tests {
             .with_availability(|_| true)
             .with_catalog(cat);
         let prompt = "design and architect a complex concurrency refactor across modules";
-        let d = r.route(prompt, BudgetState::default()).await;
+        let d = r
+            .route(prompt, BudgetState::default(), &ModelHealth::default())
+            .await;
         assert_eq!(d.tier, TaskTier::Complex);
         assert_eq!(d.model, "anthropic::claude-opus-4-8", "{}", d.rationale);
         assert!(d.rationale.contains("auto-selected"), "{}", d.rationale);
@@ -820,7 +944,9 @@ mod tests {
         let r = HeuristicRouter::new(Config::default())
             .with_availability(|_| true)
             .with_catalog(cat);
-        let d = r.route("fix typo", BudgetState::default()).await;
+        let d = r
+            .route("fix typo", BudgetState::default(), &ModelHealth::default())
+            .await;
         assert_eq!(d.tier, TaskTier::Trivial);
         assert_eq!(d.model, "groq::llama-3.1-8b-instant", "{}", d.rationale);
     }
@@ -841,6 +967,7 @@ mod tests {
             .route(
                 "design and architect a complex concurrency refactor across modules",
                 BudgetState::default(),
+                &ModelHealth::default(),
             )
             .await;
         assert_eq!(d.model, "openai::gpt-4o-mini", "{}", d.rationale);
@@ -857,7 +984,9 @@ mod tests {
         );
         let r = HeuristicRouter::new(c).with_availability(|_| true);
         let prompt = "add a new endpoint that returns the list of users as json".repeat(2);
-        let d = r.route(&prompt, BudgetState::default()).await;
+        let d = r
+            .route(&prompt, BudgetState::default(), &ModelHealth::default())
+            .await;
         assert_eq!(d.model, "openai::gpt-4o-mini");
     }
 
@@ -873,6 +1002,7 @@ mod tests {
             .route(
                 "design the system architecture carefully",
                 BudgetState::default(),
+                &ModelHealth::default(),
             )
             .await;
         assert_eq!(d.model, "claude-cli::");
@@ -890,9 +1020,98 @@ mod tests {
             .route(
                 "design the system architecture carefully",
                 BudgetState::default(),
+                &ModelHealth::default(),
             )
             .await;
         assert_eq!(d.model, "claude-cli::");
         assert!(!d.rationale.contains("paid subscription"));
+    }
+
+    // --- Model health / failover ---
+
+    fn benched(models: &[&str]) -> ModelHealth {
+        ModelHealth::new(models.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[tokio::test]
+    async fn benched_model_is_skipped_and_next_best_chosen() {
+        // Auto-discovery ranks opus #1 for Complex; bench it → the next usable model wins (AC-3).
+        let cat = ModelCatalog::new(vec![
+            "anthropic::claude-opus-4-8".into(),
+            "groq::llama-3.1-8b-instant".into(),
+        ]);
+        let r = HeuristicRouter::new(Config::default())
+            .with_availability(|_| true)
+            .with_catalog(cat);
+        let prompt = "design and architect a complex concurrency refactor across modules";
+        let d = r
+            .route(
+                prompt,
+                BudgetState::default(),
+                &benched(&["anthropic::claude-opus-4-8"]),
+            )
+            .await;
+        assert_eq!(d.tier, TaskTier::Complex);
+        assert_ne!(
+            d.model, "anthropic::claude-opus-4-8",
+            "benched model must not be chosen"
+        );
+        assert!(
+            !d.fallbacks
+                .contains(&"anthropic::claude-opus-4-8".to_string()),
+            "benched model must not appear as a fallback: {:?}",
+            d.fallbacks
+        );
+    }
+
+    #[tokio::test]
+    async fn decision_carries_an_ordered_failover_chain_excluding_the_pick() {
+        let cat = ModelCatalog::new(vec![
+            "anthropic::claude-opus-4-8".into(),
+            "groq::llama-3.1-8b-instant".into(),
+        ]);
+        let r = HeuristicRouter::new(Config::default())
+            .with_availability(|_| true)
+            .with_catalog(cat);
+        let d = r
+            .route(
+                "design and architect a complex concurrency refactor across modules",
+                BudgetState::default(),
+                &ModelHealth::default(),
+            )
+            .await;
+        assert!(
+            !d.fallbacks.is_empty(),
+            "expected a non-empty failover chain"
+        );
+        assert!(
+            !d.fallbacks.contains(&d.model),
+            "the pick must not also be a fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_benched_falls_through_to_the_no_fallback_warning() {
+        // Every model benched → behaves like nothing usable (AC-6 surfaces downstream).
+        let r = HeuristicRouter::new(Config::default()).with_availability(|_| true);
+        let everything =
+            HeuristicRouter::new(Config::default()).candidates_for_tier(TaskTier::Complex);
+        let refs: Vec<&str> = everything.iter().map(String::as_str).collect();
+        // Bench the complex candidates AND the cross-tier ones by benching all configured tiers.
+        let mut all: Vec<String> = Vec::new();
+        for t in [TaskTier::Complex, TaskTier::Standard, TaskTier::Trivial] {
+            all.extend(HeuristicRouter::new(Config::default()).candidates_for_tier(t));
+        }
+        let all_refs: Vec<&str> = all.iter().map(String::as_str).collect();
+        let _ = refs; // (kept for clarity; all_refs is the superset used below)
+        let d = r
+            .route(
+                "design the architecture",
+                BudgetState::default(),
+                &benched(&all_refs),
+            )
+            .await;
+        assert!(d.fallbacks.is_empty());
+        assert!(d.rationale.contains("no usable key"), "{}", d.rationale);
     }
 }

@@ -293,6 +293,76 @@ impl Store {
         self.spend_between(s, e)
     }
 
+    // --- Model health / failover (docs/features/model-health-failover.md) ---
+
+    /// Bench a model until `cooldown_until` (epoch secs), recording why. Upsert: a fresh failure
+    /// or probe overwrites any prior bench.
+    pub fn bench_model(&self, model: &str, cooldown_until: i64, reason: &str) -> Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO model_health (model, cooldown_until, reason, updated_at)
+             VALUES (?1, ?2, ?3, strftime('%s','now'))
+             ON CONFLICT(model) DO UPDATE SET
+               cooldown_until = excluded.cooldown_until,
+               reason = excluded.reason,
+               updated_at = excluded.updated_at",
+            (model, cooldown_until, reason),
+        )?;
+        Ok(())
+    }
+
+    /// Bench a model for `cooldown` from now (convenience over [`bench_model`] that owns the
+    /// clock, like [`spend_today_usd`](Self::spend_today_usd)).
+    pub fn bench_for(
+        &self,
+        model: &str,
+        cooldown: std::time::Duration,
+        reason: &str,
+    ) -> Result<()> {
+        let until = chrono::Utc::now().timestamp() + cooldown.as_secs() as i64;
+        self.bench_model(model, until, reason)
+    }
+
+    /// Currently-benched snapshot as of *now* (convenience over [`benched_models`]).
+    pub fn current_benched(&self) -> Result<forge_types::ModelHealth> {
+        self.benched_models(chrono::Utc::now().timestamp())
+    }
+
+    /// Currently-benched detailed report as of *now* (convenience over [`benched_report`]).
+    pub fn current_benched_report(&self) -> Result<Vec<(String, i64, String)>> {
+        self.benched_report(chrono::Utc::now().timestamp())
+    }
+
+    /// Clear any bench on a model (e.g. a healthy probe). No-op if it wasn't benched.
+    pub fn clear_model_health(&self, model: &str) -> Result<()> {
+        self.lock()?
+            .execute("DELETE FROM model_health WHERE model = ?1", [model])?;
+        Ok(())
+    }
+
+    /// Snapshot of models still benched as of `now` (epoch secs) — cooldown not yet elapsed.
+    pub fn benched_models(&self, now: i64) -> Result<forge_types::ModelHealth> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT model FROM model_health WHERE cooldown_until > ?1")?;
+        let set = stmt
+            .query_map([now], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
+        Ok(forge_types::ModelHealth::new(set))
+    }
+
+    /// Detailed view of currently-benched models (model, cooldown_until, reason) for the CLI /
+    /// startup hint, newest cooldown first.
+    pub fn benched_report(&self, now: i64) -> Result<Vec<(String, i64, String)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT model, cooldown_until, reason FROM model_health
+             WHERE cooldown_until > ?1 ORDER BY cooldown_until DESC",
+        )?;
+        let rows = stmt
+            .query_map([now], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Number of messages in a session.
     pub fn message_count(&self, session_id: &str) -> Result<i64> {
         Ok(self.lock()?.query_row(
@@ -593,5 +663,57 @@ mod tests {
         let matches = store.matching_session_ids(&prefix).unwrap();
         assert_eq!(matches, vec![id]);
         assert!(store.matching_session_ids("zzzzzzzz").unwrap().is_empty());
+    }
+
+    // --- Model health / failover ---
+
+    #[test]
+    fn benched_model_is_in_snapshot_until_cooldown_elapses() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .bench_model("gemini::antigravity", 1000, "rate-limited")
+            .unwrap();
+        // now=500 < cooldown 1000 → still benched (AC-3).
+        assert!(store
+            .benched_models(500)
+            .unwrap()
+            .is_benched("gemini::antigravity"));
+        // now=1001 > cooldown → eligible again (AC-4).
+        assert!(!store
+            .benched_models(1001)
+            .unwrap()
+            .is_benched("gemini::antigravity"));
+    }
+
+    #[test]
+    fn bench_is_upsert_and_clear_removes_it() {
+        let store = Store::open_in_memory().unwrap();
+        store.bench_model("m", 1000, "rate-limited").unwrap();
+        store.bench_model("m", 2000, "auth failed").unwrap(); // upsert, no PK clash
+        let report = store.benched_report(500).unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(
+            report[0],
+            ("m".to_string(), 2000, "auth failed".to_string())
+        );
+        store.clear_model_health("m").unwrap();
+        assert!(store.benched_models(500).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bench_persists_across_reopen() {
+        // Same file → a daily-quota bench survives a Forge restart (AC-3).
+        let dir = std::env::temp_dir().join(forge_types::new_id());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("forge.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .bench_model("m", 9_999_999_999, "probe: quota 0")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert!(store.benched_models(500).unwrap().is_benched("m"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

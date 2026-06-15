@@ -58,4 +58,11 @@ CREATE TABLE IF NOT EXISTS usage (
     created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_usage_created_at ON usage(created_at);
+
+CREATE TABLE IF NOT EXISTS model_health (
+    model          TEXT PRIMARY KEY,
+    cooldown_until INTEGER NOT NULL,   -- epoch secs; the model is benched while this is > now
+    reason         TEXT NOT NULL,      -- "rate-limited", "auth failed", "probe: quota 0", …
+    updated_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
 "#;

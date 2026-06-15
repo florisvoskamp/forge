@@ -100,7 +100,9 @@ async fn tool_call_is_translated() {
 }
 
 #[tokio::test]
-async fn http_error_maps_to_provider_error_not_panic() {
+async fn http_500_maps_to_unavailable_for_failover() {
+    // A 5xx is a transient provider problem → classified Unavailable (retryable) so the mesh
+    // benches the model and fails over (model-health-failover), not a hard Request failure.
     let server = MockServer::start_async().await;
     let _m = server.mock(|when, then| {
         when.method(POST).path("/chat/completions");
@@ -117,5 +119,6 @@ async fn http_error_maps_to_provider_error_not_panic() {
         )
         .await
         .expect_err("a 500 must surface as an error");
-    assert!(matches!(err, ProviderError::Request(_)));
+    assert!(err.is_retryable(), "5xx should be retryable: {err:?}");
+    assert!(matches!(err, ProviderError::Unavailable(_)), "got {err:?}");
 }

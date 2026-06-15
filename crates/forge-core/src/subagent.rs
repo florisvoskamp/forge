@@ -229,8 +229,14 @@ pub async fn run_subagent(
             tier,
             model: model.to_string(),
             rationale: format!("pinned by agent type '{}'", agent.name),
+            fallbacks: Vec::new(),
         },
-        None => ctx.router.route(task, budget).await,
+        // Route around benched models too (model-health-failover): a child still avoids a
+        // model the parent just rate-limited.
+        None => {
+            let health = ctx.store.current_benched().unwrap_or_default();
+            ctx.router.route(task, budget, &health).await
+        }
     };
 
     let mut transcript = vec![Message::system(&agent.system_prompt), Message::user(task)];

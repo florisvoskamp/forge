@@ -33,6 +33,8 @@ pub enum CoreError {
     Json(#[from] serde_json::Error),
     #[error("session not found: {0}")]
     SessionNotFound(String),
+    #[error("no healthy model available: every routed/fallback model is rate-limited or down")]
+    NoHealthyModel,
 }
 
 /// One interactive session. Construct with [`Session::start`], then drive [`Session::run_turn`].
@@ -265,7 +267,10 @@ impl Session {
             BudgetStatus::Ok => {}
         }
 
-        let decision = self.router.route(prompt, budget).await;
+        // Route around any currently-benched models (failover): the snapshot excludes models
+        // whose cooldown hasn't elapsed, even across restarts (model-health-failover).
+        let health = self.store.current_benched().unwrap_or_default();
+        let decision = self.router.route(prompt, budget, &health).await;
         self.presenter.emit(PresenterEvent::Routing {
             tier: decision.tier.as_str().to_string(),
             model: decision.model.clone(),
@@ -281,17 +286,29 @@ impl Session {
         let specs = self.tool_specs();
         let mut final_text = String::new();
 
+        // Failover state (model-health-failover): try `active_model`, and on a *retryable*
+        // provider error (rate-limit / unavailable / auth) bench it and advance down the
+        // routed decision's fallback chain. `active_model` is the model that actually answered,
+        // so cost / usage / routing are recorded against it (not the original pick).
+        let failover_enabled = self.config.mesh.failover;
+        let default_cooldown =
+            std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
+        let mut chain = decision.fallbacks.clone().into_iter();
+        let mut active_model = decision.model.clone();
+
         // 3. Model <-> tool loop.
         for step in 0..MAX_STEPS {
-            // Stream the reply: deltas flow to the presenter as the model produces them.
-            let mut resp =
-                {
-                    let provider = &self.provider;
-                    let presenter = &mut self.presenter;
-                    let r =
+            // Stream the reply, with transparent failover for this step's completion.
+            let mut resp = loop {
+                // Tight scope: borrow provider + presenter only for the streamed call, so the
+                // failover branch below has full `&mut self` for benching + warnings.
+                let result =
+                    {
+                        let provider = &self.provider;
+                        let presenter = &mut self.presenter;
                         provider
                             .complete(
-                                &decision.model,
+                                &active_model,
                                 &self.transcript,
                                 &specs,
                                 &mut |ev: StreamEvent| match ev {
@@ -325,16 +342,46 @@ impl Session {
                                     }),
                                 },
                             )
-                            .await?;
-                    if !r.content.is_empty() {
-                        presenter.emit(PresenterEvent::AssistantDone);
+                            .await
+                    };
+                match result {
+                    Ok(r) => {
+                        if !r.content.is_empty() {
+                            self.presenter.emit(PresenterEvent::AssistantDone);
+                        }
+                        break r;
                     }
-                    r
-                };
+                    Err(e) if failover_enabled && e.is_retryable() => {
+                        let reason = e.reason();
+                        let _ = self.store.bench_for(
+                            &active_model,
+                            e.cooldown(default_cooldown),
+                            reason,
+                        );
+                        self.presenter.emit(PresenterEvent::Warning(format!(
+                            "{active_model} {reason} — failing over"
+                        )));
+                        match chain.next() {
+                            Some(next) => {
+                                self.presenter.emit(PresenterEvent::Routing {
+                                    tier: decision.tier.as_str().to_string(),
+                                    model: next.clone(),
+                                    rationale: format!("failover from {active_model}"),
+                                });
+                                active_model = next;
+                                continue;
+                            }
+                            // Nothing healthy left to try (AC-6).
+                            None => return Err(CoreError::NoHealthyModel),
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            };
 
             // Compute the real cost from token counts and the model's price (FR-5, A-7).
             resp.usage.cost_usd = self.pricing.cost_for(
-                &decision.model,
+                &active_model,
                 resp.usage.input_tokens,
                 resp.usage.output_tokens,
             );
@@ -350,7 +397,7 @@ impl Session {
                 seq,
                 Role::Assistant,
                 &resp.content,
-                Some(&decision.model),
+                Some(&active_model),
                 &resp.tool_calls,
                 None,
             )?;
@@ -358,7 +405,7 @@ impl Session {
                 self.store.record_routing(
                     &msg_id,
                     decision.tier,
-                    &decision.model,
+                    &active_model,
                     &decision.rationale,
                 )?;
             }
@@ -1426,5 +1473,144 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Model health / failover (model-health-failover) ---
+
+    /// A router that returns a fixed model + fallback chain, so the failover loop is testable
+    /// without depending on discovery/availability.
+    struct FixedRouter {
+        model: String,
+        fallbacks: Vec<String>,
+    }
+    #[async_trait::async_trait]
+    impl Router for FixedRouter {
+        async fn route(
+            &self,
+            _prompt: &str,
+            _budget: BudgetState,
+            _health: &forge_types::ModelHealth,
+        ) -> forge_mesh::RoutingDecision {
+            forge_mesh::RoutingDecision {
+                tier: forge_types::TaskTier::Trivial,
+                model: self.model.clone(),
+                rationale: "test".into(),
+                fallbacks: self.fallbacks.clone(),
+            }
+        }
+    }
+
+    /// A provider that fails for `bad` models (with a chosen error) and answers for any other.
+    struct FlakyProvider {
+        bad: std::collections::HashSet<String>,
+        err: fn(&str) -> forge_provider::ProviderError,
+    }
+    #[async_trait::async_trait]
+    impl Provider for FlakyProvider {
+        async fn complete(
+            &self,
+            model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            if self.bad.contains(model) {
+                return Err((self.err)(model));
+            }
+            on_event(StreamEvent::Text("recovered".into()));
+            Ok(forge_provider::ModelResponse {
+                content: "recovered".into(),
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+            })
+        }
+    }
+
+    fn rate_limited(_m: &str) -> forge_provider::ProviderError {
+        forge_provider::ProviderError::RateLimited {
+            message: "429".into(),
+            retry_after: Some(std::time::Duration::from_secs(42)),
+        }
+    }
+
+    fn fixed_session(
+        provider: Arc<dyn Provider>,
+        router: Arc<dyn Router>,
+    ) -> (Arc<Store>, Session) {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let session = Session::start(
+            Arc::clone(&store),
+            provider,
+            router,
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+        (store, session)
+    }
+
+    #[tokio::test]
+    async fn retryable_error_benches_the_model_and_fails_over() {
+        // AC-1 + AC-2: the primary 429s → benched (with the server's 42s cooldown) → the turn
+        // retries on the fallback and succeeds.
+        let provider = Arc::new(FlakyProvider {
+            bad: ["bad::model".to_string()].into_iter().collect(),
+            err: rate_limited,
+        });
+        let router = Arc::new(FixedRouter {
+            model: "bad::model".into(),
+            fallbacks: vec!["good::model".into()],
+        });
+        let (store, mut session) = fixed_session(provider, router);
+        let answer = session.run_turn("hi").await.unwrap();
+        assert_eq!(answer, "recovered");
+        // The bad model is benched; the cooldown reflects the server's 42s (not the default).
+        let report = store.current_benched_report().unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].0, "bad::model");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            (report[0].1 - now - 42).abs() <= 2,
+            "cooldown ~42s: {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_error_does_not_fail_over_or_bench() {
+        // AC-5: a 400-style error fails the turn as before; the model is NOT benched.
+        let provider = Arc::new(FlakyProvider {
+            bad: ["bad::model".to_string()].into_iter().collect(),
+            err: |_| forge_provider::ProviderError::Request("bad request".into()),
+        });
+        let router = Arc::new(FixedRouter {
+            model: "bad::model".into(),
+            fallbacks: vec!["good::model".into()],
+        });
+        let (store, mut session) = fixed_session(provider, router);
+        assert!(session.run_turn("hi").await.is_err());
+        assert!(store.current_benched().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausting_the_chain_returns_no_healthy_model() {
+        // AC-6: primary 429s, no fallbacks → a clear error, not a hang.
+        let provider = Arc::new(FlakyProvider {
+            bad: ["bad::model".to_string()].into_iter().collect(),
+            err: rate_limited,
+        });
+        let router = Arc::new(FixedRouter {
+            model: "bad::model".into(),
+            fallbacks: vec![],
+        });
+        let (_store, mut session) = fixed_session(provider, router);
+        assert!(matches!(
+            session.run_turn("hi").await,
+            Err(CoreError::NoHealthyModel)
+        ));
     }
 }
