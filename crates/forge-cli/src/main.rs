@@ -284,7 +284,7 @@ async fn spawn_assay(
     let config = forge_config::load().unwrap_or_default();
     let pricing = forge_mesh::pricing::Pricing::from_config(&config);
     let store = open_store()?;
-    let cat = discover_catalog().await;
+    let cat = discover_catalog(&config).await;
     if cat.is_empty() {
         app.note("assay: no models available — `forge auth <provider>` or run ollama");
         return Ok(None);
@@ -478,7 +478,7 @@ pub(crate) fn build_provider_and_router(
 /// auto-discovery routing: query each provider that has a key (plus keyless local `ollama`) for
 /// its model list, with a short per-provider timeout, and skip any that error. Cheap providers
 /// usually number 1–3, so this runs sequentially at session start (cached for the process).
-async fn discover_catalog() -> forge_mesh::ModelCatalog {
+async fn discover_catalog(config: &forge_config::Config) -> forge_mesh::ModelCatalog {
     use std::time::Duration;
     let mut models = Vec::new();
     // Keyless local first, then every key-holding provider.
@@ -498,8 +498,26 @@ async fn discover_catalog() -> forge_mesh::ModelCatalog {
     // Always-available subscription bridges (claude-cli/codex-cli) if their CLI is installed.
     // They don't rate-limit like the free API tiers, so the mesh can rely on them — and being
     // $0 subscriptions they rank first (prefer_subscription), so routing reaches a working model
-    // instead of erroring out when metered providers are throttled.
-    models.extend(forge_provider::available_bridge_models());
+    // instead of erroring out when metered providers are throttled. Each installed bridge
+    // contributes its bare default id PLUS one id per model alias (config override, else the
+    // bridge's built-in defaults) so the mesh can size each turn (haiku/mini ↔ opus) instead of
+    // seeing a single model. A stale alias just benches itself via failover — never a hard error.
+    for k in forge_provider::CliKind::all()
+        .into_iter()
+        .filter(|k| k.available())
+    {
+        let prefix = k.prefix();
+        models.push(k.default_model_id());
+        match config.mesh.bridge_models.get(prefix) {
+            Some(custom) if !custom.is_empty() => {
+                models.extend(custom.iter().map(|m| format!("{prefix}::{m}")));
+            }
+            _ => models.extend(k.default_models().iter().map(|m| format!("{prefix}::{m}"))),
+        }
+    }
+    // Dedup while preserving discovery order (a provider could list the same id twice).
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|m| seen.insert(m.clone()));
     forge_mesh::ModelCatalog::new(models)
 }
 
@@ -508,7 +526,7 @@ async fn discover_catalog() -> forge_mesh::ModelCatalog {
 async fn models(probe: bool) -> Result<()> {
     forge_config::inject_provider_keys();
     let config = forge_config::load().unwrap_or_default();
-    let cat = discover_catalog().await;
+    let cat = discover_catalog(&config).await;
     if cat.is_empty() {
         println!(
             "no models discovered — set a provider key (`forge auth <provider>`) or run ollama"
@@ -522,17 +540,42 @@ async fn models(probe: bool) -> Result<()> {
         println!();
     }
 
-    println!("discovered {} usable models:", cat.models().len());
-    let benched = store.current_benched().unwrap_or_default();
-    for m in cat.models() {
-        let mark = if benched.is_benched(m) {
-            "  (benched)"
-        } else {
-            ""
-        };
-        println!("  {m}{mark}");
-    }
     let pricing = forge_mesh::pricing::Pricing::from_config(&config);
+    let benched = store.current_benched().unwrap_or_default();
+    let s = cat.stats(&pricing);
+    println!(
+        "{} models · {} frontier · {} free · {} subscription · {} paid · {} providers\n",
+        s.total, s.frontier, s.free, s.subscription, s.paid, s.providers
+    );
+    for g in cat.by_provider(&pricing) {
+        println!("{} ({} models)", g.provider, g.total());
+        for m in &g.models {
+            let name = if m.name.is_empty() {
+                "(default)"
+            } else {
+                m.name.as_str()
+            };
+            let mut tags: Vec<String> = Vec::new();
+            if m.subscription {
+                tags.push("subscription".into());
+            }
+            if m.frontier {
+                tags.push("frontier".into());
+            }
+            if m.free {
+                tags.push("free".into());
+            }
+            if m.cost > f64::EPSILON {
+                tags.push(format!("paid ~${:.4}/turn", m.cost));
+            } else if m.paid {
+                tags.push("paid".into());
+            }
+            if benched.is_benched(&m.id) {
+                tags.push("benched".into());
+            }
+            println!("  {name:<30} {}", tags.join(" · "));
+        }
+    }
     println!("\nmesh auto-pick per tier:");
     for tier in [TaskTier::Trivial, TaskTier::Standard, TaskTier::Complex] {
         // Mirror routing: skip benched models so the shown pick is the one the mesh would
@@ -628,25 +671,27 @@ async fn build_session_with(
     // Auto-discovery: build a live model catalog so the mesh routes to the best usable model
     // (docs/features/auto-discovery-mesh.md). Skipped for the offline mock and when disabled.
     let catalog = if !mock && config.mesh.auto_discover {
-        Some(discover_catalog().await)
+        Some(discover_catalog(&config).await)
     } else {
         None
     };
-    let (provider, router) = build_provider_and_router(&config, mock, pin, catalog);
+    let (provider, router) = build_provider_and_router(&config, mock, pin, catalog.clone());
     let tools = ToolRegistry::with_core_tools();
 
-    match resume {
+    let mut session = match resume {
         Some(prefix) => {
             let full = resolve_session(&store, &prefix)?;
             Session::resume(store, provider, router, tools, presenter, config, &full)
-                .with_context(|| format!("resuming session {full}"))
+                .with_context(|| format!("resuming session {full}"))?
         }
         None => {
             let cwd = std::env::current_dir()?.display().to_string();
             Session::start(store, provider, router, tools, presenter, config, &cwd)
-                .context("starting session")
+                .context("starting session")?
         }
-    }
+    };
+    session.set_catalog(catalog);
+    Ok(session)
 }
 
 /// Build a session with the default surface (TUI on a tty, else plain).
@@ -866,12 +911,33 @@ async fn run_chat_tui(
             // acts on the selection (resume / rewind), Esc cancels.
             if app.picker.open {
                 match key {
-                    KeyKind::Esc => app.picker.close(),
+                    KeyKind::Esc => {
+                        // In the models browser, Esc from a drilled-in provider steps back to the
+                        // provider list rather than closing the whole picker.
+                        if app.picker.kind == Some(forge_tui::PickerKind::Models)
+                            && app.models_drilled.is_some()
+                        {
+                            open_models_root(&session, &mut app).await?;
+                        } else {
+                            app.models_drilled = None;
+                            app.picker.close();
+                        }
+                    }
                     KeyKind::Up => app.picker.move_up(),
                     KeyKind::Down => app.picker.move_down(),
                     KeyKind::Enter => {
                         let chosen = app.picker.selected_row().cloned();
                         let kind = app.picker.kind;
+                        // The models browser drills (provider → models) on Enter instead of
+                        // resolving; model rows are terminal. Keep the picker open either way.
+                        if kind == Some(forge_tui::PickerKind::Models) {
+                            if let Some(row) = chosen {
+                                if app.models_drilled.is_none() && !row.id.contains("::") {
+                                    open_models_provider(&session, &mut app, &row.id).await?;
+                                }
+                            }
+                            continue;
+                        }
                         app.picker.close();
                         if let (Some(row), Some(kind)) = (chosen, kind) {
                             if kind == forge_tui::PickerKind::AssayChoice {
@@ -1201,6 +1267,9 @@ async fn dispatch_command(
         // its filter. Resolving + swapping the session happens on Enter (picker_accept).
         CommandAction::Resume(prefix) => open_sessions_picker(app, &prefix)?,
         CommandAction::ListSessions => open_sessions_picker(app, "")?,
+        // `/models` opens the interactive model browser: a provider list (with global counts in
+        // the heading) that drills into each provider's models on Enter; Esc steps back.
+        CommandAction::ListModels => open_models_root(session, app).await?,
         // `/undo` and `/checkpoints` both open the same interactive picker over the per-turn
         // checkpoints — pick any past message to rewind (chat + files) to. Enter acts in
         // picker_accept.
@@ -1291,6 +1360,145 @@ fn checkpoint_rows(cps: &[forge_store::CheckpointRow]) -> Vec<forge_tui::PickerR
         .collect()
 }
 
+/// Build the top-level provider list for the `/models` browser, with a stats heading.
+fn models_provider_view(
+    cat: &forge_mesh::ModelCatalog,
+    pricing: &forge_mesh::pricing::Pricing,
+    benched: &forge_types::ModelHealth,
+) -> (String, Vec<forge_tui::PickerRow>) {
+    let s = cat.stats(pricing);
+    let heading = format!(
+        "⊞ models — {} total · {} frontier · {} free · {} subscription · {} providers",
+        s.total, s.frontier, s.free, s.subscription, s.providers
+    );
+    let rows = cat
+        .by_provider(pricing)
+        .into_iter()
+        .map(|g| {
+            let benched_n = g
+                .models
+                .iter()
+                .filter(|m| benched.is_benched(&m.id))
+                .count();
+            let mut parts = vec![format!("{} models", g.total())];
+            if g.frontier() > 0 {
+                parts.push(format!("{} frontier", g.frontier()));
+            }
+            if g.free() > 0 {
+                parts.push(format!("{} free", g.free()));
+            }
+            if g.paid() > 0 {
+                parts.push(format!("{} paid", g.paid()));
+            }
+            if benched_n > 0 {
+                parts.push(format!("{benched_n} benched"));
+            }
+            forge_tui::PickerRow {
+                id: g.provider.clone(),
+                title: g.provider.clone(),
+                subtitle: parts.join(" · "),
+            }
+        })
+        .collect();
+    (heading, rows)
+}
+
+/// Build the drill-in model list for one provider (Enter on a provider row).
+fn models_for_provider(
+    cat: &forge_mesh::ModelCatalog,
+    pricing: &forge_mesh::pricing::Pricing,
+    benched: &forge_types::ModelHealth,
+    provider: &str,
+) -> (String, Vec<forge_tui::PickerRow>) {
+    let rows: Vec<forge_tui::PickerRow> = cat
+        .by_provider(pricing)
+        .into_iter()
+        .find(|g| g.provider == provider)
+        .map(|g| {
+            g.models
+                .iter()
+                .map(|m| {
+                    let name = if m.name.is_empty() {
+                        "(default model)".to_string()
+                    } else {
+                        m.name.clone()
+                    };
+                    let mut badges: Vec<String> = Vec::new();
+                    if m.subscription {
+                        badges.push("subscription".into());
+                    }
+                    if m.frontier {
+                        badges.push("frontier".into());
+                    }
+                    if m.free {
+                        badges.push("free".into());
+                    }
+                    if m.cost > f64::EPSILON {
+                        badges.push(format!("paid ~${:.4}/turn", m.cost));
+                    } else if m.paid {
+                        badges.push("paid".into()); // metered gateway model, price unknown
+                    }
+                    if benched.is_benched(&m.id) {
+                        badges.push("benched".into());
+                    }
+                    forge_tui::PickerRow {
+                        id: m.id.clone(),
+                        title: name,
+                        subtitle: badges.join(" · "),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let heading = format!("⊞ {provider} — {} model(s)  ·  esc: back", rows.len());
+    (heading, rows)
+}
+
+/// Open the `/models` browser at the top-level provider list (also the Esc target from a drill-in).
+async fn open_models_root(
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    app: &mut forge_tui::App,
+) -> Result<()> {
+    let benched = open_store()?.current_benched().unwrap_or_default();
+    let view = {
+        let s = session.lock().await;
+        s.catalog()
+            .map(|c| models_provider_view(c, s.pricing(), &benched))
+    };
+    match view {
+        Some((heading, rows)) if !rows.is_empty() => {
+            app.models_drilled = None;
+            app.picker
+                .open_with(forge_tui::PickerKind::Models, &heading, rows);
+        }
+        Some(_) => app.note(
+            "no models discovered — set a provider key (`forge auth <provider>`) or run ollama",
+        ),
+        None => app.note("model discovery is off (mock/offline) — nothing to browse"),
+    }
+    Ok(())
+}
+
+/// Drill the `/models` browser into one provider's models.
+async fn open_models_provider(
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    app: &mut forge_tui::App,
+    provider: &str,
+) -> Result<()> {
+    let benched = open_store()?.current_benched().unwrap_or_default();
+    let view = {
+        let s = session.lock().await;
+        s.catalog()
+            .map(|c| models_for_provider(c, s.pricing(), &benched, provider))
+    };
+    if let Some((heading, rows)) = view {
+        app.models_drilled = Some(provider.to_string());
+        app.picker
+            .open_with(forge_tui::PickerKind::Models, &heading, rows);
+    }
+    Ok(())
+}
+
 /// Act on the picker's selected row: resume the chosen session, or rewind to the chosen
 /// checkpoint — then redraw the surviving transcript into scrollback.
 async fn picker_accept(
@@ -1343,6 +1551,8 @@ async fn picker_accept(
         }
         // Assay's choice is handled in the render loop (it spawns a background task), never here.
         forge_tui::PickerKind::AssayChoice => {}
+        // The models browser drills/steps within the render loop; Enter never resolves here.
+        forge_tui::PickerKind::Models => {}
     }
     Ok(())
 }
@@ -1387,6 +1597,46 @@ mod tests {
         // runs must route logs to a file; only pipes/CI write to stderr.
         assert_eq!(log_target(true), LogTarget::File);
         assert_eq!(log_target(false), LogTarget::Stderr);
+    }
+
+    fn models_catalog() -> forge_mesh::ModelCatalog {
+        forge_mesh::ModelCatalog::new(vec![
+            "anthropic::claude-opus-4-8".into(),
+            "groq::llama-3.1-8b-instant".into(),
+            "groq::llama-3.3-70b-versatile".into(),
+            "claude-cli::".into(),
+        ])
+    }
+
+    #[test]
+    fn models_provider_view_heading_has_counts_and_rows_per_provider() {
+        let cat = models_catalog();
+        let pricing = forge_mesh::pricing::Pricing::default();
+        let (heading, rows) = models_provider_view(&cat, &pricing, &Default::default());
+        assert!(heading.contains("4 total"), "heading counts: {heading}");
+        assert!(heading.contains("2 frontier") && heading.contains("1 subscription"));
+        // groq has 2 models → it's the first (richest) provider row.
+        assert_eq!(rows[0].id, "groq");
+        assert!(rows[0].subtitle.contains("2 models"));
+        // every provider row is a header (no `::` in id) so the browser knows it can drill.
+        assert!(rows.iter().all(|r| !r.id.contains("::")));
+    }
+
+    #[test]
+    fn models_for_provider_lists_models_with_badges() {
+        let cat = models_catalog();
+        let pricing = forge_mesh::pricing::Pricing::default();
+        let (heading, rows) = models_for_provider(&cat, &pricing, &Default::default(), "groq");
+        assert!(heading.contains("groq") && heading.contains("esc: back"));
+        assert_eq!(rows.len(), 2);
+        // model rows carry the full id (so Enter on them is a no-op, not a drill) + badges.
+        assert!(rows.iter().all(|r| r.id.contains("::")));
+        let frontier = rows.iter().find(|r| r.id.contains("70b")).unwrap();
+        assert!(frontier.subtitle.contains("frontier") && frontier.subtitle.contains("free"));
+        // the bare subscription bridge shows "(default model)" as its name + a subscription badge.
+        let (_, sub) = models_for_provider(&cat, &pricing, &Default::default(), "claude-cli");
+        assert_eq!(sub[0].title, "(default model)");
+        assert!(sub[0].subtitle.contains("subscription"));
     }
 
     #[test]

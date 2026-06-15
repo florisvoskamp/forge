@@ -11,7 +11,7 @@ pub mod capability;
 pub mod catalog;
 pub mod pricing;
 
-pub use catalog::ModelCatalog;
+pub use catalog::{CatalogStats, ModelCatalog, ModelInfo, ProviderGroup};
 
 /// Live budget context the router considers when choosing a tier. Carries both the daily
 /// and monthly axes (FR-5); the stricter of the two governs.

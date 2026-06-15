@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use forge_config::Config;
 use forge_mesh::pricing::Pricing;
-use forge_mesh::{BudgetState, BudgetStatus, Router};
+use forge_mesh::{BudgetState, BudgetStatus, ModelCatalog, Router};
 use forge_provider::{Provider, StreamEvent, ToolSpec};
 use forge_store::Store;
 use forge_tools::ToolRegistry;
@@ -66,6 +66,9 @@ pub struct Session {
     checkpoint_root: std::path::PathBuf,
     /// The seq that began the current turn (its user message), keying this turn's snapshot dir.
     current_turn_seq: i64,
+    /// The discovered model catalog (auto-discovery mesh), kept so the TUI `/models` browser can
+    /// classify + group what's available without re-running discovery. `None` for mock/offline.
+    catalog: Option<ModelCatalog>,
 }
 
 impl Session {
@@ -161,6 +164,7 @@ impl Session {
             seq,
             checkpoint_root: std::path::PathBuf::from(".forge/checkpoints"),
             current_turn_seq: 0,
+            catalog: None,
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -169,6 +173,21 @@ impl Session {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Attach the discovered catalog so the `/models` browser can read it (composition root).
+    pub fn set_catalog(&mut self, catalog: Option<ModelCatalog>) {
+        self.catalog = catalog;
+    }
+
+    /// The discovered model catalog, if auto-discovery ran for this session.
+    pub fn catalog(&self) -> Option<&ModelCatalog> {
+        self.catalog.as_ref()
+    }
+
+    /// The pricing table in effect (bundled defaults + config overrides), for cost display.
+    pub fn pricing(&self) -> &Pricing {
+        &self.pricing
     }
 
     /// Override where code shadow-snapshots are stored (default `.forge/checkpoints`). Used by the
