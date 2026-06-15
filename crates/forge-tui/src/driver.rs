@@ -47,6 +47,19 @@ impl ChannelPresenter {
     }
 }
 
+/// Block the current async task on a sync channel WITHOUT starving the tokio runtime. The
+/// presenter's `confirm`/`ask` are sync trait methods called from inside the async turn task;
+/// a bare `recv()` parks a worker and can stall the runtime — including the render loop's timer
+/// — so the whole TUI freezes (Ctrl-C dead). `block_in_place` hands the worker back to the
+/// runtime so the render loop keeps running and can deliver the user's answer.
+fn recv_blocking<T>(rx: &std::sync::mpsc::Receiver<T>) -> Result<T, std::sync::mpsc::RecvError> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| rx.recv())
+    } else {
+        rx.recv()
+    }
+}
+
 impl Presenter for ChannelPresenter {
     fn emit(&mut self, event: PresenterEvent) {
         let _ = self.tx.send(UiMsg::Event(event));
@@ -65,7 +78,7 @@ impl Presenter for ChannelPresenter {
         {
             return false;
         }
-        answer.recv().unwrap_or(false) // blocks this turn task until the loop answers
+        recv_blocking(&answer).unwrap_or(false) // blocks this turn task until the loop answers
     }
 
     fn ask(&mut self, question: &str, options: &[crate::QChoice], allow_other: bool) -> String {
@@ -82,9 +95,7 @@ impl Presenter for ChannelPresenter {
         {
             return crate::NO_ANSWER.to_string();
         }
-        answer
-            .recv()
-            .unwrap_or_else(|_| crate::NO_ANSWER.to_string()) // blocks the turn task until answered
+        recv_blocking(&answer).unwrap_or_else(|_| crate::NO_ANSWER.to_string())
     }
 
     fn read_line(&mut self) -> Option<String> {
@@ -99,8 +110,27 @@ pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
+/// Install (once) a panic hook that disables raw mode before the default hook prints, so a
+/// panic anywhere can never leave the terminal stuck. Idempotent across `Tui`/`TuiPresenter`.
+pub fn install_panic_restore() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
+            prev(info);
+        }));
+    });
+}
+
 impl Tui {
     pub fn new() -> io::Result<Self> {
+        // Belt-and-suspenders: if *anything* panics while the terminal is in raw mode, restore
+        // it before the panic prints — otherwise a panic would leave the shell wedged (no echo,
+        // Ctrl-C inert). `Drop` covers the normal/unwind path; this covers the print itself.
+        install_panic_restore();
         enable_raw_mode()?;
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::with_options(
@@ -166,5 +196,52 @@ impl Drop for Tui {
         let _ = self.terminal.show_cursor();
         // No alternate screen to leave: the conversation stays in the user's scrollback.
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::QChoice;
+
+    /// Regression: `ask`/`confirm` block on a sync channel from inside the async turn task. On a
+    /// single-worker multi-thread runtime a bare `recv()` parks the only worker → the answering
+    /// task can never run → deadlock (the real "frozen TUI, Ctrl-C dead"). `block_in_place` must
+    /// hand the worker back so the answer is delivered and `ask` returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn ask_does_not_starve_the_single_worker_runtime() {
+        let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
+
+        // The "turn" task: calls the blocking `ask()` (sync method) from within an async task.
+        let turn = tokio::spawn(async move {
+            let mut p = ChannelPresenter::new(tx);
+            p.ask(
+                "pick one",
+                &[QChoice {
+                    label: "A".into(),
+                    description: String::new(),
+                }],
+                false,
+            )
+        });
+
+        // The "render loop" task: must get CPU despite the turn blocking, receive the question,
+        // and reply. If the worker were starved this would never run.
+        let render = tokio::spawn(async move {
+            loop {
+                if let Ok(UiMsg::Question { reply, .. }) = rx.try_recv() {
+                    let _ = reply.send("A".to_string());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let answer = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .expect("ask() must not deadlock the runtime")
+            .unwrap();
+        render.await.unwrap();
+        assert_eq!(answer, "A");
     }
 }

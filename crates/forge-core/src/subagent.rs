@@ -252,16 +252,44 @@ pub async fn run_subagent(
     let mut final_text = String::new();
     let mut ok = true;
 
+    // Failover (model-health-failover): subagents fail over down the routed chain too, so a
+    // child whose model rate-limits/stalls doesn't kill the whole spawn.
+    let failover_enabled = ctx.config.mesh.failover;
+    let default_cooldown = std::time::Duration::from_secs(ctx.config.mesh.failover_cooldown_secs);
+    let mut chain = decision.fallbacks.clone().into_iter();
+    let mut active_model = decision.model.clone();
+
     for step in 0..MAX_STEPS {
         // Forward the child's streamed deltas so the orchestrator can show live per-child
-        // activity (RFC subagent-orchestration Phase 3b).
-        let mut sink = |ev: StreamEvent| on_delta(ev);
-        let mut resp = ctx
-            .provider
-            .complete(&decision.model, &transcript, &specs, &mut sink)
-            .await?;
+        // activity (RFC subagent-orchestration Phase 3b), with transparent failover.
+        let mut resp = loop {
+            let mut sink = |ev: StreamEvent| on_delta(ev);
+            match ctx
+                .provider
+                .complete(&active_model, &transcript, &specs, &mut sink)
+                .await
+            {
+                Ok(r) => break r,
+                Err(e) if failover_enabled && e.is_retryable() => {
+                    let _ = ctx.store.bench_for(
+                        &active_model,
+                        e.cooldown(default_cooldown),
+                        e.reason(),
+                    );
+                    match chain.next() {
+                        Some(next) => {
+                            tracing::debug!("subagent failover {active_model} -> {next}: {e}");
+                            active_model = next;
+                            continue;
+                        }
+                        None => return Err(e.into()),
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
         resp.usage.cost_usd = ctx.pricing.cost_for(
-            &decision.model,
+            &active_model,
             resp.usage.input_tokens,
             resp.usage.output_tokens,
         );
@@ -275,17 +303,13 @@ pub async fn run_subagent(
             next_seq(),
             Role::Assistant,
             &resp.content,
-            Some(&decision.model),
+            Some(&active_model),
             &resp.tool_calls,
             None,
         )?;
         if step == 0 {
-            ctx.store.record_routing(
-                &msg_id,
-                decision.tier,
-                &decision.model,
-                &decision.rationale,
-            )?;
+            ctx.store
+                .record_routing(&msg_id, decision.tier, &active_model, &decision.rationale)?;
         }
         ctx.store.record_usage(child_id, &msg_id, &resp.usage)?;
 
@@ -628,5 +652,110 @@ mod tests {
         assert!(!SUBAGENT_TOOLS.contains(&SPAWN_AGENTS_TOOL));
         // And the read-only set is exactly investigation tools (no write/shell).
         assert_eq!(SUBAGENT_TOOLS, &["read_file", "list_dir", "search"]);
+    }
+
+    // --- Subagent failover (model-health-failover): a child whose model rate-limits must
+    // fail over down its chain, not die — the bug the user hit ("run a testing task" → the
+    // spawned child 429'd). ---
+
+    struct FlakyProvider {
+        bad: std::collections::HashSet<String>,
+    }
+    #[async_trait::async_trait]
+    impl Provider for FlakyProvider {
+        async fn complete(
+            &self,
+            model: &str,
+            _messages: &[forge_types::Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            if self.bad.contains(model) {
+                return Err(forge_provider::ProviderError::RateLimited {
+                    message: "429".into(),
+                    retry_after: Some(std::time::Duration::from_secs(30)),
+                });
+            }
+            Ok(forge_provider::ModelResponse {
+                content: "child done".into(),
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+            })
+        }
+    }
+
+    struct FixedRouter {
+        model: String,
+        fallbacks: Vec<String>,
+    }
+    #[async_trait::async_trait]
+    impl Router for FixedRouter {
+        async fn route(
+            &self,
+            _p: &str,
+            _b: BudgetState,
+            _h: &forge_types::ModelHealth,
+        ) -> RoutingDecision {
+            RoutingDecision {
+                tier: TaskTier::Standard,
+                model: self.model.clone(),
+                rationale: "test".into(),
+                fallbacks: self.fallbacks.clone(),
+            }
+        }
+    }
+
+    fn ctx_with(
+        provider: Arc<dyn Provider>,
+        router: Arc<dyn Router>,
+        store: Arc<Store>,
+    ) -> AgentCtx {
+        let config = Config::default();
+        let pricing = Pricing::from_config(&config);
+        AgentCtx {
+            provider,
+            router,
+            store,
+            config,
+            pricing,
+            mode: PermissionMode::default(),
+            rules: Vec::new(),
+            depth: 1,
+            max_depth: 2,
+            agents: Arc::new(HashMap::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_fails_over_when_its_model_rate_limits() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let child = store
+            .create_child_session(".", "default", "parent")
+            .unwrap();
+        let provider = Arc::new(FlakyProvider {
+            bad: ["bad::model".to_string()].into_iter().collect(),
+        });
+        let router = Arc::new(FixedRouter {
+            model: "bad::model".into(),
+            fallbacks: vec!["good::model".into()],
+        });
+        let ctx = ctx_with(provider, router, Arc::clone(&store));
+        let agent = ResolvedAgent {
+            name: "general".into(),
+            task: "run a testing task".into(),
+            system_prompt: "you are a subagent".into(),
+            tools: Vec::new(),
+            tier: None,
+        };
+        let mut sink = |_: StreamEvent| {};
+        let out = run_subagent(&ctx, &child, &agent, BudgetState::default(), &mut sink)
+            .await
+            .expect("subagent must recover via failover, not error");
+        assert!(out.ok, "subagent succeeded on the fallback");
+        assert_eq!(out.final_text, "child done");
+        assert!(
+            store.current_benched().unwrap().is_benched("bad::model"),
+            "the rate-limited model was benched"
+        );
     }
 }

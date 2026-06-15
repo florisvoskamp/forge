@@ -11,6 +11,7 @@ repository.workspace = true
 forge-types.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+tokio.workspace = true
 pulldown-cmark.workspace = true
 syntect.workspace = true
 similar.workspace = true

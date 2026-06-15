@@ -25,6 +25,7 @@ pub struct TuiPresenter {
 impl TuiPresenter {
     /// Enter raw mode + an inline viewport and take over the bottom of the terminal.
     pub fn new() -> io::Result<Self> {
+        crate::driver::install_panic_restore();
         enable_raw_mode()?;
         // From here on, any failure must undo raw mode — Drop won't run because the
         // struct isn't constructed yet, which would otherwise leave the shell broken.

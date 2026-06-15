@@ -119,12 +119,60 @@ impl From<Mode> for PermissionMode {
     }
 }
 
+/// Where diagnostic logs go. On an interactive terminal we must NEVER write to stderr — the
+/// inline TUI shares the screen, and a library log (e.g. genai dumping a 429 body via
+/// `tracing::error!`) would shred the display. There, logs go to a file; otherwise stderr.
+#[derive(Debug, PartialEq, Eq)]
+enum LogTarget {
+    Stderr,
+    File,
+}
+
+fn log_target(interactive: bool) -> LogTarget {
+    if interactive {
+        LogTarget::File
+    } else {
+        LogTarget::Stderr
+    }
+}
+
+/// Install the tracing subscriber. Interactive → a log file under `.forge/` (so nothing ever
+/// leaks onto the TUI); non-interactive (pipe/CI) → stderr as before. Default level is `warn`
+/// unless `RUST_LOG` overrides.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    match log_target(std::io::stdout().is_terminal()) {
+        LogTarget::Stderr => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
+        }
+        LogTarget::File => {
+            let _ = std::fs::create_dir_all(".forge");
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(".forge/forge.log")
+            {
+                Ok(file) => tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_ansi(false)
+                    .with_writer(move || file.try_clone().expect("clone forge.log handle"))
+                    .init(),
+                // Can't open the log file → stay silent rather than corrupt the TUI.
+                Err(_) => tracing_subscriber::fmt()
+                    .with_env_filter(EnvFilter::new("off"))
+                    .init(),
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    init_tracing();
 
     let cli = Cli::parse();
     match cli.command {
@@ -582,6 +630,13 @@ async fn run_chat_tui(
         // fast typing to the frame rate (~16 keys/sec) — the source of the input lag.
         while let Some(key) = tui.poll_key().context("reading input")? {
             dirty = true;
+            // Esc / Ctrl-C ALWAYS quit — checked before any prompt handling, so the user can
+            // never get wedged at a permission/question prompt with no way out. A pending reply
+            // is dropped (its sender closes → the blocked turn task unblocks and the process exits).
+            if matches!(key, KeyKind::Esc) {
+                quit = true;
+                break;
+            }
             if let Some(reply) = pending.take() {
                 // Answering a permission prompt.
                 let yes = matches!(
@@ -610,10 +665,7 @@ async fn run_chat_tui(
                     InputOutcome::Editing => {}
                 }
             } else if busy {
-                if matches!(key, KeyKind::Esc) {
-                    quit = true;
-                    break;
-                }
+                // Mid-turn: ignore typing (quit is already handled above).
             } else if matches!(key, KeyKind::CycleTemper) {
                 // SHIFT+TAB: cycle the operating temper (idle only — never mid-turn).
                 let new = {
@@ -703,6 +755,14 @@ async fn run_chat_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_logs_go_to_a_file_never_the_tui() {
+        // The crash: genai logged a 429 body to stderr, shredding the inline TUI. Interactive
+        // runs must route logs to a file; only pipes/CI write to stderr.
+        assert_eq!(log_target(true), LogTarget::File);
+        assert_eq!(log_target(false), LogTarget::Stderr);
+    }
 
     #[test]
     fn chat_action_classifies_lines() {
