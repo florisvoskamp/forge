@@ -91,9 +91,13 @@ enum Command {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Mode {
+    #[value(alias = "guarded")]
     Default,
+    #[value(alias = "smith")]
     AcceptEdits,
+    #[value(alias = "unfettered")]
     Bypass,
+    #[value(alias = "survey")]
     Plan,
 }
 
@@ -404,6 +408,7 @@ async fn run_chat_tui(
     // The welcome banner is a one-time print into scrollback (not a render branch).
     tui.insert_lines(banner_lines(tui.width()));
     let mut app = App::default();
+    app.temper = session.lock().await.temper().label().to_string();
     let mut busy = false;
     let mut pending: Option<std::sync::mpsc::Sender<bool>> = None;
     // Baseline for the spinner: deriving the tick from elapsed time keeps the animation
@@ -438,6 +443,13 @@ async fn run_chat_tui(
                     quit = true;
                     break;
                 }
+            } else if matches!(key, KeyKind::CycleTemper) {
+                // SHIFT+TAB: cycle the operating temper (idle only — never mid-turn).
+                let new = {
+                    let mut sess = session.lock().await;
+                    sess.cycle_temper()
+                };
+                app.set_temper(new.label());
             } else {
                 match handle_key(&mut app.input, key) {
                     InputOutcome::Submit(line) => {

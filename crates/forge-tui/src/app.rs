@@ -62,6 +62,8 @@ pub struct App {
     pub routing: Option<RoutingView>,
     pub cost_usd: f64,
     pub done: bool,
+    /// The active operating temper label (e.g. "Guarded"), shown in the statusline.
+    pub temper: String,
     /// A pending permission question shown while the loop blocks on the user's y/n.
     pub prompt: Option<String>,
     /// The current input-line buffer (shown in the input box).
@@ -103,6 +105,8 @@ pub enum KeyKind {
     Backspace,
     Enter,
     Esc,
+    /// SHIFT+TAB — cycle the operating temper (handled by the shell, not the input line).
+    CycleTemper,
 }
 
 /// The result of feeding a keystroke to the input line.
@@ -132,6 +136,8 @@ pub fn handle_key(input: &mut String, key: KeyKind) -> InputOutcome {
             }
         }
         KeyKind::Esc => InputOutcome::Quit,
+        // Temper cycling is handled by the shell before reaching the input line; ignore here.
+        KeyKind::CycleTemper => InputOutcome::Editing,
     }
 }
 
@@ -242,6 +248,15 @@ impl App {
             }
             PresenterEvent::Done { .. } => self.done = true,
         }
+    }
+
+    /// Update the active temper label and note the switch in scrollback.
+    pub fn set_temper(&mut self, label: &str) {
+        self.temper = label.to_string();
+        self.flush.push(TextLine::from(vec![
+            Span::styled("  temper → ", Style::default().fg(DIM)),
+            Span::styled(label.to_string(), Style::default().fg(ORANGE).bold()),
+        ]));
     }
 
     /// Flush accumulated reasoning into scrollback as a dim "thinking" block (once), if any.
@@ -524,14 +539,22 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
         format!("${:.4}", app.cost_usd),
         Style::default().fg(OKGREEN).bold().bg(STATUSBG),
     ));
+    // The active temper (operating mode), always shown when set.
+    if !app.temper.is_empty() && w >= 46 {
+        left.push(sep());
+        left.push(Span::styled(
+            app.temper.clone(),
+            Style::default().fg(TOOLCYAN).bold().bg(STATUSBG),
+        ));
+    }
 
     if w >= 70 {
-        let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(22)]).split(area);
+        let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(24)]).split(area);
         frame.render_widget(Paragraph::new(TextLine::from(left)).style(bg), cols[0]);
         let hint = if app.done {
             "done · esc quit "
         } else {
-            "↵ send · esc quit "
+            "⇧⇥ temper · esc quit "
         };
         frame.render_widget(
             Paragraph::new(TextLine::from(Span::styled(
@@ -644,6 +667,40 @@ mod tests {
             "branch: {sb}"
         );
         assert!(sb.contains("2 agents"), "footer with count: {sb}");
+    }
+
+    #[test]
+    fn temper_shows_in_statusline_and_switch_notes_scrollback() {
+        let mut app = App {
+            temper: "Guarded".into(),
+            ..App::default()
+        };
+        // Wide enough that the temper segment renders.
+        assert!(
+            screen_wh(&app, 90, LIVE_H).contains("Guarded"),
+            "active temper shown in the statusline"
+        );
+
+        app.set_temper("Smith");
+        assert_eq!(app.temper, "Smith");
+        assert!(
+            screen_wh(&app, 90, LIVE_H).contains("Smith"),
+            "statusline reflects the new temper"
+        );
+        assert!(
+            flush_text(&mut app).contains("temper → Smith"),
+            "a switch note is queued to scrollback"
+        );
+    }
+
+    #[test]
+    fn shift_tab_is_a_cycle_temper_key_not_an_edit() {
+        let mut input = String::new();
+        assert_eq!(
+            handle_key(&mut input, KeyKind::CycleTemper),
+            InputOutcome::Editing
+        );
+        assert!(input.is_empty(), "temper key never edits the input line");
     }
 
     #[test]

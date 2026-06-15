@@ -118,6 +118,24 @@ impl Store {
         Ok(id)
     }
 
+    /// A session's stored permission mode (temper) string.
+    pub fn session_mode(&self, session_id: &str) -> Result<String> {
+        Ok(self.lock()?.query_row(
+            "SELECT permission_mode FROM session WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Update a session's permission mode (temper) — persisted when the user switches it live.
+    pub fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<()> {
+        self.lock()?.execute(
+            "UPDATE session SET permission_mode = ?2, updated_at = strftime('%s','now') WHERE id = ?1",
+            (session_id, mode),
+        )?;
+        Ok(())
+    }
+
     /// Ids of the subagent child sessions spawned by `parent_id`, oldest first.
     pub fn child_sessions(&self, parent_id: &str) -> Result<Vec<String>> {
         let conn = self.lock()?;

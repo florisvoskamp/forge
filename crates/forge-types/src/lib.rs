@@ -132,19 +132,50 @@ impl TaskTier {
     }
 }
 
-/// Session-level tool-safety posture (ADR-0008).
+/// Session-level tool-safety posture (ADR-0008). Exposed in the UI as the **temper** (the
+/// forge/metallurgy framing for the agent's disposition); see `docs/features/temper-modes.md`.
+/// Serde accepts both the canonical kebab key and the temper-label alias.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
-    /// Ask before any side effect.
+    /// Ask before any side effect. Temper: **Guarded**.
     #[default]
+    #[serde(alias = "guarded")]
     Default,
-    /// Auto-allow file writes/edits; still ask for shell.
+    /// Auto-allow file writes/edits; still ask for shell. Temper: **Smith**.
+    #[serde(alias = "smith")]
     AcceptEdits,
-    /// Auto-allow everything (explicit, dangerous opt-in).
+    /// Auto-allow everything (explicit, dangerous opt-in). Temper: **Unfettered**.
+    #[serde(alias = "unfettered")]
     Bypass,
-    /// Read-only: deny all side effects.
+    /// Read-only: deny all side effects. Temper: **Survey**.
+    #[serde(alias = "survey")]
     Plan,
+}
+
+impl PermissionMode {
+    /// The themed temper label shown in the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            PermissionMode::Plan => "Survey",
+            PermissionMode::Default => "Guarded",
+            PermissionMode::AcceptEdits => "Smith",
+            PermissionMode::Bypass => "Unfettered",
+        }
+    }
+
+    /// The next temper in the SHIFT+TAB cycle. The cycle covers the three everyday tempers and
+    /// **wraps** — `Bypass`/Unfettered is intentionally excluded (reachable only via explicit
+    /// `--mode unfettered`/config, never by tapping a key). From Unfettered, cycling re-enters
+    /// the safe loop at Guarded.
+    pub fn cycle_next(self) -> PermissionMode {
+        match self {
+            PermissionMode::Default => PermissionMode::AcceptEdits, // Guarded → Smith
+            PermissionMode::AcceptEdits => PermissionMode::Plan,    // Smith → Survey
+            PermissionMode::Plan => PermissionMode::Default,        // Survey → Guarded (wrap)
+            PermissionMode::Bypass => PermissionMode::Default,      // leave the unsafe temper
+        }
+    }
 }
 
 /// How "dangerous" a tool is — drives the permission decision.
@@ -237,6 +268,47 @@ mod tests {
     #[test]
     fn permission_mode_default_is_safe() {
         assert_eq!(PermissionMode::default(), PermissionMode::Default);
+    }
+
+    #[test]
+    fn temper_labels_are_themed() {
+        assert_eq!(PermissionMode::Plan.label(), "Survey");
+        assert_eq!(PermissionMode::Default.label(), "Guarded");
+        assert_eq!(PermissionMode::AcceptEdits.label(), "Smith");
+        assert_eq!(PermissionMode::Bypass.label(), "Unfettered");
+    }
+
+    #[test]
+    fn temper_cycle_wraps_through_the_safe_three_and_excludes_bypass() {
+        let mut m = PermissionMode::Default;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(m);
+            m = m.cycle_next();
+        }
+        assert_eq!(m, PermissionMode::Default, "cycle wraps after three");
+        assert_eq!(
+            seen,
+            vec![
+                PermissionMode::Default,
+                PermissionMode::AcceptEdits,
+                PermissionMode::Plan
+            ]
+        );
+        // The dangerous temper is never produced by cycling, and cycling off it is safe.
+        assert!(!seen.contains(&PermissionMode::Bypass));
+        assert_eq!(PermissionMode::Bypass.cycle_next(), PermissionMode::Default);
+    }
+
+    #[test]
+    fn temper_labels_deserialize_as_aliases() {
+        let m: PermissionMode = serde_json::from_str("\"survey\"").unwrap();
+        assert_eq!(m, PermissionMode::Plan);
+        let m: PermissionMode = serde_json::from_str("\"smith\"").unwrap();
+        assert_eq!(m, PermissionMode::AcceptEdits);
+        // Canonical keys still work.
+        let m: PermissionMode = serde_json::from_str("\"accept-edits\"").unwrap();
+        assert_eq!(m, PermissionMode::AcceptEdits);
     }
 
     #[test]

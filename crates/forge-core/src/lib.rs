@@ -153,6 +153,21 @@ impl Session {
         &self.id
     }
 
+    /// The session's current temper (permission mode).
+    pub fn temper(&self) -> PermissionMode {
+        self.mode
+    }
+
+    /// Advance the temper through the SHIFT+TAB cycle, persist it, and return the new temper
+    /// (RFC/temper-modes). Takes effect on the next turn's permission decisions.
+    pub fn cycle_temper(&mut self) -> PermissionMode {
+        self.mode = self.mode.cycle_next();
+        let _ = self
+            .store
+            .update_session_mode(&self.id, &format!("{:?}", self.mode));
+        self.mode
+    }
+
     /// Read the next user prompt from the attached surface. `None` ends the session.
     pub fn read_line(&mut self) -> Option<String> {
         self.presenter.read_line()
@@ -1125,6 +1140,29 @@ mod tests {
                 }],
                 usage,
             })
+        }
+    }
+
+    #[test]
+    fn cycle_temper_advances_wraps_and_persists() {
+        use forge_types::PermissionMode;
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let session = fresh_session(Arc::clone(&store), Config::default());
+        let id = session.id().to_string();
+        let mut session = session;
+
+        assert_eq!(session.temper(), PermissionMode::Default); // Guarded
+        assert_eq!(session.cycle_temper(), PermissionMode::AcceptEdits); // → Smith
+        assert_eq!(
+            store.session_mode(&id).unwrap(),
+            "AcceptEdits",
+            "switch persisted"
+        );
+        assert_eq!(session.cycle_temper(), PermissionMode::Plan); // → Survey
+        assert_eq!(session.cycle_temper(), PermissionMode::Default); // wraps → Guarded
+                                                                     // Cycling never lands on the dangerous Unfettered temper.
+        for _ in 0..6 {
+            assert_ne!(session.cycle_temper(), PermissionMode::Bypass);
         }
     }
 

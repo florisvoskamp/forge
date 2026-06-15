@@ -122,6 +122,8 @@ impl Tui {
                     KeyCode::Backspace => KeyKind::Backspace,
                     KeyCode::Enter => KeyKind::Enter,
                     KeyCode::Esc => KeyKind::Esc,
+                    // Shift+Tab — crossterm reports it as BackTab — cycles the operating temper.
+                    KeyCode::BackTab => KeyKind::CycleTemper,
                     _ => return Ok(None),
                 };
                 return Ok(Some(key));
