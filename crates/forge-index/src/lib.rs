@@ -245,6 +245,44 @@ impl Lattice {
         self.rows_to_hits(rows)
     }
 
+    /// Store a node's embedding vector (semantic retrieval, code-intelligence.md §5.6). The vector
+    /// is produced by an [`Embedder`]; this just persists it.
+    pub fn set_embedding(&self, node_id: &str, vector: &[f32]) -> Result<(), LatticeError> {
+        self.store.put_lattice_embedding(node_id, vector)?;
+        Ok(())
+    }
+
+    /// How many nodes currently carry an embedding.
+    pub fn embedding_count(&self) -> Result<i64, LatticeError> {
+        Ok(self.store.lattice_embedding_count()?)
+    }
+
+    /// Rank indexed nodes by cosine similarity to a query embedding, best first (semantic
+    /// retrieval). Returns the top `limit` nodes that still exist. Empty when no embeddings are
+    /// stored — the caller then falls back to structural/lexical retrieval (graceful degrade).
+    pub fn rank_by_vector(
+        &self,
+        query: &[f32],
+        limit: usize,
+    ) -> Result<Vec<NodeHit>, LatticeError> {
+        let mut scored: Vec<(f32, String)> = self
+            .store
+            .lattice_embeddings()?
+            .into_iter()
+            .map(|(id, v)| (cosine(query, &v), id))
+            .collect();
+        // Highest similarity first; NaN (zero-norm) sorts last.
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Greater));
+        scored.truncate(limit);
+        let mut rows = Vec::new();
+        for (_, id) in scored {
+            if let Some(row) = self.store.lattice_node_by_id(&id)? {
+                rows.push(row);
+            }
+        }
+        self.rows_to_hits(rows)
+    }
+
     /// Reverse-dependency closure: who references `symbol`, transitively, up to `max_depth` hops.
     pub fn impact(&self, symbol: &str, max_depth: usize) -> Result<BlastRadius, LatticeError> {
         let roots = self.rows_to_hits(self.store.lattice_nodes_by_name(symbol, 32)?)?;
@@ -422,6 +460,24 @@ impl Lattice {
     }
 }
 
+/// Cosine similarity of two vectors in `[-1, 1]`; `0.0` if lengths differ or either is zero-norm
+/// (so an all-zero or mismatched vector ranks last rather than NaN-poisoning the sort).
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
 /// Directories never worth indexing — build output, VCS, dependencies, and dotdirs.
 fn is_skippable_dir(name: &str) -> bool {
     matches!(
@@ -555,6 +611,58 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].rel_path, "src/lib.rs");
         assert!(lat.query("should_not_index", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cosine_similarity_basics() {
+        assert!(
+            (cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6,
+            "identical = 1"
+        );
+        assert!(
+            cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6,
+            "orthogonal = 0"
+        );
+        assert!(
+            (cosine(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < 1e-6,
+            "opposite = -1"
+        );
+        assert_eq!(cosine(&[1.0], &[1.0, 2.0]), 0.0, "length mismatch = 0");
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 1.0]), 0.0, "zero-norm = 0");
+    }
+
+    #[test]
+    fn rank_by_vector_orders_nodes_by_cosine() {
+        let t = Tmp::new();
+        t.write(
+            "src/lib.rs",
+            "pub fn alpha() {}\npub fn beta() {}\npub fn gamma() {}\n",
+        );
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let lat = Lattice::new(Arc::clone(&store), &t.root);
+        lat.update().unwrap();
+
+        // Assign distinct unit vectors per node, then query near `beta`'s.
+        for n in store.lattice_nodes_by_name("", 100).unwrap() {
+            let v = match n.name.as_str() {
+                "alpha" => [1.0, 0.0, 0.0],
+                "beta" => [0.0, 1.0, 0.0],
+                _ => [0.0, 0.0, 1.0],
+            };
+            lat.set_embedding(&n.id, &v).unwrap();
+        }
+        assert_eq!(lat.embedding_count().unwrap(), 3);
+
+        let ranked = lat.rank_by_vector(&[0.1, 0.9, 0.0], 2).unwrap();
+        assert_eq!(ranked.len(), 2, "top-2 only");
+        assert_eq!(ranked[0].name, "beta", "nearest vector ranks first");
+
+        // Graceful degrade: a fresh index with no embeddings returns nothing.
+        let t2 = Tmp::new();
+        t2.write("src/x.rs", "pub fn z() {}\n");
+        let empty = lattice(&t2.root);
+        empty.update().unwrap();
+        assert!(empty.rank_by_vector(&[1.0, 0.0], 5).unwrap().is_empty());
     }
 
     #[test]

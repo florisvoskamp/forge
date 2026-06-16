@@ -176,4 +176,13 @@ CREATE TABLE IF NOT EXISTS lattice_ref (
 );
 CREATE INDEX IF NOT EXISTS idx_lref_name ON lattice_ref(name);
 CREATE INDEX IF NOT EXISTS idx_lref_src ON lattice_ref(src_id);
+
+-- Optional per-node embedding vector for semantic retrieval (code-intelligence.md §5.6;
+-- off by default). `vec` is the f32 components packed little-endian; `dim` is the length.
+-- Cascades with the node so a reindex/delete drops a stale vector.
+CREATE TABLE IF NOT EXISTS lattice_embedding (
+    node_id TEXT PRIMARY KEY REFERENCES lattice_node(id) ON DELETE CASCADE,
+    dim     INTEGER NOT NULL,
+    vec     BLOB NOT NULL
+);
 "#;
