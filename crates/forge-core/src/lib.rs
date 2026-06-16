@@ -2459,6 +2459,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Calls `write_file` once (to `path`), then answers `done`.
+    struct WriteFileProvider {
+        path: String,
+    }
+    #[async_trait::async_trait]
+    impl Provider for WriteFileProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            if messages.iter().any(|m| m.role == Role::Tool) {
+                return Ok(ModelResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                    quota: None,
+                });
+            }
+            Ok(ModelResponse {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "write_file".into(),
+                    args: serde_json::json!({ "path": self.path, "content": "hi from auto-edit" }),
+                }],
+                usage: Usage::default(),
+                quota: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_edit_allows_file_writes_without_prompting() {
+        // AcceptEdits must auto-allow a `write_file` (Write side effect) end to end through the
+        // live session. CapturePresenter::confirm returns false, so if the turn wrongly PROMPTS
+        // the write is denied and the file never appears — making a regression observable.
+        let path = std::env::temp_dir()
+            .join(format!("forge-autoedit-{}.txt", forge_types::new_id()))
+            .to_string_lossy()
+            .to_string();
+        let config = Config {
+            permission_mode: forge_types::PermissionMode::AcceptEdits,
+            ..Config::default()
+        };
+        let mut session = Session::start(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(WriteFileProvider { path: path.clone() }),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            config,
+            ".",
+        )
+        .unwrap();
+
+        session.run_turn("write the file").await.unwrap();
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "auto-edit allowed the write without prompting"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Never streams an event and never returns — simulates a half-open / stalled connection.
     struct StallingProvider;
     #[async_trait::async_trait]

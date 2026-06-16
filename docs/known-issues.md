@@ -3,25 +3,30 @@
 Tracked limitations and intentionally-deferred features. Each entry: symptom, what
 we know, and the planned fix.
 
-## Auto-edit (AcceptEdits) temper still prompts
+## Auto-edit (AcceptEdits) temper — file edits auto-allowed (verified)
 
-**Symptom:** In the auto-edit temper, Forge still asks for permission on actions the
-user expects to be auto-approved.
+**Symptom (reported):** in the auto-edit temper, Forge seems to still ask for permission on
+actions the user expects to be auto-approved.
 
-**What we know (verified in code):** `permission::decide_mode` for `AcceptEdits`
-auto-allows `Write` side effects and **gates `Shell` with a prompt by design**;
-read-only never prompts. The `ask_user` virtual tool always prompts regardless of
-temper (it's a question to the user, not a side effect). So a turn that runs shell
-commands or calls `ask_user` will still prompt in auto-edit — that part is expected.
+**What we know (verified in code):** `permission::decide_mode` for `AcceptEdits` auto-allows
+`Write` side effects and **gates `Shell` with a prompt by design**; read-only never prompts. The
+`ask_user` virtual tool always prompts regardless of temper (it's a question to the user, not a
+side effect). So a turn that runs shell commands or calls `ask_user` will still prompt in
+auto-edit — that part is expected.
 
-**Unverified / to investigate:** whether *file edits* (`write_file`/`edit_file`,
-`Write` side effect) still prompt in auto-edit. If they do, the bug is most likely
-that the selected temper isn't reaching `Session.mode` at decision time (e.g. a live
-SHIFT+TAB switch not applied to the in-flight turn, or `--mode` not sticking) rather
-than in `decide_mode` itself. Needs a reproduction + a permission-decision test that
-asserts auto-edit allows `write_file` end-to-end through the live session.
+**Verified (file edits do NOT prompt):** the end-to-end test
+`auto_edit_allows_file_writes_without_prompting` (forge-core) drives a live `AcceptEdits` session
+whose model calls `write_file` with a presenter that *denies* any prompt; the file is still
+written, proving the write was auto-allowed without a confirm. `--mode` sticks
+(`build_session_with`: `config.permission_mode = m.into()` → `Session.mode`), and with no
+matching allow/ask rule `decide` falls back to `decide_mode(AcceptEdits, Write) = Allow`.
 
-**Status:** documented; fix deferred. Do not assert a root cause until reproduced.
+**Residual (by design, not a bug):** a live SHIFT+TAB temper switch applies on the **next** turn,
+not the in-flight one — the turn task holds the `Session` mutex for its duration, so the switch
+can't mutate `Session.mode` mid-turn. A configured `ask`/`deny` rule for `write_file` also still
+prompts (rules outrank the mode by design).
+
+**Status:** common case verified + regression-tested; only the by-design residual remains.
 
 ## No way to remove / disable a provider key or model
 
