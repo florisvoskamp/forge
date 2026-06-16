@@ -50,4 +50,7 @@ locations, keyring, TUI, MCP client) are portable; the shell tool is the main ex
 on PATH and document it), and make the deny-list command parsing OS-aware.
 
 **Status:** documented; fix deferred. Tracked on the cross-platform watch-list.
+
+**Related:** the hooks system ([hooks.md](features/hooks.md)) also runs `sh -c`, so user hooks
+are POSIX-only for the same reason; the same OS-aware fix covers both.
 </content>
