@@ -392,10 +392,17 @@ pub async fn run() -> Result<()> {
     };
     // Connect the external MCP servers in THIS process so the bridge model can drive them — the
     // bridge's whole tool surface is this server. Skipped (None) when none are configured.
+    // Connect external MCP servers in the BACKGROUND so the bridge serves Forge's own tools
+    // (update_tasks, spawn_agents, file/shell, …) IMMEDIATELY. Awaiting connect here previously
+    // stalled the whole tool list behind a slow/auth-gated server (e.g. helm), so the spawned
+    // claude/codex CLI timed out waiting for the MCP server and fell back to its native tools
+    // ("update_tasks not in my toolset"). The meta-tools are advertised right away via
+    // `connecting`; the first `mcp_call` lazily connects on demand.
     let mcp = if config.mcp.active_servers().next().is_some() {
-        Some(Arc::new(
-            forge_mcp::McpManager::connect_all(&config.mcp).await,
-        ))
+        let mgr = Arc::new(forge_mcp::McpManager::connecting(&config.mcp));
+        let bg = Arc::clone(&mgr);
+        tokio::spawn(async move { bg.connect_active().await });
+        Some(mgr)
     } else {
         None
     };

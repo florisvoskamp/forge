@@ -157,10 +157,50 @@ impl McpManager {
 
     /// Connect to every enabled + allowlisted server concurrently, isolating failures: a server
     /// that can't connect lands `failed` with a reason but never blocks the others or the session.
+    /// Blocking — the returned manager is fully connected. (`mcp-serve` instead uses
+    /// [`connecting`](Self::connecting) + a background [`connect_active`](Self::connect_active) so
+    /// it never stalls the bridge's tool advertisement on a slow external server.)
     pub async fn connect_all(config: &McpConfig) -> Self {
         let mgr = Self::empty(config);
-        let connect_timeout = mgr.connect_timeout;
-        let servers: Vec<_> = config.active_servers().cloned().collect();
+        mgr.connect_active().await;
+        mgr
+    }
+
+    /// Construct the manager with every active server pre-marked `Reconnecting` (a connect is in
+    /// flight) WITHOUT awaiting any network I/O. Crucially `is_empty()` is then false, so the MCP
+    /// meta-tools (`mcp_search_tools`/`mcp_call`/…) are advertised IMMEDIATELY and a slow external
+    /// server (e.g. an OAuth one) can't delay the rest of the tool surface. Pair with a background
+    /// [`connect_active`](Self::connect_active); the first `mcp_call` lazily connects on demand.
+    pub fn connecting(config: &McpConfig) -> Self {
+        let mgr = Self::empty(config);
+        {
+            let mut conns = mgr.conns.lock().unwrap();
+            for s in config.active_servers() {
+                conns.insert(
+                    s.name.clone(),
+                    Connection {
+                        name: s.name.clone(),
+                        status: ServerStatus::Reconnecting,
+                        transport_label: s.transport_label(),
+                        peer: None,
+                        service: None,
+                        tools: vec![],
+                        resources: vec![],
+                        prompts: vec![],
+                        reconnect_attempts: 0,
+                    },
+                );
+            }
+        }
+        mgr
+    }
+
+    /// Connect every active server concurrently (isolating failures) and surface declared-inactive
+    /// ones, overwriting any placeholder entries. Shared by the blocking [`connect_all`] and the
+    /// background path in `mcp-serve` (after [`connecting`](Self::connecting)).
+    pub async fn connect_active(&self) {
+        let connect_timeout = self.connect_timeout;
+        let servers: Vec<_> = self.config.active_servers().cloned().collect();
         let results = futures::future::join_all(servers.into_iter().map(|s| async move {
             let label = s.transport_label();
             match tokio::time::timeout(connect_timeout, transport::serve(&s)).await {
@@ -180,10 +220,10 @@ impl McpManager {
 
         for (name, label, res) in results {
             match res {
-                Ok(service) => mgr.add_established(&name, label, service).await,
+                Ok(service) => self.add_established(&name, label, service).await,
                 Err(reason) => {
                     tracing::warn!("mcp: server '{name}' failed to connect: {reason}");
-                    mgr.conns.lock().unwrap().insert(
+                    self.conns.lock().unwrap().insert(
                         name.clone(),
                         Connection {
                             name,
@@ -203,8 +243,8 @@ impl McpManager {
         // Surface declared-but-inactive servers (disabled, or excluded by the allowlist) so the
         // user sees them in `forge mcp` rather than wondering why they're silent.
         {
-            let mut conns = mgr.conns.lock().unwrap();
-            for s in &config.servers {
+            let mut conns = self.conns.lock().unwrap();
+            for s in &self.config.servers {
                 if !conns.contains_key(&s.name) {
                     conns.insert(
                         s.name.clone(),
@@ -223,7 +263,6 @@ impl McpManager {
                 }
             }
         }
-        mgr
     }
 
     /// Given an initialized client connection, list its tools/resources/prompts, namespace them,
@@ -1074,5 +1113,31 @@ mod tests {
             !mgr.knows_tool(MCP_SEARCH_TOOLS),
             "no meta-tools without servers"
         );
+    }
+
+    #[test]
+    fn connecting_advertises_meta_tools_without_any_network_io() {
+        // The fix for "mcp-serve stalls behind a slow external server": `connecting` must make the
+        // meta-tools available IMMEDIATELY (no await, no connection) so the bridge serves its tool
+        // list instantly; `connect_active` fills in the real status in the background.
+        let config = McpConfig {
+            servers: vec![forge_config::McpServerConfig {
+                name: "blackhole".into(),
+                transport: forge_config::McpTransport::Http {
+                    url: "http://10.255.255.1:8080/mcp".into(),
+                    headers: Default::default(),
+                },
+                auth: None,
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+        let mgr = McpManager::connecting(&config);
+        assert!(!mgr.is_empty(), "declared server is present immediately");
+        assert!(
+            !mgr.advertised_specs().is_empty(),
+            "meta-tools advertised before any connection completes"
+        );
+        assert!(mgr.knows_tool(MCP_CALL), "mcp_call routable immediately");
     }
 }
