@@ -128,6 +128,51 @@ pub struct LatticeConfig {
     /// explicit `update`/agent edits.
     #[serde(default = "default_lattice_watch")]
     pub watch: bool,
+    /// Semantic retrieval via embeddings (code-intelligence.md §5.6). Off by default — structural/
+    /// lexical retrieval is unchanged until a backend is configured + `forge lattice embed` is run.
+    #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
+}
+
+/// Embedding-backed semantic retrieval settings. Off by default (zero setup); when on, node
+/// embeddings are computed via `backend`/`model` and blended into retrieval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsConfig {
+    /// Master switch. Off → no embeddings are computed or used; retrieval is structural/lexical.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Embedding backend (currently `"ollama"`; provider backends are a follow-up).
+    #[serde(default = "default_embed_backend")]
+    pub backend: String,
+    /// Embedding model id (e.g. ollama's `nomic-embed-text`).
+    #[serde(default = "default_embed_model")]
+    pub model: String,
+    /// Backend endpoint (ollama's HTTP API root).
+    #[serde(default = "default_embed_endpoint")]
+    pub endpoint: String,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: default_embed_backend(),
+            model: default_embed_model(),
+            endpoint: default_embed_endpoint(),
+        }
+    }
+}
+
+fn default_embed_backend() -> String {
+    "ollama".to_string()
+}
+
+fn default_embed_model() -> String {
+    "nomic-embed-text".to_string()
+}
+
+fn default_embed_endpoint() -> String {
+    "http://localhost:11434".to_string()
 }
 
 impl Default for LatticeConfig {
@@ -137,6 +182,7 @@ impl Default for LatticeConfig {
             inject: default_lattice_inject(),
             inject_token_budget: default_inject_budget(),
             watch: default_lattice_watch(),
+            embeddings: EmbeddingsConfig::default(),
         }
     }
 }
