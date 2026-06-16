@@ -104,9 +104,6 @@ pub struct App {
     /// The live task list (`update_tasks`). Kept so the sticky tasks panel stays visible during
     /// the turn (the inline scrollback copy scrolls away); cleared when the model empties the list.
     tasks: Vec<forge_types::TodoItem>,
-    /// When `Some(i)`, the preview region shows subagent `i`'s fuller progress log instead of the
-    /// compact running-list (toggled by the shell). Cleared when the batch finishes.
-    subagent_detail: Option<usize>,
 }
 
 /// One subagent's live row in the TUI.
@@ -122,6 +119,17 @@ struct SubRow {
     log: Vec<String>,
     done: bool,
     cost: f64,
+}
+
+/// An owned snapshot of one subagent for the full-screen transcript browser ([`App::subagent_views`]).
+#[derive(Debug, Clone)]
+pub struct SubagentView {
+    pub agent: String,
+    pub task: String,
+    pub done: bool,
+    pub cost: f64,
+    /// The child's full captured transcript (progress lines + the final result), oldest first.
+    pub log: Vec<String>,
 }
 
 /// A keystroke, decoupled from crossterm so input handling is testable.
@@ -254,6 +262,11 @@ impl App {
                 self.context_limit = context_limit;
             }
             PresenterEvent::SubagentStart { id, agent, task } => {
+                // A new batch: the previous (all-finished) batch's rows are retained until now so
+                // their transcripts stay viewable (Ctrl+O); drop them as the next batch begins.
+                if !self.subagents.is_empty() && self.subagents.iter().all(|r| r.done) {
+                    self.subagents.clear();
+                }
                 // First child of a batch opens the group box in scrollback.
                 if self.subagents.is_empty() {
                     self.flush.push(subagent_header_line());
@@ -276,8 +289,9 @@ impl App {
                     if n > 80 {
                         row.last = row.last.chars().skip(n - 80).collect();
                     }
-                    // Keep a bounded backlog of snippets for the expandable detail view.
-                    const MAX_LOG: usize = 200;
+                    // Keep the FULL transcript for the scrollable browser (Ctrl+O), capped only by
+                    // a high safety bound so a pathological child can't exhaust memory.
+                    const MAX_LOG: usize = 10_000;
                     for piece in snippet.split('\n').filter(|p| !p.trim().is_empty()) {
                         row.log.push(piece.trim().to_string());
                     }
@@ -299,15 +313,23 @@ impl App {
                 if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id) {
                     row.done = true;
                     row.cost = cost_usd;
+                    // Record the outcome at the tail of the transcript so the browser shows it.
+                    row.log.push(String::new());
+                    row.log.push(format!(
+                        "── result ({}) ──",
+                        if ok { "ok" } else { "failed" }
+                    ));
+                    for piece in summary.split('\n').filter(|p| !p.trim().is_empty()) {
+                        row.log.push(piece.trim().to_string());
+                    }
                 }
-                // When every child in the batch has reported, close the box and clear the live
-                // running list.
+                // When every child in the batch has reported, close the scrollback box. The rows
+                // are KEPT (not cleared) so their full transcripts remain viewable via Ctrl+O until
+                // the next batch starts; the live panel collapses on its own (no rows are running).
                 if self.subagents.iter().all(|r| r.done) {
                     let n = self.subagents.len();
                     let total: f64 = self.subagents.iter().map(|r| r.cost).sum();
                     self.flush.push(subagent_footer_line(n, total));
-                    self.subagents.clear();
-                    self.subagent_detail = None; // batch gone — drop any open detail view.
                 }
             }
             PresenterEvent::Diff(diff) => {
@@ -351,25 +373,20 @@ impl App {
         self.subagents.iter().filter(|r| !r.done).count()
     }
 
-    /// Toggle the expandable detail view for the next running subagent (or close it if open). The
-    /// detail view swaps the preview region to one child's fuller progress log.
-    ///
-    /// Key-wiring hook: the shell (forge-cli render loop) should call this from a key handler —
-    /// add a `KeyKind` variant (e.g. mapped to Ctrl+O in `driver.rs::poll_key`) and route it here.
-    /// It isn't bound yet to avoid forcing an exhaustive-match break across the crate boundary in
-    /// this forge-tui-only pass; the rendering + toggle state are complete and unit-tested.
-    pub fn toggle_subagent_detail(&mut self) {
-        if self.subagent_detail.is_some() {
-            self.subagent_detail = None;
-            return;
-        }
-        // Open the first still-running child's detail; if none running, the most recent.
-        let idx = self
-            .subagents
+    /// Owned snapshot of the current batch's subagents (running + just-finished), for the
+    /// full-screen scrollable transcript browser (Ctrl+O → [`crate::run_subagent_transcript`]).
+    /// In spawn order; empty when no batch has run yet / a new batch hasn't started.
+    pub fn subagent_views(&self) -> Vec<SubagentView> {
+        self.subagents
             .iter()
-            .position(|r| !r.done)
-            .or_else(|| self.subagents.len().checked_sub(1));
-        self.subagent_detail = idx;
+            .map(|r| SubagentView {
+                agent: r.agent.clone(),
+                task: r.task.clone(),
+                done: r.done,
+                cost: r.cost,
+                log: r.log.clone(),
+            })
+            .collect()
     }
 
     /// Update the active temper label. The colored statusline segment is the live indicator —
@@ -892,17 +909,6 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Expanded detail view: one child's fuller progress log, swapped in over the running list.
-    if let Some(idx) = app.subagent_detail {
-        if let Some(row) = app.subagents.get(idx) {
-            frame.render_widget(
-                Paragraph::new(subagent_detail_lines(row, area.height)),
-                area,
-            );
-            return;
-        }
-    }
-
     // While a spawn_agents batch runs (and nothing is streaming), animate the still-running
     // children here in the live region; finished ones have already flowed to scrollback.
     let running: Vec<&SubRow> = app.subagents.iter().filter(|r| !r.done).collect();
@@ -911,10 +917,13 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
         let h = area.height as usize;
         let mut lines: Vec<TextLine> = Vec::with_capacity(h);
         // A header so the persistent panel reads as a distinct region, with the expand hint.
-        lines.push(TextLine::from(Span::styled(
-            format!("  ⚒ subagents ({} running)", running.len()),
-            Style::default().fg(TOOLCYAN).bold(),
-        )));
+        lines.push(TextLine::from(vec![
+            Span::styled(
+                format!("  ⚒ subagents ({} running)", running.len()),
+                Style::default().fg(TOOLCYAN).bold(),
+            ),
+            Span::styled("  ^O transcript", Style::default().fg(DIM)),
+        ]));
         let body_h = h.saturating_sub(1);
         for r in running.iter().take(body_h) {
             lines.push(subagent_running_line(spin, &r.agent, &r.task, &r.last));
@@ -984,40 +993,6 @@ fn tasks_panel_lines(tasks: &[forge_types::TodoItem], height: u16) -> Vec<TextLi
         lines.push(TextLine::from(Span::styled(
             format!("    … +{} more", tasks.len() - shown),
             Style::default().fg(DIM),
-        )));
-    }
-    lines
-}
-
-/// The expanded detail view for one subagent: its label + task, then the tail of its progress log
-/// sized to the live region. This is the in-place expansion that fits the fixed inline viewport.
-///
-/// TODO(subagent-transcript): a *full* scrollable transcript (the child's whole chat/tool log, not
-/// just recent progress snippets) would need a fullscreen takeover like `Tui::run_fullscreen`
-/// (the `/config` wizard) — the inline viewport can't grow at runtime. The child's full transcript
-/// is persisted by core; that view would load it by subagent id and render it over an alt-screen,
-/// restoring the inline chat on exit. This compact log view is the in-viewport stand-in.
-fn subagent_detail_lines(row: &SubRow, height: u16) -> Vec<TextLine<'static>> {
-    let h = height as usize;
-    let mut lines = vec![TextLine::from(vec![
-        Span::styled(
-            format!("  ⚒ [{}] ", row.agent),
-            Style::default().fg(TOOLCYAN).bold(),
-        ),
-        Span::styled(truncate(&row.task, 52), Style::default().fg(DIM)),
-    ])];
-    let body_h = h.saturating_sub(1);
-    let start = row.log.len().saturating_sub(body_h);
-    if row.log.is_empty() {
-        lines.push(TextLine::from(Span::styled(
-            "    (no activity yet)",
-            Style::default().fg(DIM),
-        )));
-    }
-    for snippet in row.log.iter().skip(start) {
-        lines.push(TextLine::from(Span::styled(
-            format!("    {}", truncate(snippet, 70)),
-            Style::default().fg(Color::Rgb(205, 205, 215)),
         )));
     }
     lines
@@ -1787,34 +1762,51 @@ mod tests {
     }
 
     #[test]
-    fn subagent_detail_toggle_shows_progress_log() {
+    fn subagent_views_capture_full_transcript_and_result() {
         let mut app = App::default();
         app.apply(PresenterEvent::SubagentStart {
             id: "a".into(),
             agent: "general".into(),
             task: "find call sites".into(),
         });
-        app.apply(PresenterEvent::SubagentProgress {
+        // More progress than the old 200-snippet cap — the full transcript must be kept.
+        for i in 0..250 {
+            app.apply(PresenterEvent::SubagentProgress {
+                id: "a".into(),
+                snippet: format!("step {i}"),
+            });
+        }
+        app.apply(PresenterEvent::SubagentResult {
             id: "a".into(),
-            snippet: "scanning module one\nscanning module two".into(),
+            agent: "general".into(),
+            ok: true,
+            summary: "found 3 call sites".into(),
+            cost_usd: 0.01,
         });
-        // Compact running list by default — not the detail view.
-        assert!(screen(&app).contains("subagents (1 running)"));
-
-        app.toggle_subagent_detail();
-        let s = screen(&app);
-        assert!(s.contains("[general]"), "detail header: {s}");
+        // Views are retained after the batch finishes (so Ctrl+O can still open them).
+        let views = app.subagent_views();
+        assert_eq!(views.len(), 1);
+        let v = &views[0];
         assert!(
-            s.contains("scanning module two"),
-            "progress log line shown: {s}"
+            v.done && v.log.len() > 200,
+            "full log kept: {}",
+            v.log.len()
+        );
+        assert!(v.log.iter().any(|l| l == "step 0"), "oldest line kept");
+        assert!(v.log.iter().any(|l| l == "step 249"), "newest line kept");
+        assert!(
+            v.log.iter().any(|l| l.contains("found 3 call sites")),
+            "result appended to transcript"
         );
 
-        // Toggling again closes it back to the running list.
-        app.toggle_subagent_detail();
-        assert!(
-            screen(&app).contains("subagents (1 running)"),
-            "detail closed"
-        );
+        // A new batch drops the previous (finished) rows.
+        app.apply(PresenterEvent::SubagentStart {
+            id: "b".into(),
+            agent: "general".into(),
+            task: "next".into(),
+        });
+        assert_eq!(app.subagent_views().len(), 1);
+        assert_eq!(app.subagent_views()[0].task, "next");
     }
 
     #[test]

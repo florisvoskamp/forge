@@ -39,8 +39,11 @@ mod driver;
 pub mod init_wizard;
 mod render;
 pub mod select;
+mod transcript;
 mod tui;
-pub use app::{banner_lines, handle_key, lattice_view_lines, App, InputOutcome, KeyKind};
+pub use app::{
+    banner_lines, handle_key, lattice_view_lines, App, InputOutcome, KeyKind, SubagentView,
+};
 pub use commands::{
     filter_commands, parse_command, slash_token_at, Command, CommandAction, Palette, PaletteEntry,
     Picker, PickerKind, PickerRow, SlashToken, COMMANDS,
@@ -48,6 +51,7 @@ pub use commands::{
 pub use driver::{ChannelPresenter, Tui, UiMsg};
 pub use init_wizard::{BridgeItem, ProviderItem, WizardInput, WizardOutcome};
 pub use select::{select_multi, SelectItem};
+pub use transcript::{run_subagent_transcript, transcript_lines};
 pub use tui::TuiPresenter;
 
 // `QChoice`, `resolve_answer`, `NO_ANSWER` are defined above and re-exported at crate root.
