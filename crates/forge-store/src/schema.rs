@@ -162,4 +162,18 @@ CREATE TABLE IF NOT EXISTS lattice_edge (
 );
 CREATE INDEX IF NOT EXISTS idx_ledge_src ON lattice_edge(src_id, kind);
 CREATE INDEX IF NOT EXISTS idx_ledge_dst ON lattice_edge(dst_id, kind);
+
+-- Unresolved references / call sites: one row per identifier use inside a definition. dst is a
+-- NAME (not a node id) resolved by join at query time, so cross-file calls survive incremental
+-- reindexing (a reference is tied to its own file's src node and cascades with it). This powers
+-- `impact` (who references X) and `path` (call-chain BFS) without fragile stored dst ids.
+CREATE TABLE IF NOT EXISTS lattice_ref (
+    id      TEXT PRIMARY KEY,
+    src_id  TEXT NOT NULL REFERENCES lattice_node(id) ON DELETE CASCADE,
+    name    TEXT NOT NULL,             -- referenced identifier (callee / type / module)
+    kind    TEXT NOT NULL,             -- calls | references | type | module | …
+    line    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lref_name ON lattice_ref(name);
+CREATE INDEX IF NOT EXISTS idx_lref_src ON lattice_ref(src_id);
 "#;

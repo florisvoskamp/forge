@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use forge_config::Config;
+use forge_index::Lattice;
 use forge_mesh::pricing::Pricing;
 use forge_mesh::{BudgetState, BudgetStatus, ModelCatalog, Router};
 use forge_provider::{Provider, StreamEvent, ToolSpec};
@@ -40,6 +41,8 @@ pub enum CoreError {
     Provider(#[from] forge_provider::ProviderError),
     #[error(transparent)]
     Store(#[from] forge_store::StoreError),
+    #[error(transparent)]
+    Lattice(#[from] forge_index::LatticeError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("session not found: {0}")]
@@ -83,6 +86,13 @@ pub struct Session {
     /// Connected external MCP servers (mcp-client.md). `None` when no servers are configured —
     /// the whole MCP path is then inert (zero overhead for non-MCP users).
     mcp: Option<Arc<forge_mcp::McpManager>>,
+    /// The code-intelligence index (code-intelligence.md). `None` when disabled or unavailable —
+    /// retrieval then injects nothing and the turn runs exactly as before (additive guarantee).
+    /// `Arc` so the model-facing `lattice` tool shares the same index.
+    lattice: Option<Arc<Lattice>>,
+    /// Background file watcher that keeps the index fresh on external edits. Held only to keep the
+    /// watcher thread alive for the session's lifetime (dropped → watching stops).
+    lattice_watcher: Option<forge_index::LatticeWatcher>,
 }
 
 impl Session {
@@ -183,6 +193,8 @@ impl Session {
             catalog: None,
             tasks,
             mcp: None,
+            lattice: None,
+            lattice_watcher: None,
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -214,6 +226,29 @@ impl Session {
         // An empty manager (no servers connected) adds nothing — keep it `None` so the path stays
         // fully inert and `tool_specs` is byte-for-byte unchanged.
         self.mcp = mcp.filter(|m| !m.is_empty());
+    }
+
+    /// Attach the code-intelligence index (composition root). When set and `lattice.inject` is on,
+    /// each turn auto-injects relevant code; the agent's edits reindex the touched file in-turn.
+    pub fn set_lattice(&mut self, lattice: Option<Arc<Lattice>>) {
+        self.lattice = lattice;
+    }
+
+    /// Attach the background reindex watcher (composition root); held for the session's lifetime.
+    pub fn set_lattice_watcher(&mut self, watcher: Option<forge_index::LatticeWatcher>) {
+        self.lattice_watcher = watcher;
+    }
+
+    /// Scoped subgraph for `symbol` from the session's live index (the `/lattice` view). `Ok(None)`
+    /// when no index is attached.
+    pub fn lattice_view(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<forge_index::LatticeView>, CoreError> {
+        match &self.lattice {
+            Some(l) => Ok(Some(l.view(symbol)?)),
+            None => Ok(None),
+        }
     }
 
     /// Per-server MCP status for the `/mcp` listing (empty when no servers are configured).
@@ -696,6 +731,44 @@ impl Session {
         // restorable by `/undo` (the in-process tool path snapshots directly in `invoke_tool`).
         self.export_checkpoint_env(seq);
 
+        // ★ Auto-retrieve relevant code from the Lattice index and inject it as a system message
+        // before the first provider call (code-intelligence.md §5.1). Retrieve into an owned value
+        // first so the `&self.lattice` borrow is released before we mutate the transcript. The
+        // budget shrinks with budget pressure — context spend follows the same discipline as model
+        // spend. Empty index / disabled / any error → nothing injected, turn runs as before.
+        let injected = self
+            .lattice
+            .as_ref()
+            .filter(|_| self.config.lattice.inject)
+            .and_then(|lat| {
+                lat.retrieve(
+                    prompt,
+                    inject_budget(self.config.lattice.inject_token_budget, status),
+                )
+                .ok()
+            })
+            .filter(|ctx| !ctx.is_empty());
+        if let Some(ctx) = injected {
+            let files = ctx
+                .snippets
+                .iter()
+                .map(|s| s.rel_path.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            let symbols = ctx.nodes.len();
+            let tokens = ctx.est_tokens;
+            let body = ctx.render();
+            let iseq = self.next_seq();
+            self.store
+                .add_message(&self.id, iseq, Role::System, &body, None)?;
+            self.transcript.push(Message::system(&body));
+            self.presenter.emit(PresenterEvent::ContextInjected {
+                symbols,
+                files,
+                tokens,
+            });
+        }
+
         let specs = self.tool_specs();
         let mut final_text = String::new();
         // Tokens in the live context after the latest call (the statusline gauge).
@@ -708,6 +781,7 @@ impl Session {
         let failover_enabled = self.config.mesh.failover;
         let default_cooldown =
             std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
+        let stream_idle = std::time::Duration::from_secs(self.config.mesh.stream_idle_timeout_secs);
         let mut chain = decision.fallbacks.clone().into_iter();
         let mut active_model = decision.model.clone();
 
@@ -717,48 +791,53 @@ impl Session {
             let mut resp = loop {
                 // Tight scope: borrow provider + presenter only for the streamed call, so the
                 // failover branch below has full `&mut self` for benching + warnings.
-                let result =
-                    {
-                        let provider = &self.provider;
-                        let presenter = &mut self.presenter;
-                        provider
-                            .complete(
-                                &active_model,
-                                &self.transcript,
-                                &specs,
-                                &mut |ev: StreamEvent| match ev {
-                                    StreamEvent::Text(t) => {
-                                        presenter.emit(PresenterEvent::AssistantDelta(t))
-                                    }
-                                    StreamEvent::Reasoning(t) => {
-                                        presenter.emit(PresenterEvent::Reasoning(t))
-                                    }
-                                    StreamEvent::ToolStarted { name, args } => {
-                                        presenter.emit(PresenterEvent::ToolStart { name, args })
-                                    }
-                                    StreamEvent::ToolFinished { name, ok, summary } => presenter
-                                        .emit(PresenterEvent::ToolResult { name, ok, summary }),
-                                    StreamEvent::SubagentStarted { id, agent, task } => presenter
-                                        .emit(PresenterEvent::SubagentStart { id, agent, task }),
-                                    StreamEvent::SubagentProgress { id, snippet } => presenter
-                                        .emit(PresenterEvent::SubagentProgress { id, snippet }),
-                                    StreamEvent::SubagentFinished {
-                                        id,
-                                        agent,
-                                        ok,
-                                        summary,
-                                        cost_usd,
-                                    } => presenter.emit(PresenterEvent::SubagentResult {
-                                        id,
-                                        agent,
-                                        ok,
-                                        summary,
-                                        cost_usd,
-                                    }),
-                                },
-                            )
-                            .await
+                let result = {
+                    let provider = &self.provider;
+                    let presenter = &mut self.presenter;
+                    // Bump on every stream event so the idle watchdog can distinguish a live
+                    // stream from a stalled half-open connection — a stall fails over (below)
+                    // instead of hanging the turn forever.
+                    let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let act = std::sync::Arc::clone(&activity);
+                    let mut sink = |ev: StreamEvent| {
+                        act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        match ev {
+                            StreamEvent::Text(t) => {
+                                presenter.emit(PresenterEvent::AssistantDelta(t))
+                            }
+                            StreamEvent::Reasoning(t) => {
+                                presenter.emit(PresenterEvent::Reasoning(t))
+                            }
+                            StreamEvent::ToolStarted { name, args } => {
+                                presenter.emit(PresenterEvent::ToolStart { name, args })
+                            }
+                            StreamEvent::ToolFinished { name, ok, summary } => {
+                                presenter.emit(PresenterEvent::ToolResult { name, ok, summary })
+                            }
+                            StreamEvent::SubagentStarted { id, agent, task } => {
+                                presenter.emit(PresenterEvent::SubagentStart { id, agent, task })
+                            }
+                            StreamEvent::SubagentProgress { id, snippet } => {
+                                presenter.emit(PresenterEvent::SubagentProgress { id, snippet })
+                            }
+                            StreamEvent::SubagentFinished {
+                                id,
+                                agent,
+                                ok,
+                                summary,
+                                cost_usd,
+                            } => presenter.emit(PresenterEvent::SubagentResult {
+                                id,
+                                agent,
+                                ok,
+                                summary,
+                                cost_usd,
+                            }),
+                        }
                     };
+                    let fut = provider.complete(&active_model, &self.transcript, &specs, &mut sink);
+                    stream_with_idle_timeout(fut, &activity, stream_idle).await
+                };
                 match result {
                     Ok(r) => {
                         if !r.content.is_empty() {
@@ -996,6 +1075,11 @@ impl Session {
                             self.current_turn_seq,
                             path,
                         );
+                        // Reindex the touched file in-turn so later retrieval/queries this turn
+                        // reflect the edit (code-intelligence.md — post-edit freshness).
+                        if let Some(lat) = &self.lattice {
+                            let _ = lat.reindex_path(path);
+                        }
                     }
                     (out, true)
                 }
@@ -1387,6 +1471,57 @@ pub fn update_tasks_spec() -> ToolSpec {
 }
 
 /// True if the per-process budget override is set (lets one over-budget run proceed).
+/// Scale the Lattice injection token budget by budget pressure: full when Ok, half at Warning, a
+/// quarter at Exhausted. Context spend follows the same discipline as model spend (§5.4).
+fn inject_budget(base: usize, status: BudgetStatus) -> usize {
+    match status {
+        BudgetStatus::Ok => base,
+        BudgetStatus::Warning => base / 2,
+        BudgetStatus::Exhausted => base / 4,
+    }
+}
+
+/// Await a streaming completion, but abort it if the stream goes silent for `idle` (a half-open /
+/// stalled connection) so a turn never hangs forever — the caller treats the synthesized
+/// `Unavailable` as retryable and fails over. `activity` is bumped by the completion's event sink;
+/// `idle == 0` disables the watchdog. Polls coarsely (every few seconds) — this guards against a
+/// hang, it is not a precise deadline.
+async fn stream_with_idle_timeout<F>(
+    fut: F,
+    activity: &std::sync::atomic::AtomicU64,
+    idle: std::time::Duration,
+) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError>
+where
+    F: std::future::Future<
+        Output = Result<forge_provider::ModelResponse, forge_provider::ProviderError>,
+    >,
+{
+    tokio::pin!(fut);
+    if idle.is_zero() {
+        return fut.await;
+    }
+    let mut last_seen = 0u64;
+    let mut last_change = std::time::Instant::now();
+    let poll = std::time::Duration::from_secs(3).min(idle);
+    loop {
+        tokio::select! {
+            r = &mut fut => return r,
+            _ = tokio::time::sleep(poll) => {
+                let now = activity.load(std::sync::atomic::Ordering::Relaxed);
+                if now != last_seen {
+                    last_seen = now;
+                    last_change = std::time::Instant::now();
+                } else if last_change.elapsed() >= idle {
+                    return Err(forge_provider::ProviderError::Unavailable(format!(
+                        "stream stalled — no data for {}s",
+                        idle.as_secs()
+                    )));
+                }
+            }
+        }
+    }
+}
+
 fn budget_override_active() -> bool {
     matches!(
         std::env::var("FORGE_BUDGET_OVERRIDE").as_deref(),
@@ -1807,6 +1942,131 @@ mod tests {
                 quota: None,
             })
         }
+    }
+
+    /// Reports, as its final answer, whether the transcript it received carried a Lattice
+    /// auto-injection system message — lets a test assert injection happened.
+    struct InjectionProbeProvider;
+    #[async_trait::async_trait]
+    impl Provider for InjectionProbeProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            let saw = messages.iter().any(|m| {
+                m.role == Role::System && m.content.starts_with("Relevant code (Lattice):")
+            });
+            Ok(forge_provider::ModelResponse {
+                content: if saw { "SAW_INJECTION" } else { "NO_INJECTION" }.into(),
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+                quota: None,
+            })
+        }
+    }
+
+    fn probe_session(store: Arc<Store>, config: Config) -> Session {
+        Session::start(
+            store,
+            Arc::new(InjectionProbeProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            ".",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn lattice_injects_relevant_code_into_the_turn() {
+        let dir = std::env::temp_dir().join(format!(
+            "forge-inj-{}-{}",
+            std::process::id(),
+            forge_types::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("probe.rs"), "pub fn lattice_probe_symbol() {}\n").unwrap();
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let lat = forge_index::Lattice::new(Arc::clone(&store), &dir);
+        lat.update().unwrap();
+
+        let mut session = probe_session(Arc::clone(&store), Config::default());
+        session.set_lattice(Some(Arc::new(lat)));
+        let answer = session
+            .run_turn("explain lattice_probe_symbol please")
+            .await
+            .unwrap();
+        assert_eq!(
+            answer, "SAW_INJECTION",
+            "the symbol was retrieved + injected"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Never streams an event and never returns — simulates a half-open / stalled connection.
+    struct StallingProvider;
+    #[async_trait::async_trait]
+    impl Provider for StallingProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            unreachable!("the idle watchdog must abort this before it ever returns")
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_times_out_instead_of_hanging() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut config = Config::default();
+        config.mesh.stream_idle_timeout_secs = 1; // trip fast in the test
+        config.mesh.failover = false; // no fallback → the error surfaces directly
+        let mut session = Session::start(
+            store,
+            Arc::new(StallingProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            ".",
+        )
+        .unwrap();
+        // The whole call must return well within this bound — if it hangs, the test fails here.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            session.run_turn("anything"),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "run_turn hung instead of timing out the stream"
+        );
+        assert!(
+            res.unwrap().is_err(),
+            "a stalled stream should surface an error, not a silent hang"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_runs_unchanged_without_a_lattice() {
+        // Additive guarantee: no index attached → no injection, turn proceeds as before.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = probe_session(store, Config::default());
+        let answer = session
+            .run_turn("explain lattice_probe_symbol")
+            .await
+            .unwrap();
+        assert_eq!(answer, "NO_INJECTION");
     }
 
     #[tokio::test]

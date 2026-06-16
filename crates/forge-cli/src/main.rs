@@ -147,7 +147,24 @@ enum LatticeOp {
         /// Symbol name or fragment.
         query: String,
     },
-    /// Show index counts (files, symbols, edges).
+    /// Blast radius: everything that references a symbol (transitively) — "what breaks if I change X".
+    Impact {
+        /// Symbol name.
+        symbol: String,
+    },
+    /// Shortest call/reference chain of symbol names from A to B.
+    Path {
+        /// Source symbol name.
+        from: String,
+        /// Target symbol name.
+        to: String,
+    },
+    /// Decision provenance: who last changed a symbol's definition, when, and in which commit.
+    Why {
+        /// Symbol name.
+        symbol: String,
+    },
+    /// Show index counts (files, symbols, edges, refs).
     Status,
 }
 
@@ -399,12 +416,56 @@ fn lattice_cmd(op: LatticeOp) -> Result<()> {
                 }
             }
         }
+        LatticeOp::Impact { symbol } => {
+            let lat = forge_index::Lattice::new(store, &cwd);
+            let blast = lat.impact(&symbol, 4).map_err(|e| anyhow::anyhow!("{e}"))?;
+            if blast.roots.is_empty() {
+                println!("no symbol named '{symbol}' — run `forge lattice update` first?");
+            } else if blast.dependents.is_empty() {
+                println!("⌬ {symbol}: no known references (leaf, or callers not yet indexed)");
+            } else {
+                println!(
+                    "⌬ impact · {symbol} — {} site(s) across {} file(s)",
+                    blast.total_sites,
+                    blast.files.len()
+                );
+                for d in &blast.dependents {
+                    println!("  ← {:<8} {} {}:{}", d.kind, d.name, d.rel_path, d.line);
+                }
+            }
+        }
+        LatticeOp::Path { from, to } => {
+            let lat = forge_index::Lattice::new(store, &cwd);
+            match lat
+                .path(&from, &to, 8)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            {
+                Some(chain) => println!("⌬ path · {}", chain.join(" → ")),
+                None => println!("no reference path from '{from}' to '{to}' within 8 hops"),
+            }
+        }
+        LatticeOp::Why { symbol } => {
+            let lat = forge_index::Lattice::new(store, &cwd);
+            match lat.why(&symbol).map_err(|e| anyhow::anyhow!("{e}"))? {
+                Some(p) => println!(
+                    "⌬ why · {} ({}:{})\n  {} · {} · {} · {}",
+                    p.name, p.rel_path, p.line, p.author, p.date, p.commit, p.subject
+                ),
+                None => println!(
+                    "no provenance for '{symbol}' — unknown symbol, or the tree isn't under git"
+                ),
+            }
+        }
         LatticeOp::Status => {
             let lat = forge_index::Lattice::new(store, &cwd);
             let s = lat.status().map_err(|e| anyhow::anyhow!("{e}"))?;
             println!(
-                "⌬ lattice — {} file(s), {} symbol(s), {} edge(s)",
-                s.files, s.nodes, s.edges
+                "⌬ lattice — {} file(s), {} symbol(s), {} edge(s), {} ref(s) · {} languages",
+                s.files,
+                s.nodes,
+                s.edges,
+                s.refs,
+                forge_index::supported_languages().len()
             );
         }
     }
@@ -1303,8 +1364,11 @@ async fn build_session_with(
     // is built so its presenter can show the connection status.
     let mcp_config = config.mcp.clone();
     let config_has_mcp = mcp_config.active_servers().next().is_some();
+    let lattice_enabled = config.lattice.enabled;
+    let config_lattice_watch = config.lattice.watch;
 
     let store = Arc::new(open_store()?);
+    let store_for_lattice = Arc::clone(&store);
     // Startup hint: if models are benched from a prior run/probe, tell the user how to recheck
     // (model-health-failover — we never auto-probe, so a stale bench is the user's to clear).
     let mut presenter = presenter;
@@ -1325,7 +1389,18 @@ async fn build_session_with(
         None
     };
     let (provider, router) = build_provider_and_router(&config, mock, pin, catalog.clone());
-    let tools = ToolRegistry::with_core_tools();
+
+    // Build the code-intelligence index up front so it can be shared between the model-facing
+    // `lattice` tool and the turn's auto-injection (code-intelligence.md). Cheap to construct; it
+    // reads whatever `forge lattice update` last persisted.
+    let lattice = (!mock && lattice_enabled).then(|| {
+        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        Arc::new(forge_index::Lattice::new(store_for_lattice, &root))
+    });
+    let mut tools = ToolRegistry::with_core_tools();
+    if let Some(lat) = &lattice {
+        tools.register(Box::new(forge_tools::LatticeTool::new(Arc::clone(lat))));
+    }
 
     let mut session = match resume {
         Some(prefix) => {
@@ -1340,6 +1415,23 @@ async fn build_session_with(
         }
     };
     session.set_catalog(catalog);
+    // Share the index with the session so turns auto-inject relevant code and agent edits reindex
+    // in-turn (code-intelligence.md). Empty index → nothing injected (additive guarantee).
+    // Also start the background watcher so external editor edits reindex automatically.
+    if let Some(lat) = &lattice {
+        if config_lattice_watch {
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match forge_index::spawn_watcher(
+                Arc::clone(lat),
+                &root,
+                std::time::Duration::from_millis(400),
+            ) {
+                Ok(w) => session.set_lattice_watcher(Some(w)),
+                Err(e) => session.notify_error(&format!("lattice watcher disabled: {e}")),
+            }
+        }
+    }
+    session.set_lattice(lattice);
 
     // Connect external MCP servers (mcp-client.md). Skipped for the offline mock. Per-server
     // failures are isolated inside connect_all (each lands `failed` with a reason); we surface the
@@ -2195,6 +2287,33 @@ async fn dispatch_command(
         }
         // `/compact` makes a model call → run it as a background task so the spinner ticks.
         CommandAction::Compact => return Ok(DispatchOutcome::RunCompact),
+        CommandAction::Lattice(symbol) => {
+            if symbol.is_empty() {
+                app.note("usage: /lattice <symbol>");
+            } else {
+                let view = { session.lock().await.lattice_view(&symbol)? };
+                match view {
+                    None => app.note("lattice is disabled (set [lattice] enabled = true)"),
+                    Some(v) => {
+                        let rows = |hits: &[forge_index::NodeHit]| {
+                            hits.iter()
+                                .map(|h| {
+                                    (h.kind.clone(), h.name.clone(), h.rel_path.clone(), h.line)
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        let why = v.why.map(|p| (p.author, p.date, p.commit, p.subject));
+                        let lines = forge_tui::lattice_view_lines(
+                            &v.query,
+                            &rows(&v.roots),
+                            &rows(&v.dependents),
+                            why,
+                        );
+                        tui.insert_lines(lines);
+                    }
+                }
+            }
+        }
         // Not a builtin → try the file-based command/skill catalog.
         CommandAction::Unknown(_) => {
             return dispatch_catalog(line, catalog, session, app, armed, trust_project, busy).await

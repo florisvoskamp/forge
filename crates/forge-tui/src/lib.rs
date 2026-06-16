@@ -40,7 +40,7 @@ pub mod init_wizard;
 mod render;
 pub mod select;
 mod tui;
-pub use app::{banner_lines, handle_key, App, InputOutcome, KeyKind};
+pub use app::{banner_lines, handle_key, lattice_view_lines, App, InputOutcome, KeyKind};
 pub use commands::{
     filter_commands, parse_command, Command, CommandAction, Palette, PaletteEntry, Picker,
     PickerKind, PickerRow, COMMANDS,
@@ -174,6 +174,12 @@ pub enum PresenterEvent {
     Tasks(Vec<forge_types::TodoItem>),
     /// MCP server connection status changed / was requested (`/mcp`); render the listing.
     McpStatus(Vec<forge_types::McpServerLine>),
+    /// Lattice auto-retrieval injected relevant code ahead of the model call (code-intelligence.md).
+    ContextInjected {
+        symbols: usize,
+        files: usize,
+        tokens: usize,
+    },
     Done {
         final_text: String,
     },
@@ -316,6 +322,15 @@ impl Presenter for HeadlessPresenter {
                         );
                     }
                 }
+            }
+            PresenterEvent::ContextInjected {
+                symbols,
+                files,
+                tokens,
+            } => {
+                println!(
+                    "  ⌬ lattice → injected {symbols} symbols · {files} files (~{tokens} tok)"
+                );
             }
             // The final answer was already streamed via AssistantText; Done is a
             // lifecycle marker, so the headless renderer needs no extra output here.

@@ -791,6 +791,32 @@ pub struct LatticeEdgeRow {
     pub unresolved_name: Option<String>,
 }
 
+/// A persisted reference / call site (resolved to a node by name-join at query time).
+#[derive(Debug, Clone)]
+pub struct LatticeRefRow {
+    pub id: String,
+    pub src_id: String,
+    pub name: String,
+    pub kind: String,
+    pub line: i64,
+}
+
+/// Read a [`LatticeNodeRow`] from the first 9 columns of a row (id, file_id, kind, name, qualname,
+/// signature, span_start, span_end, line_start).
+fn lattice_node_from_row(r: &rusqlite::Row) -> rusqlite::Result<LatticeNodeRow> {
+    Ok(LatticeNodeRow {
+        id: r.get(0)?,
+        file_id: r.get(1)?,
+        kind: r.get(2)?,
+        name: r.get(3)?,
+        qualname: r.get(4)?,
+        signature: r.get(5)?,
+        span_start: r.get(6)?,
+        span_end: r.get(7)?,
+        line_start: r.get(8)?,
+    })
+}
+
 impl Store {
     /// The stored content hash for a file, or `None` if it hasn't been indexed — the
     /// incremental-update gate (skip files whose hash is unchanged).
@@ -813,6 +839,7 @@ impl Store {
         file: &LatticeFileRow,
         nodes: &[LatticeNodeRow],
         edges: &[LatticeEdgeRow],
+        refs: &[LatticeRefRow],
     ) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -860,8 +887,56 @@ impl Store {
                 rusqlite::params![e.id, e.src_id, e.dst_id, e.kind, e.unresolved_name],
             )?;
         }
+        for r in refs {
+            tx.execute(
+                "INSERT INTO lattice_ref (id, src_id, name, kind, line)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![r.id, r.src_id, r.name, r.kind, r.line],
+            )?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Distinct definitions that reference `name` — the direct callers/dependents of a symbol
+    /// (one hop of `impact`). Resolves the name-keyed `lattice_ref` rows back to their src nodes.
+    pub fn lattice_callers_by_name(&self, name: &str, limit: usize) -> Result<Vec<LatticeNodeRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT n.id, n.file_id, n.kind, n.name, n.qualname, n.signature,
+                    n.span_start, n.span_end, n.line_start
+             FROM lattice_ref r
+             JOIN lattice_node n ON n.id = r.src_id
+             WHERE r.name = ?1 AND n.name <> ?1
+             ORDER BY n.name
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![name, limit as i64], lattice_node_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Distinct identifier names referenced *by* definitions named `name` — one forward hop for
+    /// `path` BFS (what the symbol calls/uses).
+    pub fn lattice_callees_of_name(&self, name: &str) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT r.name
+             FROM lattice_ref r
+             JOIN lattice_node n ON n.id = r.src_id
+             WHERE n.name = ?1 AND r.name <> ?1",
+        )?;
+        let rows = stmt
+            .query_map([name], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Total reference rows — completes the `status` summary.
+    pub fn lattice_ref_count(&self) -> Result<i64> {
+        let conn = self.lock()?;
+        Ok(conn.query_row("SELECT COUNT(*) FROM lattice_ref", [], |r| r.get(0))?)
     }
 
     /// Symbols whose name contains `query` (case-insensitive), best-first: exact name, then

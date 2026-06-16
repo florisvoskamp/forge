@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 forge-types.workspace = true
+forge-index.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -217,6 +217,11 @@ impl App {
             PresenterEvent::ToolResult { name, ok, summary } => {
                 self.flush.push(tool_result_line(&name, ok, &summary))
             }
+            PresenterEvent::ContextInjected {
+                symbols,
+                files,
+                tokens,
+            } => self.flush.push(lattice_line(symbols, files, tokens)),
             PresenterEvent::Cost {
                 session_total_usd,
                 session_in,
@@ -444,6 +449,79 @@ fn tool_start_line(name: &str, args: &str) -> TextLine<'static> {
         Span::styled(name.to_string(), Style::default().fg(TOOLCYAN).bold()),
         Span::styled(
             format!("  {}", truncate(args, 48)),
+            Style::default().fg(DIM),
+        ),
+    ])
+}
+
+/// Render a symbol's scoped subgraph (the `/lattice` view) as styled scrollback lines: the
+/// matching definitions, their reverse-dependents (blast radius), and a provenance line. Takes
+/// plain tuples `(kind, name, rel_path, line)` so this crate needn't depend on forge-index.
+#[allow(clippy::type_complexity)]
+pub fn lattice_view_lines(
+    query: &str,
+    roots: &[(String, String, String, i64)],
+    dependents: &[(String, String, String, i64)],
+    why: Option<(String, String, String, String)>,
+) -> Vec<TextLine<'static>> {
+    let mut out = Vec::new();
+    out.push(TextLine::from(vec![
+        Span::styled("  ⌬ LATTICE ", Style::default().fg(TOOLCYAN).bold()),
+        Span::styled(format!(" {query}"), Style::default().fg(DIM)),
+    ]));
+    if roots.is_empty() {
+        out.push(TextLine::from(Span::styled(
+            format!("    no symbols match '{query}' — run `forge lattice update`?"),
+            Style::default().fg(DIM),
+        )));
+        return out;
+    }
+    for (kind, name, path, line) in roots {
+        out.push(TextLine::from(vec![
+            Span::styled("    ● ", Style::default().fg(ORANGE)),
+            Span::styled(format!("{kind} "), Style::default().fg(DIM)),
+            Span::styled(name.clone(), Style::default().fg(ORANGE).bold()),
+            Span::styled(format!("  {path}:{line}"), Style::default().fg(DIM)),
+        ]));
+    }
+    if !dependents.is_empty() {
+        const MAX: usize = 20;
+        out.push(TextLine::from(Span::styled(
+            format!("    blast radius: {} reference(s)", dependents.len()),
+            Style::default().fg(TOOLCYAN),
+        )));
+        for (kind, name, path, line) in dependents.iter().take(MAX) {
+            out.push(TextLine::from(vec![
+                Span::styled("    ← ", Style::default().fg(DIM)),
+                Span::styled(format!("{kind} "), Style::default().fg(DIM)),
+                Span::styled(name.clone(), Style::default()),
+                Span::styled(format!("  {path}:{line}"), Style::default().fg(DIM)),
+            ]));
+        }
+        if dependents.len() > MAX {
+            out.push(TextLine::from(Span::styled(
+                format!(
+                    "    … +{} more (forge lattice impact)",
+                    dependents.len() - MAX
+                ),
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+    if let Some((author, date, commit, subject)) = why {
+        out.push(TextLine::from(Span::styled(
+            format!("    why: {author} · {date} · {commit} · {subject}"),
+            Style::default().fg(DIM),
+        )));
+    }
+    out
+}
+
+fn lattice_line(symbols: usize, files: usize, tokens: usize) -> TextLine<'static> {
+    TextLine::from(vec![
+        Span::styled("  ⌬ lattice ", Style::default().fg(TOOLCYAN).bold()),
+        Span::styled(
+            format!("→ injected {symbols} symbols · {files} files (~{tokens} tok)"),
             Style::default().fg(DIM),
         ),
     ])

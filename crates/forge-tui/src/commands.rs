@@ -79,6 +79,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/compact",
     },
     Command {
+        name: "lattice",
+        desc: "show a symbol's code-intelligence subgraph (callers + provenance)",
+        usage: "/lattice <symbol>",
+    },
+    Command {
         name: "clear",
         desc: "clear the screen (keep the session)",
         usage: "/clear",
@@ -117,6 +122,8 @@ pub enum CommandAction {
     ListCheckpoints,
     /// Summarize older transcript messages to free up context (`/compact`).
     Compact,
+    /// Show the code-intelligence subgraph for a symbol (`/lattice <symbol>`).
+    Lattice(String),
     Quit,
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
@@ -150,6 +157,7 @@ pub fn parse_command(line: &str) -> CommandAction {
         "checkpoint" | "cp" => CommandAction::Checkpoint((!arg.is_empty()).then_some(arg)),
         "checkpoints" => CommandAction::ListCheckpoints,
         "compact" => CommandAction::Compact,
+        "lattice" | "lat" => CommandAction::Lattice(arg),
         "clear" | "cls" => CommandAction::ClearScreen,
         "quit" | "exit" | "q" => CommandAction::Quit,
         other => CommandAction::Unknown(other.to_string()),
@@ -488,6 +496,14 @@ mod tests {
         assert_eq!(parse_command("/new"), CommandAction::New);
         assert_eq!(parse_command("/clear"), CommandAction::ClearScreen);
         assert_eq!(parse_command("/quit"), CommandAction::Quit);
+        assert_eq!(
+            parse_command("/lattice Session"),
+            CommandAction::Lattice("Session".into())
+        );
+        assert_eq!(
+            parse_command("/lat foo"),
+            CommandAction::Lattice("foo".into())
+        );
         assert_eq!(
             parse_command("/bogus"),
             CommandAction::Unknown("bogus".into())

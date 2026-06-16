@@ -10,9 +10,11 @@ use forge_types::{FileDiff, SideEffect};
 use serde_json::Value;
 
 mod core_tools;
+mod lattice_tool;
 mod shell;
 mod web;
 pub use core_tools::{EditFileTool, ListDirTool, ReadFileTool, SearchTool, WriteFileTool};
+pub use lattice_tool::LatticeTool;
 pub use shell::ShellTool;
 pub use web::{BraveSearch, DuckDuckGo, SearchBackend, SearchResult, WebFetchTool, WebSearchTool};
 

@@ -108,18 +108,45 @@ pub struct LatticeConfig {
     /// Build + maintain the structural graph. Off → the `forge lattice` commands are inert.
     #[serde(default = "default_lattice_enabled")]
     pub enabled: bool,
+    /// Auto-inject relevant code into each turn (the killer step). Off → the index still builds
+    /// and the CLI/tool work, but no system message is injected before the model call.
+    #[serde(default = "default_lattice_inject")]
+    pub inject: bool,
+    /// Token ceiling for the auto-injected context block. Scaled down as the daily budget tightens.
+    #[serde(default = "default_inject_budget")]
+    pub inject_token_budget: usize,
+    /// Watch the working tree and reindex changed files automatically (external editor edits), so
+    /// retrieval stays fresh without a manual `forge lattice update`. Off → index only updates on
+    /// explicit `update`/agent edits.
+    #[serde(default = "default_lattice_watch")]
+    pub watch: bool,
 }
 
 impl Default for LatticeConfig {
     fn default() -> Self {
         Self {
             enabled: default_lattice_enabled(),
+            inject: default_lattice_inject(),
+            inject_token_budget: default_inject_budget(),
+            watch: default_lattice_watch(),
         }
     }
 }
 
+fn default_lattice_watch() -> bool {
+    true
+}
+
 fn default_lattice_enabled() -> bool {
     true
+}
+
+fn default_lattice_inject() -> bool {
+    true
+}
+
+fn default_inject_budget() -> usize {
+    1500
 }
 
 /// Settings for the slash-command + skill system.
@@ -342,6 +369,10 @@ pub struct MeshConfig {
     /// Default bench duration (seconds) when a rate-limited provider gives no `Retry-After`.
     #[serde(default = "default_failover_cooldown_secs")]
     pub failover_cooldown_secs: u64,
+    /// Abort a model stream that goes silent for this many seconds (a half-open/stalled
+    /// connection) and fail over, instead of hanging the turn forever. `0` disables the watchdog.
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
     /// Which subscription plan backs each CLI bridge (`claude-cli` → "max-20x", `codex-cli` →
     /// "plus"), captured by `forge init`. Records the usage headroom the user has so the mesh can
     /// (in the quota-aware layer, provider-cost-routing.md L3) avoid overrunning a plan. Currently
@@ -367,6 +398,12 @@ fn default_failover() -> bool {
 
 fn default_failover_cooldown_secs() -> u64 {
     300
+}
+
+fn default_stream_idle_timeout_secs() -> u64 {
+    // Long enough to never trip during normal generation (incl. slow reasoning models and a
+    // bridge running a slow tool), short enough to recover from a genuine stall in reasonable time.
+    120
 }
 
 /// Subagent orchestration settings (RFC subagent-orchestration).
@@ -523,6 +560,7 @@ impl Default for Config {
                 auto_discover: default_auto_discover(),
                 failover: default_failover(),
                 failover_cooldown_secs: default_failover_cooldown_secs(),
+                stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
                 bridge_models: HashMap::new(),
                 subscriptions: HashMap::new(),
             },

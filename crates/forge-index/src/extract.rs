@@ -1,209 +1,394 @@
-//! Tree-sitter extraction: a Rust source file → a flat list of symbol [`RawNode`]s plus the
-//! `contains` parent→child relationships between them. Pure (no I/O, no store): the caller owns
-//! reading the file and persisting the result. Language support starts with Rust; adding a
-//! grammar is additive here.
+//! Multi-language extraction via tree-sitter **tags queries** (`tags.scm`) — the same mechanism
+//! GitHub code-nav uses. A source file + its detected language yields symbol *definitions*
+//! (graph nodes) and *references* (call/use sites → graph edges), uniformly across every language
+//! whose grammar ships a tags query. Pure: no I/O, no store; the caller reads files and persists.
+//!
+//! Adding a language is one row in [`LANGS`] (grammar `Language` + its bundled `TAGS_QUERY` +
+//! file extensions). The category strings come from the grammar's own `@definition.*` /
+//! `@reference.*` captures, so we stay grammar-driven rather than hand-classifying per language.
 
-use tree_sitter::{Node as TsNode, Parser};
+use std::collections::HashMap;
+use tree_sitter_tags::{TagsConfiguration, TagsContext};
 
-/// A symbol pulled from the AST, before it gets a persisted `SymbolId`.
+/// A symbol definition pulled from a tags query.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawNode {
-    pub kind: NodeKind,
+pub struct Def {
+    /// Normalized tags category: `function|method|class|struct|enum|trait|interface|module|
+    /// constant|type|constructor|macro|union|field` (grammar-driven; unknowns kept verbatim).
+    pub kind: String,
     pub name: String,
-    /// Enclosing named items joined by `::` (e.g. `Session::run_turn`), the symbol included.
+    /// Enclosing-definition chain joined by `.` (e.g. `Session.run_turn`), this symbol included.
     pub qualname: String,
     pub signature: Option<String>,
     pub span_start: usize,
     pub span_end: usize,
     pub line_start: u32,
-    /// Index into the returned `Vec<RawNode>` of the enclosing symbol (for a `contains` edge);
-    /// `None` for a top-level item.
+    /// Index into the returned `defs` of the nearest enclosing definition (a `contains` edge);
+    /// `None` for a top-level item. Derived from span nesting, so it is language-agnostic.
     pub parent: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeKind {
-    Function,
-    Method,
-    Struct,
-    Enum,
-    Trait,
-    Impl,
-    Const,
-    Module,
-    TypeAlias,
+/// A reference / call site: an identifier use that is not itself a definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ref {
+    pub name: String,
+    /// Reference category, e.g. `call`, `type`, `module`, `implementation`.
+    pub kind: String,
+    pub line: u32,
+    /// Index into `defs` of the definition whose span encloses this reference (the edge source);
+    /// `None` if the reference sits at file scope outside any indexed definition.
+    pub from: Option<usize>,
 }
 
-impl NodeKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            NodeKind::Function => "function",
-            NodeKind::Method => "method",
-            NodeKind::Struct => "struct",
-            NodeKind::Enum => "enum",
-            NodeKind::Trait => "trait",
-            NodeKind::Impl => "impl",
-            NodeKind::Const => "const",
-            NodeKind::Module => "module",
-            NodeKind::TypeAlias => "type",
-        }
-    }
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Parsed {
+    pub defs: Vec<Def>,
+    pub refs: Vec<Ref>,
 }
 
-/// Parse Rust source and return its symbols (depth-first, parents before children). Returns an
-/// empty vec if the grammar fails to load or the source doesn't parse into a tree.
-pub fn extract_rust(src: &str) -> Vec<RawNode> {
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .is_err()
+struct LangEntry {
+    name: &'static str,
+    config: TagsConfiguration,
+}
+
+struct Registry {
+    entries: Vec<LangEntry>,
+    by_ext: HashMap<&'static str, usize>,
+}
+
+fn lang(language: tree_sitter::Language, tags: &str) -> Option<TagsConfiguration> {
+    TagsConfiguration::new(language, tags, "").ok()
+}
+
+thread_local! {
+    // `TagsConfiguration` is not `Sync`, so the compiled-query registry is cached per thread
+    // rather than in a global static. Build cost (query compilation) is paid once per thread.
+    static REGISTRY: Registry = build_registry();
+}
+
+/// Build every supported language's [`TagsConfiguration`]. A grammar whose query fails to compile
+/// is skipped (logged) rather than panicking — degrade, don't crash.
+fn build_registry() -> Registry {
     {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(src, None) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    walk(tree.root_node(), src, None, &[], false, &mut out);
-    out
-}
-
-fn walk(
-    node: TsNode,
-    src: &str,
-    parent: Option<usize>,
-    scope: &[String],
-    in_impl: bool,
-    out: &mut Vec<RawNode>,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        let (this_parent, this_scope, child_in_impl) =
-            if let Some((kind, name)) = classify(&child, src, in_impl) {
-                let qualname = {
-                    let mut q = scope.to_vec();
-                    q.push(name.clone());
-                    q.join("::")
-                };
-                out.push(RawNode {
-                    kind,
-                    name: name.clone(),
-                    qualname: qualname.clone(),
-                    signature: signature(&child, src),
-                    span_start: child.start_byte(),
-                    span_end: child.end_byte(),
-                    line_start: child.start_position().row as u32 + 1,
-                    parent,
-                });
-                let idx = out.len() - 1;
-                let mut next_scope = scope.to_vec();
-                next_scope.push(name);
-                (Some(idx), next_scope, in_impl || kind == NodeKind::Impl)
-            } else {
-                (parent, scope.to_vec(), in_impl)
+        // (name, build TagsConfiguration, file extensions)
+        let specs: Vec<(
+            &'static str,
+            Option<TagsConfiguration>,
+            &'static [&'static str],
+        )> = vec![
+            (
+                "rust",
+                lang(
+                    tree_sitter_rust::LANGUAGE.into(),
+                    tree_sitter_rust::TAGS_QUERY,
+                ),
+                &["rs"],
+            ),
+            (
+                "python",
+                lang(
+                    tree_sitter_python::LANGUAGE.into(),
+                    tree_sitter_python::TAGS_QUERY,
+                ),
+                &["py", "pyi"],
+            ),
+            (
+                "javascript",
+                lang(
+                    tree_sitter_javascript::LANGUAGE.into(),
+                    tree_sitter_javascript::TAGS_QUERY,
+                ),
+                &["js", "jsx", "mjs", "cjs"],
+            ),
+            (
+                "typescript",
+                lang(
+                    tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                    tree_sitter_typescript::TAGS_QUERY,
+                ),
+                &["ts", "mts", "cts"],
+            ),
+            (
+                "tsx",
+                lang(
+                    tree_sitter_typescript::LANGUAGE_TSX.into(),
+                    tree_sitter_typescript::TAGS_QUERY,
+                ),
+                &["tsx"],
+            ),
+            (
+                "go",
+                lang(tree_sitter_go::LANGUAGE.into(), tree_sitter_go::TAGS_QUERY),
+                &["go"],
+            ),
+            (
+                "java",
+                lang(
+                    tree_sitter_java::LANGUAGE.into(),
+                    tree_sitter_java::TAGS_QUERY,
+                ),
+                &["java"],
+            ),
+            (
+                "c",
+                lang(tree_sitter_c::LANGUAGE.into(), tree_sitter_c::TAGS_QUERY),
+                &["c", "h"],
+            ),
+            (
+                "cpp",
+                lang(
+                    tree_sitter_cpp::LANGUAGE.into(),
+                    tree_sitter_cpp::TAGS_QUERY,
+                ),
+                &["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
+            ),
+            (
+                "ruby",
+                lang(
+                    tree_sitter_ruby::LANGUAGE.into(),
+                    tree_sitter_ruby::TAGS_QUERY,
+                ),
+                &["rb"],
+            ),
+        ];
+        let mut entries = Vec::new();
+        let mut by_ext = HashMap::new();
+        for (name, config, exts) in specs {
+            let Some(config) = config else {
+                tracing::warn!(language = name, "tags query failed to compile; skipping");
+                continue;
             };
-        walk(child, src, this_parent, &this_scope, child_in_impl, out);
-    }
-}
-
-/// Map a tree-sitter node to a [`NodeKind`] + its declared name, or `None` if it isn't a symbol
-/// we index. A `function_item` inside an `impl` block is a method.
-fn classify(node: &TsNode, src: &str, in_impl: bool) -> Option<(NodeKind, String)> {
-    let kind = match node.kind() {
-        "function_item" | "function_signature_item" => {
-            if in_impl {
-                NodeKind::Method
-            } else {
-                NodeKind::Function
+            let idx = entries.len();
+            entries.push(LangEntry { name, config });
+            for ext in exts {
+                by_ext.insert(*ext, idx);
             }
         }
-        "struct_item" => NodeKind::Struct,
-        "enum_item" => NodeKind::Enum,
-        "trait_item" => NodeKind::Trait,
-        "const_item" | "static_item" => NodeKind::Const,
-        "mod_item" => NodeKind::Module,
-        "type_item" => NodeKind::TypeAlias,
-        "impl_item" => {
-            // The "name" of an impl is the type it's for (skip the trait for `impl X for Y`).
-            let name = node
-                .child_by_field_name("type")
-                .and_then(|n| text(&n, src))
-                .unwrap_or_else(|| "impl".to_string());
-            return Some((NodeKind::Impl, name));
-        }
-        _ => return None,
-    };
-    let name = node
-        .child_by_field_name("name")
-        .and_then(|n| text(&n, src))?;
-    Some((kind, name))
+        Registry { entries, by_ext }
+    }
 }
 
-/// A one-line signature: the node's text up to the body `{` / `;` / `=`, collapsed to one line.
-fn signature(node: &TsNode, src: &str) -> Option<String> {
-    let full = text(node, src)?;
+/// The language name Lattice will record for a path, or `None` if unsupported.
+pub fn lang_for_path(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit('.').next()?;
+    REGISTRY.with(|reg| reg.by_ext.get(ext).map(|&i| reg.entries[i].name))
+}
+
+/// Every language name with a working grammar (for `status` / diagnostics).
+pub fn supported_languages() -> Vec<&'static str> {
+    REGISTRY.with(|reg| reg.entries.iter().map(|e| e.name).collect())
+}
+
+/// Extract definitions + references from `src`, choosing the grammar by `path`'s extension.
+/// Returns an empty [`Parsed`] for unsupported languages or unparseable input — never errors.
+pub fn extract(path: &str, src: &str) -> Parsed {
+    let Some(ext) = path.rsplit('.').next() else {
+        return Parsed::default();
+    };
+    REGISTRY.with(|reg| {
+        let Some(&idx) = reg.by_ext.get(ext) else {
+            return Parsed::default();
+        };
+        extract_with(&reg.entries[idx].config, src)
+    })
+}
+
+fn extract_with(config: &TagsConfiguration, src: &str) -> Parsed {
+    let mut ctx = TagsContext::new();
+    let bytes = src.as_bytes();
+    let Ok((tags, _had_error)) = ctx.generate_tags(config, bytes, None) else {
+        return Parsed::default();
+    };
+
+    // Pass 1: collect raw tags (definitions and references) with byte spans + categories.
+    struct RawDef {
+        kind: String,
+        name: String,
+        span_start: usize,
+        span_end: usize,
+        line_start: u32,
+    }
+    struct RawRef {
+        name: String,
+        kind: String,
+        pos: usize,
+        line: u32,
+    }
+    let mut raw_defs: Vec<RawDef> = Vec::new();
+    let mut raw_refs: Vec<RawRef> = Vec::new();
+
+    for tag in tags {
+        let Ok(tag) = tag else { continue };
+        let Some(name) = src.get(tag.name_range.clone()) else {
+            continue;
+        };
+        let name = name.to_string();
+        let category = config.syntax_type_name(tag.syntax_type_id).to_string();
+        let line = tag.span.start.row as u32 + 1;
+        if tag.is_definition {
+            raw_defs.push(RawDef {
+                kind: category,
+                name,
+                span_start: tag.range.start,
+                span_end: tag.range.end,
+                line_start: line,
+            });
+        } else {
+            raw_refs.push(RawRef {
+                name,
+                kind: category,
+                pos: tag.name_range.start,
+                line,
+            });
+        }
+    }
+
+    // Definitions are processed outer-to-inner so a parent is always already present when its
+    // children are placed. Sort by start asc, then by end desc (wider span = outer = first).
+    raw_defs.sort_by(|a, b| {
+        a.span_start
+            .cmp(&b.span_start)
+            .then(b.span_end.cmp(&a.span_end))
+    });
+
+    let mut defs: Vec<Def> = Vec::with_capacity(raw_defs.len());
+    for rd in &raw_defs {
+        let parent = enclosing(&defs, rd.span_start, rd.span_end);
+        let qualname = match parent {
+            Some(p) => format!("{}.{}", defs[p].qualname, rd.name),
+            None => rd.name.clone(),
+        };
+        defs.push(Def {
+            kind: rd.kind.clone(),
+            name: rd.name.clone(),
+            qualname,
+            signature: signature(src, rd.span_start, rd.span_end),
+            span_start: rd.span_start,
+            span_end: rd.span_end,
+            line_start: rd.line_start,
+            parent,
+        });
+    }
+
+    let refs = raw_refs
+        .into_iter()
+        .map(|rr| Ref {
+            from: enclosing_point(&defs, rr.pos),
+            name: rr.name,
+            kind: rr.kind,
+            line: rr.line,
+        })
+        .collect();
+
+    Parsed { defs, refs }
+}
+
+/// Index of the smallest already-placed definition strictly enclosing `[start, end)` (excluding an
+/// identical span, so a def is never its own parent).
+fn enclosing(defs: &[Def], start: usize, end: usize) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, d) in defs.iter().enumerate() {
+        let encloses = d.span_start <= start
+            && d.span_end >= end
+            && (d.span_end - d.span_start) > (end - start);
+        if encloses {
+            match best {
+                Some(b)
+                    if (defs[b].span_end - defs[b].span_start) <= (d.span_end - d.span_start) => {}
+                _ => best = Some(i),
+            }
+        }
+    }
+    best
+}
+
+/// Index of the smallest definition whose span contains byte offset `pos`.
+fn enclosing_point(defs: &[Def], pos: usize) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, d) in defs.iter().enumerate() {
+        if d.span_start <= pos && pos < d.span_end {
+            match best {
+                Some(b)
+                    if (defs[b].span_end - defs[b].span_start) <= (d.span_end - d.span_start) => {}
+                _ => best = Some(i),
+            }
+        }
+    }
+    best
+}
+
+/// A one-line signature: the definition's text up to the body delimiter, collapsed to one line.
+fn signature(src: &str, start: usize, end: usize) -> Option<String> {
+    let full = src.get(start..end)?;
     let head: String = full
         .chars()
-        .take_while(|&c| c != '{' && c != ';' && c != '\n')
+        .take_while(|&c| c != '{' && c != '\n')
         .collect();
     let head = head.split_whitespace().collect::<Vec<_>>().join(" ");
     (!head.is_empty()).then_some(head)
-}
-
-fn text(node: &TsNode, src: &str) -> Option<String> {
-    node.utf8_text(src.as_bytes()).ok().map(|s| s.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SRC: &str = r#"
-pub mod net {
-    pub struct Session { id: String }
-
-    impl Session {
-        pub fn run_turn(&self, prompt: &str) -> String { String::new() }
+    fn def<'a>(p: &'a Parsed, name: &str) -> &'a Def {
+        p.defs.iter().find(|d| d.name == name).expect("def present")
     }
 
-    pub trait Router { fn route(&self); }
-    pub enum Tier { Trivial, Complex }
-    pub const MAX: usize = 8;
-    pub fn helper() {}
-    type Alias = u32;
+    #[test]
+    fn rust_definitions_and_nesting() {
+        let src = r#"
+pub struct Session { id: String }
+impl Session {
+    pub fn run_turn(&self, prompt: &str) -> String { helper() }
 }
+pub fn helper() -> String { String::new() }
 "#;
-
-    fn find<'a>(nodes: &'a [RawNode], name: &str) -> &'a RawNode {
-        nodes.iter().find(|n| n.name == name).expect("node present")
+        let p = extract("net.rs", src);
+        // Categories are grammar-defined: Rust's tags.scm maps `struct_item` to `class`.
+        assert_eq!(def(&p, "Session").kind, "class");
+        let m = def(&p, "run_turn");
+        assert!(!m.kind.is_empty());
+        // Rust's tags.scm doesn't capture `impl` blocks as containers, so a method is a sibling
+        // of its struct (no qualname nesting). Nesting is exercised via Python (classes contain
+        // their methods lexically) in `python_class_nesting`.
+        assert_eq!(m.qualname, "run_turn");
+        assert!(def(&p, "helper").parent.is_none());
+        // The call to helper() inside run_turn is a reference attributed to run_turn.
+        let call = p
+            .refs
+            .iter()
+            .find(|r| r.name == "helper")
+            .expect("helper() call captured as a reference");
+        let from = call.from.map(|i| p.defs[i].name.as_str());
+        assert_eq!(from, Some("run_turn"), "ref attributed to enclosing def");
     }
 
     #[test]
-    fn extracts_each_symbol_kind() {
-        let nodes = extract_rust(SRC);
-        assert_eq!(find(&nodes, "net").kind, NodeKind::Module);
-        assert_eq!(find(&nodes, "Session").kind, NodeKind::Struct);
-        assert_eq!(find(&nodes, "Router").kind, NodeKind::Trait);
-        assert_eq!(find(&nodes, "Tier").kind, NodeKind::Enum);
-        assert_eq!(find(&nodes, "MAX").kind, NodeKind::Const);
-        assert_eq!(find(&nodes, "helper").kind, NodeKind::Function);
-        assert_eq!(find(&nodes, "Alias").kind, NodeKind::TypeAlias);
+    fn python_class_nesting() {
+        // A Python class lexically contains its methods, so span-nesting gives a dotted qualname.
+        let src = "class Greeter:\n    def hi(self):\n        pass\n";
+        let p = extract("g.py", src);
+        let hi = def(&p, "hi");
+        assert_eq!(hi.qualname, "Greeter.hi", "method nests under class");
+        assert!(hi.parent.is_some());
     }
 
     #[test]
-    fn function_in_impl_is_a_method_with_qualname() {
-        let nodes = extract_rust(SRC);
-        let m = find(&nodes, "run_turn");
-        assert_eq!(m.kind, NodeKind::Method);
-        assert_eq!(m.qualname, "net::Session::run_turn");
-        assert!(m.signature.as_deref().unwrap().contains("run_turn"));
-        // Its parent is the impl block.
-        let parent = m.parent.map(|i| nodes[i].kind);
-        assert_eq!(parent, Some(NodeKind::Impl));
+    fn python_is_supported() {
+        let src = "def greet(name):\n    return hello(name)\n\nclass Greeter:\n    def hi(self):\n        pass\n";
+        let p = extract("g.py", src);
+        assert!(p.defs.iter().any(|d| d.name == "greet"));
+        assert!(p.defs.iter().any(|d| d.name == "Greeter"));
+        assert!(p.refs.iter().any(|r| r.name == "hello"));
     }
 
     #[test]
-    fn empty_or_unparseable_source_yields_no_nodes() {
-        assert!(extract_rust("").is_empty());
+    fn unsupported_or_empty_is_clean() {
+        assert!(extract("notes.txt", "hello world").defs.is_empty());
+        assert!(extract("x.rs", "").defs.is_empty());
+        assert_eq!(lang_for_path("a.go"), Some("go"));
+        assert_eq!(lang_for_path("a.unknownext"), None);
     }
 }
