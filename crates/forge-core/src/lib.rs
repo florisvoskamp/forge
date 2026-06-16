@@ -2103,8 +2103,11 @@ mod tests {
     }
 
     /// First call emits a failing `shell` command; the diagnosis call (identified by its system
-    /// prompt) returns a fix; after the tool result it answers `done`.
+    /// prompt) returns a fix; after the tool result it answers `done`. Unix-only: the `shell`
+    /// tool shells out to `sh`, so the e2e tests using it are gated to Unix.
+    #[cfg(unix)]
     struct ShellFailProvider;
+    #[cfg(unix)]
     #[async_trait::async_trait]
     impl Provider for ShellFailProvider {
         async fn complete(
@@ -2217,8 +2220,10 @@ mod tests {
         );
     }
 
-    /// Emits a succeeding `shell` command once, then answers `done`.
+    /// Emits a succeeding `shell` command once, then answers `done`. Unix-only (see above).
+    #[cfg(unix)]
     struct EchoShellProvider;
+    #[cfg(unix)]
     #[async_trait::async_trait]
     impl Provider for EchoShellProvider {
         async fn complete(
