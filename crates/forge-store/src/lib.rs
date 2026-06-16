@@ -980,6 +980,21 @@ impl Store {
         Ok(rows)
     }
 
+    /// A single node row by id — used to resolve embedding-ranked node ids back to nodes.
+    pub fn lattice_node_by_id(&self, id: &str) -> Result<Option<LatticeNodeRow>> {
+        let conn = self.lock()?;
+        match conn.query_row(
+            "SELECT id, file_id, kind, name, qualname, signature, span_start, span_end, line_start
+             FROM lattice_node WHERE id = ?1",
+            [id],
+            lattice_node_from_row,
+        ) {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The `rel_path` of an indexed file by its id (for rendering a node's location).
     pub fn lattice_file_path(&self, file_id: &str) -> Result<Option<String>> {
         let conn = self.lock()?;
@@ -999,6 +1014,45 @@ impl Store {
         let nodes = conn.query_row("SELECT COUNT(*) FROM lattice_node", [], |r| r.get(0))?;
         let edges = conn.query_row("SELECT COUNT(*) FROM lattice_edge", [], |r| r.get(0))?;
         Ok((files, nodes, edges))
+    }
+
+    /// Upsert a node's embedding vector (semantic retrieval, code-intelligence.md §5.6). `vec` is
+    /// stored as little-endian f32 components.
+    pub fn put_lattice_embedding(&self, node_id: &str, vec: &[f32]) -> Result<()> {
+        let mut bytes = Vec::with_capacity(vec.len() * 4);
+        for f in vec {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        self.lock()?.execute(
+            "INSERT INTO lattice_embedding (node_id, dim, vec) VALUES (?1, ?2, ?3)
+             ON CONFLICT(node_id) DO UPDATE SET dim = excluded.dim, vec = excluded.vec",
+            rusqlite::params![node_id, vec.len() as i64, bytes],
+        )?;
+        Ok(())
+    }
+
+    /// All stored `(node_id, vector)` embeddings — loaded once to cosine-rank a query vector.
+    pub fn lattice_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT node_id, vec FROM lattice_embedding")?;
+        let rows = stmt.query_map([], |r| {
+            let id: String = r.get(0)?;
+            let blob: Vec<u8> = r.get(1)?;
+            let vec = blob
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            Ok((id, vec))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// How many nodes currently have an embedding (`forge lattice status`: "embeddings: N").
+    pub fn lattice_embedding_count(&self) -> Result<i64> {
+        Ok(self
+            .lock()?
+            .query_row("SELECT COUNT(*) FROM lattice_embedding", [], |r| r.get(0))?)
     }
 }
 
@@ -1411,6 +1465,45 @@ mod tests {
         );
         store.clear_model_health("m").unwrap();
         assert!(store.benched_models(500).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lattice_embedding_round_trips_and_upserts() {
+        let store = Store::open_in_memory().unwrap();
+        // A node row is required (FK). Insert one via the file-replace path.
+        let file = LatticeFileRow {
+            id: "f1".into(),
+            repo_root: "/r".into(),
+            rel_path: "a.rs".into(),
+            lang: "rust".into(),
+            content_hash: "h".into(),
+            parse_status: "ok".into(),
+        };
+        let node = LatticeNodeRow {
+            id: "n1".into(),
+            file_id: "f1".into(),
+            kind: "function".into(),
+            name: "foo".into(),
+            qualname: None,
+            signature: None,
+            span_start: 0,
+            span_end: 1,
+            line_start: 1,
+        };
+        store
+            .replace_lattice_file(&file, &[node], &[], &[])
+            .unwrap();
+
+        store
+            .put_lattice_embedding("n1", &[1.0, -0.5, 0.25])
+            .unwrap();
+        assert_eq!(store.lattice_embedding_count().unwrap(), 1);
+        let all = store.lattice_embeddings().unwrap();
+        assert_eq!(all, vec![("n1".to_string(), vec![1.0, -0.5, 0.25])]);
+        // Upsert replaces, not duplicates.
+        store.put_lattice_embedding("n1", &[2.0, 2.0]).unwrap();
+        assert_eq!(store.lattice_embedding_count().unwrap(), 1);
+        assert_eq!(store.lattice_embeddings().unwrap()[0].1, vec![2.0, 2.0]);
     }
 
     #[test]
