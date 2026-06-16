@@ -57,6 +57,9 @@ pub struct Config {
     /// Native code-intelligence graph (code-intelligence.md).
     #[serde(default)]
     pub lattice: LatticeConfig,
+    /// Shell tool behaviour, incl. the AI error interceptor (shell-error-interceptor.md).
+    #[serde(default)]
+    pub shell: ShellConfig,
     /// Pre/post tool-use shell hooks (hooks.md). Each `[[hooks]]` entry runs a command around a
     /// matching tool call.
     #[serde(default)]
@@ -147,6 +150,29 @@ fn default_lattice_inject() -> bool {
 
 fn default_inject_budget() -> usize {
     1500
+}
+
+/// Settings for the `shell` tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellConfig {
+    /// When a shell command fails (non-zero exit, timeout, spawn error), make one cheap
+    /// trivial-tier model call to explain the likely cause and suggest a fix, surfaced
+    /// alongside the result — no prompt needed (shell-error-interceptor.md). Skipped when the
+    /// budget is exhausted.
+    #[serde(default = "default_explain_errors")]
+    pub explain_errors: bool,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            explain_errors: default_explain_errors(),
+        }
+    }
+}
+
+fn default_explain_errors() -> bool {
+    true
 }
 
 /// Settings for the slash-command + skill system.
@@ -568,6 +594,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             commands: CommandsConfig::default(),
             lattice: LatticeConfig::default(),
+            shell: ShellConfig::default(),
             hooks: Vec::new(),
         }
     }

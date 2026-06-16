@@ -222,6 +222,9 @@ impl App {
                 files,
                 tokens,
             } => self.flush.push(lattice_line(symbols, files, tokens)),
+            PresenterEvent::ShellDiagnosis { command, diagnosis } => self
+                .flush
+                .extend(shell_diagnosis_lines(&command, &diagnosis)),
             PresenterEvent::Cost {
                 session_total_usd,
                 session_in,
@@ -525,6 +528,22 @@ fn lattice_line(symbols: usize, files: usize, tokens: usize) -> TextLine<'static
             Style::default().fg(DIM),
         ),
     ])
+}
+
+/// A failed shell command + the model's likely-cause/fix, rendered as a header line plus one
+/// dimmed line per diagnosis line (shell-error-interceptor.md).
+fn shell_diagnosis_lines(command: &str, diagnosis: &str) -> Vec<TextLine<'static>> {
+    let mut lines = vec![TextLine::from(vec![
+        Span::styled("  ⚠ shell failed ", Style::default().fg(ERRRED).bold()),
+        Span::styled(truncate(command, 56), Style::default().fg(DIM)),
+    ])];
+    for line in diagnosis.lines() {
+        lines.push(TextLine::from(Span::styled(
+            format!("    {line}"),
+            Style::default().fg(DIM),
+        )));
+    }
+    lines
 }
 
 /// Opens the subagent group box in scrollback.
