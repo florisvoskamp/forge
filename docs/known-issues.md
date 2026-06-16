@@ -45,20 +45,24 @@ to a junk value so auth fails and the mesh benches/avoids it.
 
 **Status:** shipped + tested (`is_model_disabled`, `clear_all_model_health`).
 
-## Shell tool is POSIX-only (Windows gap)
+## Shell tool: Windows execution (fixed) — denylist OS-awareness (deferred)
 
-**Symptom:** The `shell` tool runs `sh -c <command>` and the permission deny-list parser
-assumes POSIX command syntax. On Windows (no `sh` by default) shell commands won't run.
+**Was:** the `shell` tool ran `sh -c <command>`, which doesn't exist on Windows, so shell
+commands wouldn't run there at all.
 
-**What we know:** This predates the cross-platform mandate
-([cross-platform.md](architecture/cross-platform.md)). All other subsystems (config/secret
-locations, keyring, TUI, MCP client) are portable; the shell tool is the main exception.
+**Fixed:** `shell` now selects the OS shell — `sh -c` on Unix, `cmd /C` on Windows
+(`shell_invocation()` in `forge-tools/src/shell.rs`). The rest of the path (null stdin, capture,
+timeout-kill) was already cross-platform. Windows exec tests (`mod exec_windows`) run on the
+`windows-latest` CI runner: echo+exit, non-zero exit, timeout-kill (`ping -n`), bad-cwd spawn
+failure.
 
-**Planned fix (deferred):** branch to `cmd /C` / PowerShell on Windows (or require a `sh`
-on PATH and document it), and make the deny-list command parsing OS-aware.
+**Still deferred:** the catastrophic **denylist patterns are POSIX-oriented** (`rm -rf`,
+secret-file reads); Windows-specific dangerous commands (`del`, `rd /s`, `format`) aren't matched
+yet — a safety-completeness follow-up, not a "won't run" gap. PowerShell (vs `cmd`) is also a
+possible future option.
 
-**Status:** documented; fix deferred. Tracked on the cross-platform watch-list.
+**Status:** Windows execution shipped + CI-tested; denylist OS-awareness tracked as follow-up.
 
-**Related:** the hooks system ([hooks.md](features/hooks.md)) also runs `sh -c`, so user hooks
-are POSIX-only for the same reason; the same OS-aware fix covers both.
+**Related:** the hooks system ([hooks.md](features/hooks.md)) still runs `sh -c` directly; giving
+it the same `shell_invocation()` treatment is a small follow-up.
 </content>
