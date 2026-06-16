@@ -369,12 +369,20 @@ pub struct ImportSource {
 /// Windsurf, VS Code) and return the sources that exist and declare ≥1 server. Read-only.
 /// Secrets are stripped during parsing — an [`ImportSource`]'s servers never carry a token value.
 pub fn discover_import_sources(cwd: &Path) -> Vec<ImportSource> {
+    let base = directories::BaseDirs::new();
+    let home = base.as_ref().map(|b| b.home_dir());
+    let config_dir = base.as_ref().map(|b| b.config_dir());
+    discover_in(cwd, home, config_dir)
+}
+
+/// Discovery core with the home + config directories injected, so tests can point it at a fake
+/// tree without env-var games (`directories` resolves Windows home via the known-folder API, which
+/// ignores `HOME`, so an env override only works on Unix).
+fn discover_in(cwd: &Path, home: Option<&Path>, config_dir: Option<&Path>) -> Vec<ImportSource> {
     let mut out = Vec::new();
-    let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
-    let config_dir = directories::BaseDirs::new().map(|b| b.config_dir().to_path_buf());
 
     // --- Claude Code: ~/.claude.json (global `mcpServers` + per-project) ---
-    if let Some(home) = &home {
+    if let Some(home) = home {
         let claude = home.join(".claude.json");
         if let Ok(text) = std::fs::read_to_string(&claude) {
             if let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -404,7 +412,7 @@ pub fn discover_import_sources(cwd: &Path) -> Vec<ImportSource> {
     scan_json(&mut out, "claude-code (.mcp.json)", &cwd.join(".mcp.json"));
 
     // --- Codex: ~/.codex/config.toml ([mcp_servers.<name>]) ---
-    if let Some(home) = &home {
+    if let Some(home) = home {
         let codex = home.join(".codex/config.toml");
         if let Ok(text) = std::fs::read_to_string(&codex) {
             push_source(&mut out, "codex", &codex, servers_from_codex_toml(&text));
@@ -412,13 +420,13 @@ pub fn discover_import_sources(cwd: &Path) -> Vec<ImportSource> {
     }
 
     // --- Cursor: ~/.cursor/mcp.json (global) + ./.cursor/mcp.json (project) ---
-    if let Some(home) = &home {
+    if let Some(home) = home {
         scan_json(&mut out, "cursor (global)", &home.join(".cursor/mcp.json"));
     }
     scan_json(&mut out, "cursor (project)", &cwd.join(".cursor/mcp.json"));
 
     // --- Claude Desktop: <config>/Claude/claude_desktop_config.json ---
-    if let Some(cfg) = &config_dir {
+    if let Some(cfg) = config_dir {
         scan_json(
             &mut out,
             "claude-desktop",
@@ -427,7 +435,7 @@ pub fn discover_import_sources(cwd: &Path) -> Vec<ImportSource> {
     }
 
     // --- Windsurf: ~/.codeium/windsurf/mcp_config.json ---
-    if let Some(home) = &home {
+    if let Some(home) = home {
         scan_json(
             &mut out,
             "windsurf",
@@ -672,10 +680,8 @@ Authorization = "Bearer SECRET-TOKEN"
         )
         .unwrap();
 
-        // Point discovery at the fake HOME by overriding it for this thread.
-        std::env::set_var("HOME", &home);
-        let sources = discover_import_sources(&cwd);
-        std::env::remove_var("HOME");
+        // Inject the fake home directly — env overrides don't reach `directories` on Windows.
+        let sources = discover_in(&cwd, Some(&home), Some(&home));
 
         let labels: Vec<&str> = sources.iter().map(|s| s.label.as_str()).collect();
         assert!(labels.contains(&"claude-code (global)"), "{labels:?}");
