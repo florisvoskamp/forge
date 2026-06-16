@@ -63,7 +63,7 @@ pub async fn list_models(namespace: &str) -> Result<Vec<String>, ProviderError> 
 /// namespace, strips it, and retargets the OpenAI adapter + Cerebras endpoint + key. All native
 /// namespaces (groq/gemini/open_router/opencode_go/github_copilot/mimo/minimax/…) pass through
 /// unchanged.
-fn build_client() -> Client {
+pub(crate) fn build_client() -> Client {
     let resolver = ServiceTargetResolver::from_resolver_fn(
         |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
             let is_cerebras = st.model.model_name.namespace_is("cerebras");
@@ -90,7 +90,7 @@ fn build_client() -> Client {
 /// API-key env var) explicitly instead of relying on name inference. The only fix-up is
 /// Forge's `openrouter` alias → genai's `open_router` namespace. A model with no `::` is
 /// passed verbatim (genai falls back to name inference).
-fn to_genai_model(model: &str) -> String {
+pub(crate) fn to_genai_model(model: &str) -> String {
     match model.split_once("::") {
         Some((prefix, name)) => format!("{}::{}", normalize_namespace(prefix), name),
         None => model.to_string(),

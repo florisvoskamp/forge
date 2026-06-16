@@ -1263,6 +1263,8 @@ name = "forge-provider"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "forge-config",
+ "forge-index",
  "forge-types",
  "futures",
  "genai",

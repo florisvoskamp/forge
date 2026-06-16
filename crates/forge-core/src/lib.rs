@@ -836,13 +836,15 @@ impl Session {
             if let Some(lat) = self.lattice.as_ref().filter(|_| self.config.lattice.inject) {
                 let budget = inject_budget(self.config.lattice.inject_token_budget, status);
                 let emb = &self.config.lattice.embeddings;
-                if emb.enabled {
-                    // Hybrid: blend embedding neighbours of the prompt with structural hits. Any
-                    // backend error degrades to structural inside `retrieve_hybrid`.
-                    let embedder = forge_index::OllamaEmbedder::new(&emb.endpoint, &emb.model);
-                    lat.retrieve_hybrid(prompt, budget, &embedder).await.ok()
-                } else {
-                    lat.retrieve(prompt, budget).ok()
+                // Hybrid: blend embedding neighbours of the prompt with structural hits. The
+                // backend is chosen by config (auto-picks the cheapest available); any backend
+                // error degrades to structural inside `retrieve_hybrid`. No backend → structural.
+                match forge_provider::select_embedder(emb) {
+                    Some((embedder, _)) => lat
+                        .retrieve_hybrid(prompt, budget, embedder.as_ref())
+                        .await
+                        .ok(),
+                    None => lat.retrieve(prompt, budget).ok(),
                 }
             } else {
                 None

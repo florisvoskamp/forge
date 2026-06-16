@@ -128,8 +128,9 @@ pub struct LatticeConfig {
     /// explicit `update`/agent edits.
     #[serde(default = "default_lattice_watch")]
     pub watch: bool,
-    /// Semantic retrieval via embeddings (code-intelligence.md §5.6). Off by default — structural/
-    /// lexical retrieval is unchanged until a backend is configured + `forge lattice embed` is run.
+    /// Semantic retrieval via embeddings (code-intelligence.md §5.6). On by default with
+    /// `backend = "auto"`: embeddings are computed in the background when a backend is reachable
+    /// and blended into retrieval, and it's a no-op (zero cost, structural-only) when none is.
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
 }
@@ -141,13 +142,17 @@ pub struct EmbeddingsConfig {
     /// Master switch. Off → no embeddings are computed or used; retrieval is structural/lexical.
     #[serde(default)]
     pub enabled: bool,
-    /// Embedding backend (currently `"ollama"`; provider backends are a follow-up).
+    /// Embedding backend: `"auto"` (default — pick the cheapest available, see below), `"ollama"`
+    /// (local HTTP), or a provider namespace genai can embed with (`"openai"`, `"gemini"`). `auto`
+    /// prefers a free/cheap cloud model when a key exists (gemini free-tier → openai), else falls
+    /// back to local ollama; if nothing is reachable it costs nothing (retrieval stays structural).
     #[serde(default = "default_embed_backend")]
     pub backend: String,
-    /// Embedding model id (e.g. ollama's `nomic-embed-text`).
+    /// Embedding model id. Used as-is for `ollama`/explicit-provider backends (e.g. ollama's
+    /// `nomic-embed-text`); ignored under `auto`, which picks the model per chosen provider.
     #[serde(default = "default_embed_model")]
     pub model: String,
-    /// Backend endpoint (ollama's HTTP API root).
+    /// ollama HTTP API root (only used by the ollama backend / auto's local fallback).
     #[serde(default = "default_embed_endpoint")]
     pub endpoint: String,
 }
@@ -155,7 +160,7 @@ pub struct EmbeddingsConfig {
 impl Default for EmbeddingsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             backend: default_embed_backend(),
             model: default_embed_model(),
             endpoint: default_embed_endpoint(),
@@ -164,7 +169,7 @@ impl Default for EmbeddingsConfig {
 }
 
 fn default_embed_backend() -> String {
-    "ollama".to_string()
+    "auto".to_string()
 }
 
 fn default_embed_model() -> String {

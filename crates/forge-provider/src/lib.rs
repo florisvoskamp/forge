@@ -8,10 +8,12 @@ use async_trait::async_trait;
 use forge_types::{Message, QuotaHint, ToolCall, Usage};
 
 mod cli_provider;
+mod embedder;
 mod genai_provider;
 mod mock;
 
 pub use cli_provider::{available_bridge_models, CliKind, CliProvider, SUBAGENT_SINK_ENV};
+pub use embedder::{select_embedder, GenaiEmbedder};
 pub use genai_provider::{list_models, GenAiProvider};
 pub use mock::MockProvider;
 

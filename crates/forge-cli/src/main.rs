@@ -460,15 +460,18 @@ async fn lattice_cmd(op: LatticeOp) -> Result<()> {
             }
             let lat = forge_index::Lattice::new(store, &cwd);
             lat.update().map_err(|e| anyhow::anyhow!("{e}"))?;
-            let embedder = forge_index::OllamaEmbedder::new(&emb.endpoint, &emb.model);
+            let Some((embedder, label)) = forge_provider::select_embedder(emb) else {
+                println!(
+                    "no embedding backend available — set [lattice.embeddings] backend + a provider key, or run ollama"
+                );
+                return Ok(());
+            };
             let n = lat
-                .embed_pending(&embedder, 64)
+                .embed_pending(embedder.as_ref(), 64)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!(
-                "⌬ embedded {n} node(s) via {} ({}); {} total",
-                emb.backend,
-                emb.model,
+                "⌬ embedded {n} node(s) via {label}; {} total",
                 lat.embedding_count().map_err(|e| anyhow::anyhow!("{e}"))?
             );
         }
@@ -1510,10 +1513,10 @@ async fn build_session_with(
         let lat_bg = Arc::clone(lat);
         let embeddings = config.lattice.embeddings.clone();
         tokio::spawn(async move {
-            if lat_bg.update().is_ok() && embeddings.enabled {
-                let embedder =
-                    forge_index::OllamaEmbedder::new(&embeddings.endpoint, &embeddings.model);
-                let _ = lat_bg.embed_pending(&embedder, 64).await;
+            if lat_bg.update().is_ok() {
+                if let Some((embedder, _)) = forge_provider::select_embedder(&embeddings) {
+                    let _ = lat_bg.embed_pending(embedder.as_ref(), 64).await;
+                }
             }
         });
     }
