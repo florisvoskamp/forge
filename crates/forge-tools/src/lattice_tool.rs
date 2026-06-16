@@ -33,9 +33,10 @@ impl Tool for LatticeTool {
         "Query the code-intelligence index of this repository. ops: \
          \"query\" (find definitions by name — args: name), \
          \"impact\" (what references a symbol, transitively — args: name), \
-         \"path\" (a reference chain between two symbols — args: from, to). \
-         Use it instead of grepping when you need structure: callers, blast radius, or how two \
-         symbols connect. Returns file:line locations. Read-only."
+         \"path\" (a reference chain between two symbols — args: from, to), \
+         \"why\" (who last changed a symbol's definition + the commit — args: name). \
+         Use it instead of grepping when you need structure: callers, blast radius, how two \
+         symbols connect, or decision provenance. Returns file:line locations. Read-only."
     }
 
     fn side_effect(&self) -> SideEffect {
@@ -46,8 +47,8 @@ impl Tool for LatticeTool {
         json!({
             "type": "object",
             "properties": {
-                "op": { "type": "string", "enum": ["query", "impact", "path"] },
-                "name": { "type": "string", "description": "symbol name for query/impact" },
+                "op": { "type": "string", "enum": ["query", "impact", "path", "why"] },
+                "name": { "type": "string", "description": "symbol name for query/impact/why" },
                 "from": { "type": "string", "description": "source symbol for path" },
                 "to": { "type": "string", "description": "target symbol for path" }
             },
@@ -102,8 +103,20 @@ impl Tool for LatticeTool {
                     None => Ok(format!("no reference path from '{from}' to '{to}'")),
                 }
             }
+            "why" => {
+                let name = str_arg(args, "name")?;
+                match self.lattice.why(name).map_err(map)? {
+                    Some(p) => Ok(format!(
+                        "{} ({}:{}) — {} · {} · {} · {}",
+                        p.name, p.rel_path, p.line, p.author, p.date, p.commit, p.subject
+                    )),
+                    None => Ok(format!(
+                        "no provenance for '{name}' (unknown symbol or not under git)"
+                    )),
+                }
+            }
             other => Err(ToolError::BadArgs(format!(
-                "unknown op '{other}' (expected query|impact|path)"
+                "unknown op '{other}' (expected query|impact|path|why)"
             ))),
         }
     }

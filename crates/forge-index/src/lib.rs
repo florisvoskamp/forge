@@ -65,6 +65,18 @@ pub struct BlastRadius {
     pub total_sites: usize,
 }
 
+/// Git provenance for a symbol — who last changed the line it's defined on, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    pub name: String,
+    pub rel_path: String,
+    pub line: i64,
+    pub author: String,
+    pub date: String,
+    pub commit: String,
+    pub subject: String,
+}
+
 /// Index-wide counts for `forge lattice status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStatus {
@@ -304,6 +316,35 @@ impl Lattice {
         Ok(None)
     }
 
+    /// Git provenance for a symbol: resolve its definition's file+line, `git blame` that line for
+    /// the last commit that touched it, and report author/date/commit/subject. `Ok(None)` when the
+    /// symbol isn't indexed, the tree isn't under git, or git is unavailable (never errors the turn).
+    pub fn why(&self, symbol: &str) -> Result<Option<Provenance>, LatticeError> {
+        let Some(hit) = self
+            .query(symbol, 8)?
+            .into_iter()
+            .find(|h| h.name == symbol)
+        else {
+            return Ok(None);
+        };
+        let sha = match git_blame_sha(&self.repo_root, &hit.rel_path, hit.line) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let Some(meta) = git_show_meta(&self.repo_root, &sha) else {
+            return Ok(None);
+        };
+        Ok(Some(Provenance {
+            name: hit.name,
+            rel_path: hit.rel_path,
+            line: hit.line,
+            author: meta.0,
+            date: meta.1,
+            commit: meta.2,
+            subject: meta.3,
+        }))
+    }
+
     /// Retrieve a budgeted set of relevant code for `prompt` — the auto-injection payload.
     pub fn retrieve(
         &self,
@@ -366,6 +407,61 @@ fn is_skippable_dir(name: &str) -> bool {
             | "build"
             | "__pycache__"
     ) || name.starts_with('.')
+}
+
+/// The commit sha that last touched `line` of `rel_path`, via `git blame --porcelain`. `None` if
+/// git fails (not a repo, git missing, path untracked).
+fn git_blame_sha(repo_root: &str, rel_path: &str, line: i64) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["blame", "-L"])
+        .arg(format!("{line},{line}"))
+        .args(["--porcelain", "--"])
+        .arg(rel_path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_blame_sha(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The first token of `git blame --porcelain` output is the commit sha.
+fn parse_blame_sha(porcelain: &str) -> Option<String> {
+    let sha = porcelain.split_whitespace().next()?;
+    (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
+/// `(author, date, short-sha, subject)` for a commit via `git show`. `None` on git failure.
+fn git_show_meta(repo_root: &str, sha: &str) -> Option<(String, String, String, String)> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "show",
+            "-s",
+            "--date=short",
+            "--format=%an%x09%ad%x09%h%x09%s",
+            sha,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_show_meta(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse the tab-separated `git show` line into `(author, date, short-sha, subject)`.
+fn parse_show_meta(line: &str) -> Option<(String, String, String, String)> {
+    let line = line.trim();
+    let mut parts = line.splitn(4, '\t');
+    let author = parts.next()?.to_string();
+    let date = parts.next()?.to_string();
+    let commit = parts.next()?.to_string();
+    let subject = parts.next().unwrap_or("").to_string();
+    Some((author, date, commit, subject))
 }
 
 fn sha_hex(bytes: &[u8]) -> String {
@@ -486,6 +582,24 @@ mod tests {
             lat.query("alpha", 10).unwrap().is_empty(),
             "stale symbol removed"
         );
+    }
+
+    #[test]
+    fn parses_git_provenance_output() {
+        let porcelain =
+            "9b64263a1f2e3d4c5b6a7890 12 12 1\nauthor Floris\nsummary did a thing\n\tcode line\n";
+        assert_eq!(
+            parse_blame_sha(porcelain).as_deref(),
+            Some("9b64263a1f2e3d4c5b6a7890")
+        );
+        assert_eq!(parse_blame_sha("\n\n"), None);
+
+        let show = "Floris\t2026-06-16\tab3b2ef\tfeat: add the watcher\n";
+        let (author, date, commit, subject) = parse_show_meta(show).unwrap();
+        assert_eq!(author, "Floris");
+        assert_eq!(date, "2026-06-16");
+        assert_eq!(commit, "ab3b2ef");
+        assert_eq!(subject, "feat: add the watcher");
     }
 
     #[test]

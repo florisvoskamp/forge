@@ -159,6 +159,11 @@ enum LatticeOp {
         /// Target symbol name.
         to: String,
     },
+    /// Decision provenance: who last changed a symbol's definition, when, and in which commit.
+    Why {
+        /// Symbol name.
+        symbol: String,
+    },
     /// Show index counts (files, symbols, edges, refs).
     Status,
 }
@@ -437,6 +442,18 @@ fn lattice_cmd(op: LatticeOp) -> Result<()> {
             {
                 Some(chain) => println!("⌬ path · {}", chain.join(" → ")),
                 None => println!("no reference path from '{from}' to '{to}' within 8 hops"),
+            }
+        }
+        LatticeOp::Why { symbol } => {
+            let lat = forge_index::Lattice::new(store, &cwd);
+            match lat.why(&symbol).map_err(|e| anyhow::anyhow!("{e}"))? {
+                Some(p) => println!(
+                    "⌬ why · {} ({}:{})\n  {} · {} · {} · {}",
+                    p.name, p.rel_path, p.line, p.author, p.date, p.commit, p.subject
+                ),
+                None => println!(
+                    "no provenance for '{symbol}' — unknown symbol, or the tree isn't under git"
+                ),
             }
         }
         LatticeOp::Status => {
