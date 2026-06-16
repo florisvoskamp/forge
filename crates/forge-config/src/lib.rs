@@ -135,8 +135,9 @@ pub struct LatticeConfig {
     pub embeddings: EmbeddingsConfig,
 }
 
-/// Embedding-backed semantic retrieval settings. Off by default (zero setup); when on, node
-/// embeddings are computed via `backend`/`model` and blended into retrieval.
+/// Embedding-backed semantic retrieval settings. On by default with `backend = "auto"`, which
+/// picks the cheapest available backend and is a zero-cost no-op when none is reachable; node
+/// embeddings are computed via the chosen backend and blended into retrieval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingsConfig {
     /// Master switch. Off → no embeddings are computed or used; retrieval is structural/lexical.
