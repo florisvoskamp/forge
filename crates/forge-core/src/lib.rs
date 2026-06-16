@@ -12,7 +12,7 @@ use forge_provider::{Provider, StreamEvent, ToolSpec};
 use forge_store::Store;
 use forge_tools::ToolRegistry;
 use forge_tui::{Presenter, PresenterEvent};
-use forge_types::{Message, PermissionDecision, PermissionMode, PermissionRule, Role};
+use forge_types::{Message, PermissionDecision, PermissionMode, PermissionRule, Role, TaskTier};
 
 pub mod assay;
 pub mod llm_router;
@@ -182,6 +182,11 @@ impl Session {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Whether project-scope (`./.forge/`) commands/skills run without a first-use confirmation.
+    pub fn commands_trust_project(&self) -> bool {
+        self.config.commands.trust_project
     }
 
     /// Attach the discovered catalog so the `/models` browser can read it (composition root).
@@ -500,6 +505,32 @@ impl Session {
 
     /// Run one full turn: route -> (model -> tools)* -> final answer. Returns the answer.
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, CoreError> {
+        self.run_turn_with(prompt, &[], None).await
+    }
+
+    /// Inject command/skill guidance as persisted system messages *without* a model call — for
+    /// `/skill <name>` with no prompt, so the methodology primes the next turn the user types.
+    pub fn prime_guidance(&mut self, guidance: &[String]) -> Result<(), CoreError> {
+        for g in guidance {
+            let gseq = self.next_seq();
+            self.store
+                .add_message(&self.id, gseq, Role::System, g, None)?;
+            self.transcript.push(Message::system(g));
+        }
+        Ok(())
+    }
+
+    /// Like [`Session::run_turn`], but first prepends `guidance` (an invoked command's or
+    /// skill's methodology) as persisted system messages, and biases routing with an optional
+    /// `tier_override` (the command/skill `tier:` hint). `run_turn(p)` is exactly
+    /// `run_turn_with(p, &[], None)` — the agent loop, tools, permission broker, pricing and
+    /// persistence are otherwise unchanged.
+    pub async fn run_turn_with(
+        &mut self,
+        prompt: &str,
+        guidance: &[String],
+        tier_override: Option<TaskTier>,
+    ) -> Result<String, CoreError> {
         // 1. Route the task (deterministic, no model call) and record why. The budget is
         // aggregated across ALL sessions for the current local day + month (FR-5), not one
         // session's running total.
@@ -555,12 +586,25 @@ impl Session {
         // Quota-aware routing (L3): demote/skip a subscription that the bridge reported is near or
         // over its plan limit (recorded after earlier turns from the CLI's rate-limit events).
         let quota = self.store.current_quota().unwrap_or_default();
-        let decision = self.router.route(prompt, budget, &health, &quota).await;
+        let decision = self
+            .router
+            .route_hinted(prompt, budget, &health, &quota, tier_override)
+            .await;
         self.presenter.emit(PresenterEvent::Routing {
             tier: decision.tier.as_str().to_string(),
             model: decision.model.clone(),
             rationale: decision.rationale.clone(),
         });
+
+        // Prepend any command/skill guidance as persisted system messages, so the methodology
+        // is in context for this turn and rehydrates verbatim on resume (the skill file is not
+        // re-read).
+        for g in guidance {
+            let gseq = self.next_seq();
+            self.store
+                .add_message(&self.id, gseq, Role::System, g, None)?;
+            self.transcript.push(Message::system(g));
+        }
 
         // 2. Persist + record the user message. Its seq keys this turn's code-snapshot dir
         // (PR3): files written during the turn are restorable by rewinding to this boundary.
@@ -2318,6 +2362,36 @@ mod tests {
         )
         .unwrap();
         (store, session)
+    }
+
+    #[tokio::test]
+    async fn run_turn_with_prepends_persisted_guidance_before_the_prompt() {
+        // A skill/command's methodology is injected as a System message ahead of the user prompt
+        // and persisted (so resume rehydrates it). The turn otherwise runs exactly as normal.
+        let provider = Arc::new(FlakyProvider {
+            bad: std::collections::HashSet::new(),
+            err: rate_limited,
+        });
+        let router = Arc::new(FixedRouter {
+            model: "good::model".into(),
+            fallbacks: vec![],
+        });
+        let (store, mut session) = fixed_session(provider, router);
+        let answer = session
+            .run_turn_with(
+                "do the thing",
+                &["METHODOLOGY: be rigorous".to_string()],
+                Some(TaskTier::Complex),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "recovered");
+
+        let msgs = store.load_messages(session.id()).unwrap();
+        assert_eq!(msgs[0].role, Role::System);
+        assert!(msgs[0].content.contains("METHODOLOGY"));
+        assert_eq!(msgs[1].role, Role::User);
+        assert_eq!(msgs[1].content, "do the thing");
     }
 
     #[tokio::test]

@@ -92,6 +92,28 @@ impl Router for LlmRouter {
             }
         }
     }
+
+    async fn route_hinted(
+        &self,
+        prompt: &str,
+        budget: BudgetState,
+        health: &ModelHealth,
+        quota: &SubscriptionQuota,
+        tier_override: Option<TaskTier>,
+    ) -> RoutingDecision {
+        match tier_override {
+            // An explicit command/skill tier hint skips the classifier model call entirely.
+            Some(tier) => self.fallback.decide(
+                tier,
+                format!("tier hint: {}", tier.as_str()),
+                budget,
+                health,
+                RouteHints::from_prompt(prompt),
+                quota,
+            ),
+            None => self.route(prompt, budget, health, quota).await,
+        }
+    }
 }
 
 #[cfg(test)]

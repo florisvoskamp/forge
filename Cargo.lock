@@ -1147,6 +1147,7 @@ dependencies = [
  "forge-mcp",
  "forge-mesh",
  "forge-provider",
+ "forge-skills",
  "forge-store",
  "forge-tools",
  "forge-tui",
@@ -1165,6 +1166,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "figment",
+ "forge-skills",
  "forge-types",
  "keyring",
  "serde",
@@ -1234,6 +1236,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "forge-skills"
+version = "0.1.0"
+dependencies = [
+ "forge-types",
  "tracing",
 ]
 

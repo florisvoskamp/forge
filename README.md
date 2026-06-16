@@ -32,6 +32,12 @@ a budget; Forge stays under it.
 - **MCP client** — connect external MCP servers (stdio + HTTP/SSE) and drive their tools
   through Forge's permission gate; declare them in `.forge/mcp.toml` or `forge mcp import`
   a Claude-Code `.mcp.json`. `forge mcp` / `/mcp` list status; tools load on demand.
+- **Commands & skills** — reusable prompt templates and methodologies as markdown files in
+  `./.forge/commands`, `./.forge/skills/<name>/SKILL.md` (and the same dirs under your user
+  config). Type `/` in the TUI for a fuzzy palette; `/name args` expands a template (`$1`,
+  `$ARGUMENTS`), `/skill <name>` injects a methodology. Claude-Code's `~/.claude/commands` and
+  `skills` formats parse unchanged. `forge commands` lists them. Project-scope files are
+  confirmed on first use (they can steer the model).
 - **Local-first** — SQLite session state, no cloud account required to run.
 
 The full vision (semantic code memory, multi-agent orchestration, MCP, marketplace,

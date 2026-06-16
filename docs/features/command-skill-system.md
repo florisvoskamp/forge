@@ -1,5 +1,18 @@
 # Feature: slash-command + skill system (with TUI autocomplete)
 
+> **Status (shipped):** `forge-skills` crate (Catalog, lenient frontmatter, `$1`/`$NAME`/
+> `$ARGUMENTS` templates, fuzzy match, scope precedence, Claude-Code readers, progressive
+> skill-body loading); `forge-config::command_sources()` + `[commands]` block; `Session::
+> run_turn_with(prompt, guidance, tier_override)` + `prime_guidance`; `Router::route_hinted`
+> (default no-op, honored by Heuristic/Llm routers); `forge commands` CLI listing; in-TUI
+> dispatch through the existing palette (builtins first, file catalog fallback), `/skill`
+> injection, missing-arg/unknown short-circuits, and a project-trust gate (first use confirmed
+> by re-running, unless `commands.trust_project`).
+>
+> **Deferred (not in this PR):** `@path` file-path completion (should-have); command-body
+> `/skill` references producing guidance; namespaced subdir commands; argument *types*; the
+> plain (non-TUI) chat path does not yet expand `/name` (TUI is the supported surface).
+
 > A new capability layer spanning the workspace: a `forge-skills` crate (Command + Skill
 > data model and loaders), a discovery/precedence path that hangs off `forge-config`, a
 > dispatch hook in front of `Session::run_turn` (`forge-core` / `forge-cli`), and a command

@@ -95,6 +95,21 @@ pub trait Router: Send + Sync {
         health: &ModelHealth,
         quota: &SubscriptionQuota,
     ) -> RoutingDecision;
+
+    /// Route with an optional tier hint from an invoked command/skill (`tier:` frontmatter).
+    /// The default ignores the hint and delegates to [`Router::route`]; classifying routers
+    /// override this to pin the tier (an explicit user `--model` pin still wins, handled in
+    /// `decide`). A `None` hint is exactly today's behaviour.
+    async fn route_hinted(
+        &self,
+        prompt: &str,
+        budget: BudgetState,
+        health: &ModelHealth,
+        quota: &SubscriptionQuota,
+        _tier_override: Option<TaskTier>,
+    ) -> RoutingDecision {
+        self.route(prompt, budget, health, quota).await
+    }
 }
 
 // --- Classification signals (weighted scoring; see `classify`). Capability over length. ---
@@ -659,6 +674,29 @@ impl Router for HeuristicRouter {
             quota,
         )
     }
+
+    async fn route_hinted(
+        &self,
+        prompt: &str,
+        budget: BudgetState,
+        health: &ModelHealth,
+        quota: &SubscriptionQuota,
+        tier_override: Option<TaskTier>,
+    ) -> RoutingDecision {
+        match tier_override {
+            // A command/skill tier hint replaces classification but goes through the same
+            // selection path (pin, budget pressure, cost-aware candidates all still apply).
+            Some(tier) => self.decide(
+                tier,
+                format!("tier hint: {}", tier.as_str()),
+                budget,
+                health,
+                RouteHints::from_prompt(prompt),
+                quota,
+            ),
+            None => self.route(prompt, budget, health, quota).await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -708,6 +746,36 @@ mod tests {
         )
         .await
         .model
+    }
+
+    #[tokio::test]
+    async fn route_hinted_pins_the_given_tier_over_classification() {
+        let r = mixed_router();
+        // A SHORT prompt the heuristic would classify Trivial, forced Complex by a skill hint.
+        let d = r
+            .route_hinted(
+                "fix typo",
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+                Some(TaskTier::Complex),
+            )
+            .await;
+        assert_eq!(d.tier, TaskTier::Complex);
+        assert!(d.rationale.contains("tier hint"));
+        // A None hint behaves exactly like plain route().
+        let plain = route_model(&r, "fix typo").await;
+        let none_hint = r
+            .route_hinted(
+                "fix typo",
+                BudgetState::default(),
+                &ModelHealth::default(),
+                &SubscriptionQuota::default(),
+                None,
+            )
+            .await
+            .model;
+        assert_eq!(plain, none_hint);
     }
 
     #[tokio::test]

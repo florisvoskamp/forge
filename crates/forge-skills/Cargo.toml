@@ -1,0 +1,13 @@
+[package]
+name = "forge-skills"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Slash-command + skill catalog: discovery, frontmatter, templates, Claude-Code readers."
+
+[dependencies]
+forge-types = { workspace = true }
+tracing = { workspace = true }

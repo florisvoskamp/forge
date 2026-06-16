@@ -78,6 +78,8 @@ enum Command {
     },
     /// List past sessions (newest first).
     Sessions,
+    /// List discovered slash commands + skills (project and user scope) with their descriptions.
+    Commands,
     /// Show the auto-discovered model catalog and the mesh's best pick per tier.
     Models {
         /// Actively ping every discovered model and persist the result: clear healthy ones,
@@ -215,6 +217,7 @@ async fn main() -> Result<()> {
             model,
         } => chat(mock, mode, resume, plain, model).await,
         Command::Sessions => sessions(),
+        Command::Commands => commands_cmd(),
         Command::Models { probe } => models(probe).await,
         Command::Auth { provider } => auth(&provider),
         Command::Init => init(),
@@ -419,6 +422,37 @@ fn sessions() -> Result<()> {
             "{id}  ${:>8.4}  {:>3} msgs  {}",
             s.total_cost_usd, s.message_count, preview
         );
+    }
+    Ok(())
+}
+
+/// `forge commands` — list discovered slash commands + skills with scope and collision markers.
+fn commands_cmd() -> Result<()> {
+    let catalog = forge_skills::Catalog::load(&forge_config::command_sources());
+    let entries = catalog.entries();
+    if entries.is_empty() {
+        println!(
+            "no commands or skills found — add markdown to ./.forge/commands, ./.forge/skills,\n\
+             or the same dirs under your user config (see `forge commands` docs)"
+        );
+    } else {
+        for e in &entries {
+            let kind = if e.is_skill { "skill  " } else { "command" };
+            let shadow = if e.shadows {
+                "  (shadows lower scope)"
+            } else {
+                ""
+            };
+            println!(
+                "/{:<16} {kind}  [{}]  {}{shadow}",
+                e.name,
+                e.scope.label(),
+                e.description
+            );
+        }
+    }
+    for w in catalog.warnings() {
+        eprintln!("warning: {w}");
     }
     Ok(())
 }
@@ -1248,6 +1282,30 @@ async fn run_chat_tui(
     tui.insert_lines(banner_lines(tui.width()));
     let mut app = App::default();
     app.temper = session.lock().await.temper().label().to_string();
+
+    // Discover file-based slash commands + skills (command-skill-system.md). Feed them into the
+    // palette alongside the builtins; surface any malformed-file warnings once.
+    let catalog = forge_skills::Catalog::load(&forge_config::command_sources());
+    app.palette.extra = catalog
+        .entries()
+        .iter()
+        .map(|e| forge_tui::PaletteEntry {
+            name: e.name.clone(),
+            desc: if e.is_skill {
+                format!("{}  (skill)", e.description)
+            } else {
+                e.description.clone()
+            },
+        })
+        .collect();
+    for w in catalog.warnings() {
+        app.note(&format!("⚠ {w}"));
+    }
+    let trust_project = session.lock().await.commands_trust_project();
+    // Project-scope commands/skills can steer the model; their first use this session is gated
+    // unless trusted. Re-running a gated command confirms it (its name lands here).
+    let mut armed_project: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     let mut busy = false;
     // Each turn gets a monotonic generation; the abort handle lets Esc interrupt it (RFC
     // session-management). The current gen gates the done-signal so an aborted turn's late
@@ -1302,9 +1360,41 @@ async fn run_chat_tui(
                             .unwrap_or_else(|| app.input.clone());
                         app.palette.close();
                         app.input.clear();
-                        if dispatch_command(&line, &session, &mut tui, &mut app, busy).await? {
-                            quit = true;
-                            break;
+                        match dispatch_command(
+                            &line,
+                            &session,
+                            &mut tui,
+                            &mut app,
+                            &catalog,
+                            &mut armed_project,
+                            trust_project,
+                            busy,
+                        )
+                        .await?
+                        {
+                            DispatchOutcome::Quit => {
+                                quit = true;
+                                break;
+                            }
+                            DispatchOutcome::Handled => {}
+                            DispatchOutcome::RunTurn {
+                                prompt,
+                                guidance,
+                                tier,
+                            } => {
+                                turn_gen += 1;
+                                turn_handle = Some(spawn_turn_with(
+                                    prompt,
+                                    guidance,
+                                    tier,
+                                    &session,
+                                    &done_tx,
+                                    turn_gen,
+                                    &mut app,
+                                    &mut busy,
+                                    &mut busy_since,
+                                ));
+                            }
                         }
                     }
                     KeyKind::Char(c) => {
@@ -1470,9 +1560,41 @@ async fn run_chat_tui(
                                 &mut busy_since,
                             ));
                         } else if line.starts_with('/') {
-                            if dispatch_command(&line, &session, &mut tui, &mut app, busy).await? {
-                                quit = true;
-                                break;
+                            match dispatch_command(
+                                &line,
+                                &session,
+                                &mut tui,
+                                &mut app,
+                                &catalog,
+                                &mut armed_project,
+                                trust_project,
+                                busy,
+                            )
+                            .await?
+                            {
+                                DispatchOutcome::Quit => {
+                                    quit = true;
+                                    break;
+                                }
+                                DispatchOutcome::Handled => {}
+                                DispatchOutcome::RunTurn {
+                                    prompt,
+                                    guidance,
+                                    tier,
+                                } => {
+                                    turn_gen += 1;
+                                    turn_handle = Some(spawn_turn_with(
+                                        prompt,
+                                        guidance,
+                                        tier,
+                                        &session,
+                                        &done_tx,
+                                        turn_gen,
+                                        &mut app,
+                                        &mut busy,
+                                        &mut busy_since,
+                                    ));
+                                }
                             }
                         } else {
                             turn_gen += 1;
@@ -1595,17 +1717,67 @@ fn spawn_turn(
     })
 }
 
-/// Execute a slash command (RFC session-management-and-commands, PR1). Returns `Ok(true)` to
-/// quit. Session-mutating commands (`/new`, `/resume`, `/clear`) are gated while a turn is in
-/// flight (the turn task holds the session `Mutex`). All session access is `lock().await` — no
-/// blocking on the render-loop thread (the #45 invariant).
+/// Like [`spawn_turn`] but runs an expanded command/skill: prepends `guidance` and biases routing
+/// with the `tier` hint. The displayed user line is the original `/command` (echoed by the
+/// dispatcher), so the model receives the expanded `prompt` while the transcript shows the turn.
+#[allow(clippy::too_many_arguments)]
+fn spawn_turn_with(
+    prompt: String,
+    guidance: Vec<String>,
+    tier: Option<forge_types::TaskTier>,
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    done_tx: &std::sync::mpsc::Sender<u64>,
+    gen: u64,
+    app: &mut forge_tui::App,
+    busy: &mut bool,
+    busy_since: &mut std::time::Instant,
+) -> tokio::task::JoinHandle<()> {
+    app.submit_user(&prompt);
+    app.done = false;
+    app.tick = 0;
+    *busy = true;
+    *busy_since = std::time::Instant::now();
+    let s = session.clone();
+    let dt = done_tx.clone();
+    tokio::spawn(async move {
+        let _done = DoneGuard(dt, gen);
+        let mut sess = s.lock().await;
+        if let Err(e) = sess.run_turn_with(&prompt, &guidance, tier).await {
+            sess.notify_error(&format!("turn failed: {e}"));
+        }
+    })
+}
+
+/// What the render loop must do after [`dispatch_command`].
+enum DispatchOutcome {
+    /// Command fully handled in-loop (palette, picker, note, …) — keep going.
+    Handled,
+    /// `/quit` — exit the TUI.
+    Quit,
+    /// A file command/skill expanded into a model turn the caller should spawn.
+    RunTurn {
+        prompt: String,
+        guidance: Vec<String>,
+        tier: Option<forge_types::TaskTier>,
+    },
+}
+
+/// Execute a slash command (command-skill-system.md). Builtins are matched first; an unrecognised
+/// `/name` falls through to the file-based command/skill [`forge_skills::Catalog`]. Returns
+/// [`DispatchOutcome`]. Session-mutating commands (`/new`, `/resume`, `/clear`) and file
+/// commands/skills are gated while a turn holds the session `Mutex`. All session access is
+/// `lock().await` — no blocking on the render-loop thread (the #45 invariant).
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_command(
     line: &str,
     session: &Arc<tokio::sync::Mutex<Session>>,
     tui: &mut forge_tui::Tui,
     app: &mut forge_tui::App,
+    catalog: &forge_skills::Catalog,
+    armed: &mut std::collections::HashSet<String>,
+    trust_project: bool,
     busy: bool,
-) -> Result<bool> {
+) -> Result<DispatchOutcome> {
     use forge_tui::CommandAction;
     let action = forge_tui::parse_command(line);
     // Everything that touches the live `Session` (lock().await) or swaps it is gated while a turn
@@ -1621,11 +1793,11 @@ async fn dispatch_command(
     );
     if busy && mutates {
         app.note("⚠ finish or Esc the current turn first");
-        return Ok(false);
+        return Ok(DispatchOutcome::Handled);
     }
     match action {
         CommandAction::Help => app.palette.open_with(""),
-        CommandAction::Quit => return Ok(true),
+        CommandAction::Quit => return Ok(DispatchOutcome::Quit),
         CommandAction::ClearScreen => {
             tui.clear_screen();
             app.note("— screen cleared —");
@@ -1746,9 +1918,128 @@ async fn dispatch_command(
                 None => app.note("✓ checkpoint saved"),
             }
         }
-        CommandAction::Unknown(x) => app.note(&format!("unknown command: /{x} — try /help")),
+        // Not a builtin → try the file-based command/skill catalog.
+        CommandAction::Unknown(_) => {
+            return dispatch_catalog(line, catalog, session, app, armed, trust_project, busy).await
+        }
     }
-    Ok(false)
+    Ok(DispatchOutcome::Handled)
+}
+
+/// Resolve a `/line` that isn't a builtin against the file catalog: expand a command, load a
+/// skill's methodology, or report a missing-arg / unknown error. A project-scope definition is
+/// gated on first use (re-run confirms) unless `trust_project`.
+async fn dispatch_catalog(
+    line: &str,
+    catalog: &forge_skills::Catalog,
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    app: &mut forge_tui::App,
+    armed: &mut std::collections::HashSet<String>,
+    trust_project: bool,
+    busy: bool,
+) -> Result<DispatchOutcome> {
+    use forge_skills::Resolved;
+    match catalog.resolve(line) {
+        Resolved::Command {
+            cmd,
+            prompt,
+            guidance,
+        } => {
+            if busy {
+                app.note("⚠ finish or Esc the current turn first");
+                return Ok(DispatchOutcome::Handled);
+            }
+            if !project_trust_ok(&cmd.name, cmd.scope, trust_project, armed, app) {
+                return Ok(DispatchOutcome::Handled);
+            }
+            app.note(&format!(
+                "⚒ command · /{} ({})",
+                cmd.name,
+                cmd.scope.label()
+            ));
+            Ok(DispatchOutcome::RunTurn {
+                prompt,
+                guidance,
+                tier: cmd.tier,
+            })
+        }
+        Resolved::Skill { meta, prompt } => {
+            if busy {
+                app.note("⚠ finish or Esc the current turn first");
+                return Ok(DispatchOutcome::Handled);
+            }
+            if !project_trust_ok(&meta.name, meta.scope, trust_project, armed, app) {
+                return Ok(DispatchOutcome::Handled);
+            }
+            let skill = forge_skills::Skill::load(&meta);
+            for w in &skill.warnings {
+                app.note(&format!("⚠ {w}"));
+            }
+            app.note(&format!("⚒ skill · {} ({})", meta.name, meta.scope.label()));
+            if !skill.resources.is_empty() {
+                app.note(&format!(
+                    "↳ loaded methodology + {} resource(s)",
+                    skill.resources.len()
+                ));
+            }
+            let guidance = vec![skill.guidance()];
+            if prompt.trim().is_empty() {
+                // No task given: prime the methodology into the transcript (no model call) so it
+                // shapes the next turn the user types.
+                {
+                    let mut s = session.lock().await;
+                    s.prime_guidance(&guidance)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                app.note("↳ methodology primed — type your task");
+                Ok(DispatchOutcome::Handled)
+            } else {
+                Ok(DispatchOutcome::RunTurn {
+                    prompt,
+                    guidance,
+                    tier: meta.tier,
+                })
+            }
+        }
+        Resolved::MissingArgs { name, missing } => {
+            let need = missing
+                .iter()
+                .map(|m| format!("<{m}>"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            app.note(&format!("/{name} requires {need}"));
+            Ok(DispatchOutcome::Handled)
+        }
+        Resolved::Unknown(x) => {
+            app.note(&format!("unknown command: /{x} — try /help"));
+            Ok(DispatchOutcome::Handled)
+        }
+        // A `/`-line never resolves to Plain, but stay safe rather than silently submit it.
+        Resolved::Plain(_) => {
+            app.note("unknown command — try /help");
+            Ok(DispatchOutcome::Handled)
+        }
+    }
+}
+
+/// First use of a *project*-scope command/skill is confirmed by re-running it (its name is
+/// "armed" on the first attempt and runs on the second) — unless project scope is trusted. User-
+/// scope and builtins are never gated. Returns true when the invocation may proceed.
+fn project_trust_ok(
+    name: &str,
+    scope: forge_skills::Scope,
+    trust_project: bool,
+    armed: &mut std::collections::HashSet<String>,
+    app: &mut forge_tui::App,
+) -> bool {
+    if scope != forge_skills::Scope::Project || trust_project || armed.contains(name) {
+        return true;
+    }
+    armed.insert(name.to_string());
+    app.note(&format!(
+        "⚠ /{name} is a project command — it can steer the model. Run it again to confirm."
+    ));
+    false
 }
 
 /// Populate + open the session picker from the store (newest first). `query` pre-fills the filter.

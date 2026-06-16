@@ -51,6 +51,35 @@ pub struct Config {
     /// External MCP servers Forge connects to as a client (mcp-client.md). Empty = inert.
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Slash-command + skill discovery and trust (command-skill-system.md).
+    #[serde(default)]
+    pub commands: CommandsConfig,
+}
+
+/// Settings for the slash-command + skill system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandsConfig {
+    /// Trust project-scope (`./.forge/`) commands/skills without a first-run confirmation. A
+    /// project file is a *prompt*, not an instruction to the harness — but it can still try to
+    /// steer the model, so by default the first use of a project-scope definition is confirmed.
+    #[serde(default)]
+    pub trust_project: bool,
+    /// Max rows the command palette shows at once before overflow.
+    #[serde(default = "default_max_palette")]
+    pub max_palette: usize,
+}
+
+impl Default for CommandsConfig {
+    fn default() -> Self {
+        Self {
+            trust_project: false,
+            max_palette: default_max_palette(),
+        }
+    }
+}
+
+fn default_max_palette() -> usize {
+    8
 }
 
 /// Fine-grained permission rules (FR-10). Resolution is by specificity/precedence, not file
@@ -433,6 +462,7 @@ impl Default for Config {
             },
             permissions: PermissionsConfig::default(),
             mcp: McpConfig::default(),
+            commands: CommandsConfig::default(),
         }
     }
 }
@@ -476,6 +506,34 @@ impl Config {
 /// Per-OS config directory: `<config>/forge`.
 pub fn config_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "forge", "forge").map(|d| d.config_dir().to_path_buf())
+}
+
+/// The command/skill discovery sources, scope-tagged: user scope (`<config>/forge/{commands,
+/// skills}`, present only when a config dir resolves) then project scope (`./.forge/{commands,
+/// skills}`). Project wins on a name collision (see `forge_skills::Catalog`).
+pub fn command_sources() -> forge_skills::Sources {
+    use forge_skills::{Scope, ScopedDir};
+    let mut commands = Vec::new();
+    let mut skills = Vec::new();
+    if let Some(dir) = config_dir() {
+        commands.push(ScopedDir {
+            scope: Scope::User,
+            path: dir.join("commands"),
+        });
+        skills.push(ScopedDir {
+            scope: Scope::User,
+            path: dir.join("skills"),
+        });
+    }
+    commands.push(ScopedDir {
+        scope: Scope::Project,
+        path: PathBuf::from("./.forge/commands"),
+    });
+    skills.push(ScopedDir {
+        scope: Scope::Project,
+        path: PathBuf::from("./.forge/skills"),
+    });
+    forge_skills::Sources { commands, skills }
 }
 
 /// Load configuration with full layered precedence (lowest -> highest):

@@ -183,8 +183,16 @@ pub fn filter_commands(query: &str) -> Vec<&'static Command> {
     scored.into_iter().map(|(_, _, c)| c).collect()
 }
 
+/// One palette row, owned so it can mix the static builtins with file-based commands/skills
+/// (the binary populates [`Palette::extra`] from `forge_skills::Catalog`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteEntry {
+    pub name: String,
+    pub desc: String,
+}
+
 /// Inline command-palette state. Opens when the input line starts with `/`. The binary's render
-/// loop drives it via keystrokes and reads [`Palette::accepted`] / the filtered list.
+/// loop drives it via keystrokes and reads the filtered list / selection.
 #[derive(Debug, Clone, Default)]
 pub struct Palette {
     pub open: bool,
@@ -193,6 +201,9 @@ pub struct Palette {
     pub selected: usize,
     /// Eases 0.0 → 1.0 on open for the reveal animation (advanced by the render tick).
     pub anim: f32,
+    /// File-based commands + skills discovered at startup, shown alongside the builtins. Set
+    /// once by the binary; preserved across open/close.
+    pub extra: Vec<PaletteEntry>,
 }
 
 impl Palette {
@@ -210,9 +221,29 @@ impl Palette {
         self.anim = 0.0;
     }
 
-    /// The currently-filtered commands.
-    pub fn matches(&self) -> Vec<&'static Command> {
-        filter_commands(&self.query)
+    /// The currently-filtered palette rows: builtins + any file-based `extra`, ranked best-first
+    /// (prefix before fuzzy, then order), deduped by name (a builtin wins a name clash).
+    pub fn matches(&self) -> Vec<PaletteEntry> {
+        let mut all: Vec<PaletteEntry> = COMMANDS
+            .iter()
+            .map(|c| PaletteEntry {
+                name: c.name.to_string(),
+                desc: c.desc.to_string(),
+            })
+            .collect();
+        all.extend(self.extra.iter().cloned());
+        let mut scored: Vec<(u32, usize, PaletteEntry)> = all
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, e)| match_score(&e.name, &self.query).map(|s| (s, i, e)))
+            .collect();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut seen = std::collections::HashSet::new();
+        scored
+            .into_iter()
+            .filter(|(_, _, e)| seen.insert(e.name.clone()))
+            .map(|(_, _, e)| e)
+            .collect()
     }
 
     pub fn move_up(&mut self) {
@@ -236,9 +267,12 @@ impl Palette {
         }
     }
 
-    /// The selected command's name, for Tab-completion / Enter.
-    pub fn selected_name(&self) -> Option<&'static str> {
-        self.matches().get(self.selected).map(|c| c.name)
+    /// The selected row's name, for Tab-completion / Enter.
+    pub fn selected_name(&self) -> Option<String> {
+        self.matches()
+            .into_iter()
+            .nth(self.selected)
+            .map(|e| e.name)
     }
 
     /// Advance the reveal animation toward 1.0 (called per render tick while open).
@@ -501,7 +535,40 @@ mod tests {
         p.query = "help".into();
         p.clamp();
         assert_eq!(p.selected, 0);
-        assert_eq!(p.selected_name(), Some("help"));
+        assert_eq!(p.selected_name().as_deref(), Some("help"));
+    }
+
+    #[test]
+    fn palette_merges_file_entries_and_builtin_wins_name_clash() {
+        let mut p = Palette {
+            extra: vec![
+                PaletteEntry {
+                    name: "review".into(),
+                    desc: "file command".into(),
+                },
+                // Same name as a builtin: the builtin must win (no duplicate row).
+                PaletteEntry {
+                    name: "clear".into(),
+                    desc: "shadowing attempt".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        p.open_with("");
+        let names: Vec<String> = p.matches().into_iter().map(|e| e.name).collect();
+        assert!(names.iter().any(|n| n == "review"), "file command shown");
+        assert_eq!(
+            names.iter().filter(|n| *n == "clear").count(),
+            1,
+            "no duplicate 'clear'"
+        );
+        let clear = p.matches().into_iter().find(|e| e.name == "clear").unwrap();
+        assert_ne!(clear.desc, "shadowing attempt", "builtin clear wins");
+
+        // Filtering still works over the merged set.
+        p.query = "review".into();
+        p.clamp();
+        assert_eq!(p.selected_name().as_deref(), Some("review"));
     }
 
     #[test]
