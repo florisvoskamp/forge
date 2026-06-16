@@ -114,6 +114,10 @@ pub struct Session {
     /// Background file watcher that keeps the index fresh on external edits. Held only to keep the
     /// watcher thread alive for the session's lifetime (dropped → watching stops).
     lattice_watcher: Option<forge_index::LatticeWatcher>,
+    /// The discovered command/skill catalog, so the model can find + load Forge's own skills via
+    /// the `use_skill` virtual tool (command-skill-system.md). `None` → the tool is not advertised
+    /// and the turn runs exactly as before.
+    skills: Option<Arc<forge_skills::Catalog>>,
 }
 
 impl Session {
@@ -216,6 +220,7 @@ impl Session {
             mcp: None,
             lattice: None,
             lattice_watcher: None,
+            skills: None,
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -258,6 +263,12 @@ impl Session {
     /// Attach the background reindex watcher (composition root); held for the session's lifetime.
     pub fn set_lattice_watcher(&mut self, watcher: Option<forge_index::LatticeWatcher>) {
         self.lattice_watcher = watcher;
+    }
+
+    /// Attach the command/skill catalog (composition root) so the model can discover and load
+    /// Forge's own skills via the `use_skill` tool. `None` (or an empty catalog) → not advertised.
+    pub fn set_skills(&mut self, skills: Option<Arc<forge_skills::Catalog>>) {
+        self.skills = skills;
     }
 
     /// Scoped subgraph for `symbol` from the session's live index (the `/lattice` view). `Ok(None)`
@@ -566,6 +577,13 @@ impl Session {
         specs.push(ask_user_spec());
         // The task-tracking tool — always advertised so the model can keep a live todo list.
         specs.push(update_tasks_spec());
+        // The skill-loading tool — advertised (with the available-skills list) only when a
+        // non-empty catalog is attached, so the model can find + apply Forge's own skills.
+        if let Some(cat) = &self.skills {
+            if !cat.skill_listing().is_empty() {
+                specs.push(use_skill_spec(cat));
+            }
+        }
         // External MCP servers: the meta-tools (search/expose/resources/prompt) + any exposed
         // server tools (deferred loading keeps this bounded). Empty unless servers are connected.
         if let Some(mcp) = &self.mcp {
@@ -1057,6 +1075,11 @@ impl Session {
         if call.name == UPDATE_TASKS_TOOL {
             return self.update_tasks(msg_id, call);
         }
+        // Skill loading is core-owned (it reads the attached catalog). Returns the skill's
+        // methodology as the tool result so the model follows it; unknown name → a helpful error.
+        if call.name == USE_SKILL_TOOL {
+            return self.use_skill(msg_id, call);
+        }
         // External MCP tools (meta-tools + exposed server tools) are owned by the manager, not the
         // built-in registry. Route them here, still through the permission broker (mcp-client.md).
         if self.mcp.as_ref().is_some_and(|m| m.knows_tool(&call.name)) {
@@ -1459,6 +1482,58 @@ impl Session {
     pub fn tasks(&self) -> &[forge_types::TodoItem] {
         &self.tasks
     }
+
+    /// Load a Forge skill's methodology (the `use_skill` virtual tool) and return it as the tool
+    /// result so the model applies it this turn. Unknown name → an error listing valid skills.
+    fn use_skill(
+        &mut self,
+        msg_id: &str,
+        call: &forge_types::ToolCall,
+    ) -> Result<String, CoreError> {
+        let args_json = serde_json::to_string(&call.args)?;
+        let name = call
+            .args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let (result, ok) = match self.skills.as_ref().and_then(|c| c.skill_guidance(name)) {
+            Some(guidance) => {
+                self.presenter
+                    .emit(PresenterEvent::Warning(format!("⚒ skill loaded · {name}")));
+                (
+                    format!("Loaded the '{name}' skill. Apply this methodology now:\n\n{guidance}"),
+                    true,
+                )
+            }
+            None => {
+                let available = self
+                    .skills
+                    .as_ref()
+                    .map(|c| {
+                        c.skill_listing()
+                            .into_iter()
+                            .map(|(n, _)| n)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                (
+                    format!("no Forge skill named '{name}'. Available: {available}"),
+                    false,
+                )
+            }
+        };
+        self.store.record_tool_call(
+            msg_id,
+            &call.name,
+            &args_json,
+            &result,
+            "allowed",
+            if ok { "ok" } else { "error" },
+        )?;
+        Ok(result)
+    }
 }
 
 /// The interactive-question virtual tool name (AskUserQuestion).
@@ -1495,6 +1570,39 @@ fn ask_user_spec() -> ToolSpec {
                 }
             },
             "required": ["question"]
+        }),
+    }
+}
+
+/// The skill-loading virtual tool name.
+pub const USE_SKILL_TOOL: &str = "use_skill";
+
+/// The `ToolSpec` advertised for [`USE_SKILL_TOOL`], listing the available Forge skills in its
+/// description so the model both *discovers* what exists and can *invoke* one. Shared by the
+/// direct path and the CLI-bridge `mcp-serve` handler so a bridged claude/codex sees it too.
+pub fn use_skill_spec(catalog: &forge_skills::Catalog) -> ToolSpec {
+    let listing = catalog
+        .skill_listing()
+        .into_iter()
+        .map(|(name, desc)| {
+            let desc: String = desc.chars().take(100).collect();
+            format!("- {name}: {desc}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    ToolSpec {
+        name: USE_SKILL_TOOL.to_string(),
+        description: format!(
+            "Load a Forge skill's methodology into this turn, then follow it. These are Forge's \
+             OWN skills — do NOT search the filesystem (~/.claude, ~/.codex) for skills; call this \
+             tool with the exact skill name instead. Available skills:\n{listing}"
+        ),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "exact skill name from the list" }
+            },
+            "required": ["name"]
         }),
     }
 }
@@ -2264,6 +2372,91 @@ mod tests {
                 quota: None,
             })
         }
+    }
+
+    /// Calls `use_skill("demoskill")` once, then reports whether the tool result carried the
+    /// skill's methodology marker — lets a test assert the skill was found + loaded.
+    struct UseSkillProvider;
+    #[async_trait::async_trait]
+    impl Provider for UseSkillProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            if let Some(t) = messages.iter().rev().find(|m| m.role == Role::Tool) {
+                let saw = t.content.contains("DEMO_SKILL_MARKER");
+                return Ok(ModelResponse {
+                    content: if saw { "SAW_SKILL" } else { "NO_SKILL" }.into(),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                    quota: None,
+                });
+            }
+            Ok(ModelResponse {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: USE_SKILL_TOOL.into(),
+                    args: serde_json::json!({ "name": "demoskill" }),
+                }],
+                usage: Usage::default(),
+                quota: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn use_skill_tool_loads_a_real_skills_methodology() {
+        let dir = std::env::temp_dir().join(format!("forge-useskill-{}", forge_types::new_id()));
+        std::fs::create_dir_all(dir.join("skills/demoskill")).unwrap();
+        std::fs::write(
+            dir.join("skills/demoskill/SKILL.md"),
+            "---\nname: demoskill\ndescription: a demo skill\n---\nDEMO_SKILL_MARKER: do the steps.",
+        )
+        .unwrap();
+        let catalog = forge_skills::Catalog::load(&forge_skills::Sources {
+            commands: vec![],
+            skills: vec![forge_skills::ScopedDir {
+                scope: forge_skills::Scope::User,
+                path: dir.join("skills"),
+            }],
+        });
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let config = Config::default();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(UseSkillProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            ".",
+        )
+        .unwrap();
+        session.set_skills(Some(Arc::new(catalog)));
+
+        // The tool is advertised to the model...
+        assert!(
+            session
+                .tool_specs()
+                .iter()
+                .any(|s| s.name == USE_SKILL_TOOL),
+            "use_skill is advertised when a non-empty catalog is attached"
+        );
+        // ...and invoking it returns the skill's methodology as the tool result.
+        let answer = session.run_turn("use the demo skill").await.unwrap();
+        assert_eq!(
+            answer, "SAW_SKILL",
+            "use_skill returned the methodology to the model"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Never streams an event and never returns — simulates a half-open / stalled connection.

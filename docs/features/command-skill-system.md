@@ -489,3 +489,20 @@ and runs a turn that decomposes it into a tracked plan via the `update_tasks` to
 completion.") until the model ends a reply with `LOOP_COMPLETE` or the iteration cap (25) is hit;
 Esc stops it. Implemented as `DispatchOutcome::StartLoop` + `LoopState` in the render loop, with a
 pure `loop_stop_reason` decision and `Session::last_assistant_text` for completion detection.
+
+## Update — `use_skill`: model-discoverable + invokable skills
+
+The model (including a bridged claude/codex) previously had **no way to know Forge's skills
+exist** — the orchestrate skill's "survey available skills" step found the CLI's own
+`~/.claude`/`~/.codex` skills instead. Fixed with one virtual tool that does both jobs:
+
+- **`use_skill { name }`** (forge-core `use_skill_spec` + `USE_SKILL_TOOL`) — its *description*
+  lists every Forge skill (name + short desc), so advertising the tool **is** the catalog
+  awareness; calling it returns that skill's methodology as the tool result, which the model then
+  applies. The description explicitly says "do NOT search the filesystem for skills."
+- Wired on **both** paths (like `update_tasks`/`spawn_agents`): the direct path advertises it in
+  `Session::tool_specs` and handles it in `invoke_tool` → `Session::use_skill`; the CLI bridge
+  (`mcp-serve`) advertises + handles it in `list_tools`/`call_tool`. Both resolve via
+  `forge_skills::Catalog::{skill_listing, skill_guidance}`.
+- Attached at the composition root: `Session::set_skills(Arc<Catalog>)` (forge-cli
+  `build_session_with`); only advertised when the catalog is non-empty.

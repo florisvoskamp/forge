@@ -1479,6 +1479,11 @@ async fn build_session_with(
     }
     session.set_lattice(lattice);
 
+    // Attach the command/skill catalog so the model can discover + load Forge's own skills via
+    // the `use_skill` tool (instead of hunting ~/.claude). Cheap, sync, pure.
+    let skill_catalog = forge_skills::Catalog::load(&forge_config::command_sources());
+    session.set_skills(Some(std::sync::Arc::new(skill_catalog)));
+
     // Connect external MCP servers (mcp-client.md). Skipped for the offline mock. Per-server
     // failures are isolated inside connect_all (each lands `failed` with a reason); we surface the
     // whole listing once so connection state — including failures — is visible at startup.

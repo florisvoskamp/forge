@@ -144,6 +144,26 @@ fn wrapper_delegating_to_a_same_named_skill_still_injects_it() {
 }
 
 #[test]
+fn skill_listing_and_guidance_back_use_skill() {
+    let t = Tmp::new();
+    t.skill(
+        "user",
+        "router",
+        "---\nname: router\ndescription: route tasks\n---\nStep 1. Step 2.",
+    );
+    let cat = t.load();
+    let listing = cat.skill_listing();
+    assert!(listing
+        .iter()
+        .any(|(n, d)| n == "router" && d == "route tasks"));
+    assert!(cat
+        .skill_guidance("router")
+        .unwrap()
+        .contains("Step 1. Step 2."));
+    assert!(cat.skill_guidance("nope").is_none());
+}
+
+#[test]
 fn command_without_skill_reference_has_no_injected_guidance() {
     let t = Tmp::new();
     t.cmd("user", "plain", "Do the thing: $ARGUMENTS");

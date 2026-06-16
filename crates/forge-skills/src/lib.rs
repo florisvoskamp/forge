@@ -479,6 +479,25 @@ impl Catalog {
         Resolved::Unknown(name)
     }
 
+    /// `(name, description)` of every skill in the catalog, sorted by name — for advertising the
+    /// `use_skill` tool's available-skills list to the model.
+    pub fn skill_listing(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .skills
+            .values()
+            .map(|m| (m.name.clone(), m.description.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Load a skill by name and render its full methodology guidance (body + resources), or
+    /// `None` if no skill has that name. Used by the `use_skill` virtual tool on both the direct
+    /// and CLI-bridge paths.
+    pub fn skill_guidance(&self, name: &str) -> Option<String> {
+        self.skills.get(name).map(|m| Skill::load(m).guidance())
+    }
+
     /// Methodology guidance for every known skill that `body` references as a markdown-bold token
     /// (`**skill-name**`) — the Claude-Code "Use the **X** skill …" wrapper pattern. Each matched
     /// skill is loaded once (deduped). A command and the skill it delegates to commonly share a

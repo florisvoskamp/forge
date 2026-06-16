@@ -1188,6 +1188,7 @@ dependencies = [
  "forge-mcp",
  "forge-mesh",
  "forge-provider",
+ "forge-skills",
  "forge-store",
  "forge-tools",
  "forge-tui",

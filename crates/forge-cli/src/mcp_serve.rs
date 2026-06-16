@@ -62,6 +62,9 @@ struct ForgeMcp {
     /// this server, so the MCP meta-tools must be advertised + handled here — otherwise a bridge
     /// model (claude/codex) can't see or call any external MCP tool. `None` when none configured.
     mcp: Option<Arc<forge_mcp::McpManager>>,
+    /// Command/skill catalog so a bridged model can discover + load Forge's own skills via the
+    /// `use_skill` tool (otherwise claude/codex hunt their own ~/.claude / ~/.codex skills).
+    skills: Arc<forge_skills::Catalog>,
 }
 
 impl ServerHandler for ForgeMcp {
@@ -104,6 +107,13 @@ impl ServerHandler for ForgeMcp {
         let ts = forge_core::update_tasks_spec();
         let ts_schema: JsonObject = ts.schema.as_object().cloned().unwrap_or_default();
         tools.push(Tool::new(ts.name, ts.description, Arc::new(ts_schema)));
+        // Advertise skill loading (with the available-skills list) so a bridge model finds + uses
+        // Forge's own skills instead of its native ones.
+        if !self.skills.skill_listing().is_empty() {
+            let us = forge_core::use_skill_spec(&self.skills);
+            let us_schema: JsonObject = us.schema.as_object().cloned().unwrap_or_default();
+            tools.push(Tool::new(us.name, us.description, Arc::new(us_schema)));
+        }
         // External MCP meta-tools (mcp_search_tools / mcp_call / resources / prompt) so a bridge
         // model can discover + call the connected servers' tools (e.g. helm). Empty if none.
         if let Some(m) = &self.mcp {
@@ -147,6 +157,33 @@ impl ServerHandler for ForgeMcp {
                 "task list updated: {} task(s) — {done} done",
                 tasks.len()
             ))]));
+        }
+
+        // Skill loading — return the named Forge skill's methodology so the bridge model applies
+        // it (parity with the direct path's use_skill handler).
+        if name == forge_core::USE_SKILL_TOOL {
+            let skill = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            return Ok(match self.skills.skill_guidance(skill) {
+                Some(g) => CallToolResult::success(vec![Content::text(format!(
+                    "Loaded the '{skill}' skill. Apply this methodology now:\n\n{g}"
+                ))]),
+                None => {
+                    let available = self
+                        .skills
+                        .skill_listing()
+                        .into_iter()
+                        .map(|(n, _)| n)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    CallToolResult::error(vec![Content::text(format!(
+                        "no Forge skill named '{skill}'. Available: {available}"
+                    ))])
+                }
+            });
         }
 
         // External MCP meta-tools — gate (External/ReadOnly) then route to the manager. Server
@@ -342,6 +379,7 @@ pub async fn run() -> Result<()> {
     } else {
         None
     };
+    let skills = Arc::new(forge_skills::Catalog::load(&forge_config::command_sources()));
     let server = ForgeMcp {
         registry: ToolRegistry::with_core_tools(),
         mode: config.permission_mode,
@@ -350,6 +388,7 @@ pub async fn run() -> Result<()> {
         subagents,
         tasks_store,
         mcp,
+        skills,
     };
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
