@@ -1,10 +1,14 @@
-//! The `shell` tool: run a non-interactive POSIX `sh -c` command, capture stdout/stderr and
-//! the exit code, with a timeout that kills the whole process group. Safety (allow/ask/deny,
-//! the catastrophic denylist, secret reads) is enforced upstream by the permission broker
-//! (`forge-core::permission`) against the rule engine — this tool only executes.
+//! The `shell` tool: run a non-interactive command via the OS shell (`sh -c` on Unix, `cmd /C`
+//! on Windows), capture stdout/stderr and the exit code, with a timeout that kills the whole
+//! process group. Safety (allow/ask/deny, the catastrophic denylist, secret reads) is enforced
+//! upstream by the permission broker (`forge-core::permission`) against the rule engine — this
+//! tool only executes.
 //!
-//! Non-interactive only: stdin is `/dev/null`, no TTY. Model-facing output is ANSI-stripped
-//! and truncated to a token budget; the true byte size is reported.
+//! Non-interactive only: stdin is null, no TTY. Model-facing output is ANSI-stripped and
+//! truncated to a token budget; the true byte size is reported.
+//!
+//! Note: the catastrophic denylist patterns are still POSIX-oriented (`rm -rf`, secret-file
+//! reads); Windows-specific dangerous-command patterns are a follow-up (known-issues.md).
 //!
 //! Deferred to follow-ups (see docs/features/shell-tool.md): live output streaming to the
 //! TUI (`ToolOutputDelta`/`ToolEnd`), background jobs (`shell_poll`/`shell_kill`),
@@ -39,10 +43,10 @@ impl Tool for ShellTool {
         "shell"
     }
     fn description(&self) -> &str {
-        "Run a non-interactive POSIX `sh -c` command in the project and return its exit code \
-         and combined output. No TTY/stdin (commands that block on input fail fast). Prefer \
-         read_file/search/list_dir over cat/grep/ls. Args: command (required), cwd (default \
-         \".\"), timeout_secs (default 120, max 600)."
+        "Run a non-interactive shell command in the project (`sh -c` on Unix, `cmd /C` on \
+         Windows) and return its exit code and combined output. No TTY/stdin (commands that \
+         block on input fail fast). Prefer read_file/search/list_dir over cat/grep/ls. Args: \
+         command (required), cwd (default \".\"), timeout_secs (default 120, max 600)."
     }
     fn side_effect(&self) -> SideEffect {
         SideEffect::Shell
@@ -73,8 +77,9 @@ impl Tool for ShellTool {
 /// Execute `command` and format a model-facing result. Never returns `Err`: a failed spawn,
 /// a non-zero exit, and a timeout are all normal results the model can react to.
 async fn run_command(command: &str, cwd: &str, timeout_secs: u64) -> String {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
+    let (shell, flag) = shell_invocation();
+    let mut cmd = Command::new(shell);
+    cmd.arg(flag)
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -181,6 +186,20 @@ async fn read_capped<R: AsyncRead + Unpin>(mut r: R) -> (Vec<u8>, bool) {
         }
     }
     (buf, capped)
+}
+
+/// The OS shell + its "run this command string" flag: `sh -c` on Unix, `cmd /C` on Windows
+/// (Windows has no `sh` by default). Keeps the tool runnable on all three platforms
+/// (cross-platform mandate; known-issues.md).
+fn shell_invocation() -> (&'static str, &'static str) {
+    #[cfg(windows)]
+    {
+        ("cmd", "/C")
+    }
+    #[cfg(not(windows))]
+    {
+        ("sh", "-c")
+    }
 }
 
 /// Put the child in its own process group so a timeout kill takes down the whole tree.
@@ -351,6 +370,43 @@ mod tests {
         #[tokio::test]
         async fn bad_cwd_is_a_spawn_failure_not_a_panic() {
             let out = run_command("echo hi", "/no/such/dir/xyz", 5).await;
+            assert!(out.contains("failed to start"), "spawn failure: {out}");
+        }
+    }
+
+    // Execution tests for the Windows `cmd /C` path — run on the windows-latest CI runner.
+    #[cfg(windows)]
+    mod exec_windows {
+        use super::*;
+
+        #[tokio::test]
+        async fn runs_and_captures_stdout_and_exit() {
+            let out = run_command("echo hello", ".", 30).await;
+            assert!(out.contains("hello"), "stdout captured: {out}");
+            assert!(out.contains("exit 0"), "exit code reported: {out}");
+        }
+
+        #[tokio::test]
+        async fn non_zero_exit_is_reported() {
+            let out = run_command("exit 3", ".", 30).await;
+            assert!(out.contains("exit 3"), "non-zero exit: {out}");
+        }
+
+        #[tokio::test]
+        async fn timeout_kills_and_reports() {
+            // `ping -n 20` sleeps ~19s between echoes; a 1s timeout must kill it fast.
+            let start = Instant::now();
+            let out = run_command("ping -n 20 127.0.0.1", ".", 1).await;
+            assert!(out.contains("timed out"), "timeout reported: {out}");
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "must not wait for the full ping"
+            );
+        }
+
+        #[tokio::test]
+        async fn bad_cwd_is_a_spawn_failure_not_a_panic() {
+            let out = run_command("echo hi", "Z:\\no\\such\\dir\\xyz", 5).await;
             assert!(out.contains("failed to start"), "spawn failure: {out}");
         }
     }
