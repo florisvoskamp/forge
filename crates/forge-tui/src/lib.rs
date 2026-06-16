@@ -180,6 +180,12 @@ pub enum PresenterEvent {
         files: usize,
         tokens: usize,
     },
+    /// A failed shell command was auto-diagnosed by the model (shell-error-interceptor.md):
+    /// a short likely-cause + suggested fix, surfaced alongside the tool result.
+    ShellDiagnosis {
+        command: String,
+        diagnosis: String,
+    },
     Done {
         final_text: String,
     },
@@ -331,6 +337,12 @@ impl Presenter for HeadlessPresenter {
                 println!(
                     "  ⌬ lattice → injected {symbols} symbols · {files} files (~{tokens} tok)"
                 );
+            }
+            PresenterEvent::ShellDiagnosis { command, diagnosis } => {
+                println!("  ⚠ shell failed: {command}");
+                for line in diagnosis.lines() {
+                    println!("    {line}");
+                }
             }
             // The final answer was already streamed via AssistantText; Done is a
             // lifecycle marker, so the headless renderer needs no extra output here.

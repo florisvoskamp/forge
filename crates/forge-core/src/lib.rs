@@ -35,6 +35,27 @@ const COMPACT_SYSTEM: &str = "You are compacting a coding-assistant conversation
 Summarize the messages below concisely but preserve: decisions made, key facts, file paths, \
 function/type names, and any open threads or TODOs. Output only the summary.";
 
+const SHELL_DIAGNOSE_SYSTEM: &str = "A shell command run by a coding agent just failed. In at \
+most three short sentences, state the most likely cause and a concrete fix (a corrected command, \
+a missing dependency to install, etc.). Be specific and terse. No preamble, no restating the \
+command.";
+
+/// Whether a `shell` tool result reports a failure (non-zero exit, signal, timeout, or spawn
+/// error). The tool's first line is `shell: exit N in …`, `shell: timed out …`, `shell: error: …`,
+/// or `shell: failed to start …`; only `exit 0` is success.
+pub(crate) fn shell_command_failed(result: &str) -> bool {
+    let first = result.lines().next().unwrap_or("");
+    match first.strip_prefix("shell: exit ") {
+        Some(rest) => {
+            rest.split_whitespace()
+                .next()
+                .and_then(|t| t.parse::<i32>().ok())
+                != Some(0)
+        }
+        None => first.starts_with("shell:"),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error(transparent)]
@@ -616,6 +637,53 @@ impl Session {
         Ok((before, after))
     }
 
+    /// On a failed shell command, make one cheap trivial-tier model call explaining the likely
+    /// cause + a concrete fix, surfaced via [`PresenterEvent::ShellDiagnosis`]. Best-effort: it
+    /// is skipped when the budget is exhausted and stays silent on any model error, so it can
+    /// never derail the turn (shell-error-interceptor.md).
+    async fn diagnose_shell_error(&mut self, command: &str, result: &str) {
+        let budget = BudgetState {
+            spent_today_usd: self.store.spend_today_usd().unwrap_or(0.0),
+            daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_month_usd: self.store.spend_this_month_usd().unwrap_or(0.0),
+            monthly_cap_usd: self.config.mesh.monthly_cap_usd,
+            warn_fraction: self.config.mesh.warn_threshold,
+        };
+        if budget.status() == BudgetStatus::Exhausted {
+            return;
+        }
+        let health = self.store.current_benched().unwrap_or_default();
+        let quota = self.store.current_quota().unwrap_or_default();
+        let decision = self
+            .router
+            .route_hinted(
+                "explain a shell error",
+                budget,
+                &health,
+                &quota,
+                Some(TaskTier::Trivial),
+            )
+            .await;
+        let messages = [
+            Message::system(SHELL_DIAGNOSE_SYSTEM),
+            Message::user(format!("Command:\n{command}\n\nResult:\n{result}")),
+        ];
+        let mut sink = |_: StreamEvent| {};
+        if let Ok(r) = self
+            .provider
+            .complete(&decision.model, &messages, &[], &mut sink)
+            .await
+        {
+            let diagnosis = r.content.trim().to_string();
+            if !diagnosis.is_empty() {
+                self.presenter.emit(PresenterEvent::ShellDiagnosis {
+                    command: command.to_string(),
+                    diagnosis,
+                });
+            }
+        }
+    }
+
     /// Inject command/skill guidance as persisted system messages *without* a model call — for
     /// `/skill <name>` with no prompt, so the methodology primes the next turn the user types.
     pub fn prime_guidance(&mut self, guidance: &[String]) -> Result<(), CoreError> {
@@ -1118,6 +1186,19 @@ impl Session {
             .await;
             for n in outcome.notes {
                 self.presenter.emit(PresenterEvent::Warning(n));
+            }
+        }
+
+        // Shell error interceptor (shell-error-interceptor.md): on a failed shell command,
+        // auto-explain the likely cause + a fix with one cheap model call. Best-effort, never
+        // alters the result the model sees.
+        if side_effect == forge_types::SideEffect::Shell
+            && self.config.shell.explain_errors
+            && shell_command_failed(&result)
+        {
+            if let Some(command) = call.args.get("command").and_then(|v| v.as_str()) {
+                let command = command.to_string();
+                self.diagnose_shell_error(&command, &result).await;
             }
         }
 
@@ -2007,6 +2088,172 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_command_failed_reads_the_exit_status() {
+        assert!(!shell_command_failed("shell: exit 0 in 5ms\n\nhi"));
+        assert!(shell_command_failed("shell: exit 1 in 5ms"));
+        assert!(shell_command_failed("shell: exit 127 in 5ms"));
+        assert!(shell_command_failed("shell: timed out after 1s (killed)"));
+        assert!(shell_command_failed("shell: failed to start (cwd .): x"));
+        assert!(shell_command_failed("shell: exit signal in 5ms"));
+        // Not a shell result at all → not treated as a shell failure.
+        assert!(!shell_command_failed("read 3 files"));
+    }
+
+    /// First call emits a failing `shell` command; the diagnosis call (identified by its system
+    /// prompt) returns a fix; after the tool result it answers `done`. Unix-only: the `shell`
+    /// tool shells out to `sh`, so the e2e tests using it are gated to Unix.
+    #[cfg(unix)]
+    struct ShellFailProvider;
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl Provider for ShellFailProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            let usage = Usage::default();
+            if messages
+                .iter()
+                .any(|m| m.role == Role::System && m.content.starts_with("A shell command run by"))
+            {
+                return Ok(ModelResponse {
+                    content: "The command is not installed. Fix: install it first.".into(),
+                    tool_calls: vec![],
+                    usage,
+                    quota: None,
+                });
+            }
+            if messages.iter().any(|m| m.role == Role::Tool) {
+                return Ok(ModelResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                    usage,
+                    quota: None,
+                });
+            }
+            Ok(ModelResponse {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "shell".into(),
+                    args: serde_json::json!({ "command": "definitelynotacommand_xyz" }),
+                }],
+                usage,
+                quota: None,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_shell_command_is_auto_diagnosed() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        // Bypass auto-allows the shell call so the interceptor path is reached.
+        let config = Config {
+            permission_mode: forge_types::PermissionMode::Bypass,
+            ..Config::default()
+        };
+        let presenter = CapturePresenter::default();
+        let events = presenter.events.clone();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(ShellFailProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(presenter),
+            config,
+            ".",
+        )
+        .unwrap();
+
+        session.run_turn("build the project").await.unwrap();
+
+        let diagnosed = events.lock().unwrap().iter().any(|e| {
+            matches!(e, PresenterEvent::ShellDiagnosis { command, diagnosis }
+                if command.contains("definitelynotacommand_xyz") && diagnosis.contains("install"))
+        });
+        assert!(
+            diagnosed,
+            "a ShellDiagnosis event was emitted for the failed command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_shell_command_is_not_diagnosed() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let config = Config {
+            permission_mode: forge_types::PermissionMode::Bypass,
+            ..Config::default()
+        };
+        let presenter = CapturePresenter::default();
+        let events = presenter.events.clone();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(EchoShellProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(presenter),
+            config,
+            ".",
+        )
+        .unwrap();
+
+        session.run_turn("say hi").await.unwrap();
+
+        let diagnosed = events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, PresenterEvent::ShellDiagnosis { .. }));
+        assert!(
+            !diagnosed,
+            "a succeeding command must not trigger the interceptor"
+        );
+    }
+
+    /// Emits a succeeding `shell` command once, then answers `done`. Unix-only (see above).
+    #[cfg(unix)]
+    struct EchoShellProvider;
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl Provider for EchoShellProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            if messages.iter().any(|m| m.role == Role::Tool) {
+                return Ok(ModelResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                    quota: None,
+                });
+            }
+            Ok(ModelResponse {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "shell".into(),
+                    args: serde_json::json!({ "command": "echo hi" }),
+                }],
+                usage: Usage::default(),
+                quota: None,
+            })
+        }
     }
 
     /// Never streams an event and never returns — simulates a half-open / stalled connection.
