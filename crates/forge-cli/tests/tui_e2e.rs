@@ -125,6 +125,40 @@ fn tui_assay_mode_opens_choice_picker_and_runs_without_crashing() {
 
 #[test]
 #[ignore = "needs a DSR-answering pty; run locally with --ignored"]
+fn tui_goal_sets_objective_and_runs() {
+    // /goal pins the objective (note) and spawns a decomposition turn; Esc stops, /quit exits.
+    let (clean, plain) = drive_pty(&[
+        ("/goal ship the parser\r", 1500),
+        ("\x1b", 600),
+        ("/quit\r", 600),
+    ]);
+    assert!(clean, "clean exit: {plain}");
+    assert!(!plain.to_lowercase().contains("panic"), "no panic: {plain}");
+    assert!(
+        plain.contains("goal set"),
+        "the /goal note was shown: {plain}"
+    );
+}
+
+#[test]
+#[ignore = "needs a DSR-answering pty; run locally with --ignored"]
+fn tui_loop_starts_and_stops_on_interrupt() {
+    // /loop starts an autonomous loop (note), Esc interrupts it, then /quit exits cleanly.
+    let (clean, plain) = drive_pty(&[
+        ("/loop keep working\r", 1500),
+        ("\x1b", 600),
+        ("/quit\r", 600),
+    ]);
+    assert!(clean, "clean exit: {plain}");
+    assert!(!plain.to_lowercase().contains("panic"), "no panic: {plain}");
+    assert!(
+        plain.contains("loop started"),
+        "the /loop note was shown: {plain}"
+    );
+}
+
+#[test]
+#[ignore = "needs a DSR-answering pty; run locally with --ignored"]
 fn tui_config_opens_wizard_fullscreen_and_returns_to_chat() {
     // /config takes over the screen with the setup wizard; Esc cancels it and the inline chat
     // loop must resume cleanly (raw mode re-enabled, viewport rebuilt) — then /quit exits. This

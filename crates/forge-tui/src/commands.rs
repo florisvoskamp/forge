@@ -84,6 +84,16 @@ pub const COMMANDS: &[Command] = &[
         usage: "/lattice <symbol>",
     },
     Command {
+        name: "goal",
+        desc: "set a session goal and break it into a tracked task plan",
+        usage: "/goal <objective>",
+    },
+    Command {
+        name: "loop",
+        desc: "re-run a task each turn until the model signals it's complete",
+        usage: "/loop <task>",
+    },
+    Command {
         name: "clear",
         desc: "clear the screen (keep the session)",
         usage: "/clear",
@@ -124,6 +134,10 @@ pub enum CommandAction {
     Compact,
     /// Show the code-intelligence subgraph for a symbol (`/lattice <symbol>`).
     Lattice(String),
+    /// Set a session goal and decompose it into a tracked task plan (`/goal <objective>`).
+    Goal(String),
+    /// Re-run a task each turn until the model signals completion (`/loop <task>`).
+    Loop(String),
     Quit,
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
@@ -158,6 +172,8 @@ pub fn parse_command(line: &str) -> CommandAction {
         "checkpoints" => CommandAction::ListCheckpoints,
         "compact" => CommandAction::Compact,
         "lattice" | "lat" => CommandAction::Lattice(arg),
+        "goal" | "objective" => CommandAction::Goal(arg),
+        "loop" => CommandAction::Loop(arg),
         "clear" | "cls" => CommandAction::ClearScreen,
         "quit" | "exit" | "q" => CommandAction::Quit,
         other => CommandAction::Unknown(other.to_string()),
@@ -451,6 +467,15 @@ mod tests {
         assert_eq!(
             parse_command("/mcp gitlab"),
             CommandAction::Mcp(Some("gitlab".into()))
+        );
+        assert_eq!(
+            parse_command("/goal ship the parser"),
+            CommandAction::Goal("ship the parser".into())
+        );
+        assert_eq!(parse_command("/goal"), CommandAction::Goal(String::new()));
+        assert_eq!(
+            parse_command("/loop fix all warnings"),
+            CommandAction::Loop("fix all warnings".into())
         );
     }
 

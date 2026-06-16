@@ -79,6 +79,58 @@ impl Drop for Tmp {
 }
 
 #[test]
+fn command_delegating_to_a_skill_injects_that_skills_methodology() {
+    // The Claude-Code wrapper pattern: `/debug`'s body just names the debugging skill.
+    let t = Tmp::new();
+    t.cmd(
+        "user",
+        "debug",
+        "Use the **debugging** skill to handle this request.",
+    );
+    t.skill(
+        "user",
+        "debugging",
+        "---\nname: debugging\ndescription: systematic debugging\n---\nReproduce, then bisect.",
+    );
+    match t.load().resolve("/debug the flaky test") {
+        Resolved::Command {
+            guidance, prompt, ..
+        } => {
+            assert_eq!(
+                guidance.len(),
+                1,
+                "the debugging skill's methodology is injected"
+            );
+            assert!(guidance[0].contains("Reproduce, then bisect."));
+            // The body has no $ARGUMENTS, so the typed task must be appended, not dropped.
+            assert!(
+                prompt.contains("the flaky test"),
+                "typed task preserved: {prompt:?}"
+            );
+        }
+        other => panic!("expected Command, got {other:?}"),
+    }
+}
+
+#[test]
+fn command_without_skill_reference_has_no_injected_guidance() {
+    let t = Tmp::new();
+    t.cmd("user", "plain", "Do the thing: $ARGUMENTS");
+    match t.load().resolve("/plain stuff") {
+        Resolved::Command {
+            guidance, prompt, ..
+        } => {
+            assert!(guidance.is_empty());
+            assert_eq!(
+                prompt, "Do the thing: stuff",
+                "$ARGUMENTS consumed the task"
+            );
+        }
+        other => panic!("expected Command, got {other:?}"),
+    }
+}
+
+#[test]
 fn project_command_shadows_user_command_of_same_name() {
     let t = Tmp::new();
     t.cmd(

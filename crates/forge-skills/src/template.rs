@@ -2,6 +2,26 @@
 //! (positional args), and `$NAME` (a declared named arg). Unknown `$tokens` are left verbatim
 //! so a body can contain literal `$` text. No shell parsing — values substitute as-is.
 
+/// Whether `body` contains any argument placeholder that would consume the user's typed text:
+/// `$ARGUMENTS`, a positional `$1..$9`, or one of the declared `$NAME` args. Used so a command
+/// whose body has no placeholder doesn't silently drop a typed task.
+pub fn uses_args(body: &str, named: &[(String, String)]) -> bool {
+    if body.contains("$ARGUMENTS") {
+        return true;
+    }
+    let bytes = body.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'$' {
+            if let Some(&next) = bytes.get(i + 1) {
+                if next.is_ascii_digit() && next != b'0' {
+                    return true;
+                }
+            }
+        }
+    }
+    named.iter().any(|(k, _)| body.contains(&format!("${k}")))
+}
+
 /// Expand `body` using positional args, named args (`(name, value)`), and `raw` (the verbatim
 /// text after the command name, for `$ARGUMENTS`).
 pub fn expand(body: &str, positional: &[&str], named: &[(String, String)], raw: &str) -> String {

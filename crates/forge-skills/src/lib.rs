@@ -334,7 +334,7 @@ impl Catalog {
         for cmd in self.commands.values() {
             out.push(Entry {
                 name: cmd.name.clone(),
-                description: cmd.description.clone(),
+                description: self.display_description(cmd),
                 scope: cmd.scope,
                 is_skill: false,
                 shadows: self.shadows(&cmd.name, cmd.scope),
@@ -358,6 +358,21 @@ impl Catalog {
 
     fn shadows(&self, name: &str, scope: Scope) -> bool {
         self.shadowed.iter().any(|(n, s)| n == name && *s < scope)
+    }
+
+    /// The description to show for a command. A Claude-Code wrapper whose own "description" is just
+    /// the delegation sentence ("Use the **X** skill …") is unhelpful in the palette, so when the
+    /// command delegates to a known skill, show that skill's description instead.
+    fn display_description(&self, cmd: &Command) -> String {
+        if cmd.description.starts_with("Use the ") {
+            if let Some(meta) = bold_tokens(&cmd.description)
+                .into_iter()
+                .find_map(|t| self.skills.get(&t))
+            {
+                return meta.description.clone();
+            }
+        }
+        cmd.description.clone()
     }
 
     /// Fuzzy-rank entries against `query` (prefix beats subsequence), best-first, capped at
@@ -433,11 +448,24 @@ impl Catalog {
                     )
                 })
                 .collect();
-            let prompt = template::expand(&cmd.body, &positional, &named, &rest);
+            let mut prompt = template::expand(&cmd.body, &positional, &named, &rest);
+            // A command that delegates to a skill ("Use the **debugging** skill …", the
+            // Claude-Code wrapper pattern) must actually load that skill's methodology, not just
+            // name it — otherwise invoking the command does nothing useful.
+            let guidance = self.referenced_skill_guidance(&cmd.body, &name);
+            // Don't silently drop a typed task when the body has no $ARGUMENTS/$N to receive it.
+            if !rest.is_empty() && !template::uses_args(&cmd.body, &named) {
+                let trimmed = prompt.trim_end().to_string();
+                prompt = if trimmed.is_empty() {
+                    rest.clone()
+                } else {
+                    format!("{trimmed}\n\n{rest}")
+                };
+            }
             return Resolved::Command {
                 cmd: cmd.clone(),
                 prompt,
-                guidance: Vec::new(),
+                guidance,
             };
         }
 
@@ -450,6 +478,46 @@ impl Catalog {
 
         Resolved::Unknown(name)
     }
+
+    /// Methodology guidance for every known skill that `body` references as a markdown-bold token
+    /// (`**skill-name**`) — the Claude-Code "Use the **X** skill …" wrapper pattern. Each matched
+    /// skill is loaded once (deduped); `self_name` (the invoking command) is never injected, so a
+    /// command can't recurse into itself. Empty when the body references no known skill.
+    fn referenced_skill_guidance(&self, body: &str, self_name: &str) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for tok in bold_tokens(body) {
+            if tok == self_name {
+                continue;
+            }
+            if let Some(meta) = self.skills.get(&tok) {
+                if seen.insert(tok) {
+                    out.push(Skill::load(meta).guidance());
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Extract the text inside each `**…**` markdown-bold span in `text`. Inner text is trimmed and
+/// empty spans are skipped; used to spot `**skill-name**` references in a command body.
+fn bold_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("**") {
+        let after = &rest[open + 2..];
+        if let Some(close) = after.find("**") {
+            let inner = after[..close].trim();
+            if !inner.is_empty() && !inner.contains('\n') {
+                out.push(inner.to_string());
+            }
+            rest = &after[close + 2..];
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 /// Rank `name` against `query`: `Some(score)` (lower = better) or `None`. Prefix matches beat

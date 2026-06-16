@@ -466,3 +466,26 @@ merges arbitrary ordered sources and records each definition's scope.
 - **Reuses today:** inline-scrollback live-region model (`docs/features/tui-inline-scrollback.md`)
   for the palette overlay; Model Mesh routing (ADR-0006) for the `tier`/`model` hints; the
   permission/trust posture (ADR-0008) as the analogue for project-content trust.
+
+---
+
+## Update — command→skill delegation, fixed descriptions, `/goal`, `/loop`
+
+**Command→skill delegation.** Claude-Code ships thin command *wrappers* (e.g. `/debug`) whose body
+is just `Use the **debugging** skill to handle this request.` Previously Forge injected that literal
+sentence and (no `$ARGUMENTS`) dropped the user's task, so the wrapper did nothing. Now
+`Catalog::resolve` scans a command body for `**skill-name**` references to known skills and appends
+each skill's methodology (`Skill::load(meta).guidance()`) to the command's guidance — the command
+actually runs the skill. `template::uses_args` ensures a body with no `$ARGUMENTS`/`$N`/`$NAME`
+placeholder gets the typed task appended rather than dropped.
+
+**Descriptions.** A wrapper whose own description is just the delegation sentence now displays the
+referenced skill's description in the palette (`Catalog::display_description`).
+
+**`/goal <objective>`** (builtin): pins the objective as a persisted north-star (`prime_guidance`)
+and runs a turn that decomposes it into a tracked plan via the `update_tasks` tool.
+
+**`/loop <task>`** (builtin): runs the task, then re-runs each turn (feeding "Continue toward
+completion.") until the model ends a reply with `LOOP_COMPLETE` or the iteration cap (25) is hit;
+Esc stops it. Implemented as `DispatchOutcome::StartLoop` + `LoopState` in the render loop, with a
+pure `loop_stop_reason` decision and `Session::last_assistant_text` for completion detection.

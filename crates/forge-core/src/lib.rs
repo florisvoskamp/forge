@@ -431,6 +431,16 @@ impl Session {
         self.mode
     }
 
+    /// The most recent assistant message's text, if any — used by `/loop` to decide whether the
+    /// model signalled completion.
+    pub fn last_assistant_text(&self) -> Option<&str> {
+        self.transcript
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| m.content.as_str())
+    }
+
     /// Advance the temper through the SHIFT+TAB cycle, persist it, and return the new temper
     /// (RFC/temper-modes). Takes effect on the next turn's permission decisions.
     pub fn cycle_temper(&mut self) -> PermissionMode {

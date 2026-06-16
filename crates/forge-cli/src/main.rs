@@ -1676,6 +1676,9 @@ async fn run_chat_tui(
     // signal is ignored once a new turn has started.
     let mut turn_gen: u64 = 0;
     let mut turn_handle: Option<tokio::task::JoinHandle<()>> = None;
+    // `/loop` state: when set, each completed turn of this generation is re-run until the model
+    // signals completion or the iteration cap is hit.
+    let mut loop_state: Option<LoopState> = None;
     let mut pending: Option<std::sync::mpsc::Sender<bool>> = None;
     let mut pending_question: Option<std::sync::mpsc::Sender<String>> = None;
     // Baseline for the spinner: deriving the tick from elapsed time keeps the animation
@@ -1762,6 +1765,25 @@ async fn run_chat_tui(
                             DispatchOutcome::RunCompact => {
                                 turn_gen += 1;
                                 turn_handle = Some(spawn_compact(
+                                    &session,
+                                    &done_tx,
+                                    turn_gen,
+                                    &mut app,
+                                    &mut busy,
+                                    &mut busy_since,
+                                ));
+                            }
+                            DispatchOutcome::StartLoop { prompt } => {
+                                turn_gen += 1;
+                                loop_state = Some(LoopState {
+                                    gen: turn_gen,
+                                    iter: 1,
+                                });
+                                app.note("↻ loop started — Esc to stop");
+                                turn_handle = Some(spawn_turn_with(
+                                    prompt,
+                                    vec![LOOP_GUIDANCE.to_string()],
+                                    None,
                                     &session,
                                     &done_tx,
                                     turn_gen,
@@ -1870,6 +1892,7 @@ async fn run_chat_tui(
                     }
                     turn_gen += 1; // discard the aborted turn's (now stale) done-signal
                     busy = false;
+                    loop_state = None; // a `/loop` in progress stops on interrupt
                     pending = None;
                     pending_question = None;
                     app.prompt = None;
@@ -1981,6 +2004,25 @@ async fn run_chat_tui(
                                         &mut busy_since,
                                     ));
                                 }
+                                DispatchOutcome::StartLoop { prompt } => {
+                                    turn_gen += 1;
+                                    loop_state = Some(LoopState {
+                                        gen: turn_gen,
+                                        iter: 1,
+                                    });
+                                    app.note("↻ loop started — Esc to stop");
+                                    turn_handle = Some(spawn_turn_with(
+                                        prompt,
+                                        vec![LOOP_GUIDANCE.to_string()],
+                                        None,
+                                        &session,
+                                        &done_tx,
+                                        turn_gen,
+                                        &mut app,
+                                        &mut busy,
+                                        &mut busy_since,
+                                    ));
+                                }
                             }
                         } else {
                             turn_gen += 1;
@@ -2043,6 +2085,41 @@ async fn run_chat_tui(
                 busy = false;
                 turn_handle = None;
                 dirty = true;
+                // `/loop`: if this was a loop turn, decide whether to run another iteration.
+                if let Some(ls) = loop_state.take() {
+                    if ls.gen == g {
+                        let last = {
+                            session
+                                .lock()
+                                .await
+                                .last_assistant_text()
+                                .map(str::to_string)
+                        };
+                        match loop_stop_reason(last.as_deref(), ls.iter) {
+                            Some(reason) => app.note(reason),
+                            None => {
+                                turn_gen += 1;
+                                loop_state = Some(LoopState {
+                                    gen: turn_gen,
+                                    iter: ls.iter + 1,
+                                });
+                                turn_handle = Some(spawn_turn_with(
+                                    "Continue toward completion.".to_string(),
+                                    vec![LOOP_GUIDANCE.to_string()],
+                                    None,
+                                    &session,
+                                    &done_tx,
+                                    turn_gen,
+                                    &mut app,
+                                    &mut busy,
+                                    &mut busy_since,
+                                ));
+                            }
+                        }
+                    } else {
+                        loop_state = Some(ls); // a different turn finished; keep waiting
+                    }
+                }
             }
         }
         if busy {
@@ -2071,6 +2148,34 @@ async fn run_chat_tui(
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
     Ok(())
+}
+
+/// `/loop` runtime state: the generation of the in-flight loop turn and how many iterations have
+/// run, so completion can be detected and capped.
+struct LoopState {
+    gen: u64,
+    iter: usize,
+}
+
+/// Iteration cap so a loop that never signals completion can't run forever.
+const LOOP_MAX_ITERS: usize = 25;
+/// The token the model is told to emit when the looped task is fully complete.
+const LOOP_DONE_SENTINEL: &str = "LOOP_COMPLETE";
+/// Guidance injected on every loop turn: make progress, and signal completion explicitly.
+const LOOP_GUIDANCE: &str = "You are running in an autonomous loop. Make concrete progress on the \
+task each turn. When — and ONLY when — the task is fully complete, end your final message with \
+the token LOOP_COMPLETE on its own line. While work remains, keep going and do NOT emit that token.";
+
+/// Decide whether a loop should stop after a turn. Returns `Some(reason)` to stop (shown to the
+/// user), or `None` to run another iteration. Pure so it's unit-testable.
+fn loop_stop_reason(last_assistant: Option<&str>, iter: usize) -> Option<&'static str> {
+    if last_assistant.is_some_and(|t| t.contains(LOOP_DONE_SENTINEL)) {
+        Some("◆ loop complete")
+    } else if iter >= LOOP_MAX_ITERS {
+        Some("◆ loop stopped — hit the iteration cap")
+    } else {
+        None
+    }
 }
 
 /// Echo a prompt + spawn the turn task (shared by normal submit and the `//` literal escape).
@@ -2173,6 +2278,8 @@ enum DispatchOutcome {
     },
     /// `/compact` — summarize older messages in a background task (it makes a model call).
     RunCompact,
+    /// `/loop <task>` — run the task, then re-run each turn until the model signals completion.
+    StartLoop { prompt: String },
 }
 
 /// Execute a slash command (command-skill-system.md). Builtins are matched first; an unrecognised
@@ -2359,6 +2466,40 @@ async fn dispatch_command(
                     }
                 }
             }
+        }
+        // `/goal <objective>` — pin a persisted north-star, then run a turn that decomposes it
+        // into a tracked task plan (update_tasks).
+        CommandAction::Goal(text) => {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                app.note("usage: /goal <objective> — sets the goal and breaks it into tasks");
+                return Ok(DispatchOutcome::Handled);
+            }
+            {
+                let mut s = session.lock().await;
+                s.prime_guidance(&[format!(
+                    "Session goal: {text}\nKeep every step aligned to this goal until it is fully met."
+                )])
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            app.note(&format!("🎯 goal set — {text}"));
+            return Ok(DispatchOutcome::RunTurn {
+                prompt: format!(
+                    "Break this goal into a concrete, ordered plan and record it with the \
+                     update_tasks tool, then start on the first step.\n\nGoal: {text}"
+                ),
+                guidance: Vec::new(),
+                tier: Some(forge_types::TaskTier::Complex),
+            });
+        }
+        // `/loop <task>` — autonomous re-run until the model signals completion.
+        CommandAction::Loop(text) => {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                app.note("usage: /loop <task> — re-runs until the model signals it's complete");
+                return Ok(DispatchOutcome::Handled);
+            }
+            return Ok(DispatchOutcome::StartLoop { prompt: text });
         }
         // Not a builtin → try the file-based command/skill catalog.
         CommandAction::Unknown(_) => {
@@ -2817,6 +2958,18 @@ mod tests {
         assert_eq!(second.skipped_commands, 1, "already present → skipped");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn loop_stops_on_sentinel_or_iteration_cap() {
+        // Keeps looping while the model hasn't signalled done and we're under the cap.
+        assert!(loop_stop_reason(Some("still working on it"), 1).is_none());
+        // Stops the moment the completion token appears.
+        assert!(loop_stop_reason(Some("all green now\nLOOP_COMPLETE"), 3).is_some());
+        // Stops at the hard iteration cap even without the token.
+        assert!(loop_stop_reason(Some("more to do"), LOOP_MAX_ITERS).is_some());
+        // No assistant text yet → not complete, keep going (under cap).
+        assert!(loop_stop_reason(None, 1).is_none());
     }
 
     #[test]
