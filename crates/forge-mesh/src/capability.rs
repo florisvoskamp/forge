@@ -6,6 +6,13 @@
 
 use forge_types::TaskTier;
 
+use crate::bench::BenchmarkScores;
+
+/// Divisor that maps an Artificial Analysis index (~0–70, frontier ≈ 60) onto the same 0–3-ish
+/// "quality" scale the family heuristic produced, so cost/conservation terms layered on top in the
+/// catalog keep working unchanged (a ~60 index ≈ quality 3.0).
+const BENCH_INDEX_DIVISOR: f64 = 20.0;
+
 /// Coarse quality class inferred from a model id's family (0 = unknown/small … 3 = frontier).
 pub(crate) fn quality_class(id: &str) -> u8 {
     let m = id.to_lowercase();
@@ -72,10 +79,39 @@ pub(crate) fn speed_class(id: &str) -> u8 {
 
 /// The pure *capability* fit of a model for a tier (higher = better), with no cost/provider terms
 /// — those are layered on in the catalog's routing score so cost-tiering + spread stay in one
-/// place. Trivial favours speed, Complex favours quality, Standard balances.
+/// place. Trivial favours speed, Complex favours quality, Standard balances. Heuristic-only
+/// (no benchmark data); thin wrapper over [`capability_score_b`]. Test-only — production paths call
+/// `capability_score_b` directly so they can pass benchmark data + code-heaviness.
+#[cfg(test)]
 pub(crate) fn capability_score(id: &str, tier: TaskTier) -> f64 {
-    let q = quality_class(id) as f64;
-    let s = speed_class(id) as f64;
+    capability_score_b(id, tier, false, None)
+}
+
+/// Capability fit, preferring REAL benchmark scores (ADR-0011) when available. The quality term is
+/// the measured index (coding index for `code_heavy` tasks, else the general intelligence index)
+/// scaled onto the heuristic's 0–3 range; speed stays a size-derived heuristic (benchmarks don't
+/// rank "fast for a trivial edit"). Falls back to the family `quality_class` when the model has no
+/// score, so a missing/disabled benchmark layer changes nothing.
+pub(crate) fn capability_score_b(
+    id: &str,
+    tier: TaskTier,
+    code_heavy: bool,
+    bench: Option<&BenchmarkScores>,
+) -> f64 {
+    let (q, s) = match bench.and_then(|b| b.score_for(id)) {
+        Some(score) => {
+            let index = if code_heavy {
+                score.coding
+            } else {
+                score.intelligence
+            };
+            (
+                (index / BENCH_INDEX_DIVISOR).clamp(0.0, 4.0),
+                speed_class(id) as f64,
+            )
+        }
+        None => (quality_class(id) as f64, speed_class(id) as f64),
+    };
     match tier {
         TaskTier::Trivial => s * 2.0 + q * 0.5,
         TaskTier::Standard => q + s,
