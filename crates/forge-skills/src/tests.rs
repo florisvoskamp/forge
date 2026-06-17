@@ -568,6 +568,38 @@ fn orchestrate_is_a_builtin_skill_with_no_import() {
 }
 
 #[test]
+fn subdir_command_gets_namespaced_name() {
+    let t = Tmp::new();
+    // Create commands/git/commit.md — should load as "git:commit"
+    let subdir = t.root.join("user/commands/git");
+    std::fs::create_dir_all(&subdir).unwrap();
+    std::fs::write(
+        subdir.join("commit.md"),
+        "---\ntitle: Commit\ndescription: Stage and commit changes\n---\nRun git commit.",
+    )
+    .unwrap();
+    let cat = t.load();
+    let entry = cat.entries().into_iter().find(|e| e.name == "git:commit");
+    assert!(entry.is_some(), "command 'git:commit' not found in catalog");
+}
+
+#[test]
+fn nested_subdir_commands_get_deeply_namespaced_name() {
+    let t = Tmp::new();
+    // commands/infra/terraform/apply.md → "infra:terraform:apply"
+    let subdir = t.root.join("user/commands/infra/terraform");
+    std::fs::create_dir_all(&subdir).unwrap();
+    std::fs::write(
+        subdir.join("apply.md"),
+        "---\ntitle: Apply\ndescription: terraform apply\n---\nRun terraform apply.",
+    )
+    .unwrap();
+    let cat = t.load();
+    let entry = cat.entries().into_iter().find(|e| e.name == "infra:terraform:apply");
+    assert!(entry.is_some(), "command 'infra:terraform:apply' not found in catalog");
+}
+
+#[test]
 fn a_user_orchestrate_overrides_the_builtin() {
     let t = Tmp::new();
     t.skill(

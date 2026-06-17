@@ -223,18 +223,41 @@ impl Catalog {
     }
 
     fn load_commands_dir(&mut self, dir: &ScopedDir) {
+        self.load_commands_dir_recurse(dir, None);
+    }
+
+    /// Recurse into `dir`, prefixing command names with `namespace` when in a subdirectory.
+    /// A file `commands/git/commit.md` at scope S becomes `/git:commit`.
+    fn load_commands_dir_recurse(&mut self, dir: &ScopedDir, namespace: Option<&str>) {
         let entries = match std::fs::read_dir(&dir.path) {
             Ok(e) => e,
             Err(_) => return, // a non-existent scope dir is normal, not an error
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            if path.is_dir() {
+                let sub_ns = match path.file_name().and_then(|s| s.to_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let new_ns = match namespace {
+                    Some(p) => format!("{p}:{sub_ns}"),
+                    None => sub_ns,
+                };
+                let sub_dir = ScopedDir { path: path.clone(), scope: dir.scope };
+                self.load_commands_dir_recurse(&sub_dir, Some(&new_ns));
+                continue;
+            }
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
             let stem = match path.file_stem().and_then(|s| s.to_str()) {
                 Some(s) => s.to_string(),
                 None => continue,
+            };
+            let name = match namespace {
+                Some(ns) => format!("{ns}:{stem}"),
+                None => stem,
             };
             let raw = match std::fs::read_to_string(&path) {
                 Ok(r) => r,
@@ -243,7 +266,7 @@ impl Catalog {
                     continue;
                 }
             };
-            match parse_command(&raw, &stem, dir.scope, &path) {
+            match parse_command(&raw, &name, dir.scope, &path) {
                 Ok(cmd) => self.insert_command(cmd),
                 Err(e) => self
                     .warnings
