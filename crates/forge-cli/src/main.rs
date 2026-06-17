@@ -1922,7 +1922,7 @@ async fn read_callback_params(stream: &mut tokio::net::TcpStream) -> Result<(Str
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or_default();
-    let query = path.splitn(2, '?').nth(1).unwrap_or_default();
+    let query = path.split_once('?').map(|(_, q)| q).unwrap_or_default();
     let mut code = None;
     let mut state = None;
     for pair in query.split('&') {
