@@ -212,6 +212,51 @@ pub fn render_turn_diff(id_a: &str, id_b: &str, a: &[ReplayEntry], b: &[ReplayEn
     out
 }
 
+/// JSON export of a single session's replay (transcript + summary), for external auditing.
+///
+/// Emits a JSON object: `{ session_id, summary, turns }`.
+/// Each turn carries `seq`, `role`, `created_at`, `content`, optional `model`, token counts,
+/// `cost_usd`, and `tool_calls`.
+pub fn render_json(id: &str, entries: &[ReplayEntry]) -> String {
+    let s = summarize(entries);
+    let turns: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "seq": e.seq,
+                "role": role_label(&e.role),
+                "created_at": e.created_at,
+                "content": e.content,
+                "model": e.model,
+                "input_tokens": e.input_tokens,
+                "output_tokens": e.output_tokens,
+                "cost_usd": e.cost_usd,
+                "tool_calls": e.tool_calls.iter().map(|tc| serde_json::json!({
+                    "id": tc.id,
+                    "name": tc.name,
+                    "args": tc.args,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let obj = serde_json::json!({
+        "session_id": id,
+        "summary": {
+            "prompts": s.prompts,
+            "messages": s.messages,
+            "total_cost_usd": s.total_cost,
+            "total_input_tokens": s.total_in,
+            "total_output_tokens": s.total_out,
+            "models": s.models,
+            "started_at": s.started_at,
+            "ended_at": s.ended_at,
+            "duration_secs": s.duration_secs(),
+        },
+        "turns": turns,
+    });
+    serde_json::to_string_pretty(&obj).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+}
+
 /// Summary-level diff between two sessions.
 pub fn render_diff(id_a: &str, id_b: &str, d: &SessionDiff) -> String {
     let mut out = String::new();
@@ -340,5 +385,22 @@ mod tests {
         assert!(out.contains("session abc123"));
         assert!(out.contains("openai::gpt-4o · $0.02"));
         assert!(out.contains("↳ read_file"));
+    }
+
+    #[test]
+    fn render_json_is_valid_json_with_expected_fields() {
+        let entries = vec![
+            entry(0, Role::User, "hello", None, None),
+            entry(1, Role::Assistant, "world", Some("openai::gpt-4o"), Some(0.01)),
+        ];
+        let out = render_json("full-id-here", &entries);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["session_id"], "full-id-here");
+        assert_eq!(v["summary"]["prompts"], 1);
+        assert_eq!(v["summary"]["messages"], 2);
+        assert!((v["summary"]["total_cost_usd"].as_f64().unwrap() - 0.01).abs() < 1e-9);
+        assert_eq!(v["turns"].as_array().unwrap().len(), 2);
+        assert_eq!(v["turns"][0]["role"], "user");
+        assert_eq!(v["turns"][1]["model"], "openai::gpt-4o");
     }
 }

@@ -84,6 +84,10 @@ enum Command {
     Replay {
         /// One session id to reconstruct, or two to diff (git-style prefixes accepted).
         ids: Vec<String>,
+        /// Emit the transcript as machine-readable JSON instead of the human-readable format.
+        /// Only valid with a single session id.
+        #[arg(long)]
+        json: bool,
     },
     /// List discovered slash commands + skills (project and user scope) with their descriptions.
     Commands,
@@ -319,7 +323,7 @@ async fn main() -> Result<()> {
             model,
         } => chat(mock, mode, resume, plain, model).await,
         Command::Sessions => sessions(),
-        Command::Replay { ids } => replay_cmd(&ids),
+        Command::Replay { ids, json } => replay_cmd(&ids, json),
         Command::Commands => commands_cmd(),
         Command::Models { probe, clear } => models(probe, clear).await,
         Command::Auth { provider, remove } => auth(&provider, remove),
@@ -834,7 +838,7 @@ fn sessions() -> Result<()> {
 }
 
 /// `forge replay <id>` reconstructs a session's transcript; `forge replay <a> <b>` diffs two.
-fn replay_cmd(ids: &[String]) -> Result<()> {
+fn replay_cmd(ids: &[String], json: bool) -> Result<()> {
     let store = open_store()?;
     let resolve = |prefix: &str| -> Result<String> {
         let mut matches = store
@@ -851,15 +855,26 @@ fn replay_cmd(ids: &[String]) -> Result<()> {
             let id = resolve(one)?;
             let entries = store.load_replay(&id).context("loading replay")?;
             if entries.is_empty() {
-                println!("session {} has no messages", &id[..id.len().min(8)]);
+                if json {
+                    println!("{{\"session_id\":\"{}\",\"turns\":[]}}", &id[..id.len().min(8)]);
+                } else {
+                    println!("session {} has no messages", &id[..id.len().min(8)]);
+                }
                 return Ok(());
             }
-            print!(
-                "{}",
-                replay::render_transcript(&id[..id.len().min(8)], &entries)
-            );
+            if json {
+                println!("{}", replay::render_json(&id, &entries));
+            } else {
+                print!(
+                    "{}",
+                    replay::render_transcript(&id[..id.len().min(8)], &entries)
+                );
+            }
         }
         [a, b] => {
+            if json {
+                anyhow::bail!("--json is only valid with a single session id");
+            }
             let (ida, idb) = (resolve(a)?, resolve(b)?);
             let ea = store.load_replay(&ida).context("loading replay a")?;
             let eb = store.load_replay(&idb).context("loading replay b")?;
@@ -912,6 +927,7 @@ fn commands_cmd() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn spawn_assay(
     cleanup: bool,
+    lenses: Vec<forge_types::FindingCategory>,
     session: &Arc<tokio::sync::Mutex<Session>>,
     done_tx: &std::sync::mpsc::Sender<u64>,
     gen: u64,
@@ -973,7 +989,7 @@ async fn spawn_assay(
     Ok(Some(tokio::spawn(async move {
         let _done = DoneGuard(dt, gen);
         let mut sess = s.lock().await;
-        if let Err(e) = sess.assay(src, models, cleanup).await {
+        if let Err(e) = sess.assay(src, models, lenses, cleanup).await {
             sess.notify_error(&format!("assay failed: {e}"));
         }
     })))
@@ -2069,6 +2085,8 @@ async fn run_chat_tui(
     let mut loop_state: Option<LoopState> = None;
     let mut pending: Option<std::sync::mpsc::Sender<bool>> = None;
     let mut pending_question: Option<std::sync::mpsc::Sender<String>> = None;
+    // Lens filter set by `/assay --only`/`--skip`; consumed when the AssayChoice picker resolves.
+    let mut assay_lenses: Vec<forge_types::FindingCategory> = Vec::new();
     // Baseline for the spinner: deriving the tick from elapsed time keeps the animation
     // speed independent of the loop frequency (one frame per 60ms, exactly as before).
     let mut busy_since = Instant::now();
@@ -2157,6 +2175,7 @@ async fn run_chat_tui(
                             &mut armed_project,
                             trust_project,
                             busy,
+                            &mut assay_lenses,
                         )
                         .await?
                         {
@@ -2265,8 +2284,10 @@ async fn run_chat_tui(
                                 // Assay runs as a background task (like a turn) so the spinner
                                 // ticks while critics + verification run.
                                 turn_gen += 1;
+                                let lenses = std::mem::take(&mut assay_lenses);
                                 turn_handle = spawn_assay(
                                     row.id == "cleanup",
+                                    lenses,
                                     &session,
                                     &done_tx,
                                     turn_gen,
@@ -2450,6 +2471,7 @@ async fn run_chat_tui(
                                 &mut armed_project,
                                 trust_project,
                                 busy,
+                                &mut assay_lenses,
                             )
                             .await?
                             {
@@ -2781,6 +2803,7 @@ async fn dispatch_command(
     armed: &mut std::collections::HashSet<String>,
     trust_project: bool,
     busy: bool,
+    assay_lenses: &mut Vec<forge_types::FindingCategory>,
 ) -> Result<DispatchOutcome> {
     use forge_tui::CommandAction;
     let action = forge_tui::parse_command(line);
@@ -2847,7 +2870,22 @@ async fn dispatch_command(
         }
         // `/assay` enters Assay mode: pick analysis-only vs full cleanup; the crew then runs as a
         // background task (spawned in the picker-Enter handler so the spinner ticks).
-        CommandAction::Assay => {
+        CommandAction::Assay { only, skip } => {
+            // Compute the lens set from --only/--skip and store for picker resolution.
+            let crew = forge_types::FindingCategory::crew();
+            *assay_lenses = if !only.is_empty() {
+                crew.iter()
+                    .filter(|l| only.iter().any(|o| o == l.as_str()))
+                    .copied()
+                    .collect()
+            } else if !skip.is_empty() {
+                crew.iter()
+                    .filter(|l| !skip.iter().any(|s| s == l.as_str()))
+                    .copied()
+                    .collect()
+            } else {
+                Vec::new() // empty = use full crew (default)
+            };
             let rows = vec![
                 forge_tui::PickerRow {
                     id: "analysis".into(),

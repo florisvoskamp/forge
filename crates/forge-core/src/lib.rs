@@ -495,10 +495,15 @@ impl Session {
         &mut self,
         source: Arc<str>,
         models: assay::TierModels,
+        lenses: Vec<forge_types::FindingCategory>,
         cleanup: bool,
     ) -> Result<(), CoreError> {
         let pricing = Arc::new(self.pricing.clone());
-        let lenses = forge_types::FindingCategory::crew().to_vec();
+        let lenses = if lenses.is_empty() {
+            forge_types::FindingCategory::crew().to_vec()
+        } else {
+            lenses
+        };
         let cooldown = std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
         let provider = Arc::clone(&self.provider);
         let store = Arc::clone(&self.store);
@@ -3905,7 +3910,8 @@ mod tests {
                     trivial: vec!["m".into()],
                     complex: vec!["m".into()],
                 },
-                false, // analysis-only
+                vec![], // default: full crew
+                false,  // analysis-only
             )
             .await
             .unwrap();

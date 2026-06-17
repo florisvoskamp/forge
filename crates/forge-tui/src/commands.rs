@@ -41,7 +41,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "assay",
         desc: "analyze code quality (AI-slop, dead/unsafe/untested) — or full cleanup",
-        usage: "/assay",
+        usage: "/assay [--only <lens,…>] [--skip <lens,…>]",
     },
     Command {
         name: "model",
@@ -136,7 +136,8 @@ pub enum CommandAction {
     /// Open the operating-mode (temper) picker.
     Mode,
     /// Enter Assay mode — pick analysis-only vs full cleanup, then run the critic crew.
-    Assay,
+    /// `only` and `skip` are lens name lists (comma-separated in the command args).
+    Assay { only: Vec<String>, skip: Vec<String> },
     /// Rewind the last turn (conversation + file edits).
     Undo,
     /// Save a checkpoint at the current point; `None` = an auto/unnamed checkpoint.
@@ -217,6 +218,22 @@ pub fn slash_token_at(input: &str, cursor: usize) -> Option<SlashToken> {
     best.or(last)
 }
 
+/// Extract a comma-separated lens list from `--flag <value>` in a raw arg string.
+/// `/assay --only dead-weight,unsafe` → `extract_flag(arg, "--only")` → `["dead-weight", "unsafe"]`
+fn extract_flag(arg: &str, flag: &str) -> Vec<String> {
+    let tokens: Vec<&str> = arg.split_whitespace().collect();
+    for (i, tok) in tokens.iter().enumerate() {
+        if *tok == flag {
+            if let Some(val) = tokens.get(i + 1) {
+                if !val.starts_with('-') {
+                    return val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Parse a submitted command line (`"/resume ab12"`). The leading `/` is required; a `//`
 /// prefix is NOT a command (it escapes to a literal prompt — handled by the caller).
 pub fn parse_command(line: &str) -> CommandAction {
@@ -241,7 +258,14 @@ pub fn parse_command(line: &str) -> CommandAction {
         "mcp" => CommandAction::Mcp((!arg.is_empty()).then_some(arg)),
         "new" | "n" => CommandAction::New,
         "mode" | "m" | "temper" => CommandAction::Mode,
-        "assay" | "analyze" | "analyse" => CommandAction::Assay,
+        "assay" | "analyze" | "analyse" => {
+            // `/assay [--only <lens,lens,…>] [--skip <lens,lens,…>]`
+            // Lens names: dead-weight, correctness, unsafe, test-coverage,
+            //             design, architecture, documentation, over-engineering
+            let only = extract_flag(&arg, "--only");
+            let skip = extract_flag(&arg, "--skip");
+            CommandAction::Assay { only, skip }
+        }
         "undo" | "u" => CommandAction::Undo,
         "checkpoint" | "cp" => CommandAction::Checkpoint((!arg.is_empty()).then_some(arg)),
         "checkpoints" => CommandAction::ListCheckpoints,
