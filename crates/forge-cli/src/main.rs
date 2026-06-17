@@ -1770,7 +1770,7 @@ async fn run_chat_tui(
     // `/loop` state: when set, each completed turn of this generation is re-run until the model
     // signals completion or the iteration cap is hit.
     let mut loop_state: Option<LoopState> = None;
-    let mut pending: Option<std::sync::mpsc::Sender<bool>> = None;
+    let mut pending: Option<(String, std::sync::mpsc::Sender<bool>)> = None;
     let mut pending_question: Option<std::sync::mpsc::Sender<String>> = None;
     // Baseline for the spinner: deriving the tick from elapsed time keeps the animation
     // speed independent of the loop frequency (one frame per 60ms, exactly as before).
@@ -2091,14 +2091,23 @@ async fn run_chat_tui(
                 quit = true;
                 break;
             }
-            if let Some(reply) = pending.take() {
+            if let Some((tool, reply)) = pending.take() {
                 // Answering a permission prompt.
-                let yes = matches!(
-                    key,
-                    KeyKind::Char('y') | KeyKind::Char('Y') | KeyKind::Enter
-                );
+                let always = matches!(key, KeyKind::Char('a') | KeyKind::Char('A'));
+                let yes = always
+                    || matches!(
+                        key,
+                        KeyKind::Char('y') | KeyKind::Char('Y') | KeyKind::Enter
+                    );
                 let _ = reply.send(yes);
                 app.prompt = None;
+                if always {
+                    if let Err(e) = forge_config::append_allow_rule(&tool) {
+                        app.note(&format!("⚠ could not save allow rule: {e}"));
+                    } else {
+                        app.note(&format!("✓ {tool} added to .forge/config.toml allow rules"));
+                    }
+                }
             } else if app.awaiting_question() {
                 // Answering an AskUserQuestion (the turn task is blocked in `ask()`): the input
                 // line collects a number or free-text answer; submit resolves + replies.
@@ -2250,8 +2259,8 @@ async fn run_chat_tui(
                     side_effect,
                     reply,
                 } => {
-                    app.prompt = Some(format!("allow {tool} ({side_effect:?})"));
-                    pending = Some(reply);
+                    app.prompt = Some(format!("allow {tool} ({side_effect:?}) [y/n/a=always]"));
+                    pending = Some((tool, reply));
                 }
                 UiMsg::Question {
                     question,
