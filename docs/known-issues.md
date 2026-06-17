@@ -56,13 +56,11 @@ timeout-kill) was already cross-platform. Windows exec tests (`mod exec_windows`
 `windows-latest` CI runner: echo+exit, non-zero exit, timeout-kill (`ping -n`), bad-cwd spawn
 failure.
 
-**Still deferred:** the catastrophic **denylist patterns are POSIX-oriented** (`rm -rf`,
-secret-file reads); Windows-specific dangerous commands (`del`, `rd /s`, `format`) aren't matched
-yet — a safety-completeness follow-up, not a "won't run" gap. PowerShell (vs `cmd`) is also a
-possible future option.
+**Also fixed:** the built-in denylist now includes Windows-specific dangerous patterns (`rd /s /q`,
+`rmdir /s /q`, `del /f /s /q`, `format c:`, PowerShell `Remove-Item -Recurse -Force`) and
+Windows secret-file reads via `type`/`more`/`copy` — parity with the POSIX patterns. The hooks
+system also received the same `shell_exe()` treatment: hooks now run via `cmd /C` on Windows
+instead of `sh -c`.
 
-**Status:** Windows execution shipped + CI-tested; denylist OS-awareness tracked as follow-up.
-
-**Related:** the hooks system ([hooks.md](features/hooks.md)) still runs `sh -c` directly; giving
-it the same `shell_invocation()` treatment is a small follow-up.
+**Status:** Windows execution, denylist OS-awareness, and hooks cross-platform shell — all shipped.
 </content>
