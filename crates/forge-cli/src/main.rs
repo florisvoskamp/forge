@@ -2307,6 +2307,29 @@ async fn run_chat_tui(
                         loop_state = Some(ls); // a different turn finished; keep waiting
                     }
                 }
+                // Auto-compact: when no new turn was spawned (not a loop iteration) and the
+                // context gauge is above AUTO_COMPACT_THRESHOLD, quietly run /compact so the
+                // user doesn't need to do it manually (context-compaction.md).
+                if turn_handle.is_none() {
+                    if let Some(lim) = app.context_limit {
+                        let fill = app.context_tokens as f64 / lim as f64;
+                        if fill > AUTO_COMPACT_THRESHOLD {
+                            app.note(&format!(
+                                "⚒ context {:.0}% full — auto-compacting",
+                                fill * 100.0
+                            ));
+                            turn_gen += 1;
+                            turn_handle = Some(spawn_compact(
+                                &session,
+                                &done_tx,
+                                turn_gen,
+                                &mut app,
+                                &mut busy,
+                                &mut busy_since,
+                            ));
+                        }
+                    }
+                }
             }
         }
         if busy {
@@ -2346,6 +2369,8 @@ struct LoopState {
 
 /// Iteration cap so a loop that never signals completion can't run forever.
 const LOOP_MAX_ITERS: usize = 25;
+/// Context-fill fraction above which a turn-end auto-compact fires (context-compaction.md).
+const AUTO_COMPACT_THRESHOLD: f64 = 0.80;
 /// The token the model is told to emit when the looped task is fully complete.
 const LOOP_DONE_SENTINEL: &str = "LOOP_COMPLETE";
 /// Guidance injected on every loop turn: make progress, and signal completion explicitly.
