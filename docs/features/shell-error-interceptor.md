@@ -34,10 +34,17 @@ fix.
 - **Wiring:** in `invoke_tool`, after the PostToolUse hooks and before returning, when
   `side_effect == Shell && config.shell.explain_errors && shell_command_failed(&result)`.
 
+## Shipped (follow-up)
+
+- **Transcript injection** — the diagnosis is now queued via `Session::pending_hints` and
+  injected as a `System` message immediately after the tool result in `run_turn_with`, so the
+  model sees the likely cause and fix on its next completion.
+- **Usage recording** — `Store::record_side_call_usage` inserts a synthetic inactive message row
+  as the FK anchor and records the diagnosis call's tokens/cost in the `usage` table, so daily
+  and monthly budget queries stay accurate. `compact()`'s summarise call is also recorded the
+  same way.
+
 ## Deferred
 
-- Feed the diagnosis back into the transcript as a `system` hint (currently UI-only, so the
-  model isn't re-prompted with it — the loop already sees the raw failure).
-- A one-keystroke "apply the suggested fix" action, and recording the diagnosis call's usage
-  against the budget (parity with compaction, which also doesn't record its own call).
+- A one-keystroke "apply the suggested fix" action (requires TUI key-binding + apply logic).
 - Pattern cache for common failures (missing binary, wrong cwd) to skip the model call.

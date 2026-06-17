@@ -37,7 +37,9 @@ pub async fn serve(server: &McpServerConfig) -> Result<RunningService<RoleClient
         McpTransport::Http { url, headers } => {
             // Decide where the token rides: a custom auth header (e.g. `X-Goog-Api-Key`) is sent
             // verbatim via the client's default headers; otherwise it's `Authorization: Bearer`.
-            let token = server.token();
+            // Static token (env/keyring) takes precedence; OAuth token is used when present and
+            // no static token is configured (run `forge mcp login <name>` to obtain one).
+            let static_token = server.token();
             let custom_header = server
                 .auth
                 .as_ref()
@@ -45,12 +47,19 @@ pub async fn serve(server: &McpServerConfig) -> Result<RunningService<RoleClient
                 .filter(|h| !h.eq_ignore_ascii_case("authorization"));
             let mut all_headers = headers.clone();
             let mut bearer = None;
-            if let Some(token) = token {
+            if let Some(token) = static_token {
                 match custom_header {
                     Some(h) => {
                         all_headers.insert(h, token);
                     }
                     None => bearer = Some(token),
+                }
+            } else if let Some(oauth) = server.auth.as_ref().and_then(|a| a.oauth.as_ref()) {
+                // OAuth server: resolve stored tokens (with auto-refresh on expiry).
+                let _ = oauth; // config used for presence check; tokens are keyed by server name
+                match crate::oauth::resolve_oauth_token_async(&server.name).await {
+                    Ok(token) => bearer = Some(token),
+                    Err(e) => return Err(e),
                 }
             }
             let client = build_http_client(&all_headers)?;

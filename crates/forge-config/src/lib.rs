@@ -19,8 +19,9 @@ pub use mcp::{
     McpAllowlist, McpAuth, McpConfig, McpServerConfig, McpTransport, ParsedServers,
 };
 pub use oauth::{
-    authorize_url, clear_oauth_tokens, load_oauth_tokens, oauth_keyring_key, store_oauth_tokens,
-    AuthServerMetadata, OAuthConfig, OAuthTokens, Pkce, ProtectedResourceMetadata,
+    authorize_url, clear_oauth_tokens, load_oauth_tokens, oauth_keyring_key, random_state,
+    store_oauth_tokens, AuthServerMetadata, OAuthConfig, OAuthTokens, Pkce,
+    ProtectedResourceMetadata,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -358,7 +359,7 @@ pub fn builtin_deny_rules() -> Vec<PermissionRule> {
         deny(
             "shell",
             &[
-                // catastrophic filesystem / disk
+                // catastrophic filesystem / disk (Unix)
                 "rm -rf /",
                 "rm -rf ~",
                 "rm -rf /*",
@@ -366,6 +367,13 @@ pub fn builtin_deny_rules() -> Vec<PermissionRule> {
                 "dd of=/dev/*",
                 "mkfs*",
                 "mkfs.*",
+                // catastrophic filesystem / disk (Windows)
+                "del /s *",
+                "del /f /s *",
+                "del /q /s *",
+                "rd /s *",
+                "rmdir /s *",
+                "format ?:*",
                 // remote-to-shell pipe (matched against the raw command line)
                 "*| sh",
                 "*|sh",

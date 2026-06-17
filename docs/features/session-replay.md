@@ -35,10 +35,28 @@ turn does — every message (`role`, `content`, `model`, tool calls, timestamp) 
   `diff`, `render_transcript`, `render_diff` — so it is unit-tested without a database. The
   `Replay` CLI command only resolves ids and prints.
 
+## Shipped (follow-up)
+
+- **`/replay` chat command** — `/replay <id>` shows the transcript inline in the TUI; `/replay
+  <a> <b>` shows the diff. Dispatched as `CommandAction::Replay` in forge-tui, handled in
+  forge-cli via the existing `replay::render_transcript` / `replay::render_diff` functions.
+  Non-mutating, so it can run while a turn is in progress.
+- **Per-turn content diff** — `render_turn_diff(id_a, id_b, a, b)` in `replay.rs` aligns
+  assistant turns pairwise and shows where content diverged (identical turns marked, additions/
+  deletions shown with A:/B: labels). Surfaced by both `forge replay <a> <b>` and `/replay <a>
+  <b>` after the summary diff.
+- **`Tui::print_text`** — convenience method for pushing plain multi-line strings into the
+  terminal scrollback without requiring callers to construct ratatui Line<'static> values.
+
+## Shipped (follow-up 2)
+
+- **`forge replay <id> --json`** — `render_json(id, entries)` in `replay.rs` emits a
+  structured JSON object: `{ session_id, summary, turns }`, with each turn carrying seq,
+  role, created_at, content, model, token counts, cost_usd, and tool_calls. Suitable for
+  external auditing, piping to `jq`, or feeding into analysis scripts.
+
 ## Deferred
 
 - **True re-execution** — re-issue the recorded prompts against the recorded model versions
   and diff the *new* output vs. the recorded one. Non-deterministic and needs live keys, so
   it can't be verified offline; the inspect/compare half is the verifiable, high-value 80%.
-- Per-turn aligned content diff (not just summary-level), a `/replay` chat command, and JSON
-  export for external auditing.

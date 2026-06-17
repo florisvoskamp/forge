@@ -38,6 +38,19 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum AssayCmd {
+    /// List past assay runs (newest first).
+    List,
+    /// Compare two assay runs by id prefix: shows new, fixed, and still-open findings.
+    Compare {
+        /// First run id (or prefix).
+        a: String,
+        /// Second run id (or prefix).
+        b: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Run a single agent turn against your prompt.
     Run {
@@ -84,6 +97,15 @@ enum Command {
     Replay {
         /// One session id to reconstruct, or two to diff (git-style prefixes accepted).
         ids: Vec<String>,
+        /// Emit the transcript as machine-readable JSON instead of the human-readable format.
+        /// Only valid with a single session id.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect past assay runs stored in the database.
+    Assay {
+        #[command(subcommand)]
+        sub: AssayCmd,
     },
     /// List discovered slash commands + skills (project and user scope) with their descriptions.
     Commands,
@@ -198,6 +220,16 @@ enum McpCmd {
         /// Path to the `.mcp.json` (default: `./.mcp.json`).
         path: Option<String>,
     },
+    /// Obtain OAuth tokens for an OAuth-protected HTTP MCP server (browser-based flow).
+    Login {
+        /// Server name (as declared in `.forge/mcp.toml`).
+        server: String,
+    },
+    /// Remove stored OAuth tokens for a server (`forge mcp logout <server>`).
+    Logout {
+        /// Server name (as declared in `.forge/mcp.toml`).
+        server: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -309,7 +341,8 @@ async fn main() -> Result<()> {
             model,
         } => chat(mock, mode, resume, plain, model).await,
         Command::Sessions => sessions(),
-        Command::Replay { ids } => replay_cmd(&ids),
+        Command::Replay { ids, json } => replay_cmd(&ids, json),
+        Command::Assay { sub } => assay_cmd(sub),
         Command::Commands => commands_cmd(),
         Command::Models { probe, clear } => models(probe, clear).await,
         Command::Auth { provider, remove } => auth(&provider, remove),
@@ -328,25 +361,29 @@ struct ImportCounts {
     skipped_commands: usize,
     copied_skills: usize,
     skipped_skills: usize,
+    copied_agents: usize,
+    skipped_agents: usize,
 }
 
-/// `forge import <source> [--project]` — copy another AI CLI's commands/skills into a Forge
-/// scope, reusing the CC-compatible readers (command-skill-system.md) to validate before
-/// copying. Claude imports commands + skills; Codex imports its prompts as commands.
+/// `forge import <source> [--project]` — copy another AI CLI's commands/skills/agents into a
+/// Forge scope, reusing the CC-compatible readers to validate before copying. Claude imports
+/// commands + skills + agents; Codex imports its prompts as commands.
 fn import_cmd(source: ImportSource) -> Result<()> {
-    let (label, project, home, commands_sub, skills_sub) = match source {
+    let (label, project, home, commands_sub, skills_sub, agents_sub) = match source {
         ImportSource::Claude { project } => (
             "claude",
             project,
             forge_config::claude_dir().context("no home directory — cannot locate ~/.claude")?,
             "commands",
             Some("skills"),
+            Some("agents"),
         ),
         ImportSource::Codex { project } => (
             "codex",
             project,
             forge_config::codex_dir().context("no home directory — cannot locate ~/.codex")?,
             "prompts",
+            None,
             None,
         ),
     };
@@ -355,14 +392,19 @@ fn import_cmd(source: ImportSource) -> Result<()> {
         return Ok(());
     }
 
-    let (cmd_dst, skill_dst) = if project {
+    let (cmd_dst, skill_dst, agent_dst) = if project {
         (
             std::path::PathBuf::from("./.forge/commands"),
             std::path::PathBuf::from("./.forge/skills"),
+            std::path::PathBuf::from("./.forge/agents"),
         )
     } else {
         let base = forge_config::config_dir().context("no config directory on this platform")?;
-        (base.join("commands"), base.join("skills"))
+        (
+            base.join("commands"),
+            base.join("skills"),
+            base.join("agents"),
+        )
     };
 
     // Validate assets with the real catalog readers (malformed files are skipped + warned).
@@ -381,25 +423,58 @@ fn import_cmd(source: ImportSource) -> Result<()> {
             .unwrap_or_default(),
     };
     let cat = forge_skills::Catalog::load(&sources);
-    let counts = copy_catalog_assets(&cat, &cmd_dst, &skill_dst);
+    let mut counts = copy_catalog_assets(&cat, &cmd_dst, &skill_dst);
 
+    // Agents: CC and Forge use the same .md front-matter format — direct file copy.
+    if let Some(asub) = agents_sub {
+        let agent_src = home.join(asub);
+        if agent_src.is_dir() {
+            count_copy_md_files(&agent_src, &agent_dst, &mut counts);
+        }
+    }
+
+    let scope = if project { "./.forge" } else { "the user config" };
     println!(
-        "✓ imported {} command(s) + {} skill(s) from {label} into {} \
-         ({} command(s), {} skill(s) already present, skipped)",
+        "✓ imported {} command(s) + {} skill(s) + {} agent(s) from {label} into {scope} \
+         ({} command(s), {} skill(s), {} agent(s) already present, skipped)",
         counts.copied_commands,
         counts.copied_skills,
-        if project {
-            "./.forge"
-        } else {
-            "the user config"
-        },
+        counts.copied_agents,
         counts.skipped_commands,
         counts.skipped_skills,
+        counts.skipped_agents,
     );
     for w in cat.warnings() {
         eprintln!("skipped (malformed): {w}");
     }
     Ok(())
+}
+
+/// Copy `*.md` files from `src` into `dst`, skipping any that already exist. Updates `counts`.
+fn count_copy_md_files(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    counts: &mut ImportCounts,
+) {
+    std::fs::create_dir_all(dst).ok();
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        if from.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(fname) = from.file_name() else {
+            continue;
+        };
+        let to = dst.join(fname);
+        if to.exists() {
+            counts.skipped_agents += 1;
+        } else if std::fs::copy(&from, &to).is_ok() {
+            counts.copied_agents += 1;
+        }
+    }
 }
 
 /// Copy a loaded catalog's command files + skill directories into the target scope, keeping any
@@ -782,7 +857,7 @@ fn sessions() -> Result<()> {
 }
 
 /// `forge replay <id>` reconstructs a session's transcript; `forge replay <a> <b>` diffs two.
-fn replay_cmd(ids: &[String]) -> Result<()> {
+fn replay_cmd(ids: &[String], json: bool) -> Result<()> {
     let store = open_store()?;
     let resolve = |prefix: &str| -> Result<String> {
         let mut matches = store
@@ -799,25 +874,103 @@ fn replay_cmd(ids: &[String]) -> Result<()> {
             let id = resolve(one)?;
             let entries = store.load_replay(&id).context("loading replay")?;
             if entries.is_empty() {
-                println!("session {} has no messages", &id[..id.len().min(8)]);
+                if json {
+                    println!("{{\"session_id\":\"{}\",\"turns\":[]}}", &id[..id.len().min(8)]);
+                } else {
+                    println!("session {} has no messages", &id[..id.len().min(8)]);
+                }
                 return Ok(());
             }
-            print!(
-                "{}",
-                replay::render_transcript(&id[..id.len().min(8)], &entries)
-            );
+            if json {
+                println!("{}", replay::render_json(&id, &entries));
+            } else {
+                print!(
+                    "{}",
+                    replay::render_transcript(&id[..id.len().min(8)], &entries)
+                );
+            }
         }
         [a, b] => {
+            if json {
+                anyhow::bail!("--json is only valid with a single session id");
+            }
             let (ida, idb) = (resolve(a)?, resolve(b)?);
             let ea = store.load_replay(&ida).context("loading replay a")?;
             let eb = store.load_replay(&idb).context("loading replay b")?;
             let d = replay::diff(&ea, &eb);
-            print!(
-                "{}",
-                replay::render_diff(&ida[..ida.len().min(8)], &idb[..idb.len().min(8)], &d)
-            );
+            let fa8 = &ida[..ida.len().min(8)];
+            let fb8 = &idb[..idb.len().min(8)];
+            print!("{}", replay::render_diff(fa8, fb8, &d));
+            print!("\n{}", replay::render_turn_diff(fa8, fb8, &ea, &eb));
         }
         _ => anyhow::bail!("usage: forge replay <id> [<id-to-diff-against>]"),
+    }
+    Ok(())
+}
+
+/// `forge assay list` / `forge assay compare <a> <b>` — inspect persisted assay runs.
+fn assay_cmd(sub: AssayCmd) -> Result<()> {
+    let store = open_store()?;
+    match sub {
+        AssayCmd::List => {
+            let runs = store.list_assay_runs().context("loading assay runs")?;
+            if runs.is_empty() {
+                println!("no assay runs found — run `/assay` inside `forge chat`");
+                return Ok(());
+            }
+            println!("{:<10}  {:<28}  {:>8}  scope", "id", "date", "cost");
+            println!("{}", "─".repeat(64));
+            for (id, scope, cost, ts) in &runs {
+                use chrono::{Local, TimeZone};
+                let date = Local
+                    .timestamp_opt(*ts, 0)
+                    .single()
+                    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| ts.to_string());
+                println!("{:<10}  {:<28}  ${:>7.4}  {}", &id[..id.len().min(8)], date, cost, scope);
+            }
+        }
+        AssayCmd::Compare { a, b } => {
+            let resolve = |prefix: &str| -> Result<String> {
+                let runs = store.list_assay_runs().context("loading assay runs")?;
+                let matches: Vec<_> = runs.into_iter().filter(|(id, ..)| id.starts_with(prefix)).collect();
+                match matches.len() {
+                    0 => anyhow::bail!("no assay run matches '{prefix}' — see `forge assay list`"),
+                    1 => Ok(matches.into_iter().next().unwrap().0),
+                    n => anyhow::bail!("'{prefix}' is ambiguous ({n} runs) — use more characters"),
+                }
+            };
+            let id_a = resolve(&a)?;
+            let id_b = resolve(&b)?;
+            let fa = store.load_findings(&id_a).context("loading run a")?;
+            let fb = store.load_findings(&id_b).context("loading run b")?;
+            let key = |f: &forge_types::Finding| format!("{}|{}", f.file, f.title);
+            let keys_a: std::collections::HashSet<String> = fa.iter().map(key).collect();
+            let keys_b: std::collections::HashSet<String> = fb.iter().map(key).collect();
+            let fixed: Vec<_> = keys_a.difference(&keys_b).collect();
+            let new_: Vec<_> = keys_b.difference(&keys_a).collect();
+            let open: usize = keys_a.intersection(&keys_b).count();
+            println!(
+                "assay compare  {}  →  {}\n",
+                &id_a[..id_a.len().min(8)],
+                &id_b[..id_b.len().min(8)]
+            );
+            println!("  fixed      {:>4}", fixed.len());
+            println!("  new        {:>4}", new_.len());
+            println!("  still-open {:>4}", open);
+            if !fixed.is_empty() {
+                println!("\nfixed:");
+                for k in fixed {
+                    println!("  ✓ {k}");
+                }
+            }
+            if !new_.is_empty() {
+                println!("\nnew:");
+                for k in new_ {
+                    println!("  + {k}");
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -860,6 +1013,8 @@ fn commands_cmd() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn spawn_assay(
     cleanup: bool,
+    lenses: Vec<forge_types::FindingCategory>,
+    scope: forge_types::AssayScope,
     session: &Arc<tokio::sync::Mutex<Session>>,
     done_tx: &std::sync::mpsc::Sender<u64>,
     gen: u64,
@@ -867,7 +1022,13 @@ async fn spawn_assay(
     busy: &mut bool,
     busy_since: &mut std::time::Instant,
 ) -> Result<Option<tokio::task::JoinHandle<()>>> {
-    let source = bundle_source(Path::new("."), 200_000);
+    let source = match bundle_scoped_source(&scope, 200_000) {
+        Ok(s) => s,
+        Err(e) => {
+            app.note(&format!("assay: {e}"));
+            return Ok(None);
+        }
+    };
     if source.trim().is_empty() {
         app.note("assay: no analyzable source files under the working directory");
         return Ok(None);
@@ -921,7 +1082,7 @@ async fn spawn_assay(
     Ok(Some(tokio::spawn(async move {
         let _done = DoneGuard(dt, gen);
         let mut sess = s.lock().await;
-        if let Err(e) = sess.assay(src, models, cleanup).await {
+        if let Err(e) = sess.assay(src, models, lenses, scope, cleanup).await {
             sess.notify_error(&format!("assay failed: {e}"));
         }
     })))
@@ -1004,6 +1165,74 @@ fn bundle_source(root: &Path, max_bytes: usize) -> String {
         }
     }
     out.truncate(floor_char_boundary(&out, max_bytes));
+    out
+}
+
+/// Bundle source for the given scope. For git-backed scopes (Diff/Branch/Since) the changed-file
+/// list is resolved via `git diff --name-only`; only those files are bundled. Returns an error
+/// string when a git scope is requested outside a repo or the git command fails.
+fn bundle_scoped_source(
+    scope: &forge_types::AssayScope,
+    max_bytes: usize,
+) -> Result<String, String> {
+    use forge_types::AssayScope::*;
+    let git_files = |args: &[&str]| -> Result<Vec<std::path::PathBuf>, String> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|e| format!("git: {e}"))?;
+        if !out.status.success() {
+            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(format!("git {}: {msg}", args.join(" ")));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect())
+    };
+    match scope {
+        Repo => Ok(bundle_source(std::path::Path::new("."), max_bytes)),
+        Path(p) => Ok(bundle_source(std::path::Path::new(p), max_bytes)),
+        Diff => {
+            let files = git_files(&["diff", "--name-only"])?;
+            if files.is_empty() {
+                return Err("no uncommitted changes (git diff --name-only returned nothing)".into());
+            }
+            Ok(bundle_file_list(&files, max_bytes))
+        }
+        Branch(base) => {
+            let files = git_files(&["diff", "--name-only", &format!("{base}...HEAD")])?;
+            if files.is_empty() {
+                return Err(format!("no changes vs {base} (git diff --name-only {base}...HEAD returned nothing)"));
+            }
+            Ok(bundle_file_list(&files, max_bytes))
+        }
+        Since(ref_) => {
+            let files = git_files(&["diff", "--name-only", ref_])?;
+            if files.is_empty() {
+                return Err(format!("no changes since {ref_} (git diff --name-only {ref_} returned nothing)"));
+            }
+            Ok(bundle_file_list(&files, max_bytes))
+        }
+    }
+}
+
+/// Bundle a specific list of file paths (e.g. from a git diff) with `// FILE:` headers.
+fn bundle_file_list(files: &[std::path::PathBuf], max_bytes: usize) -> String {
+    let mut out = String::new();
+    for p in files {
+        if out.len() >= max_bytes {
+            break;
+        }
+        if let Ok(content) = std::fs::read_to_string(p) {
+            out.push_str(&format!("// FILE: {}\n{content}\n\n", p.display()));
+            if out.len() > max_bytes {
+                out.truncate(floor_char_boundary(&out, max_bytes));
+                break;
+            }
+        }
+    }
     out
 }
 
@@ -1245,9 +1474,11 @@ async fn probe_models(
 /// `forge mcp [tools <server> | import [path]]` — connect to the configured MCP servers and show
 /// their status, list one server's tools, or import servers from your installed AI CLIs.
 async fn mcp_cmd(cmd: Option<McpCmd>) -> Result<()> {
-    // Import needs no connection. Resolve to the listing path otherwise.
+    // Import / Login / Logout need no connection. Resolve to the listing path otherwise.
     let tools_server = match cmd {
         Some(McpCmd::Import { path }) => return mcp_import(path),
+        Some(McpCmd::Login { server }) => return mcp_login(&server).await,
+        Some(McpCmd::Logout { server }) => return mcp_logout(&server),
         Some(McpCmd::Tools { server }) => Some(server),
         None => None,
     };
@@ -1460,6 +1691,249 @@ fn finish_import(
             "  ⚠ couldn't store '{name}' token in the keyring ({err}) — export it via the server's \
              token_env, or run `forge auth`. The server is imported but won't authenticate yet."
         );
+    }
+    Ok(())
+}
+
+/// Remove a server's stored OAuth tokens (`forge mcp logout <server>`).
+fn mcp_logout(server: &str) -> Result<()> {
+    match forge_config::clear_oauth_tokens(server) {
+        Ok(true) => println!("✓ OAuth tokens for '{server}' removed from the keyring."),
+        Ok(false) => println!("no stored OAuth tokens found for '{server}'."),
+        Err(e) => anyhow::bail!("keyring error: {e}"),
+    }
+    Ok(())
+}
+
+/// Interactive OAuth 2.0 login for an OAuth-protected MCP server (`forge mcp login <server>`).
+/// Opens the authorization URL in the user's browser, starts a loopback listener for the
+/// redirect, exchanges the code for tokens, and stores them in the OS keyring (ADR-0007).
+async fn mcp_login(server: &str) -> Result<()> {
+    forge_config::inject_provider_keys();
+    let config = forge_config::load().unwrap_or_default();
+
+    // Find the server by name.
+    let srv = config
+        .mcp
+        .servers
+        .iter()
+        .find(|s| s.name == server)
+        .ok_or_else(|| anyhow::anyhow!("no server '{server}' in .forge/mcp.toml"))?;
+
+    // Must have an oauth config entry.
+    let oauth_cfg = srv
+        .auth
+        .as_ref()
+        .and_then(|a| a.oauth.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "server '{server}' has no [auth.oauth] config — add it to .forge/mcp.toml"
+            )
+        })?;
+
+    let http = reqwest::Client::new();
+
+    // Discover the authorization server issuer.
+    let issuer = if let Some(i) = &oauth_cfg.issuer {
+        i.clone()
+    } else {
+        // Probe the server's well-known resource-metadata endpoint (RFC 9728).
+        let url = match &srv.transport {
+            forge_config::McpTransport::Http { url, .. } => {
+                let base = url.trim_end_matches('/');
+                format!("{base}/.well-known/oauth-protected-resource/mcp")
+            }
+            _ => anyhow::bail!("OAuth login only supported for HTTP transports"),
+        };
+        println!("Discovering auth server from {url} …");
+        let meta = forge_mcp::oauth::fetch_resource_metadata(&http, &url)
+            .await
+            .map_err(|e| anyhow::anyhow!("fetching resource metadata from {url}: {e}"))?;
+        meta.authorization_servers
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("resource metadata has no authorization_servers"))?
+    };
+
+    println!("Auth server: {issuer}");
+
+    // Fetch auth server metadata (RFC 8414).
+    let as_meta = forge_mcp::oauth::fetch_auth_server_metadata(&http, &issuer)
+        .await
+        .map_err(|e| anyhow::anyhow!("fetching auth server metadata from {issuer}: {e}"))?;
+
+    // Choose client_id (from config or a fallback public client).
+    let client_id = oauth_cfg
+        .client_id
+        .clone()
+        .unwrap_or_else(|| "forge-mcp-client".to_string());
+
+    // Bind a loopback listener to get the redirect port.
+    let redirect_port = oauth_cfg.redirect_port.unwrap_or(0);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", redirect_port))
+        .await
+        .context("binding loopback redirect listener")?;
+    let bound_port = listener.local_addr()?.port();
+    let redirect_uri = format!("http://127.0.0.1:{bound_port}/callback");
+
+    // PKCE + state.
+    let pkce = forge_config::Pkce::generate();
+    let state = forge_config::random_state();
+    let scopes = if oauth_cfg.scopes.is_empty() {
+        vec!["mcp".to_string(), "offline_access".to_string()]
+    } else {
+        oauth_cfg.scopes.clone()
+    };
+
+    let auth_url = forge_config::authorize_url(
+        &as_meta.authorization_endpoint,
+        &client_id,
+        &redirect_uri,
+        &scopes,
+        &state,
+        &pkce.challenge,
+    );
+
+    // Open the browser (cross-platform).
+    println!("Opening browser for authorization …\n  {auth_url}");
+    if let Err(e) = open_browser(&auth_url) {
+        println!("(could not open browser automatically: {e})");
+        println!("Please open the URL above manually.");
+    }
+
+    // Wait for the redirect callback on the loopback listener.
+    println!("Waiting for authorization callback on http://127.0.0.1:{bound_port}/callback …");
+    let (mut stream, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(120), listener.accept())
+            .await
+            .context("timed out waiting for OAuth callback (120 s)")?
+            .context("accepting callback connection")?;
+
+    // Read the HTTP request line to extract `code` and `state`.
+    let (code, returned_state) = read_callback_params(&mut stream).await?;
+
+    // Send a minimal HTTP 200 response so the browser doesn't show an error.
+    let _ = tokio::io::AsyncWriteExt::write_all(
+        &mut stream,
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
+          <html><body><h2>Authorization complete. You can close this tab.</h2></body></html>",
+    )
+    .await;
+    drop(stream);
+
+    // CSRF check.
+    if returned_state != state {
+        anyhow::bail!("OAuth state mismatch — possible CSRF. Login aborted.");
+    }
+
+    // Exchange the code for tokens.
+    println!("Exchanging authorization code …");
+    let tokens = forge_mcp::oauth::exchange_code(
+        &http,
+        &as_meta.token_endpoint,
+        &code,
+        &redirect_uri,
+        &client_id,
+        &pkce.verifier,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("token exchange: {e}"))?;
+
+    // Store in keyring.
+    forge_config::store_oauth_tokens(server, &tokens).context("storing OAuth tokens in keyring")?;
+
+    println!("✓ OAuth tokens stored for '{server}'. Forge will refresh them automatically.");
+    Ok(())
+}
+
+/// Parse `code` and `state` query params from the loopback HTTP GET request.
+async fn read_callback_params(stream: &mut tokio::net::TcpStream) -> Result<(String, String)> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 4096];
+    let n = stream
+        .read(&mut buf)
+        .await
+        .context("reading callback request")?;
+    let request = std::str::from_utf8(&buf[..n]).unwrap_or_default();
+    // First line: `GET /callback?code=XYZ&state=ABC HTTP/1.1`
+    let path = request
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or_default();
+    let query = path.splitn(2, '?').nth(1).unwrap_or_default();
+    let mut code = None;
+    let mut state = None;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            "code" => code = Some(url_decode(v)),
+            "state" => state = Some(url_decode(v)),
+            _ => {}
+        }
+    }
+    let code = code.ok_or_else(|| anyhow::anyhow!("no `code` in OAuth callback URL"))?;
+    let state = state.ok_or_else(|| anyhow::anyhow!("no `state` in OAuth callback URL"))?;
+    Ok((code, state))
+}
+
+/// Minimal percent-decode (ASCII only, handles `%XX` and `+` → space).
+fn url_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b as char);
+                    i += 3;
+                    continue;
+                }
+            }
+        } else if bytes[i] == b'+' {
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Open `url` in the default system browser (cross-platform best-effort).
+fn open_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", url])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // Linux / BSD: try xdg-open, then sensible-browser, then wslview.
+        let browsers = ["xdg-open", "sensible-browser", "wslview"];
+        let mut launched = false;
+        for b in browsers {
+            if std::process::Command::new(b).arg(url).spawn().is_ok() {
+                launched = true;
+                break;
+            }
+        }
+        if !launched {
+            return Err(
+                "no browser launcher found (tried xdg-open, sensible-browser, wslview)".into(),
+            );
+        }
     }
     Ok(())
 }
@@ -1772,6 +2246,10 @@ async fn run_chat_tui(
     let mut loop_state: Option<LoopState> = None;
     let mut pending: Option<(String, std::sync::mpsc::Sender<bool>)> = None;
     let mut pending_question: Option<std::sync::mpsc::Sender<String>> = None;
+    // Lens filter set by `/assay --only`/`--skip`; consumed when the AssayChoice picker resolves.
+    let mut assay_lenses: Vec<forge_types::FindingCategory> = Vec::new();
+    // Scope set by `/assay --diff/--branch/--since/<path>`; consumed when picker resolves.
+    let mut assay_scope: forge_types::AssayScope = forge_types::AssayScope::Repo;
     // Baseline for the spinner: deriving the tick from elapsed time keeps the animation
     // speed independent of the loop frequency (one frame per 60ms, exactly as before).
     let mut busy_since = Instant::now();
@@ -1860,6 +2338,8 @@ async fn run_chat_tui(
                             &mut armed_project,
                             trust_project,
                             busy,
+                            &mut assay_lenses,
+                            &mut assay_scope,
                         )
                         .await?
                         {
@@ -1968,8 +2448,15 @@ async fn run_chat_tui(
                                 // Assay runs as a background task (like a turn) so the spinner
                                 // ticks while critics + verification run.
                                 turn_gen += 1;
+                                let lenses = std::mem::take(&mut assay_lenses);
+                                let scope = std::mem::replace(
+                                    &mut assay_scope,
+                                    forge_types::AssayScope::Repo,
+                                );
                                 turn_handle = spawn_assay(
                                     row.id == "cleanup",
+                                    lenses,
+                                    scope,
                                     &session,
                                     &done_tx,
                                     turn_gen,
@@ -2162,6 +2649,8 @@ async fn run_chat_tui(
                                 &mut armed_project,
                                 trust_project,
                                 busy,
+                                &mut assay_lenses,
+                                &mut assay_scope,
                             )
                             .await?
                             {
@@ -2518,6 +3007,8 @@ async fn dispatch_command(
     armed: &mut std::collections::HashSet<String>,
     trust_project: bool,
     busy: bool,
+    assay_lenses: &mut Vec<forge_types::FindingCategory>,
+    assay_scope: &mut forge_types::AssayScope,
 ) -> Result<DispatchOutcome> {
     use forge_tui::CommandAction;
     let action = forge_tui::parse_command(line);
@@ -2531,6 +3022,8 @@ async fn dispatch_command(
             | CommandAction::ListSessions
             | CommandAction::Resume(_)
             | CommandAction::ClearScreen
+            | CommandAction::PinModel(_)
+            | CommandAction::Replay(_, _)
     );
     if busy && mutates {
         app.note("⚠ finish or Esc the current turn first");
@@ -2582,7 +3075,34 @@ async fn dispatch_command(
         }
         // `/assay` enters Assay mode: pick analysis-only vs full cleanup; the crew then runs as a
         // background task (spawned in the picker-Enter handler so the spinner ticks).
-        CommandAction::Assay => {
+        CommandAction::Assay { only, skip, scope } => {
+            // Compute the lens set from --only/--skip and store for picker resolution.
+            let crew = forge_types::FindingCategory::crew();
+            *assay_lenses = if !only.is_empty() {
+                crew.iter()
+                    .filter(|l| only.iter().any(|o| o == l.as_str()))
+                    .copied()
+                    .collect()
+            } else if !skip.is_empty() {
+                crew.iter()
+                    .filter(|l| !skip.iter().any(|s| s == l.as_str()))
+                    .copied()
+                    .collect()
+            } else {
+                Vec::new() // empty = use full crew (default)
+            };
+            // Resolve the scope string into a typed AssayScope.
+            *assay_scope = if scope == "--diff" {
+                forge_types::AssayScope::Diff
+            } else if let Some(b) = scope.strip_prefix("--branch ") {
+                forge_types::AssayScope::Branch(b.to_string())
+            } else if let Some(r) = scope.strip_prefix("--since ") {
+                forge_types::AssayScope::Since(r.to_string())
+            } else if !scope.is_empty() {
+                forge_types::AssayScope::Path(scope)
+            } else {
+                forge_types::AssayScope::Repo
+            };
             let rows = vec![
                 forge_tui::PickerRow {
                     id: "analysis".into(),
@@ -2603,6 +3123,16 @@ async fn dispatch_command(
         // its filter. Resolving + swapping the session happens on Enter (picker_accept).
         CommandAction::Resume(prefix) => open_sessions_picker(app, &prefix)?,
         CommandAction::ListSessions => open_sessions_picker(app, "")?,
+        // `/model <id>` pins a specific model for the rest of this session (or clears the pin).
+        // Works while a turn is running (pin takes effect on the NEXT turn).
+        CommandAction::PinModel(model_id) => {
+            let mut s = session.lock().await;
+            s.pin_model(model_id.clone());
+            match model_id {
+                Some(id) => app.note(&format!("⊕ model pinned: {id} (clears with /model)")),
+                None => app.note("⊖ model pin cleared — mesh routing restored"),
+            }
+        }
         // `/models` opens the interactive model browser: a provider list (with global counts in
         // the heading) that drills into each provider's models on Enter; Esc steps back.
         CommandAction::ListModels => open_models_root(session, app).await?,
@@ -2721,6 +3251,67 @@ async fn dispatch_command(
                 return Ok(DispatchOutcome::Handled);
             }
             return Ok(DispatchOutcome::StartLoop { prompt: text });
+        }
+        // `/replay <id>` — show a transcript inline; `/replay <a> <b>` diffs two sessions.
+        CommandAction::Replay(id_a, id_b) => {
+            if id_a.is_empty() {
+                app.note("usage: /replay <id>  or  /replay <id-a> <id-b>");
+                return Ok(DispatchOutcome::Handled);
+            }
+            let text = {
+                let s = session.lock().await;
+                match id_b {
+                    None => {
+                        // resolve prefix → full id, load, render
+                        let ids = s
+                            .matching_session_ids(&id_a)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        match ids.first() {
+                            None => format!("no session matching '{id_a}'"),
+                            Some(full) => {
+                                let entries = s
+                                    .load_replay(full)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                crate::replay::render_transcript(
+                                    &full[..full.len().min(8)],
+                                    &entries,
+                                )
+                            }
+                        }
+                    }
+                    Some(id_b) => {
+                        let ids_a = s
+                            .matching_session_ids(&id_a)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let ids_b = s
+                            .matching_session_ids(&id_b)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        match (ids_a.first(), ids_b.first()) {
+                            (Some(fa), Some(fb)) => {
+                                let ea = s
+                                    .load_replay(fa)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let eb = s
+                                    .load_replay(fb)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let d = crate::replay::diff(&ea, &eb);
+                                let fa8 = &fa[..fa.len().min(8)];
+                                let fb8 = &fb[..fb.len().min(8)];
+                                let mut out =
+                                    crate::replay::render_diff(fa8, fb8, &d);
+                                out.push('\n');
+                                out.push_str(&crate::replay::render_turn_diff(
+                                    fa8, fb8, &ea, &eb,
+                                ));
+                                out
+                            }
+                            (None, _) => format!("no session matching '{id_a}'"),
+                            (_, None) => format!("no session matching '{id_b}'"),
+                        }
+                    }
+                }
+            };
+            tui.print_text(&text);
         }
         // Not a builtin → try the file-based command/skill catalog.
         CommandAction::Unknown(_) => {

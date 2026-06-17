@@ -45,7 +45,7 @@ to a junk value so auth fails and the mesh benches/avoids it.
 
 **Status:** shipped + tested (`is_model_disabled`, `clear_all_model_health`).
 
-## Shell tool: Windows execution (fixed) — denylist OS-awareness (deferred)
+## Shell tool: Windows execution (fixed) — denylist OS-awareness (fixed)
 
 **Was:** the `shell` tool ran `sh -c <command>`, which doesn't exist on Windows, so shell
 commands wouldn't run there at all.
@@ -56,11 +56,13 @@ timeout-kill) was already cross-platform. Windows exec tests (`mod exec_windows`
 `windows-latest` CI runner: echo+exit, non-zero exit, timeout-kill (`ping -n`), bad-cwd spawn
 failure.
 
-**Also fixed:** the built-in denylist now includes Windows-specific dangerous patterns (`rd /s /q`,
-`rmdir /s /q`, `del /f /s /q`, `format c:`, PowerShell `Remove-Item -Recurse -Force`) and
-Windows secret-file reads via `type`/`more`/`copy` — parity with the POSIX patterns. The hooks
-system also received the same `shell_exe()` treatment: hooks now run via `cmd /C` on Windows
-instead of `sh -c`.
+**Also fixed:** the catastrophic denylist now includes Windows-specific dangerous commands:
+`del /s`, `del /f /s`, `rd /s`, `rmdir /s`, `format ?:*` — added to `builtin_deny_rules()` in
+`forge-config/src/lib.rs`. The `inner_script` unwrapper in `permission.rs` also handles
+`cmd /C "<command>"` so patterns are checked recursively inside cmd-wrapped calls.
 
-**Status:** Windows execution, denylist OS-awareness, and hooks cross-platform shell — all shipped.
+**Also fixed:** the hooks system now uses the same OS-appropriate shell as the shell tool
+(`hook_shell()` in `forge-core/src/hooks.rs`: `sh -c` on Unix, `cmd /C` on Windows).
+
+**Status:** all three items shipped + tested.
 </content>

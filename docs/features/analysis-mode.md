@@ -1,15 +1,22 @@
 # Feature: Assay — `forge assay` (AI-slop / quality analysis mode)
 
-> Status: **interactive mode shipped** (2026-06-15). Assay is now a **chat mode**, not a CLI
-> subcommand (the `forge assay` command was removed): `/assay` opens an interactive picker —
-> **Analysis only** vs **Full cleanup (Refine)** — then runs the parallel, mesh-routed (health-
-> aware), adversarially-verified critic crew, renders a ranked report inline, persists it, and on
-> **Full cleanup** runs **Refine**: a permission-gated, **undoable** fix turn (reuses the agent
-> loop, so edits go through the temper + are shadow-snapshotted; `/undo` reverts them). Covers
-> U1, U3–U7, U9 (interactive), U10, U11.
-> **Deferred:** git scopes `--diff/--branch/--since` (U2), per-critic live progress rows (U9 full),
-> report diff `--since-last` (U12), `--only/--skip` (U13), budget pre-estimate scope-down (U8 —
-> the daily cap still applies), fan-out fixing (Refine currently fixes via one seeded turn).
+> Status: **done** (2026-06-17). Assay is a **chat mode**: `/assay` opens an interactive picker —
+> **Analysis only** vs **Full cleanup (Refine)**. Covers U1–U3, U5–U7, U9 (interactive), U10–U13.
+>
+> **Shipped in full:**
+> - Parallel critic crew, adversarial verification, ranked findings report (U3, U5, U6)
+> - Persisted runs (`assay_run` + `finding` tables) + auto-diff vs prior run for same scope (U7, U12)
+> - `forge assay list` / `forge assay compare <a> <b>` CLI (U12)
+> - Git scopes: `--diff` (working tree), `--branch <b>`, `--since <ref>`, `[path]` (U2)
+> - `--only <lens,…>` / `--skip <lens,…>` lens selection (U13)
+> - Analysis-only and Full cleanup (Refine) modes (U10, U11)
+> - `forge assay` top-level CLI subcommand with `list` and `compare` subcommands
+>
+> **Deferred:**
+> - Per-critic live TUI progress rows (U9 full — currently progress emitted as text lines)
+> - Budget pre-estimate scope-down (U8 — daily cap still applies, no pre-run estimate)
+> - Fan-out fixing in Refine (currently one seeded turn, not per-finding parallel fixes)
+>
 > Original design below.
 >
 > Status: **DRAFT — design only** (2026-06-15). No Rust written yet.

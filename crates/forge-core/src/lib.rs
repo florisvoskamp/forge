@@ -118,6 +118,12 @@ pub struct Session {
     /// the `use_skill` virtual tool (command-skill-system.md). `None` → the tool is not advertised
     /// and the turn runs exactly as before.
     skills: Option<Arc<forge_skills::Catalog>>,
+    /// In-session model pin (`/model <id>`). When set, mesh routing still classifies the prompt
+    /// (for stats), but this model is used instead of the routed pick. `None` = mesh routing.
+    pinned_model: Option<String>,
+    /// System hints queued by side-call diagnostics (e.g. shell error interceptor) to be injected
+    /// into the transcript immediately after the tool result that triggered them. Cleared each time.
+    pending_hints: Vec<String>,
 }
 
 impl Session {
@@ -221,6 +227,8 @@ impl Session {
             lattice: None,
             lattice_watcher: None,
             skills: None,
+            pinned_model: None,
+            pending_hints: vec![],
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -239,6 +247,17 @@ impl Session {
     /// Attach the discovered catalog so the `/models` browser can read it (composition root).
     pub fn set_catalog(&mut self, catalog: Option<ModelCatalog>) {
         self.catalog = catalog;
+    }
+
+    /// Pin (or clear) the in-session model override. When `Some`, subsequent turns use this model
+    /// instead of the mesh-routed pick. `None` returns to normal mesh routing.
+    pub fn pin_model(&mut self, model_id: Option<String>) {
+        self.pinned_model = model_id;
+    }
+
+    /// The currently-pinned model, if any (`/model <id>` was called this session).
+    pub fn pinned_model(&self) -> Option<&str> {
+        self.pinned_model.as_deref()
     }
 
     /// The discovered model catalog, if auto-discovery ran for this session.
@@ -476,10 +495,16 @@ impl Session {
         &mut self,
         source: Arc<str>,
         models: assay::TierModels,
+        lenses: Vec<forge_types::FindingCategory>,
+        scope: forge_types::AssayScope,
         cleanup: bool,
     ) -> Result<(), CoreError> {
         let pricing = Arc::new(self.pricing.clone());
-        let lenses = forge_types::FindingCategory::crew().to_vec();
+        let lenses = if lenses.is_empty() {
+            forge_types::FindingCategory::crew().to_vec()
+        } else {
+            lenses
+        };
         let cooldown = std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
         let provider = Arc::clone(&self.provider);
         let store = Arc::clone(&self.store);
@@ -489,7 +514,7 @@ impl Session {
             presenter.emit(PresenterEvent::AssayProgress(assay::progress_line(&p)));
         };
         let mut report = assay::run_assay(
-            forge_types::AssayScope::Repo,
+            scope,
             source,
             lenses,
             models,
@@ -507,6 +532,18 @@ impl Session {
             report.run_id = run_id.clone();
             for f in &report.findings {
                 let _ = self.store.add_finding(&run_id, f);
+            }
+            // Auto-diff: compare against the prior run for this scope so users see what changed.
+            if let Ok(Some(prev_id)) = self
+                .store
+                .latest_run_for_scope(&report.scope.label(), &run_id)
+            {
+                if let Ok(prev) = self.store.load_findings(&prev_id) {
+                    let note = assay_diff_note(&prev, &report.findings, &prev_id[..8.min(prev_id.len())]);
+                    if !note.is_empty() {
+                        self.presenter.emit(PresenterEvent::Warning(note));
+                    }
+                }
             }
         }
         self.presenter
@@ -642,12 +679,15 @@ impl Session {
 
         let messages = [Message::system(COMPACT_SYSTEM), Message::user(rendered)];
         let mut sink = |_: StreamEvent| {};
-        let summary = self
+        let resp = self
             .provider
             .complete(&decision.model, &messages, &[], &mut sink)
             .await
-            .map(|r| r.content)
             .map_err(CoreError::Provider)?;
+        let _ = self
+            .store
+            .record_side_call_usage(&self.id, "compact/summarize", &resp.usage);
+        let summary = resp.content;
 
         let mut compacted = Vec::with_capacity(COMPACT_KEEP_RECENT + 1);
         compacted.push(Message::system(format!(
@@ -656,6 +696,12 @@ impl Session {
         )));
         compacted.extend(self.transcript.split_off(split));
         self.transcript = compacted;
+
+        // Persist: soft-delete the summarised messages and store the summary so a resumed
+        // session rehydrates the compacted view instead of the full uncompacted transcript.
+        let _ = self
+            .store
+            .compact_session_store(&self.id, summary.trim(), COMPACT_KEEP_RECENT);
 
         let after = self.transcript.len();
         self.presenter.emit(PresenterEvent::Warning(format!(
@@ -702,8 +748,14 @@ impl Session {
             .complete(&decision.model, &messages, &[], &mut sink)
             .await
         {
+            let _ = self
+                .store
+                .record_side_call_usage(&self.id, "shell/diagnose", &r.usage);
             let diagnosis = r.content.trim().to_string();
             if !diagnosis.is_empty() {
+                // Queue a system hint so the model sees the diagnosis on its next completion.
+                self.pending_hints
+                    .push(format!("[shell diagnosis] {diagnosis}"));
                 self.presenter.emit(PresenterEvent::ShellDiagnosis {
                     command: command.to_string(),
                     diagnosis,
@@ -722,6 +774,19 @@ impl Session {
             self.transcript.push(Message::system(g));
         }
         Ok(())
+    }
+
+    /// Load the persisted replay entries for any session (not just this one) — used by the
+    /// `/replay` chat command to show a transcript inline.
+    pub fn load_replay(&self, session_id: &str) -> Result<Vec<forge_store::ReplayEntry>, CoreError> {
+        self.store.load_replay(session_id).map_err(CoreError::Store)
+    }
+
+    /// Resolve a session-id prefix to full ids — allows `/replay abc` to find `abc123…`.
+    pub fn matching_session_ids(&self, prefix: &str) -> Result<Vec<String>, CoreError> {
+        self.store
+            .matching_session_ids(prefix)
+            .map_err(CoreError::Store)
     }
 
     /// Like [`Session::run_turn`], but first prepends `guidance` (an invoked command's or
@@ -794,9 +859,13 @@ impl Session {
             .router
             .route_hinted(prompt, budget, &health, &quota, tier_override)
             .await;
+        // `/model <id>` override: use the pinned model instead of the mesh-routed pick; mesh still
+        // classifies (for tier stats) but the actual call uses the pin.
+        let pinned = self.pinned_model.clone();
+        let routed_model = pinned.unwrap_or_else(|| decision.model.clone());
         self.presenter.emit(PresenterEvent::Routing {
             tier: decision.tier.as_str().to_string(),
-            model: decision.model.clone(),
+            model: routed_model.clone(),
             rationale: decision.rationale.clone(),
         });
 
@@ -886,7 +955,7 @@ impl Session {
             std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
         let stream_idle = std::time::Duration::from_secs(self.config.mesh.stream_idle_timeout_secs);
         let mut chain = decision.fallbacks.clone().into_iter();
-        let mut active_model = decision.model.clone();
+        let mut active_model = routed_model;
 
         // 3. Model <-> tool loop.
         for step in 0..MAX_STEPS {
@@ -1040,6 +1109,14 @@ impl Session {
                     Some(&call.id),
                 )?;
                 self.transcript.push(Message::tool_result(&call.id, result));
+                // Drain any system hints queued by side-call diagnostics (e.g. shell error
+                // interceptor) so the model sees them after the failing tool result.
+                let hints: Vec<String> = self.pending_hints.drain(..).collect();
+                for hint in hints {
+                    let hseq = self.next_seq();
+                    let _ = self.store.add_message(&self.id, hseq, Role::System, &hint, None);
+                    self.transcript.push(Message::system(hint));
+                }
             }
         }
 
@@ -1750,6 +1827,28 @@ fn over_budget_message(b: &BudgetState) -> String {
         cap(b.daily_cap_usd),
         b.spent_month_usd,
         cap(b.monthly_cap_usd)
+    )
+}
+
+/// Compare previous and current findings, return a human-readable diff note.
+/// Matching is by (file, title) — same issue at the same location.
+fn assay_diff_note(
+    prev: &[forge_types::Finding],
+    current: &[forge_types::Finding],
+    prev_id: &str,
+) -> String {
+    let key = |f: &forge_types::Finding| format!("{}|{}", f.file, f.title);
+    let prev_keys: std::collections::HashSet<String> = prev.iter().map(key).collect();
+    let curr_keys: std::collections::HashSet<String> = current.iter().map(key).collect();
+    let fixed: usize = prev_keys.difference(&curr_keys).count();
+    let new_: usize = curr_keys.difference(&prev_keys).count();
+    let still_open: usize = prev_keys.intersection(&curr_keys).count();
+    if fixed == 0 && new_ == 0 {
+        return String::new(); // nothing to say — identical findings
+    }
+    format!(
+        "⚒ vs run {prev_id}: {} fixed · {} new · {} still-open",
+        fixed, new_, still_open
     )
 }
 
@@ -3849,7 +3948,9 @@ mod tests {
                     trivial: vec!["m".into()],
                     complex: vec!["m".into()],
                 },
-                false, // analysis-only
+                vec![],                      // default: full crew
+                forge_types::AssayScope::Repo,
+                false,                       // analysis-only
             )
             .await
             .unwrap();

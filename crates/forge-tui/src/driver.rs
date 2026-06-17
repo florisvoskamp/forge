@@ -147,6 +147,15 @@ impl Tui {
         self.terminal.size().map(|s| s.width).unwrap_or(80)
     }
 
+    /// Push plain multi-line text into the scrollback (convenience over [`insert_lines`]).
+    pub fn print_text(&mut self, text: &str) {
+        let lines: Vec<TextLine<'static>> = text
+            .lines()
+            .map(|s| TextLine::from(s.to_owned()))
+            .collect();
+        self.insert_lines(lines);
+    }
+
     /// Push finalized lines into the terminal's native scrollback, above the live region.
     pub fn insert_lines(&mut self, lines: Vec<TextLine<'static>>) {
         if lines.is_empty() {

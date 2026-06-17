@@ -24,6 +24,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/sessions",
     },
     Command {
+        name: "replay",
+        desc: "show a session transcript inline (/replay <id>) or diff two sessions (/replay <a> <b>)",
+        usage: "/replay <id> [<id2>]",
+    },
+    Command {
         name: "resume",
         desc: "resume a session by id prefix",
         usage: "/resume <id>",
@@ -36,7 +41,12 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "assay",
         desc: "analyze code quality (AI-slop, dead/unsafe/untested) — or full cleanup",
-        usage: "/assay",
+        usage: "/assay [--diff|--branch <b>|--since <ref>|<path>] [--only <lens,…>] [--skip <lens,…>]",
+    },
+    Command {
+        name: "model",
+        desc: "pin a specific model for this session (/model <id>), or clear the pin (/model)",
+        usage: "/model [<id>]",
     },
     Command {
         name: "models",
@@ -112,6 +122,9 @@ pub enum CommandAction {
     Help,
     ListSessions,
     Resume(String),
+    /// Pin a specific model for all subsequent turns in this session. `None` clears the pin
+    /// and returns to mesh routing. `/model <id>` sets; `/model` clears.
+    PinModel(Option<String>),
     /// Open the interactive model browser (`/models`).
     ListModels,
     /// Open the interactive config wizard (`/config`) — set provider/search keys + plans.
@@ -123,7 +136,9 @@ pub enum CommandAction {
     /// Open the operating-mode (temper) picker.
     Mode,
     /// Enter Assay mode — pick analysis-only vs full cleanup, then run the critic crew.
-    Assay,
+    /// `only`/`skip` are lens name lists; `scope` is `""` (repo), a path, `"--diff"`,
+    /// `"--branch <b>"`, or `"--since <ref>"`.
+    Assay { only: Vec<String>, skip: Vec<String>, scope: String },
     /// Rewind the last turn (conversation + file edits).
     Undo,
     /// Save a checkpoint at the current point; `None` = an auto/unnamed checkpoint.
@@ -138,6 +153,8 @@ pub enum CommandAction {
     Goal(String),
     /// Re-run a task each turn until the model signals completion (`/loop <task>`).
     Loop(String),
+    /// Show a session transcript inline, or diff two sessions (`/replay <id> [<id2>]`).
+    Replay(String, Option<String>),
     Quit,
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
@@ -202,6 +219,27 @@ pub fn slash_token_at(input: &str, cursor: usize) -> Option<SlashToken> {
     best.or(last)
 }
 
+/// Extract a comma-separated lens list from `--flag <value>` in a raw arg string.
+/// `/assay --only dead-weight,unsafe` → `extract_flag(arg, "--only")` → `["dead-weight", "unsafe"]`
+fn extract_flag(arg: &str, flag: &str) -> Vec<String> {
+    let tokens: Vec<&str> = arg.split_whitespace().collect();
+    for (i, tok) in tokens.iter().enumerate() {
+        if *tok == flag {
+            if let Some(val) = tokens.get(i + 1) {
+                if !val.starts_with('-') {
+                    return val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Check whether a boolean flag (no value) is present in `arg`.
+fn has_flag(arg: &str, flag: &str) -> bool {
+    arg.split_whitespace().any(|t| t == flag)
+}
+
 /// Parse a submitted command line (`"/resume ab12"`). The leading `/` is required; a `//`
 /// prefix is NOT a command (it escapes to a literal prompt — handled by the caller).
 pub fn parse_command(line: &str) -> CommandAction {
@@ -220,12 +258,34 @@ pub fn parse_command(line: &str) -> CommandAction {
                 CommandAction::Resume(arg)
             }
         }
+        "model" => CommandAction::PinModel((!arg.is_empty()).then_some(arg)),
         "models" | "mc" => CommandAction::ListModels,
         "config" | "cfg" | "settings" => CommandAction::Config,
         "mcp" => CommandAction::Mcp((!arg.is_empty()).then_some(arg)),
         "new" | "n" => CommandAction::New,
         "mode" | "m" | "temper" => CommandAction::Mode,
-        "assay" | "analyze" | "analyse" => CommandAction::Assay,
+        "assay" | "analyze" | "analyse" => {
+            // `/assay [--diff|--branch <b>|--since <ref>|<path>] [--only <lens,…>] [--skip <lens,…>]`
+            let only = extract_flag(&arg, "--only");
+            let skip = extract_flag(&arg, "--skip");
+            // Scope: --diff, --branch <b>, --since <ref>, a path, or empty (full repo).
+            let scope = if has_flag(&arg, "--diff") {
+                "--diff".to_string()
+            } else if let Some(b) = extract_flag(&arg, "--branch").into_iter().next() {
+                format!("--branch {b}")
+            } else if let Some(r) = extract_flag(&arg, "--since").into_iter().next() {
+                format!("--since {r}")
+            } else {
+                // Remaining tokens that aren't flags → treat as path.
+                let path: String = arg
+                    .split_whitespace()
+                    .filter(|t| !t.starts_with("--"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                path
+            };
+            CommandAction::Assay { only, skip, scope }
+        }
         "undo" | "u" => CommandAction::Undo,
         "checkpoint" | "cp" => CommandAction::Checkpoint((!arg.is_empty()).then_some(arg)),
         "checkpoints" => CommandAction::ListCheckpoints,
@@ -233,6 +293,13 @@ pub fn parse_command(line: &str) -> CommandAction {
         "lattice" | "lat" => CommandAction::Lattice(arg),
         "goal" | "objective" => CommandAction::Goal(arg),
         "loop" => CommandAction::Loop(arg),
+        "replay" => {
+            // `/replay <id>` or `/replay <a> <b>`
+            let mut ids = arg.splitn(2, char::is_whitespace);
+            let id_a = ids.next().unwrap_or("").trim().to_string();
+            let id_b = ids.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            CommandAction::Replay(id_a, id_b)
+        }
         "clear" | "cls" => CommandAction::ClearScreen,
         "quit" | "exit" | "q" => CommandAction::Quit,
         other => CommandAction::Unknown(other.to_string()),

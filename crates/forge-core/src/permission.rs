@@ -253,7 +253,8 @@ fn strip_wrappers(tokens: &[String]) -> Vec<String> {
     tokens[i..].to_vec()
 }
 
-/// If the command is `bash -c "<script>"` / `sh -lc "<script>"` etc., return the inner script.
+/// If the command is `bash -c "<script>"` / `sh -lc "<script>"` / `cmd /C "<command>"` etc.,
+/// return the inner script so catastrophic-deny patterns can be checked recursively.
 fn inner_script(tokens: &[String]) -> Option<String> {
     if tokens.len() < 3 {
         return None;
@@ -262,13 +263,21 @@ fn inner_script(tokens: &[String]) -> Option<String> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(&tokens[0]);
-    if !matches!(bin, "bash" | "sh" | "zsh" | "dash") {
+    if matches!(bin, "bash" | "sh" | "zsh" | "dash") {
+        // find a `-c` (possibly combined like `-lc`) and take the following token as the script.
+        for (i, t) in tokens.iter().enumerate().skip(1) {
+            if t.starts_with('-') && t.contains('c') {
+                return tokens.get(i + 1).cloned();
+            }
+        }
         return None;
     }
-    // find a `-c` (possibly combined like `-lc`) and take the following token as the script.
-    for (i, t) in tokens.iter().enumerate().skip(1) {
-        if t.starts_with('-') && t.contains('c') {
-            return tokens.get(i + 1).cloned();
+    // Windows: `cmd /C <command>` — everything after /C is the inner command.
+    if bin.eq_ignore_ascii_case("cmd") {
+        for (i, t) in tokens.iter().enumerate().skip(1) {
+            if t.eq_ignore_ascii_case("/C") && i + 1 < tokens.len() {
+                return Some(tokens[i + 1..].join(" "));
+            }
         }
     }
     None
@@ -746,5 +755,68 @@ mod tests {
         assert!(shell_match("*", "anything at all / with slashes"));
         assert!(!shell_match("git *", "cargo build"));
         assert!(shell_match("rm -rf /", "rm -rf /"));
+    }
+
+    // ---- Windows-specific denylist patterns ----
+
+    #[test]
+    fn windows_del_recursive_is_denied() {
+        let rules = [builtin_deny("shell", &["del /s *"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Bypass,
+                SideEffect::Shell,
+                "shell",
+                &shell("del /s C:\\Users"),
+                &rules
+            ),
+            Deny
+        );
+    }
+
+    #[test]
+    fn windows_rd_recursive_is_denied() {
+        let rules = [builtin_deny("shell", &["rd /s *"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Bypass,
+                SideEffect::Shell,
+                "shell",
+                &shell("rd /s /q C:\\Temp"),
+                &rules
+            ),
+            Deny
+        );
+    }
+
+    #[test]
+    fn windows_format_is_denied() {
+        let rules = [builtin_deny("shell", &["format ?:*"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Bypass,
+                SideEffect::Shell,
+                "shell",
+                &shell("format C: /Q /Y"),
+                &rules
+            ),
+            Deny
+        );
+    }
+
+    #[test]
+    fn cmd_c_unwrapping_catches_inner_danger() {
+        // `cmd /C "del /s C:\"` — inner_script must recurse into the quoted command.
+        let rules = [builtin_deny("shell", &["del /s *"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Bypass,
+                SideEffect::Shell,
+                "shell",
+                &shell("cmd /C \"del /s C:\\\\\""),
+                &rules
+            ),
+            Deny
+        );
     }
 }

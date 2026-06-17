@@ -312,6 +312,12 @@ impl Effort {
 pub enum AssayScope {
     Repo,
     Path(String),
+    /// Uncommitted working-tree changes (git diff).
+    Diff,
+    /// Files changed between this branch and `base` (git diff <base>...).
+    Branch(String),
+    /// Files changed since a git ref (git diff <ref> --name-only).
+    Since(String),
 }
 
 impl AssayScope {
@@ -319,6 +325,9 @@ impl AssayScope {
         match self {
             AssayScope::Repo => "repo".to_string(),
             AssayScope::Path(p) => format!("path {p}"),
+            AssayScope::Diff => "diff (working tree)".to_string(),
+            AssayScope::Branch(b) => format!("branch vs {b}"),
+            AssayScope::Since(r) => format!("since {r}"),
         }
     }
 }
