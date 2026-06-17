@@ -45,8 +45,8 @@ pub use app::{
     banner_lines, handle_key, lattice_view_lines, App, InputOutcome, KeyKind, SubagentView,
 };
 pub use commands::{
-    filter_commands, parse_command, slash_token_at, Command, CommandAction, Palette, PaletteEntry,
-    Picker, PickerKind, PickerRow, SlashToken, COMMANDS,
+    at_token_at, filter_commands, parse_command, slash_token_at, AtPathPicker, AtToken, Command,
+    CommandAction, Palette, PaletteEntry, Picker, PickerKind, PickerRow, SlashToken, COMMANDS,
 };
 pub use driver::{ChannelPresenter, Tui, UiMsg};
 pub use init_wizard::{BridgeItem, ProviderItem, WizardInput, WizardOutcome};

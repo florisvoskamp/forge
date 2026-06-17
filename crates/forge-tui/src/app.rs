@@ -113,6 +113,8 @@ pub struct App {
     /// The live task list (`update_tasks`). Kept so the sticky tasks panel stays visible during
     /// the turn (the inline scrollback copy scrolls away); cleared when the model empties the list.
     tasks: Vec<forge_types::TodoItem>,
+    /// File-path picker for `@path` inline completion. Opens when the input contains `@…` at cursor.
+    pub at_picker: crate::commands::AtPathPicker,
     /// When true, the subagent picker overlay is shown in the stream area (opened by Ctrl+O when
     /// multiple subagents are in the current batch). ↑↓ navigate, Enter opens transcript, Esc closes.
     pub subagent_picking: bool,
@@ -869,6 +871,8 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     // areas[0]: stream preview (or modal overlay when palette / picker / agent-picker is open).
     if app.palette.open {
         render_palette(frame, areas[0], app);
+    } else if app.at_picker.open {
+        render_at_path_picker(frame, areas[0], app);
     } else if app.picker.open {
         render_picker(frame, areas[0], app);
     } else if app.subagent_picking {
@@ -934,6 +938,45 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!("  {marker}/{}", c.name), name_style),
                 Span::styled(format!("  {}", c.desc), Style::default().fg(DIM)),
             ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The `@path` file-path picker: a scrolling, filter-narrowed list of files, revealed by the
+/// same ease-in animation as the command palette.
+fn render_at_path_picker(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 {
+        return;
+    }
+    let matches = app.at_picker.matches();
+    if matches.is_empty() {
+        frame.render_widget(
+            Paragraph::new(TextLine::from(Span::styled(
+                "  no files match",
+                Style::default().fg(DIM),
+            ))),
+            area,
+        );
+        return;
+    }
+    let h = area.height as usize;
+    let revealed = ((app.at_picker.anim * h as f32).ceil() as usize).clamp(1, h);
+    let start = app.at_picker.selected.saturating_sub(h.saturating_sub(1));
+    let lines: Vec<TextLine> = matches
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(revealed)
+        .map(|(i, path)| {
+            let selected = i == app.at_picker.selected;
+            let marker = if selected { "▸ " } else { "  " };
+            let style = if selected {
+                Style::default().fg(TOOLCYAN).bold()
+            } else {
+                Style::default().fg(USER)
+            };
+            TextLine::from(Span::styled(format!("  {marker}@{path}"), style))
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);

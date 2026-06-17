@@ -319,6 +319,46 @@ fn sync_palette_to_slash_token(app: &mut forge_tui::App) {
     }
 }
 
+/// Enumerate project files for `@path` completion: `git ls-files` first, `find` fallback.
+fn load_at_files() -> Vec<String> {
+    if let Ok(out) = std::process::Command::new("git").args(["ls-files"]).output() {
+        if out.status.success() {
+            return String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|s| s.to_string())
+                .collect();
+        }
+    }
+    if let Ok(out) = std::process::Command::new("find")
+        .args([".", "-maxdepth", "5", "-type", "f", "-not", "-path", "*/.*"])
+        .output()
+    {
+        if out.status.success() {
+            return String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|s| s.trim_start_matches("./").to_string())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Keep the `@path` picker in sync with the `@token` at the cursor: open + filter when present,
+/// close when the token disappears. Files are loaded once on first open (cache lives in picker).
+fn sync_at_picker_to_at_token(app: &mut forge_tui::App) {
+    if let Some(tok) = forge_tui::at_token_at(&app.input, app.input.len()) {
+        if app.at_picker.open {
+            app.at_picker.query = tok.query;
+            app.at_picker.clamp();
+        } else {
+            let files = load_at_files();
+            app.at_picker.open_with(&tok.query, files);
+        }
+    } else {
+        app.at_picker.close();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -2488,6 +2528,50 @@ async fn run_chat_tui(
                 continue;
             }
 
+            // The @path file-path picker is modal while open.
+            if app.at_picker.open {
+                match key {
+                    KeyKind::Esc => app.at_picker.close(),
+                    KeyKind::Up => app.at_picker.move_up(),
+                    KeyKind::Down => app.at_picker.move_down(),
+                    KeyKind::Tab => {
+                        if let Some(path) = app.at_picker.selected_path() {
+                            if let Some(tok) =
+                                forge_tui::at_token_at(&app.input, app.input.len())
+                            {
+                                app.input
+                                    .replace_range(tok.start..tok.end, &format!("@{path}"));
+                            } else {
+                                app.input = format!("@{path}");
+                            }
+                            app.at_picker.query = path;
+                            app.at_picker.clamp();
+                        }
+                    }
+                    KeyKind::Enter => {
+                        if let Some(path) = app.at_picker.selected_path() {
+                            if let Some(tok) =
+                                forge_tui::at_token_at(&app.input, app.input.len())
+                            {
+                                app.input
+                                    .replace_range(tok.start..tok.end, &format!("@{path} "));
+                            }
+                        }
+                        app.at_picker.close();
+                    }
+                    KeyKind::Char(c) => {
+                        app.input.push(c);
+                        sync_at_picker_to_at_token(&mut app);
+                    }
+                    KeyKind::Backspace => {
+                        app.input.pop();
+                        sync_at_picker_to_at_token(&mut app);
+                    }
+                    KeyKind::CycleTemper | KeyKind::ToggleSubagentDetail => {}
+                }
+                continue;
+            }
+
             // The session/checkpoint picker is modal too: arrows navigate, typing filters, Enter
             // acts on the selection (resume / rewind), Esc cancels.
             if app.picker.open {
@@ -2820,10 +2904,14 @@ async fn run_chat_tui(
                         break;
                     }
                     InputOutcome::Editing => {
-                        // A `/command` token anywhere on the line opens the palette (not only at
-                        // the start) — mid-line autocomplete + highlighting.
+                        // `/command` anywhere on the line opens the palette; `@path` opens the
+                        // file picker. They are mutually exclusive — slash wins at cursor.
                         if let Some(tok) = forge_tui::slash_token_at(&app.input, app.input.len()) {
+                            app.at_picker.close();
                             app.palette.open_with(&tok.name);
+                        } else {
+                            app.palette.close();
+                            sync_at_picker_to_at_token(&mut app);
                         }
                     }
                 }
@@ -2931,9 +3019,13 @@ async fn run_chat_tui(
                 dirty = true;
             }
         }
-        // Animate the command palette's / picker's ease-in reveal while open.
+        // Animate the command palette's / picker's / at-path picker's ease-in reveal while open.
         if app.palette.open && app.palette.anim < 1.0 {
             app.palette.tick_anim();
+            dirty = true;
+        }
+        if app.at_picker.open && app.at_picker.anim < 1.0 {
+            app.at_picker.tick_anim();
             dirty = true;
         }
         if app.picker.open && app.picker.anim < 1.0 {

@@ -219,6 +219,116 @@ pub fn slash_token_at(input: &str, cursor: usize) -> Option<SlashToken> {
     best.or(last)
 }
 
+/// An `@path` token found in the input line — drives the file-path autocomplete popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtToken {
+    pub start: usize,
+    pub end: usize,
+    pub query: String,
+}
+
+/// Find the `@path` token to drive the file-path picker for, given the cursor position.
+/// Scans every whitespace-delimited word; qualifies when it begins with `@`.
+/// The token at/before the cursor wins; otherwise the last `@` token on the line.
+pub fn at_token_at(input: &str, cursor: usize) -> Option<AtToken> {
+    let mut best: Option<AtToken> = None;
+    let mut last: Option<AtToken> = None;
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if (bytes[i] as char).is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let word_start = i;
+        while i < bytes.len() && !(bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        let word_end = i;
+        let word = &input[word_start..word_end];
+        if let Some(rest) = word.strip_prefix('@') {
+            let tok = AtToken {
+                start: word_start,
+                end: word_end,
+                query: rest.to_string(),
+            };
+            if cursor >= tok.start && cursor <= tok.end {
+                best = Some(tok.clone());
+            }
+            last = Some(tok);
+        }
+    }
+    best.or(last)
+}
+
+/// Inline file-path picker state. Opens when the input line contains an `@path` token at cursor.
+#[derive(Debug, Clone, Default)]
+pub struct AtPathPicker {
+    pub open: bool,
+    pub query: String,
+    pub selected: usize,
+    pub anim: f32,
+    files: Vec<String>,
+}
+
+impl AtPathPicker {
+    pub fn open_with(&mut self, query: &str, files: Vec<String>) {
+        self.open = true;
+        self.query = query.to_string();
+        self.files = files;
+        self.selected = 0;
+        self.anim = 0.0;
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.query.clear();
+        self.selected = 0;
+        self.anim = 0.0;
+    }
+
+    pub fn matches(&self) -> Vec<&String> {
+        if self.query.is_empty() {
+            return self.files.iter().collect();
+        }
+        let q = self.query.to_lowercase();
+        self.files
+            .iter()
+            .filter(|f| f.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn move_down(&mut self) {
+        let n = self.matches().len();
+        if n > 0 {
+            self.selected = (self.selected + 1).min(n - 1);
+        }
+    }
+
+    pub fn clamp(&mut self) {
+        let n = self.matches().len();
+        if n == 0 {
+            self.selected = 0;
+        } else if self.selected >= n {
+            self.selected = n - 1;
+        }
+    }
+
+    pub fn selected_path(&self) -> Option<String> {
+        self.matches().into_iter().nth(self.selected).cloned()
+    }
+
+    pub fn tick_anim(&mut self) {
+        if self.open && self.anim < 1.0 {
+            self.anim = (self.anim + 0.34).min(1.0);
+        }
+    }
+}
+
 /// Extract a comma-separated lens list from `--flag <value>` in a raw arg string.
 /// `/assay --only dead-weight,unsafe` → `extract_flag(arg, "--only")` → `["dead-weight", "unsafe"]`
 fn extract_flag(arg: &str, flag: &str) -> Vec<String> {

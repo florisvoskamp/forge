@@ -69,8 +69,8 @@ The v0.1 audit found three real gaps. All are now fixed:
 | Feature | Status | Notes |
 |---------|--------|-------|
 | **Subagent orchestration** | **done** | `spawn_agents` virtual tool, mesh-routed children, depth-1 guard, live TUI tree |
-| **Assay — analysis mode** ⚒ | **done** | parallel critics + adversarial verify + ranked report + git scopes (--diff/--branch/--since) + --only/--skip lens selection + auto-diff vs prior run + `forge assay list/compare`; deferred: per-critic live progress rows (full U9), budget pre-estimate scope-down (U8) |
-| **Commands + skills** | **done** | palette + `forge-skills`, CC-compatible, `use_skill` virtual tool, `@path` deferred |
+| **Assay — analysis mode** ⚒ | **done** | parallel critics + adversarial verify + ranked report + git scopes (--diff/--branch/--since) + --only/--skip lens selection + auto-diff vs prior run + `forge assay list/compare`; per-critic live TUI panel (U9 done PR #97); deferred: budget pre-estimate scope-down (U8) |
+| **Commands + skills** | **done** | palette + `forge-skills`, CC-compatible, `use_skill` virtual tool, `@path` file-path completion popup |
 | **MCP client** | **done** (+OAuth PR #93) | stdio + HTTP/SSE, deferred loading, allowlist, OAuth 2.0 Authorization Code + PKCE, `forge mcp login/logout` |
 | **Lattice** ⚒ | **done** | tree-sitter Rust + multi-language, resolved edges, impact/path, auto-retrieval injection, hybrid semantic+structural embeddings, file watcher, `/lattice`, `forge lattice why` |
 | **Web tools** | **done** | `web_search` + `web_fetch`, SSRF-guarded, Brave backend |
