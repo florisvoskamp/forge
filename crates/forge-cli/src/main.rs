@@ -120,6 +120,17 @@ enum Command {
         #[arg(long)]
         clear: bool,
     },
+    /// Explain how the mesh routes — classification, scored candidates, quota pressure, the
+    /// conservation roll, and the final pick. With a PROMPT, explains that prompt; without one,
+    /// shows the per-tier picks + subscription quota overview. `--json` for machine output.
+    Mesh {
+        /// The task prompt to explain (quote it). Omit for the per-tier / quota overview.
+        #[arg(trailing_var_arg = true)]
+        prompt: Vec<String>,
+        /// Emit the explanation as JSON instead of the formatted view.
+        #[arg(long)]
+        json: bool,
+    },
     /// Internal: run Forge's tool registry as an MCP server on stdio (spawned by the CLI
     /// bridge so claude/codex use Forge's tools under Forge's permission gate). Not for direct use.
     #[command(hide = true)]
@@ -462,6 +473,7 @@ async fn main() -> Result<()> {
         Command::Assay { sub } => assay_cmd(sub),
         Command::Commands => commands_cmd(),
         Command::Models { probe, clear } => models(probe, clear).await,
+        Command::Mesh { prompt, json } => mesh_explain(prompt.join(" "), json).await,
         Command::Auth { provider, remove } => auth(&provider, remove),
         Command::Init => init(),
         Command::Mcp { cmd } => mcp_cmd(cmd).await,
@@ -1763,6 +1775,238 @@ async fn models(probe: bool, clear: bool) -> Result<()> {
         println!("\ntip: `forge models --probe` pings each model and benches the dead ones.");
     }
     Ok(())
+}
+
+/// `forge mesh [PROMPT]` — explain how the mesh routes. With a prompt: the full decision trace.
+/// Without one: the per-tier picks + subscription-quota overview. The non-interactive sibling of
+/// the `/mesh` TUI inspector; both read the same [`forge_mesh::RoutingExplanation`] engine.
+async fn mesh_explain(prompt: String, json: bool) -> Result<()> {
+    forge_config::inject_provider_keys();
+    let config = forge_config::load().unwrap_or_default();
+    let cat = discover_catalog(&config).await;
+    if cat.is_empty() {
+        println!("no models discovered — set a provider key (`forge auth <provider>`) or run ollama");
+        return Ok(());
+    }
+    let store = open_store()?;
+    let quota = store
+        .current_quota()
+        .unwrap_or_default()
+        .with_plans(config.mesh.subscriptions.clone())
+        .with_conserve(config.mesh.subscription_conserve);
+    let health = store.current_benched().unwrap_or_default();
+    let budget = forge_mesh::BudgetState {
+        spent_today_usd: store.spend_today_usd().unwrap_or(0.0),
+        daily_cap_usd: config.mesh.daily_budget_usd,
+        spent_week_usd: store.spend_this_week_usd().unwrap_or(0.0),
+        weekly_cap_usd: config.mesh.weekly_budget_usd,
+        spent_month_usd: store.spend_this_month_usd().unwrap_or(0.0),
+        monthly_cap_usd: config.mesh.monthly_cap_usd,
+        warn_fraction: config.mesh.warn_threshold,
+    };
+    let router = HeuristicRouter::new(config.clone()).with_catalog(cat.clone());
+
+    if prompt.trim().is_empty() {
+        mesh_overview(&cat, &config, &quota);
+        return Ok(());
+    }
+    let e = router.explain(&prompt, budget, &health, &quota);
+    if json {
+        println!("{}", mesh_explanation_json(&e));
+    } else {
+        print_mesh_explanation(&e);
+    }
+    Ok(())
+}
+
+/// A 10-cell ASCII meter for a 0.0–1.0 fraction.
+fn meter(frac: f64) -> String {
+    let filled = (frac.clamp(0.0, 1.0) * 10.0).round() as usize;
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(10 - filled))
+}
+
+/// The no-prompt overview: subscription quota gauges + per-tier ranked picks.
+fn mesh_overview(cat: &forge_mesh::ModelCatalog, config: &forge_config::Config, quota: &forge_types::SubscriptionQuota) {
+    let pricing = forge_mesh::pricing::Pricing::from_config(config);
+    println!("subscription quota (conservation {}):", if config.mesh.subscription_conserve { "on" } else { "off" });
+    let mut subs: Vec<&str> = cat
+        .models()
+        .iter()
+        .filter(|m| forge_mesh::catalog::is_subscription(m))
+        .map(|m| forge_mesh::catalog::provider_of(m))
+        .collect();
+    subs.sort_unstable();
+    subs.dedup();
+    if subs.is_empty() {
+        println!("  (no subscription bridges installed)");
+    }
+    for p in &subs {
+        let frac = quota.fraction_for(p);
+        let plan = quota.plan_for(p);
+        let plan = if plan.is_empty() { "?" } else { plan };
+        let pc = forge_mesh::ModelCatalog::spread_probability(TaskTier::Complex, frac, plan, false);
+        let ps = forge_mesh::ModelCatalog::spread_probability(TaskTier::Standard, frac, plan, false);
+        println!(
+            "  {:<11} {} {:>3.0}% · plan {plan} · {:?} · spread P(complex)={:.0}% P(standard)={:.0}%",
+            p,
+            meter(frac),
+            frac * 100.0,
+            quota.status_for(p),
+            pc * 100.0,
+            ps * 100.0,
+        );
+    }
+    println!("\nper-tier ranking (top 5):");
+    for tier in [TaskTier::Trivial, TaskTier::Standard, TaskTier::Complex] {
+        let (_, rows) = cat.ranked_rows(tier, &pricing, false, 0, quota);
+        println!("  {}:", tier.as_str());
+        for r in rows.iter().take(5) {
+            println!(
+                "    {:<34} score {:>6.2}  {}",
+                r.model,
+                r.final_score,
+                cost_tag(r.cost_class)
+            );
+        }
+    }
+    println!("\ntip: `forge mesh \"<your task>\"` explains exactly how one prompt routes.");
+}
+
+fn cost_tag(class: u8) -> &'static str {
+    match class {
+        0 => "free",
+        1 => "subscription",
+        _ => "paid",
+    }
+}
+
+/// The formatted single-prompt explanation.
+fn print_mesh_explanation(e: &forge_mesh::RoutingExplanation) {
+    println!("prompt: {:?}", e.prompt);
+    print!("classified: {}", e.classified_tier.as_str());
+    if e.routed_tier != e.classified_tier {
+        print!(" → routed {}", e.routed_tier.as_str());
+    }
+    println!(
+        "  ·  code-heavy: {}  ·  reasons: {}",
+        if e.code_heavy { "yes" } else { "no" },
+        e.classify_reasons.join(", ")
+    );
+
+    if !e.quota.is_empty() {
+        println!("\nquota:");
+        for q in &e.quota {
+            let plan = if q.plan.is_empty() { "?" } else { &q.plan };
+            println!(
+                "  {:<11} {} {:>3.0}% · plan {plan} · {:?} · spread P={:.0}%",
+                q.provider,
+                meter(q.fraction),
+                q.fraction * 100.0,
+                q.status,
+                q.spread_probability * 100.0,
+            );
+        }
+    }
+
+    let c = &e.conserve;
+    if c.enabled {
+        let verdict = if !c.eligible {
+            "no frontier alternative → not applied".to_string()
+        } else if c.fired {
+            format!("FIRED (roll {:.2} < P {:.2}) → spread off subscriptions", c.roll, c.probability)
+        } else {
+            format!("not fired (roll {:.2} ≥ P {:.2}) → subscription kept", c.roll, c.probability)
+        };
+        println!("\nconservation: {verdict}");
+    } else {
+        println!("\nconservation: off");
+    }
+
+    if !e.candidates.is_empty() {
+        println!("\ncandidates (top {}):", e.candidates.len().min(8));
+        for c in e.candidates.iter().take(8) {
+            let marker = if c.selected { "*" } else { " " };
+            let pen = if c.row.conserve_penalty > 0.0 {
+                format!(" −{:.0}", c.row.conserve_penalty)
+            } else {
+                String::new()
+            };
+            println!(
+                "  {marker} #{:<2} {:<34} score {:>6.2}  cap {:>5.2}  {}{}{}{}",
+                c.rank,
+                c.row.model,
+                c.row.final_score,
+                c.row.capability,
+                cost_tag(c.row.cost_class),
+                pen,
+                if c.row.frontier { " · frontier" } else { "" },
+                if c.usable { "" } else { " · UNUSABLE" },
+            );
+        }
+    }
+
+    println!("\npick: {}", e.pick);
+    if !e.fallbacks.is_empty() {
+        println!("fallbacks: {}", e.fallbacks.join(", "));
+    }
+    println!("why: {}", e.rationale);
+}
+
+/// JSON form of the explanation (stable shape for scripting / tests).
+fn mesh_explanation_json(e: &forge_mesh::RoutingExplanation) -> String {
+    let candidates: Vec<_> = e
+        .candidates
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "rank": c.rank,
+                "model": c.row.model,
+                "provider": c.row.provider,
+                "final_score": c.row.final_score,
+                "capability": c.row.capability,
+                "cost_class": c.row.cost_class,
+                "conserve_penalty": c.row.conserve_penalty,
+                "subscription": c.row.subscription,
+                "frontier": c.row.frontier,
+                "usable": c.usable,
+                "selected": c.selected,
+            })
+        })
+        .collect();
+    let quota: Vec<_> = e
+        .quota
+        .iter()
+        .map(|q| {
+            serde_json::json!({
+                "provider": q.provider,
+                "status": format!("{:?}", q.status),
+                "fraction": q.fraction,
+                "plan": q.plan,
+                "spread_probability": q.spread_probability,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "prompt": e.prompt,
+        "classified_tier": e.classified_tier.as_str(),
+        "routed_tier": e.routed_tier.as_str(),
+        "classify_reasons": e.classify_reasons,
+        "code_heavy": e.code_heavy,
+        "seed": e.seed,
+        "conserve": {
+            "enabled": e.conserve.enabled,
+            "eligible": e.conserve.eligible,
+            "probability": e.conserve.probability,
+            "roll": e.conserve.roll,
+            "fired": e.conserve.fired,
+        },
+        "quota": quota,
+        "candidates": candidates,
+        "pick": e.pick,
+        "fallbacks": e.fallbacks,
+        "rationale": e.rationale,
+    }))
+    .unwrap_or_else(|_| "{}".into())
 }
 
 /// Ping every discovered model with a 1-token request; clear the healthy ones and bench the

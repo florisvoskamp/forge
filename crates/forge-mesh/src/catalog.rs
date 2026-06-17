@@ -194,19 +194,60 @@ fn has_nonsub_alternative(models: &[String], tier: TaskTier) -> bool {
     })
 }
 
+/// One model's scored row for the routing inspector: the score broken out so a human can see WHY
+/// it ranked where it did. `rotation`/`fine` are the tiebreak keys (kept for a stable, explainable
+/// sort), not shown directly.
+#[derive(Debug, Clone)]
+pub struct ScoreRow {
+    pub model: String,
+    pub provider: String,
+    /// Pure capability fit for the tier (speed/quality blend).
+    pub capability: f64,
+    /// 0 = free, 1 = subscription, 2 = paid.
+    pub cost_class: u8,
+    /// Conservation demotion applied to this model for this prompt (0.0 if none).
+    pub conserve_penalty: f64,
+    /// Final ranking score (capability + cost/code priors − quota − conservation).
+    pub final_score: f64,
+    pub subscription: bool,
+    pub frontier: bool,
+    rotation: u64,
+    fine: f64,
+}
+
+/// The full, inspectable conservation decision for a prompt (the data the `/mesh` inspector and
+/// `forge mesh explain` surface). `fired` is what routing acts on.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConserveDecision {
+    /// Conservation enabled in config.
+    pub enabled: bool,
+    /// A subscription is present AND a capable non-subscription alternative exists for the tier.
+    pub eligible: bool,
+    /// The spread probability used (max conservation pull across the present subscriptions).
+    pub probability: f64,
+    /// The deterministic per-prompt draw in [0,1).
+    pub roll: f64,
+    /// `roll < probability` — this prompt spreads off the subscriptions.
+    pub fired: bool,
+}
+
 /// Decide — deterministically for this prompt — whether to spread off the subscriptions. Takes the
 /// strongest conservation pull across the present subscription providers (protect whichever is most
-/// pressured / smallest-plan), then draws a stable per-prompt value against it. Returns false when
+/// pressured / smallest-plan), then draws a stable per-prompt value against it. Does not fire when
 /// disabled, when there are no subscriptions, or when no capable alternative exists.
-fn conserve_subscriptions(
+pub(crate) fn conserve_decision(
     models: &[String],
     tier: TaskTier,
     code_heavy: bool,
     seed: u64,
     quota: &forge_types::SubscriptionQuota,
-) -> bool {
-    if !quota.conserve_enabled() {
-        return false;
+) -> ConserveDecision {
+    let mut d = ConserveDecision {
+        enabled: quota.conserve_enabled(),
+        ..Default::default()
+    };
+    if !d.enabled {
+        return d;
     }
     let mut sub_providers: Vec<&str> = models
         .iter()
@@ -215,17 +256,19 @@ fn conserve_subscriptions(
         .collect();
     sub_providers.sort_unstable();
     sub_providers.dedup();
-    if sub_providers.is_empty() || !has_nonsub_alternative(models, tier) {
-        return false;
+    d.eligible = !sub_providers.is_empty() && has_nonsub_alternative(models, tier);
+    if !d.eligible {
+        return d;
     }
-    let p = sub_providers
+    d.probability = sub_providers
         .iter()
         .map(|prov| {
             conserve_probability(tier, quota.fraction_for(prov), quota.plan_for(prov), code_heavy)
         })
         .fold(0.0_f64, f64::max);
-    let roll = (stable_hash(&format!("{seed}:conserve")) % 10_000) as f64 / 10_000.0;
-    roll < p
+    d.roll = (stable_hash(&format!("{seed}:conserve")) % 10_000) as f64 / 10_000.0;
+    d.fired = d.roll < d.probability;
+    d
 }
 
 /// A per-prompt provider ordering key: hashing `seed:provider` means different prompts rotate
@@ -405,7 +448,7 @@ impl ModelCatalog {
         // subscription bridges onto a free-frontier model (so a complex/standard-heavy workload
         // doesn't exhaust the plan). When it fires, subscriptions take a soft penalty so the best
         // alternative leads while the subscription stays available as a fallback.
-        let conserve = conserve_subscriptions(&self.models, tier, code_heavy, seed, quota);
+        let conserve = conserve_decision(&self.models, tier, code_heavy, seed, quota).fired;
         let mut scored: Vec<(f64, u8, u64, f64, &String)> = self
             .models
             .iter()
@@ -440,6 +483,69 @@ impl ModelCatalog {
             .take(top)
             .map(|(_, _, _, _, m)| m.clone())
             .collect()
+    }
+
+    /// The full ranked candidate table for a tier with each model's score broken out — the data
+    /// behind `/mesh` and `forge mesh explain`. Same ordering as [`ranked_seeded`](Self::ranked_seeded),
+    /// but every routable model is returned (not truncated) with its capability, cost class, the
+    /// conservation penalty applied (if any), and the final score. Pure (no health/usability — the
+    /// router overlays that).
+    pub fn ranked_rows(
+        &self,
+        tier: TaskTier,
+        pricing: &Pricing,
+        code_heavy: bool,
+        seed: u64,
+        quota: &forge_types::SubscriptionQuota,
+    ) -> (ConserveDecision, Vec<ScoreRow>) {
+        let decision = conserve_decision(&self.models, tier, code_heavy, seed, quota);
+        let mut rows: Vec<ScoreRow> = self
+            .models
+            .iter()
+            .filter(|m| is_routable(m))
+            .map(|m| {
+                let cost = pricing.estimated_cost(m);
+                let base = route_score(m, tier, cost, code_heavy, quota);
+                let sub = is_subscription(m);
+                let penalty = if decision.fired && sub {
+                    CONSERVE_PENALTY
+                } else {
+                    0.0
+                };
+                ScoreRow {
+                    model: m.clone(),
+                    provider: provider_of(m).to_string(),
+                    capability: capability_score(m, tier),
+                    cost_class: cost_class(m, cost),
+                    conserve_penalty: penalty,
+                    final_score: base - penalty,
+                    subscription: sub,
+                    frontier: is_frontier(m),
+                    rotation: provider_rotation(provider_of(m), seed),
+                    fine: fine_capability(m),
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.final_score
+                .total_cmp(&a.final_score)
+                .then_with(|| a.cost_class.cmp(&b.cost_class))
+                .then_with(|| a.rotation.cmp(&b.rotation))
+                .then_with(|| b.fine.total_cmp(&a.fine))
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        (decision, rows)
+    }
+
+    /// The per-provider spread probability for a tier (the `/mesh` quota view) — how likely a task
+    /// of this tier routes off that subscription given its window fraction + plan.
+    pub fn spread_probability(
+        tier: TaskTier,
+        fraction: f64,
+        plan: &str,
+        code_heavy: bool,
+    ) -> f64 {
+        conserve_probability(tier, fraction, plan, code_heavy)
     }
 
     /// Every discovered model classified for display (id order preserved).

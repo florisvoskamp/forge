@@ -9,9 +9,11 @@ use forge_types::{ModelHealth, SubscriptionQuota, TaskTier};
 
 pub mod capability;
 pub mod catalog;
+pub mod explain;
 pub mod pricing;
 
-pub use catalog::{CatalogStats, ModelCatalog, ModelInfo, ProviderGroup};
+pub use catalog::{CatalogStats, ConserveDecision, ModelCatalog, ModelInfo, ProviderGroup, ScoreRow};
+pub use explain::{CandidateRow, ProviderQuotaView, RoutingExplanation};
 
 /// Live budget context the router considers when choosing a tier. Carries daily, weekly, and
 /// monthly axes (FR-5); the stricter of all configured axes governs.
