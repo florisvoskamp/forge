@@ -329,6 +329,8 @@ impl ForgeMcp {
         let budget = BudgetState {
             spent_today_usd: s.ctx.store.spend_today_usd().unwrap_or(0.0),
             daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_week_usd: s.ctx.store.spend_this_week_usd().unwrap_or(0.0),
+            weekly_cap_usd: self.config.mesh.weekly_budget_usd,
             spent_month_usd: s.ctx.store.spend_this_month_usd().unwrap_or(0.0),
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,

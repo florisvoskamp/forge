@@ -26,6 +26,27 @@ pub fn day_bounds_local(now: DateTime<Local>) -> (i64, i64) {
     (start.timestamp(), end.timestamp())
 }
 
+/// Half-open `[start, end)` covering the last `hours` hours ending at `now`.
+pub fn rolling_hours_bounds(now: DateTime<Local>, hours: i64) -> (i64, i64) {
+    let end = now.timestamp() + 1;
+    let start = end - hours * 3600;
+    (start, end)
+}
+
+/// Half-open `[start, end)` epoch-second bounds of `now`'s **local** ISO calendar week
+/// (Monday 00:00 local → 7 days later).
+pub fn week_bounds_local(now: DateTime<Local>) -> (i64, i64) {
+    use chrono::Datelike;
+    let days_since_monday = now.weekday().num_days_from_monday() as i64;
+    let monday = now.date_naive() - ChronoDuration::days(days_since_monday);
+    let start = Local
+        .from_local_datetime(&monday.and_hms_opt(0, 0, 0).expect("valid midnight"))
+        .earliest()
+        .unwrap_or(now);
+    let end = start + ChronoDuration::weeks(1);
+    (start.timestamp(), end.timestamp())
+}
+
 /// Half-open `[start, end)` epoch-second bounds of `now`'s **local** calendar month.
 pub fn month_bounds_local(now: DateTime<Local>) -> (i64, i64) {
     let first = now
@@ -356,6 +377,68 @@ impl Store {
     /// the empty string.
     pub fn spend_by_model_today(&self) -> Result<Vec<(String, f64, u64, u64)>> {
         let (s, e) = day_bounds_local(chrono::Local::now());
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(m.model, '') as mdl,
+                    COALESCE(SUM(u.cost_usd), 0.0),
+                    COALESCE(SUM(u.input_tokens), 0),
+                    COALESCE(SUM(u.output_tokens), 0)
+             FROM usage u JOIN message m ON m.id = u.message_id
+             WHERE u.created_at >= ?1 AND u.created_at < ?2
+             GROUP BY mdl
+             ORDER BY SUM(u.cost_usd) DESC, SUM(u.input_tokens) DESC",
+        )?;
+        let rows = stmt.query_map((s, e), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, i64>(2)? as u64,
+                r.get::<_, i64>(3)? as u64,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Spend in the last 5 hours (rolling, not calendar-day-aligned).
+    pub fn spend_last_5h_usd(&self) -> Result<f64> {
+        let (s, e) = rolling_hours_bounds(chrono::Local::now(), 5);
+        self.spend_between(s, e)
+    }
+
+    /// Spend in the current local ISO calendar week (Monday 00:00 → now).
+    pub fn spend_this_week_usd(&self) -> Result<f64> {
+        let (s, e) = week_bounds_local(chrono::Local::now());
+        self.spend_between(s, e)
+    }
+
+    /// Per-model spend + token counts for the last 5 hours.
+    pub fn spend_by_model_5h(&self) -> Result<Vec<(String, f64, u64, u64)>> {
+        let (s, e) = rolling_hours_bounds(chrono::Local::now(), 5);
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(m.model, '') as mdl,
+                    COALESCE(SUM(u.cost_usd), 0.0),
+                    COALESCE(SUM(u.input_tokens), 0),
+                    COALESCE(SUM(u.output_tokens), 0)
+             FROM usage u JOIN message m ON m.id = u.message_id
+             WHERE u.created_at >= ?1 AND u.created_at < ?2
+             GROUP BY mdl
+             ORDER BY SUM(u.cost_usd) DESC, SUM(u.input_tokens) DESC",
+        )?;
+        let rows = stmt.query_map((s, e), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, i64>(2)? as u64,
+                r.get::<_, i64>(3)? as u64,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Per-model spend + token counts for the current ISO week.
+    pub fn spend_by_model_week(&self) -> Result<Vec<(String, f64, u64, u64)>> {
+        let (s, e) = week_bounds_local(chrono::Local::now());
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT COALESCE(m.model, '') as mdl,

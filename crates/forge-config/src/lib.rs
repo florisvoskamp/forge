@@ -468,6 +468,9 @@ pub struct MeshConfig {
     /// Monthly spend cap in USD across all sessions. Absent = unlimited.
     #[serde(default)]
     pub monthly_cap_usd: Option<f64>,
+    /// Weekly spend cap in USD (Monday 00:00 local → Sunday). Absent = unlimited.
+    #[serde(default)]
+    pub weekly_budget_usd: Option<f64>,
     /// Fraction of a cap that triggers a warning (default 0.8).
     #[serde(default = "default_warn_threshold")]
     pub warn_threshold: f64,
@@ -707,6 +710,7 @@ impl Default for Config {
                 bridge_mode: BridgeMode::default(),
                 daily_budget_usd: None,
                 monthly_cap_usd: None,
+                weekly_budget_usd: None,
                 warn_threshold: default_warn_threshold(),
                 budget: BudgetBehavior::default(),
                 pricing: HashMap::new(),

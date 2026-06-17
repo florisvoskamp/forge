@@ -13,12 +13,14 @@ pub mod pricing;
 
 pub use catalog::{CatalogStats, ModelCatalog, ModelInfo, ProviderGroup};
 
-/// Live budget context the router considers when choosing a tier. Carries both the daily
-/// and monthly axes (FR-5); the stricter of the two governs.
+/// Live budget context the router considers when choosing a tier. Carries daily, weekly, and
+/// monthly axes (FR-5); the stricter of all configured axes governs.
 #[derive(Debug, Clone, Copy)]
 pub struct BudgetState {
     pub spent_today_usd: f64,
     pub daily_cap_usd: Option<f64>,
+    pub spent_week_usd: f64,
+    pub weekly_cap_usd: Option<f64>,
     pub spent_month_usd: f64,
     pub monthly_cap_usd: Option<f64>,
     /// Fraction of a cap at which to warn (e.g. 0.8 = 80%).
@@ -30,6 +32,8 @@ impl Default for BudgetState {
         Self {
             spent_today_usd: 0.0,
             daily_cap_usd: None,
+            spent_week_usd: 0.0,
+            weekly_cap_usd: None,
             spent_month_usd: 0.0,
             monthly_cap_usd: None,
             warn_fraction: DEFAULT_WARN_FRACTION,
@@ -61,13 +65,19 @@ impl BudgetState {
         }
     }
 
-    /// Classify current spending: the stricter of the daily and monthly axes wins.
+    /// Classify current spending: the stricter of all configured axes wins.
     pub fn status(&self) -> BudgetStatus {
-        Self::axis(self.spent_today_usd, self.daily_cap_usd, self.warn_fraction).max(Self::axis(
-            self.spent_month_usd,
-            self.monthly_cap_usd,
-            self.warn_fraction,
-        ))
+        Self::axis(self.spent_today_usd, self.daily_cap_usd, self.warn_fraction)
+            .max(Self::axis(
+                self.spent_week_usd,
+                self.weekly_cap_usd,
+                self.warn_fraction,
+            ))
+            .max(Self::axis(
+                self.spent_month_usd,
+                self.monthly_cap_usd,
+                self.warn_fraction,
+            ))
     }
 }
 
@@ -1086,6 +1096,8 @@ mod tests {
         let b = BudgetState {
             spent_today_usd: 1.0,
             daily_cap_usd: Some(100.0),
+            spent_week_usd: 0.0,
+            weekly_cap_usd: None,
             spent_month_usd: 80.0,
             monthly_cap_usd: Some(80.0),
             warn_fraction: DEFAULT_WARN_FRACTION,

@@ -18,6 +18,7 @@ use forge_tui::{HeadlessPresenter, Presenter, TuiPresenter};
 use forge_types::PermissionMode;
 use forge_types::TaskTier;
 
+mod bridge_stats;
 mod mcp_serve;
 mod replay;
 
@@ -3116,23 +3117,36 @@ async fn run_chat_tui(
             dirty = true;
             // Auto-refresh data every ~3 s (180 ticks × 16 ms).
             if app.usage_overlay.anim_tick % 180 == 1 {
-                let (today_usd, month_usd, by_model, (daily_cap, monthly_cap)) = {
+                let ((month_usd, by_model_5h, by_model, by_model_week, (daily_cap, monthly_cap, weekly_cap)), (session_in, session_out, session_usd)) = {
                     let s = session.lock().await;
                     (
-                        s.spend_today_usd(),
-                        s.spend_this_month_usd(),
-                        s.spend_by_model_today(),
-                        s.budget_caps(),
+                        (
+                            s.spend_this_month_usd(),
+                            s.spend_by_model_5h(),
+                            s.spend_by_model_today(),
+                            s.spend_by_model_week(),
+                            s.budget_caps(),
+                        ),
+                        s.session_usage_db(),
                     )
                 };
-                app.usage_overlay.today_usd = today_usd;
+                let bstats = tokio::task::spawn_blocking(bridge_stats::fetch).await.unwrap_or_default();
                 app.usage_overlay.month_usd = month_usd;
-                app.usage_overlay.session_usd = app.cost_usd;
-                app.usage_overlay.session_in = app.session_in;
-                app.usage_overlay.session_out = app.session_out;
+                app.usage_overlay.session_usd = session_usd;
+                app.usage_overlay.session_in = session_in;
+                app.usage_overlay.session_out = session_out;
+                app.usage_overlay.by_model_5h = by_model_5h;
                 app.usage_overlay.by_model = by_model;
+                app.usage_overlay.by_model_week = by_model_week;
                 app.usage_overlay.daily_cap = daily_cap;
+                app.usage_overlay.weekly_cap = weekly_cap;
                 app.usage_overlay.monthly_cap = monthly_cap;
+                app.usage_overlay.codex_5h_pct = bstats.codex_5h_pct;
+                app.usage_overlay.codex_weekly_pct = bstats.codex_weekly_pct;
+                app.usage_overlay.claude_5h_in = bstats.claude_5h_in;
+                app.usage_overlay.claude_5h_out = bstats.claude_5h_out;
+                app.usage_overlay.claude_weekly_in = bstats.claude_weekly_in;
+                app.usage_overlay.claude_weekly_out = bstats.claude_weekly_out;
             }
         }
 
@@ -3607,23 +3621,39 @@ async fn dispatch_command(
             tui.print_text(&text);
         }
         CommandAction::Usage => {
-            let (today_usd, month_usd, by_model, (daily_cap, monthly_cap)) = {
-                let s = session.lock().await;
-                (
-                    s.spend_today_usd(),
-                    s.spend_this_month_usd(),
-                    s.spend_by_model_today(),
-                    s.budget_caps(),
-                )
+            let ((month_usd, by_model_5h, by_model, by_model_week, (daily_cap, monthly_cap, weekly_cap)), (session_in, session_out, session_usd), bstats) = {
+                let (db_data, session_data) = {
+                    let s = session.lock().await;
+                    (
+                        (
+                            s.spend_this_month_usd(),
+                            s.spend_by_model_5h(),
+                            s.spend_by_model_today(),
+                            s.spend_by_model_week(),
+                            s.budget_caps(),
+                        ),
+                        s.session_usage_db(),
+                    )
+                };
+                let bstats = tokio::task::spawn_blocking(bridge_stats::fetch).await.unwrap_or_default();
+                (db_data, session_data, bstats)
             };
-            app.usage_overlay.today_usd = today_usd;
             app.usage_overlay.month_usd = month_usd;
-            app.usage_overlay.session_usd = app.cost_usd;
-            app.usage_overlay.session_in = app.session_in;
-            app.usage_overlay.session_out = app.session_out;
+            app.usage_overlay.session_usd = session_usd;
+            app.usage_overlay.session_in = session_in;
+            app.usage_overlay.session_out = session_out;
+            app.usage_overlay.by_model_5h = by_model_5h;
             app.usage_overlay.by_model = by_model;
+            app.usage_overlay.by_model_week = by_model_week;
             app.usage_overlay.daily_cap = daily_cap;
+            app.usage_overlay.weekly_cap = weekly_cap;
             app.usage_overlay.monthly_cap = monthly_cap;
+            app.usage_overlay.codex_5h_pct = bstats.codex_5h_pct;
+            app.usage_overlay.codex_weekly_pct = bstats.codex_weekly_pct;
+            app.usage_overlay.claude_5h_in = bstats.claude_5h_in;
+            app.usage_overlay.claude_5h_out = bstats.claude_5h_out;
+            app.usage_overlay.claude_weekly_in = bstats.claude_weekly_in;
+            app.usage_overlay.claude_weekly_out = bstats.claude_weekly_out;
             app.usage_overlay.open = true;
         }
         // Not a builtin → try the file-based command/skill catalog.

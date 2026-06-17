@@ -530,16 +530,45 @@ impl Session {
         self.store.spend_this_month_usd().unwrap_or(0.0)
     }
 
+    /// Token and cost totals for the current session from the DB (reliable for bridge providers).
+    pub fn session_usage_db(&self) -> (u64, u64, f64) {
+        let id = self.session_id();
+        let (inp, out) = self.store.session_tokens(id).unwrap_or((0, 0));
+        let cost = self.store.session_cost(id).unwrap_or(0.0);
+        (inp, out, cost)
+    }
+
+    /// Spend in the last 5 hours (rolling window). Returns 0.0 on store error.
+    pub fn spend_last_5h_usd(&self) -> f64 {
+        self.store.spend_last_5h_usd().unwrap_or(0.0)
+    }
+
+    /// Spend in the current ISO week (Monday 00:00 local → now). Returns 0.0 on store error.
+    pub fn spend_this_week_usd(&self) -> f64 {
+        self.store.spend_this_week_usd().unwrap_or(0.0)
+    }
+
+    /// Per-model spend + token counts for the last 5 hours.
+    pub fn spend_by_model_5h(&self) -> Vec<(String, f64, u64, u64)> {
+        self.store.spend_by_model_5h().unwrap_or_default()
+    }
+
     /// Per-model spend + token counts for today, for the `/usage` overlay.
     pub fn spend_by_model_today(&self) -> Vec<(String, f64, u64, u64)> {
         self.store.spend_by_model_today().unwrap_or_default()
     }
 
-    /// Daily/monthly caps from config, for the `/usage` overlay gauges.
-    pub fn budget_caps(&self) -> (Option<f64>, Option<f64>) {
+    /// Per-model spend + token counts for this ISO week.
+    pub fn spend_by_model_week(&self) -> Vec<(String, f64, u64, u64)> {
+        self.store.spend_by_model_week().unwrap_or_default()
+    }
+
+    /// Daily/monthly/weekly caps from config, for the `/usage` overlay gauges.
+    pub fn budget_caps(&self) -> (Option<f64>, Option<f64>, Option<f64>) {
         (
             self.config.mesh.daily_budget_usd,
             self.config.mesh.monthly_cap_usd,
+            self.config.mesh.weekly_budget_usd,
         )
     }
 
@@ -803,6 +832,8 @@ impl Session {
         let budget = BudgetState {
             spent_today_usd: self.store.spend_today_usd()?,
             daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_week_usd: self.store.spend_this_week_usd()?,
+            weekly_cap_usd: self.config.mesh.weekly_budget_usd,
             spent_month_usd: self.store.spend_this_month_usd()?,
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
@@ -873,6 +904,8 @@ impl Session {
         let budget = BudgetState {
             spent_today_usd: self.store.spend_today_usd().unwrap_or(0.0),
             daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_week_usd: self.store.spend_this_week_usd().unwrap_or(0.0),
+            weekly_cap_usd: self.config.mesh.weekly_budget_usd,
             spent_month_usd: self.store.spend_this_month_usd().unwrap_or(0.0),
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
@@ -978,11 +1011,13 @@ impl Session {
         tier_override: Option<TaskTier>,
     ) -> Result<String, CoreError> {
         // 1. Route the task (deterministic, no model call) and record why. The budget is
-        // aggregated across ALL sessions for the current local day + month (FR-5), not one
+        // aggregated across ALL sessions for the current local day + week + month (FR-5), not one
         // session's running total.
         let budget = BudgetState {
             spent_today_usd: self.store.spend_today_usd()?,
             daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_week_usd: self.store.spend_this_week_usd()?,
+            weekly_cap_usd: self.config.mesh.weekly_budget_usd,
             spent_month_usd: self.store.spend_this_month_usd()?,
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
@@ -1649,10 +1684,12 @@ impl Session {
             }
         };
 
-        // Budget snapshot so children also down-tier when the day/month is under pressure.
+        // Budget snapshot so children also down-tier when the day/week/month is under pressure.
         let budget = BudgetState {
             spent_today_usd: self.store.spend_today_usd()?,
             daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_week_usd: self.store.spend_this_week_usd()?,
+            weekly_cap_usd: self.config.mesh.weekly_budget_usd,
             spent_month_usd: self.store.spend_this_month_usd()?,
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
