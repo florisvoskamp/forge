@@ -31,6 +31,7 @@ use rmcp::model::{
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::Value;
 
+pub mod oauth;
 mod transport;
 
 /// Meta-tool names (the deferred-loading + resource/prompt surface). Mirrors the
