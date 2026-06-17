@@ -139,7 +139,7 @@ mod tests {
                     content: text.clone(),
                     tool_calls: Vec::new(),
                     usage: Default::default(),
-                    quota: None,
+                    quotas: Vec::new(),
                 }),
                 Err(()) => Err(ProviderError::Request("boom".into())),
             }

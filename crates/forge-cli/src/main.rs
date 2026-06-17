@@ -356,6 +356,32 @@ fn init_tracing() {
 
 /// Keep the command palette in sync with the `/command` token at the cursor (input end): open +
 /// filter when one is present anywhere on the line, close when not (`//` escape yields no token).
+/// Fill in missing bridge-provider percentages on the usage overlay from the store's
+/// `subscription_usage` table (set via rate_limit_event during Forge turns). Used as a
+/// fallback when the statusline cache file is stale or missing.
+fn apply_quota_fallback(
+    overlay: &mut forge_tui::UsageOverlay,
+    fracs: &std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
+) {
+    let pct = |f: f64| Some(f * 100.0);
+    if let Some(claude) = fracs.get("claude-cli") {
+        if overlay.claude_5h_pct.is_none() {
+            overlay.claude_5h_pct = claude.get("five_hour").copied().and_then(|f| pct(f));
+        }
+        if overlay.claude_weekly_pct.is_none() {
+            overlay.claude_weekly_pct = claude.get("weekly").copied().and_then(|f| pct(f));
+        }
+    }
+    if let Some(codex) = fracs.get("codex-cli") {
+        if overlay.codex_5h_pct.is_none() {
+            overlay.codex_5h_pct = codex.get("five_hour").copied().and_then(|f| pct(f));
+        }
+        if overlay.codex_weekly_pct.is_none() {
+            overlay.codex_weekly_pct = codex.get("weekly").copied().and_then(|f| pct(f));
+        }
+    }
+}
+
 fn sync_palette_to_slash_token(app: &mut forge_tui::App) {
     match forge_tui::slash_token_at(&app.input, app.input.len()) {
         Some(tok) if app.palette.open => {
@@ -3370,6 +3396,7 @@ async fn run_chat_tui(
                         by_model,
                         by_model_week,
                         (daily_cap, monthly_cap, weekly_cap),
+                        bridge_fracs,
                     ),
                     (session_in, session_out, session_usd),
                 ) = {
@@ -3381,6 +3408,7 @@ async fn run_chat_tui(
                             s.spend_by_model_today(),
                             s.spend_by_model_week(),
                             s.budget_caps(),
+                            s.bridge_fractions(),
                         ),
                         s.session_usage_db(),
                     )
@@ -3406,6 +3434,9 @@ async fn run_chat_tui(
                 app.usage_overlay.claude_5h_out = bstats.claude_5h_out;
                 app.usage_overlay.claude_weekly_in = bstats.claude_weekly_in;
                 app.usage_overlay.claude_weekly_out = bstats.claude_weekly_out;
+                // Fallback: use stored quota fractions when the statusline cache is stale.
+                // The store is updated on every CLI-bridge turn via rate_limit_event.
+                apply_quota_fallback(&mut app.usage_overlay, &bridge_fracs);
             }
         }
 
@@ -3887,6 +3918,7 @@ async fn dispatch_command(
                     by_model,
                     by_model_week,
                     (daily_cap, monthly_cap, weekly_cap),
+                    bridge_fracs,
                 ),
                 (session_in, session_out, session_usd),
                 bstats,
@@ -3900,6 +3932,7 @@ async fn dispatch_command(
                             s.spend_by_model_today(),
                             s.spend_by_model_week(),
                             s.budget_caps(),
+                            s.bridge_fractions(),
                         ),
                         s.session_usage_db(),
                     )
@@ -3927,6 +3960,7 @@ async fn dispatch_command(
             app.usage_overlay.claude_5h_out = bstats.claude_5h_out;
             app.usage_overlay.claude_weekly_in = bstats.claude_weekly_in;
             app.usage_overlay.claude_weekly_out = bstats.claude_weekly_out;
+            apply_quota_fallback(&mut app.usage_overlay, &bridge_fracs);
             app.usage_overlay.open = true;
         }
         // Not a builtin → try the file-based command/skill catalog.

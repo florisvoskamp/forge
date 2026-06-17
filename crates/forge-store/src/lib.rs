@@ -84,6 +84,48 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// Migrate `subscription_usage` from its old single-column PK to the composite
+/// `(provider, window_kind)` PK. Safe to call on any DB version: a no-op when the table
+/// doesn't exist yet (schema will create it correctly) or already has the composite key.
+fn migrate_subscription_usage(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='subscription_usage'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        return Ok(()); // table not yet created; schema will handle it
+    }
+    let pk_cols: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('subscription_usage') WHERE pk > 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if pk_cols >= 2 {
+        return Ok(()); // already on composite PK
+    }
+    // Old single-column PK — recreate with composite key.
+    // subscription_usage is a transient cache; data loss on migration is acceptable.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS subscription_usage_new;
+         CREATE TABLE subscription_usage_new (
+             provider    TEXT NOT NULL,
+             window_kind TEXT NOT NULL,
+             status      TEXT NOT NULL,
+             resets_at   INTEGER,
+             fraction    REAL,
+             updated_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+             PRIMARY KEY (provider, window_kind)
+         );
+         DROP TABLE subscription_usage;
+         ALTER TABLE subscription_usage_new RENAME TO subscription_usage;",
+    )
+}
+
 impl Store {
     /// Open (creating if needed) a database file and run migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -99,6 +141,8 @@ impl Store {
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Migrate before schema so old DBs get the composite PK before CREATE TABLE IF NOT EXISTS no-ops.
+        let _ = migrate_subscription_usage(&conn);
         conn.execute_batch(schema::SCHEMA)?;
         // Best-effort migrations for databases created before these columns existed
         // (errors on already-present columns are expected and ignored).
@@ -573,9 +617,10 @@ impl Store {
         self.lock()?.execute(
             "INSERT INTO subscription_usage (provider, window_kind, status, resets_at, fraction, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))
-             ON CONFLICT(provider) DO UPDATE SET
-               window_kind = excluded.window_kind, status = excluded.status,
-               resets_at = excluded.resets_at, fraction = excluded.fraction,
+             ON CONFLICT(provider, window_kind) DO UPDATE SET
+               status = excluded.status,
+               resets_at = excluded.resets_at,
+               fraction = excluded.fraction,
                updated_at = excluded.updated_at",
             (
                 hint.provider.as_str(),
@@ -623,12 +668,46 @@ impl Store {
         self.quota_at(chrono::Utc::now().timestamp())
     }
 
+    /// Per-provider, per-window fraction from `subscription_usage` (for display).
+    /// Only returns non-stale rows (window hasn't reset yet or has no reset time).
+    /// Returns `HashMap<provider, HashMap<window_kind, fraction>>`.
+    pub fn bridge_fractions(
+        &self,
+    ) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, f64>>> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT provider, window_kind, fraction FROM subscription_usage
+         WHERE fraction IS NOT NULL AND (resets_at IS NULL OR resets_at > ?1)",
+        )?;
+        let mut out: std::collections::HashMap<String, std::collections::HashMap<String, f64>> =
+            std::collections::HashMap::new();
+        let rows = stmt.query_map([now], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })?;
+        for row in rows.flatten() {
+            out.entry(row.0).or_default().insert(row.1, row.2);
+        }
+        Ok(out)
+    }
+
     /// [`current_quota`](Self::current_quota) at an explicit `now` (epoch secs) — testable clock.
     pub fn quota_at(&self, now: i64) -> Result<forge_types::SubscriptionQuota> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT provider, status FROM subscription_usage
-             WHERE resets_at IS NULL OR resets_at > ?1",
+            "SELECT provider,
+                   CASE MAX(CASE status WHEN 'exhausted' THEN 2 WHEN 'warning' THEN 1 ELSE 0 END)
+                       WHEN 2 THEN 'exhausted'
+                       WHEN 1 THEN 'warning'
+                       ELSE 'ok'
+                   END
+             FROM subscription_usage
+             WHERE resets_at IS NULL OR resets_at > ?1
+             GROUP BY provider",
         )?;
         let map = stmt
             .query_map([now], |row| {

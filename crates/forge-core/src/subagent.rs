@@ -681,7 +681,7 @@ mod tests {
                 content: "child done".into(),
                 tool_calls: vec![],
                 usage: forge_types::Usage::default(),
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }

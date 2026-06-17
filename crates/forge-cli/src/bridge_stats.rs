@@ -154,7 +154,7 @@ fn fetch_claude_rate_limits(stats: &mut BridgeStats, home: &Path) {
     };
     // Only use if the cache is fresh (< 1 hour old).
     let ts = v["ts"].as_i64().unwrap_or(0);
-    if now_epoch() - ts > 3600 {
+    if now_epoch() - ts > 4 * 3600 {
         return;
     }
     stats.claude_5h_pct = v["5h_pct"].as_f64();

@@ -104,16 +104,17 @@ CREATE TABLE IF NOT EXISTS model_health (
     updated_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 
--- Subscription quota windows (quota-aware routing, L3). One row per bridge provider; the latest
--- observation from the CLI stream (Claude's `rate_limit_event`). The row stops constraining once
--- `resets_at` passes (the window rolled over).
+-- Subscription quota windows (quota-aware routing, L3). One row per bridge provider per window;
+-- composite PK so 5h and weekly windows are tracked independently.
+-- The row stops constraining once `resets_at` passes (the window rolled over).
 CREATE TABLE IF NOT EXISTS subscription_usage (
-    provider    TEXT PRIMARY KEY,      -- bridge prefix: claude-cli / codex-cli
+    provider    TEXT NOT NULL,         -- bridge prefix: claude-cli / codex-cli
     window_kind TEXT NOT NULL,         -- five_hour / weekly / … ("" if unknown)
     status      TEXT NOT NULL,         -- ok / warning / exhausted
     resets_at   INTEGER,               -- epoch secs; row is stale once now > resets_at
     fraction    REAL,                  -- 0.0–1.0 window used, if reported
-    updated_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    updated_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (provider, window_kind)
 );
 
 -- The agent's task/todo list (the `update_tasks` tool). One row per session holding the latest

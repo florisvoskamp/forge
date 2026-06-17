@@ -541,7 +541,7 @@ mod tests {
                     content: content.into(),
                     tool_calls: vec![],
                     usage,
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             // Verifier call: refute findings whose body contains "REFUTE ME", else uphold.
@@ -556,14 +556,14 @@ mod tests {
                     content: v.into(),
                     tool_calls: vec![],
                     usage,
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
                 content: "[]".into(),
                 tool_calls: vec![],
                 usage,
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -619,7 +619,7 @@ mod tests {
                 content: content.into(),
                 tool_calls: vec![],
                 usage: Usage::default(),
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }

@@ -572,6 +572,14 @@ impl Session {
         )
     }
 
+    /// Per-provider, per-window fraction from `subscription_usage` (for display fallback when
+    /// the statusline cache is stale). Returns `HashMap<provider, HashMap<window_kind, fraction>>`.
+    pub fn bridge_fractions(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::HashMap<String, f64>> {
+        self.store.bridge_fractions().unwrap_or_default()
+    }
+
     /// Advance the temper through the SHIFT+TAB cycle, persist it, and return the new temper
     /// (RFC/temper-modes). Takes effect on the next turn's permission decisions.
     pub fn cycle_temper(&mut self) -> PermissionMode {
@@ -1298,7 +1306,7 @@ impl Session {
             self.store.record_usage(&self.id, &msg_id, &resp.usage)?;
             // Quota-aware routing (L3): if a CLI bridge reported its subscription window this turn,
             // persist it so the next route() can demote/skip a near-limit subscription.
-            if let Some(hint) = &resp.quota {
+            for hint in &resp.quotas {
                 let _ = self.store.record_quota(hint);
             }
 
@@ -2238,7 +2246,7 @@ mod tests {
                     content: "done".into(),
                     tool_calls: vec![],
                     usage,
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
@@ -2252,7 +2260,7 @@ mod tests {
                     }),
                 }],
                 usage,
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -2311,7 +2319,7 @@ mod tests {
                     content: "done".into(),
                     tool_calls: vec![],
                     usage,
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
@@ -2322,7 +2330,7 @@ mod tests {
                     args: serde_json::json!({ "name": "test__echo", "arguments": { "msg": "hi" } }),
                 }],
                 usage,
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -2429,7 +2437,7 @@ mod tests {
                     content: "done".into(),
                     tool_calls: vec![],
                     usage,
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
@@ -2443,7 +2451,7 @@ mod tests {
                     ]}),
                 }],
                 usage,
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -2504,7 +2512,7 @@ mod tests {
                     content: "done".into(),
                     tool_calls: vec![],
                     usage: Usage::default(),
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
@@ -2515,7 +2523,7 @@ mod tests {
                     args: serde_json::json!({ "path": "." }),
                 }],
                 usage: Usage::default(),
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -2535,7 +2543,7 @@ mod tests {
                 content: "SUMMARY: built the parser, wired the CLI.".into(),
                 tool_calls: vec![],
                 usage: forge_types::Usage::default(),
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -2559,7 +2567,7 @@ mod tests {
                 content: if saw { "SAW_INJECTION" } else { "NO_INJECTION" }.into(),
                 tool_calls: vec![],
                 usage: forge_types::Usage::default(),
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -2672,7 +2680,7 @@ mod tests {
                     content: "The command is not installed. Fix: install it first.".into(),
                     tool_calls: vec![],
                     usage,
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             if messages.iter().any(|m| m.role == Role::Tool) {
@@ -2680,7 +2688,7 @@ mod tests {
                     content: "done".into(),
                     tool_calls: vec![],
                     usage,
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
@@ -2691,7 +2699,7 @@ mod tests {
                     args: serde_json::json!({ "command": "definitelynotacommand_xyz" }),
                 }],
                 usage,
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -2784,7 +2792,7 @@ mod tests {
                     content: "done".into(),
                     tool_calls: vec![],
                     usage: Usage::default(),
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
@@ -2795,7 +2803,7 @@ mod tests {
                     args: serde_json::json!({ "command": "echo hi" }),
                 }],
                 usage: Usage::default(),
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -2820,7 +2828,7 @@ mod tests {
                     content: if saw { "SAW_SKILL" } else { "NO_SKILL" }.into(),
                     tool_calls: vec![],
                     usage: Usage::default(),
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
@@ -2831,7 +2839,7 @@ mod tests {
                     args: serde_json::json!({ "name": "demoskill" }),
                 }],
                 usage: Usage::default(),
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -2905,7 +2913,7 @@ mod tests {
                     content: "done".into(),
                     tool_calls: vec![],
                     usage: Usage::default(),
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
@@ -2916,7 +2924,7 @@ mod tests {
                     args: serde_json::json!({ "path": self.path, "content": "hi from auto-edit" }),
                 }],
                 usage: Usage::default(),
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -3452,7 +3460,7 @@ mod tests {
                         content: content.into(),
                         tool_calls: vec![],
                         usage,
-                        quota: None,
+                        quotas: Vec::new(),
                     });
                 }
                 return Ok(ModelResponse {
@@ -3463,7 +3471,7 @@ mod tests {
                         args: serde_json::json!({"path": "Cargo.toml"}),
                     }],
                     usage,
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             // Parent: fan out, then synthesize once results return.
@@ -3474,7 +3482,7 @@ mod tests {
                     content: content.into(),
                     tool_calls: vec![],
                     usage,
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
@@ -3488,7 +3496,7 @@ mod tests {
                     ]}),
                 }],
                 usage,
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -3640,7 +3648,7 @@ mod tests {
                     content: "leaf answer".into(),
                     tool_calls: vec![],
                     usage,
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
@@ -3651,7 +3659,7 @@ mod tests {
                     args: serde_json::json!({"agents": [{"task": "go deeper"}]}),
                 }],
                 usage,
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -3814,7 +3822,7 @@ mod tests {
                 content: "recovered".into(),
                 tool_calls: vec![],
                 usage: forge_types::Usage::default(),
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -4028,7 +4036,7 @@ mod tests {
                     content: "done".into(),
                     tool_calls: vec![],
                     usage,
-                    quota: None,
+                    quotas: Vec::new(),
                 });
             }
             Ok(ModelResponse {
@@ -4039,7 +4047,7 @@ mod tests {
                     args: serde_json::json!({ "path": self.path, "content": self.content }),
                 }],
                 usage,
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -4156,7 +4164,7 @@ mod tests {
                 content: "too late".into(),
                 tool_calls: vec![],
                 usage: forge_types::Usage::default(),
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }
@@ -4234,7 +4242,7 @@ mod tests {
                 content,
                 tool_calls: vec![],
                 usage: forge_types::Usage::default(),
-                quota: None,
+                quotas: Vec::new(),
             })
         }
     }

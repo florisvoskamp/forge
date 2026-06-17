@@ -100,10 +100,10 @@ pub struct ModelResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
-    /// A subscription quota observation surfaced by a CLI bridge this turn (Claude's
-    /// `rate_limit_event`), for quota-aware routing (L3). `None` for API providers / when the
-    /// bridge reported nothing.
-    pub quota: Option<QuotaHint>,
+    /// Subscription quota observations surfaced by a CLI bridge this turn (Claude's
+    /// `rate_limit_event` / Codex rollout). Empty for API providers / when the bridge
+    /// reported nothing. Multiple entries when both the 5h and weekly windows were observed.
+    pub quotas: Vec<QuotaHint>,
 }
 
 impl ModelResponse {
