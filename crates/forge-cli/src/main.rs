@@ -338,25 +338,29 @@ struct ImportCounts {
     skipped_commands: usize,
     copied_skills: usize,
     skipped_skills: usize,
+    copied_agents: usize,
+    skipped_agents: usize,
 }
 
-/// `forge import <source> [--project]` — copy another AI CLI's commands/skills into a Forge
-/// scope, reusing the CC-compatible readers (command-skill-system.md) to validate before
-/// copying. Claude imports commands + skills; Codex imports its prompts as commands.
+/// `forge import <source> [--project]` — copy another AI CLI's commands/skills/agents into a
+/// Forge scope, reusing the CC-compatible readers to validate before copying. Claude imports
+/// commands + skills + agents; Codex imports its prompts as commands.
 fn import_cmd(source: ImportSource) -> Result<()> {
-    let (label, project, home, commands_sub, skills_sub) = match source {
+    let (label, project, home, commands_sub, skills_sub, agents_sub) = match source {
         ImportSource::Claude { project } => (
             "claude",
             project,
             forge_config::claude_dir().context("no home directory — cannot locate ~/.claude")?,
             "commands",
             Some("skills"),
+            Some("agents"),
         ),
         ImportSource::Codex { project } => (
             "codex",
             project,
             forge_config::codex_dir().context("no home directory — cannot locate ~/.codex")?,
             "prompts",
+            None,
             None,
         ),
     };
@@ -365,14 +369,19 @@ fn import_cmd(source: ImportSource) -> Result<()> {
         return Ok(());
     }
 
-    let (cmd_dst, skill_dst) = if project {
+    let (cmd_dst, skill_dst, agent_dst) = if project {
         (
             std::path::PathBuf::from("./.forge/commands"),
             std::path::PathBuf::from("./.forge/skills"),
+            std::path::PathBuf::from("./.forge/agents"),
         )
     } else {
         let base = forge_config::config_dir().context("no config directory on this platform")?;
-        (base.join("commands"), base.join("skills"))
+        (
+            base.join("commands"),
+            base.join("skills"),
+            base.join("agents"),
+        )
     };
 
     // Validate assets with the real catalog readers (malformed files are skipped + warned).
@@ -391,25 +400,58 @@ fn import_cmd(source: ImportSource) -> Result<()> {
             .unwrap_or_default(),
     };
     let cat = forge_skills::Catalog::load(&sources);
-    let counts = copy_catalog_assets(&cat, &cmd_dst, &skill_dst);
+    let mut counts = copy_catalog_assets(&cat, &cmd_dst, &skill_dst);
 
+    // Agents: CC and Forge use the same .md front-matter format — direct file copy.
+    if let Some(asub) = agents_sub {
+        let agent_src = home.join(asub);
+        if agent_src.is_dir() {
+            count_copy_md_files(&agent_src, &agent_dst, &mut counts);
+        }
+    }
+
+    let scope = if project { "./.forge" } else { "the user config" };
     println!(
-        "✓ imported {} command(s) + {} skill(s) from {label} into {} \
-         ({} command(s), {} skill(s) already present, skipped)",
+        "✓ imported {} command(s) + {} skill(s) + {} agent(s) from {label} into {scope} \
+         ({} command(s), {} skill(s), {} agent(s) already present, skipped)",
         counts.copied_commands,
         counts.copied_skills,
-        if project {
-            "./.forge"
-        } else {
-            "the user config"
-        },
+        counts.copied_agents,
         counts.skipped_commands,
         counts.skipped_skills,
+        counts.skipped_agents,
     );
     for w in cat.warnings() {
         eprintln!("skipped (malformed): {w}");
     }
     Ok(())
+}
+
+/// Copy `*.md` files from `src` into `dst`, skipping any that already exist. Updates `counts`.
+fn count_copy_md_files(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    counts: &mut ImportCounts,
+) {
+    std::fs::create_dir_all(dst).ok();
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        if from.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(fname) = from.file_name() else {
+            continue;
+        };
+        let to = dst.join(fname);
+        if to.exists() {
+            counts.skipped_agents += 1;
+        } else if std::fs::copy(&from, &to).is_ok() {
+            counts.copied_agents += 1;
+        }
+    }
 }
 
 /// Copy a loaded catalog's command files + skill directories into the target scope, keeping any
