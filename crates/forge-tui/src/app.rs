@@ -98,6 +98,9 @@ pub struct App {
     /// animate with a spinner in the live preview; on completion each becomes a scrollback
     /// branch line, and the whole group folds (header + branches + footer) when all finish.
     subagents: Vec<SubRow>,
+    /// Per-critic rows for the live assay panel. Populated from AssayCriticRow events; cleared
+    /// when the AssayReport arrives (the full report lands in scrollback instead).
+    assay_critics: Vec<forge_types::AssayCriticRow>,
     /// The inline slash-command palette (RFC session-management-and-commands). Open while the
     /// input line starts with `/`.
     pub palette: crate::commands::Palette,
@@ -353,7 +356,20 @@ impl App {
                     Style::default().fg(DIM),
                 )));
             }
+            PresenterEvent::AssayCriticRow(row) => {
+                // Update the live panel: insert on Queued, update status on Done/Skipped.
+                if let Some(existing) = self
+                    .assay_critics
+                    .iter_mut()
+                    .find(|r| r.lens == row.lens)
+                {
+                    existing.status = row.status;
+                } else {
+                    self.assay_critics.push(row);
+                }
+            }
             PresenterEvent::AssayReport(report) => {
+                self.assay_critics.clear();
                 self.flush
                     .extend(crate::render::assay_report_lines(&report));
                 self.flush.push(TextLine::default());
@@ -393,6 +409,20 @@ impl App {
         let shown = self.tasks.len().min(TASKS_PANEL_MAX);
         let overflow = u16::from(self.tasks.len() > TASKS_PANEL_MAX);
         1 + shown as u16 + overflow
+    }
+
+    /// Number of assay critics in the live panel (> 0 while an assay run is in flight).
+    pub fn running_assay_critics(&self) -> usize {
+        self.assay_critics.len()
+    }
+
+    /// Rows the live assay critics panel wants (0 = hidden). Header + one row per critic.
+    pub fn assay_panel_height(&self) -> u16 {
+        let n = self.assay_critics.len();
+        if n == 0 {
+            return 0;
+        }
+        1 + n as u16
     }
 
     /// Rows the running-subagents panel wants in the live region (0 = none running). Dedicated
@@ -804,16 +834,21 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     let avail = frame.area().height.saturating_sub(fixed);
     let panel_avail = avail.saturating_sub(MIN_STREAM);
 
-    // Subagent panel gets at most half of panel_avail; task panel gets the rest.
+    // Subagent panel gets at most half; assay panel gets at most half of what remains; tasks get
+    // the rest. Panels are typically mutually exclusive (assay and subagents don't run together).
     let sub_h = app.subagents_panel_height().min(panel_avail / 2);
+    let assay_h = app
+        .assay_panel_height()
+        .min(panel_avail.saturating_sub(sub_h) / 2);
     let task_h = app
         .tasks_panel_height()
-        .min(panel_avail.saturating_sub(sub_h));
-    let stream_h = avail.saturating_sub(sub_h + task_h);
+        .min(panel_avail.saturating_sub(sub_h + assay_h));
+    let stream_h = avail.saturating_sub(sub_h + assay_h + task_h);
 
     let areas = Layout::vertical([
         Constraint::Length(stream_h),
         Constraint::Length(sub_h),
+        Constraint::Length(assay_h),
         Constraint::Length(task_h),
         Constraint::Length(PERMISSION_H),
         Constraint::Length(INPUT_H),
@@ -834,17 +869,20 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     if sub_h > 0 {
         render_subagents_panel(frame, areas[1], app);
     }
+    if assay_h > 0 {
+        render_assay_panel(frame, areas[2], app);
+    }
     if task_h > 0 {
         frame.render_widget(
-            Paragraph::new(tasks_panel_lines(&app.tasks, areas[2].height)),
-            areas[2],
+            Paragraph::new(tasks_panel_lines(&app.tasks, areas[3].height)),
+            areas[3],
         );
     }
     if app.prompt.is_some() {
-        render_permission(frame, areas[3], app);
+        render_permission(frame, areas[4], app);
     }
-    render_input(frame, areas[4], app);
-    render_statusline(frame, areas[5], app);
+    render_input(frame, areas[5], app);
+    render_statusline(frame, areas[6], app);
 }
 
 /// The inline slash-command palette: a scrolling window of filtered commands, selected row
@@ -1054,6 +1092,57 @@ fn render_subagents_panel(frame: &mut Frame, area: Rect, app: &App) {
         lines.pop();
         lines.push(TextLine::from(Span::styled(
             format!("  … +{} more running", running.len() - body_h + 1),
+            Style::default().fg(DIM),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The sticky live-assay panel: header showing total critic count, then one row per critic with
+/// its current status glyph (queued / spinner / done / skipped). Cleared when AssayReport arrives.
+fn render_assay_panel(frame: &mut Frame, area: Rect, app: &App) {
+    use forge_types::AssayCriticStatus;
+    if app.assay_critics.is_empty() {
+        return;
+    }
+    let spin = SPINNER[app.tick % SPINNER.len()];
+    let total = app.assay_critics.len();
+    let done = app
+        .assay_critics
+        .iter()
+        .filter(|r| !matches!(r.status, AssayCriticStatus::Queued))
+        .count();
+    let h = area.height as usize;
+    let mut lines: Vec<TextLine> = Vec::with_capacity(h);
+    lines.push(TextLine::from(Span::styled(
+        format!("  ⚒ assay critics ({done}/{total})"),
+        Style::default().fg(ORANGE).bold(),
+    )));
+    let body_h = h.saturating_sub(1);
+    for r in app.assay_critics.iter().take(body_h) {
+        let (glyph, style) = match &r.status {
+            AssayCriticStatus::Queued => (
+                format!("{spin} {}", r.lens),
+                Style::default().fg(DIM),
+            ),
+            AssayCriticStatus::Done { candidates } => (
+                format!("✓ {} ({candidates})", r.lens),
+                Style::default().fg(OKGREEN),
+            ),
+            AssayCriticStatus::Skipped { reason } => (
+                format!("⏭ {} — {}", r.lens, truncate(reason, 40)),
+                Style::default().fg(DIM),
+            ),
+        };
+        lines.push(TextLine::from(Span::styled(
+            format!("  {glyph}"),
+            style,
+        )));
+    }
+    if app.assay_critics.len() > body_h {
+        lines.pop();
+        lines.push(TextLine::from(Span::styled(
+            format!("  … +{} more", app.assay_critics.len() - body_h + 1),
             Style::default().fg(DIM),
         )));
     }
