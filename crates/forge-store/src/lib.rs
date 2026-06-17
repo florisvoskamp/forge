@@ -523,9 +523,20 @@ impl Store {
     }
 
     /// All *active* messages of a session, in turn order (by seq). Soft-deleted rows (those a
-    /// `/undo` rewound past) are excluded — they remain in the table for audit/redo.
+    /// `/undo` rewound past) are excluded — they remain in the table for audit/redo. If a
+    /// compaction summary exists (written by [`compact_session_store`](Self::compact_session_store)),
+    /// a synthetic System message is prepended so a resumed session sees the compacted view.
     pub fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
         let conn = self.lock()?;
+        // Read compaction summary before the message prepare (both are &self borrows; ordering
+        // keeps the non-mut borrow from query_row from conflicting with the stmt lifetime).
+        let summary: Option<String> = conn
+            .query_row(
+                "SELECT summary FROM session_compaction WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .ok();
         let mut stmt = conn.prepare(
             "SELECT role, content, model, tool_calls_json, tool_call_id
              FROM message WHERE session_id = ?1 AND active = 1 ORDER BY seq",
@@ -544,8 +555,68 @@ impl Store {
                 tool_call_id: row.get(4)?,
             })
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
+        let mut msgs = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        if let Some(s) = summary {
+            msgs.insert(
+                0,
+                StoredMessage {
+                    role: Role::System,
+                    content: format!(
+                        "[Earlier conversation summarized to save context]\n{}",
+                        s.trim()
+                    ),
+                    model: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                },
+            );
+        }
+        Ok(msgs)
+    }
+
+    /// Persist the compacted view of a session: soft-delete the oldest active messages (keeping
+    /// the last `keep_count`) and upsert `summary` into `session_compaction`. On the next resume,
+    /// [`load_messages`](Self::load_messages) prepends a System message with the summary so the
+    /// session rehydrates the compacted state instead of the full transcript.
+    pub fn compact_session_store(
+        &self,
+        session_id: &str,
+        summary: &str,
+        keep_count: usize,
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        if keep_count == 0 {
+            tx.execute(
+                "UPDATE message SET active = 0 WHERE session_id = ?1 AND active = 1",
+                [session_id],
+            )?;
+        } else {
+            // Soft-delete every active message whose seq is below the (keep_count)-th newest.
+            // LIMIT 1 OFFSET (keep_count-1) on DESC order gives the oldest row to KEEP.
+            tx.execute(
+                "UPDATE message SET active = 0
+                 WHERE session_id = ?1 AND active = 1
+                 AND seq < (
+                     SELECT seq FROM message
+                     WHERE session_id = ?1 AND active = 1
+                     ORDER BY seq DESC
+                     LIMIT 1 OFFSET ?2
+                 )",
+                (session_id, keep_count as i64 - 1),
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO session_compaction (session_id, summary) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET
+               summary = excluded.summary,
+               created_at = strftime('%s','now')",
+            (session_id, summary),
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Every active message of a session in turn order, each joined to its usage row so a
@@ -1396,6 +1467,60 @@ mod tests {
         }];
         store.set_tasks(&sid, &next).unwrap();
         assert_eq!(store.tasks(&sid).unwrap(), next, "replaced, not appended");
+    }
+
+    #[test]
+    fn compact_session_store_prepends_summary_on_resume() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("/tmp", "default").unwrap();
+        for i in 0..8i64 {
+            store
+                .add_message(&sid, i, Role::User, &format!("msg {i}"), None)
+                .unwrap();
+        }
+
+        // Keep the last 3, summarize the first 5.
+        store
+            .compact_session_store(&sid, "Summary of first 5 messages.", 3)
+            .unwrap();
+
+        let msgs = store.load_messages(&sid).unwrap();
+        // 1 summary + 3 kept = 4
+        assert_eq!(msgs.len(), 4, "summary + 3 kept messages");
+        assert_eq!(msgs[0].role, Role::System, "prepended summary is a System message");
+        assert!(
+            msgs[0].content.contains("Summary of first 5 messages."),
+            "summary content preserved"
+        );
+        assert_eq!(msgs[1].content, "msg 5");
+        assert_eq!(msgs[2].content, "msg 6");
+        assert_eq!(msgs[3].content, "msg 7");
+    }
+
+    #[test]
+    fn compact_session_store_upserts_summary_on_second_compact() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("/tmp", "default").unwrap();
+        for i in 0..6i64 {
+            store
+                .add_message(&sid, i, Role::User, &format!("msg {i}"), None)
+                .unwrap();
+        }
+        store.compact_session_store(&sid, "First summary.", 3).unwrap();
+        // Add 3 more messages (simulate new turns after first compact).
+        for i in 6..9i64 {
+            store
+                .add_message(&sid, i, Role::User, &format!("msg {i}"), None)
+                .unwrap();
+        }
+        store.compact_session_store(&sid, "Second summary.", 3).unwrap();
+
+        let msgs = store.load_messages(&sid).unwrap();
+        assert_eq!(msgs.len(), 4, "summary + 3 kept after second compact");
+        assert!(msgs[0].content.contains("Second summary."), "upserted summary");
+        assert_eq!(msgs[1].content, "msg 6");
+        assert_eq!(msgs[2].content, "msg 7");
+        assert_eq!(msgs[3].content, "msg 8");
     }
 
     #[test]

@@ -185,4 +185,13 @@ CREATE TABLE IF NOT EXISTS lattice_embedding (
     dim     INTEGER NOT NULL,
     vec     BLOB NOT NULL
 );
+
+-- Persisted compaction summary (/compact). When compact() runs, the older messages are
+-- soft-deleted and their model-generated summary is stored here. load_messages prepends
+-- a synthetic System message with this summary so a resumed session loads the compacted view.
+CREATE TABLE IF NOT EXISTS session_compaction (
+    session_id TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+    summary    TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
 "#;

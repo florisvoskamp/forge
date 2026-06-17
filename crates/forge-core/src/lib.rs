@@ -657,6 +657,12 @@ impl Session {
         compacted.extend(self.transcript.split_off(split));
         self.transcript = compacted;
 
+        // Persist: soft-delete the summarised messages and store the summary so a resumed
+        // session rehydrates the compacted view instead of the full uncompacted transcript.
+        let _ = self
+            .store
+            .compact_session_store(&self.id, summary.trim(), COMPACT_KEEP_RECENT);
+
         let after = self.transcript.len();
         self.presenter.emit(PresenterEvent::Warning(format!(
             "compacted {before} messages → {after} (summary via {})",
