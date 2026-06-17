@@ -356,7 +356,11 @@ impl Presenter for HeadlessPresenter {
                     "  ⌬ lattice → injected {symbols} symbols · {files} files (~{tokens} tok)"
                 );
             }
-            PresenterEvent::ShellDiagnosis { command, diagnosis, fix } => {
+            PresenterEvent::ShellDiagnosis {
+                command,
+                diagnosis,
+                fix,
+            } => {
                 println!("  ⚠ shell failed: {command}");
                 for line in diagnosis.lines() {
                     println!("    {line}");

@@ -321,7 +321,10 @@ fn sync_palette_to_slash_token(app: &mut forge_tui::App) {
 
 /// Enumerate project files for `@path` completion: `git ls-files` first, `find` fallback.
 fn load_at_files() -> Vec<String> {
-    if let Ok(out) = std::process::Command::new("git").args(["ls-files"]).output() {
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["ls-files"])
+        .output()
+    {
         if out.status.success() {
             return String::from_utf8_lossy(&out.stdout)
                 .lines()
@@ -473,7 +476,11 @@ fn import_cmd(source: ImportSource) -> Result<()> {
         }
     }
 
-    let scope = if project { "./.forge" } else { "the user config" };
+    let scope = if project {
+        "./.forge"
+    } else {
+        "the user config"
+    };
     println!(
         "✓ imported {} command(s) + {} skill(s) + {} agent(s) from {label} into {scope} \
          ({} command(s), {} skill(s), {} agent(s) already present, skipped)",
@@ -491,11 +498,7 @@ fn import_cmd(source: ImportSource) -> Result<()> {
 }
 
 /// Copy `*.md` files from `src` into `dst`, skipping any that already exist. Updates `counts`.
-fn count_copy_md_files(
-    src: &std::path::Path,
-    dst: &std::path::Path,
-    counts: &mut ImportCounts,
-) {
+fn count_copy_md_files(src: &std::path::Path, dst: &std::path::Path, counts: &mut ImportCounts) {
     std::fs::create_dir_all(dst).ok();
     let Ok(entries) = std::fs::read_dir(src) else {
         return;
@@ -915,7 +918,10 @@ fn replay_cmd(ids: &[String], json: bool) -> Result<()> {
             let entries = store.load_replay(&id).context("loading replay")?;
             if entries.is_empty() {
                 if json {
-                    println!("{{\"session_id\":\"{}\",\"turns\":[]}}", &id[..id.len().min(8)]);
+                    println!(
+                        "{{\"session_id\":\"{}\",\"turns\":[]}}",
+                        &id[..id.len().min(8)]
+                    );
                 } else {
                     println!("session {} has no messages", &id[..id.len().min(8)]);
                 }
@@ -967,13 +973,22 @@ fn assay_cmd(sub: AssayCmd) -> Result<()> {
                     .single()
                     .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
                     .unwrap_or_else(|| ts.to_string());
-                println!("{:<10}  {:<28}  ${:>7.4}  {}", &id[..id.len().min(8)], date, cost, scope);
+                println!(
+                    "{:<10}  {:<28}  ${:>7.4}  {}",
+                    &id[..id.len().min(8)],
+                    date,
+                    cost,
+                    scope
+                );
             }
         }
         AssayCmd::Compare { a, b } => {
             let resolve = |prefix: &str| -> Result<String> {
                 let runs = store.list_assay_runs().context("loading assay runs")?;
-                let matches: Vec<_> = runs.into_iter().filter(|(id, ..)| id.starts_with(prefix)).collect();
+                let matches: Vec<_> = runs
+                    .into_iter()
+                    .filter(|(id, ..)| id.starts_with(prefix))
+                    .collect();
                 match matches.len() {
                     0 => anyhow::bail!("no assay run matches '{prefix}' — see `forge assay list`"),
                     1 => Ok(matches.into_iter().next().unwrap().0),
@@ -1237,21 +1252,27 @@ fn bundle_scoped_source(
         Diff => {
             let files = git_files(&["diff", "--name-only"])?;
             if files.is_empty() {
-                return Err("no uncommitted changes (git diff --name-only returned nothing)".into());
+                return Err(
+                    "no uncommitted changes (git diff --name-only returned nothing)".into(),
+                );
             }
             Ok(bundle_file_list(&files, max_bytes))
         }
         Branch(base) => {
             let files = git_files(&["diff", "--name-only", &format!("{base}...HEAD")])?;
             if files.is_empty() {
-                return Err(format!("no changes vs {base} (git diff --name-only {base}...HEAD returned nothing)"));
+                return Err(format!(
+                    "no changes vs {base} (git diff --name-only {base}...HEAD returned nothing)"
+                ));
             }
             Ok(bundle_file_list(&files, max_bytes))
         }
         Since(ref_) => {
             let files = git_files(&["diff", "--name-only", ref_])?;
             if files.is_empty() {
-                return Err(format!("no changes since {ref_} (git diff --name-only {ref_} returned nothing)"));
+                return Err(format!(
+                    "no changes since {ref_} (git diff --name-only {ref_} returned nothing)"
+                ));
             }
             Ok(bundle_file_list(&files, max_bytes))
         }
@@ -2242,12 +2263,8 @@ async fn chat(
     {
         let sid = session.session_id().to_string();
         let hooks = session.hooks().to_vec();
-        forge_core::hooks::run_session_hooks(
-            &hooks,
-            forge_config::HookEvent::SessionStart,
-            &sid,
-        )
-        .await;
+        forge_core::hooks::run_session_hooks(&hooks, forge_config::HookEvent::SessionStart, &sid)
+            .await;
     }
     while let Some(line) = session.read_line() {
         match chat_action(&line) {
@@ -2272,12 +2289,8 @@ async fn chat(
     {
         let sid = session.session_id().to_string();
         let hooks = session.hooks().to_vec();
-        forge_core::hooks::run_session_hooks(
-            &hooks,
-            forge_config::HookEvent::SessionEnd,
-            &sid,
-        )
-        .await;
+        forge_core::hooks::run_session_hooks(&hooks, forge_config::HookEvent::SessionEnd, &sid)
+            .await;
     }
     Ok(())
 }
@@ -2341,12 +2354,8 @@ async fn run_chat_tui(
             let s = session.lock().await;
             (s.hooks().to_vec(), s.session_id().to_string())
         };
-        forge_core::hooks::run_session_hooks(
-            &hooks,
-            forge_config::HookEvent::SessionStart,
-            &sid,
-        )
-        .await;
+        forge_core::hooks::run_session_hooks(&hooks, forge_config::HookEvent::SessionStart, &sid)
+            .await;
     }
     // Project-scope commands/skills can steer the model; their first use this session is gated
     // unless trusted. Re-running a gated command confirms it (its name lands here).
@@ -2534,27 +2543,14 @@ async fn run_chat_tui(
                     KeyKind::Esc => app.at_picker.close(),
                     KeyKind::Up => app.at_picker.move_up(),
                     KeyKind::Down => app.at_picker.move_down(),
-                    KeyKind::Tab => {
+                    KeyKind::Tab | KeyKind::Enter => {
                         if let Some(path) = app.at_picker.selected_path() {
-                            if let Some(tok) =
-                                forge_tui::at_token_at(&app.input, app.input.len())
-                            {
-                                app.input
-                                    .replace_range(tok.start..tok.end, &format!("@{path}"));
-                            } else {
-                                app.input = format!("@{path}");
-                            }
-                            app.at_picker.query = path;
-                            app.at_picker.clamp();
-                        }
-                    }
-                    KeyKind::Enter => {
-                        if let Some(path) = app.at_picker.selected_path() {
-                            if let Some(tok) =
-                                forge_tui::at_token_at(&app.input, app.input.len())
-                            {
+                            if let Some(tok) = forge_tui::at_token_at(&app.input, app.input.len()) {
+                                // Insert `@path ` (trailing space so the user can keep typing).
                                 app.input
                                     .replace_range(tok.start..tok.end, &format!("@{path} "));
+                            } else {
+                                app.input = format!("@{path} ");
                             }
                         }
                         app.at_picker.close();
@@ -3053,12 +3049,8 @@ async fn run_chat_tui(
             let s = session.lock().await;
             (s.hooks().to_vec(), s.session_id().to_string())
         };
-        forge_core::hooks::run_session_hooks(
-            &hooks,
-            forge_config::HookEvent::SessionEnd,
-            &sid,
-        )
-        .await;
+        forge_core::hooks::run_session_hooks(&hooks, forge_config::HookEvent::SessionEnd, &sid)
+            .await;
     }
     Ok(())
 }
@@ -3333,8 +3325,7 @@ async fn dispatch_command(
         // `/model <id>` pins a specific model for the rest of this session (or clears the pin).
         // Works while a turn is running (pin takes effect on the NEXT turn).
         CommandAction::PinModel(model_id) => {
-            let model_id = model_id
-                .map(|id| forge_provider::normalize_model_id(&id).into_owned());
+            let model_id = model_id.map(|id| forge_provider::normalize_model_id(&id).into_owned());
             let mut s = session.lock().await;
             s.pin_model(model_id.clone());
             match model_id {
@@ -3478,9 +3469,8 @@ async fn dispatch_command(
                         match ids.first() {
                             None => format!("no session matching '{id_a}'"),
                             Some(full) => {
-                                let entries = s
-                                    .load_replay(full)
-                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let entries =
+                                    s.load_replay(full).map_err(|e| anyhow::anyhow!("{e}"))?;
                                 crate::replay::render_transcript(
                                     &full[..full.len().min(8)],
                                     &entries,
@@ -3497,21 +3487,14 @@ async fn dispatch_command(
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                         match (ids_a.first(), ids_b.first()) {
                             (Some(fa), Some(fb)) => {
-                                let ea = s
-                                    .load_replay(fa)
-                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                                let eb = s
-                                    .load_replay(fb)
-                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let ea = s.load_replay(fa).map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let eb = s.load_replay(fb).map_err(|e| anyhow::anyhow!("{e}"))?;
                                 let d = crate::replay::diff(&ea, &eb);
                                 let fa8 = &fa[..fa.len().min(8)];
                                 let fb8 = &fb[..fb.len().min(8)];
-                                let mut out =
-                                    crate::replay::render_diff(fa8, fb8, &d);
+                                let mut out = crate::replay::render_diff(fa8, fb8, &d);
                                 out.push('\n');
-                                out.push_str(&crate::replay::render_turn_diff(
-                                    fa8, fb8, &ea, &eb,
-                                ));
+                                out.push_str(&crate::replay::render_turn_diff(fa8, fb8, &ea, &eb));
                                 out
                             }
                             (None, _) => format!("no session matching '{id_a}'"),
@@ -4006,8 +3989,8 @@ mod tests {
             "anthropic::claude-opus-4-8".into(),
             "groq::llama-3.1-8b-instant".into(),
             "groq::llama-3.3-70b-versatile".into(),
-            "claude-cli::".into(),      // bare default (hidden in browser, still counted in stats)
-            "claude-cli::opus".into(),  // named alias (shown in browser)
+            "claude-cli::".into(), // bare default (hidden in browser, still counted in stats)
+            "claude-cli::opus".into(), // named alias (shown in browser)
         ])
     }
 
@@ -4040,7 +4023,10 @@ mod tests {
         // entry is hidden (it was confusingly empty in the browser).
         let (_, sub) = models_for_provider(&cat, &pricing, &Default::default(), "claude-cli");
         assert!(!sub.is_empty(), "named cli models shown");
-        assert!(sub.iter().all(|r| r.id != "claude-cli::"), "bare entry hidden");
+        assert!(
+            sub.iter().all(|r| r.id != "claude-cli::"),
+            "bare entry hidden"
+        );
         assert!(sub[0].subtitle.contains("subscription"));
     }
 

@@ -767,11 +767,7 @@ impl Store {
 
     /// The most recent assay run for `scope`, excluding `exclude_id` (the just-created run).
     /// Returns `None` when this is the first run for this scope.
-    pub fn latest_run_for_scope(
-        &self,
-        scope: &str,
-        exclude_id: &str,
-    ) -> Result<Option<String>> {
+    pub fn latest_run_for_scope(&self, scope: &str, exclude_id: &str) -> Result<Option<String>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id FROM assay_run WHERE scope = ?1 AND id != ?2
@@ -1545,7 +1541,11 @@ mod tests {
         let msgs = store.load_messages(&sid).unwrap();
         // 1 summary + 3 kept = 4
         assert_eq!(msgs.len(), 4, "summary + 3 kept messages");
-        assert_eq!(msgs[0].role, Role::System, "prepended summary is a System message");
+        assert_eq!(
+            msgs[0].role,
+            Role::System,
+            "prepended summary is a System message"
+        );
         assert!(
             msgs[0].content.contains("Summary of first 5 messages."),
             "summary content preserved"
@@ -1564,18 +1564,25 @@ mod tests {
                 .add_message(&sid, i, Role::User, &format!("msg {i}"), None)
                 .unwrap();
         }
-        store.compact_session_store(&sid, "First summary.", 3).unwrap();
+        store
+            .compact_session_store(&sid, "First summary.", 3)
+            .unwrap();
         // Add 3 more messages (simulate new turns after first compact).
         for i in 6..9i64 {
             store
                 .add_message(&sid, i, Role::User, &format!("msg {i}"), None)
                 .unwrap();
         }
-        store.compact_session_store(&sid, "Second summary.", 3).unwrap();
+        store
+            .compact_session_store(&sid, "Second summary.", 3)
+            .unwrap();
 
         let msgs = store.load_messages(&sid).unwrap();
         assert_eq!(msgs.len(), 4, "summary + 3 kept after second compact");
-        assert!(msgs[0].content.contains("Second summary."), "upserted summary");
+        assert!(
+            msgs[0].content.contains("Second summary."),
+            "upserted summary"
+        );
         assert_eq!(msgs[1].content, "msg 6");
         assert_eq!(msgs[2].content, "msg 7");
         assert_eq!(msgs[3].content, "msg 8");

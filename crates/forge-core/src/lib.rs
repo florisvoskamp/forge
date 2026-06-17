@@ -522,33 +522,37 @@ impl Session {
         let store = Arc::clone(&self.store);
         // Surface each critic/verifier as it finishes so the run shows live activity.
         let presenter = &mut self.presenter;
-        let mut on_progress = |p: assay::AssayProgress| {
-            match &p {
-                assay::AssayProgress::CriticQueued { lens } => {
-                    presenter.emit(PresenterEvent::AssayCriticRow(forge_types::AssayCriticRow {
+        let mut on_progress = |p: assay::AssayProgress| match &p {
+            assay::AssayProgress::CriticQueued { lens } => {
+                presenter.emit(PresenterEvent::AssayCriticRow(
+                    forge_types::AssayCriticRow {
                         lens: lens.as_str().to_string(),
                         status: forge_types::AssayCriticStatus::Queued,
-                    }));
-                }
-                assay::AssayProgress::CriticDone { lens, candidates } => {
-                    presenter.emit(PresenterEvent::AssayCriticRow(forge_types::AssayCriticRow {
+                    },
+                ));
+            }
+            assay::AssayProgress::CriticDone { lens, candidates } => {
+                presenter.emit(PresenterEvent::AssayCriticRow(
+                    forge_types::AssayCriticRow {
                         lens: lens.as_str().to_string(),
                         status: forge_types::AssayCriticStatus::Done {
                             candidates: *candidates,
                         },
-                    }));
-                }
-                assay::AssayProgress::CriticSkipped { lens, reason } => {
-                    presenter.emit(PresenterEvent::AssayCriticRow(forge_types::AssayCriticRow {
+                    },
+                ));
+            }
+            assay::AssayProgress::CriticSkipped { lens, reason } => {
+                presenter.emit(PresenterEvent::AssayCriticRow(
+                    forge_types::AssayCriticRow {
                         lens: lens.as_str().to_string(),
                         status: forge_types::AssayCriticStatus::Skipped {
                             reason: reason.clone(),
                         },
-                    }));
-                }
-                _ => {
-                    presenter.emit(PresenterEvent::AssayProgress(assay::progress_line(&p)));
-                }
+                    },
+                ));
+            }
+            _ => {
+                presenter.emit(PresenterEvent::AssayProgress(assay::progress_line(&p)));
             }
         };
         let mut report = assay::run_assay(
@@ -577,7 +581,8 @@ impl Session {
                 .latest_run_for_scope(&report.scope.label(), &run_id)
             {
                 if let Ok(prev) = self.store.load_findings(&prev_id) {
-                    let note = assay_diff_note(&prev, &report.findings, &prev_id[..8.min(prev_id.len())]);
+                    let note =
+                        assay_diff_note(&prev, &report.findings, &prev_id[..8.min(prev_id.len())]);
                     if !note.is_empty() {
                         self.presenter.emit(PresenterEvent::Warning(note));
                     }
@@ -836,7 +841,10 @@ impl Session {
 
     /// Load the persisted replay entries for any session (not just this one) — used by the
     /// `/replay` chat command to show a transcript inline.
-    pub fn load_replay(&self, session_id: &str) -> Result<Vec<forge_store::ReplayEntry>, CoreError> {
+    pub fn load_replay(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<forge_store::ReplayEntry>, CoreError> {
         self.store.load_replay(session_id).map_err(CoreError::Store)
     }
 
@@ -1172,7 +1180,9 @@ impl Session {
                 let hints: Vec<String> = self.pending_hints.drain(..).collect();
                 for hint in hints {
                     let hseq = self.next_seq();
-                    let _ = self.store.add_message(&self.id, hseq, Role::System, &hint, None);
+                    let _ = self
+                        .store
+                        .add_message(&self.id, hseq, Role::System, &hint, None);
                     self.transcript.push(Message::system(hint));
                 }
             }
@@ -1297,12 +1307,17 @@ impl Session {
             }
         }
 
-        let allowed =
-            match permission::decide(self.mode, side_effect, &call.name, &effective_args, &self.rules) {
-                PermissionDecision::Allow => true,
-                PermissionDecision::Deny => false,
-                PermissionDecision::Ask => self.presenter.confirm(&call.name, side_effect),
-            };
+        let allowed = match permission::decide(
+            self.mode,
+            side_effect,
+            &call.name,
+            &effective_args,
+            &self.rules,
+        ) {
+            PermissionDecision::Allow => true,
+            PermissionDecision::Deny => false,
+            PermissionDecision::Ask => self.presenter.confirm(&call.name, side_effect),
+        };
         let permission_label = if allowed { "allowed" } else { "denied" };
 
         // Snapshot the target's pre-edit bytes BEFORE a permitted write, so `/undo` can restore
@@ -4013,9 +4028,9 @@ mod tests {
                     trivial: vec!["m".into()],
                     complex: vec!["m".into()],
                 },
-                vec![],                      // default: full crew
+                vec![], // default: full crew
                 forge_types::AssayScope::Repo,
-                false,                       // analysis-only
+                false, // analysis-only
             )
             .await
             .unwrap();

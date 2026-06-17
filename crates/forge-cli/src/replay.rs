@@ -391,7 +391,13 @@ mod tests {
     fn render_json_is_valid_json_with_expected_fields() {
         let entries = vec![
             entry(0, Role::User, "hello", None, None),
-            entry(1, Role::Assistant, "world", Some("openai::gpt-4o"), Some(0.01)),
+            entry(
+                1,
+                Role::Assistant,
+                "world",
+                Some("openai::gpt-4o"),
+                Some(0.01),
+            ),
         ];
         let out = render_json("full-id-here", &entries);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");

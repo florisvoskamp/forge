@@ -347,7 +347,11 @@ impl ModelCatalog {
         let mut groups: Vec<ProviderGroup> = Vec::new();
         // Skip bare bridge ids (`claude-cli::`, `codex-cli::`) — they are valid routing
         // aliases for the CLI's own default model but show up as confusingly empty rows.
-        for info in self.infos(pricing).into_iter().filter(|m| !m.name.is_empty()) {
+        for info in self
+            .infos(pricing)
+            .into_iter()
+            .filter(|m| !m.name.is_empty())
+        {
             match groups.iter_mut().find(|g| g.provider == info.provider) {
                 Some(g) => g.models.push(info),
                 None => groups.push(ProviderGroup {
