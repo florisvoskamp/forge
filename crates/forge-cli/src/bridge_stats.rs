@@ -7,7 +7,7 @@
 /// Claude: `~/.claude/projects/**/*.jsonl` — each assistant turn has
 /// `message.usage.{input,output,cache_read,cache_creation}_tokens`.
 /// Claude doesn't embed rate-limit percentages, so we return raw token sums.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Local};
@@ -81,7 +81,7 @@ pub fn fetch() -> BridgeStats {
 
 // ── Codex ────────────────────────────────────────────────────────────────────
 
-fn fetch_codex(stats: &mut BridgeStats, home: &PathBuf) {
+fn fetch_codex(stats: &mut BridgeStats, home: &Path) {
     let root = home.join(".codex/sessions");
     // Collect all session files from the last 2 days, sorted newest-first.
     let files = jsonl_files_in_recent_days(&root, 2);
@@ -120,7 +120,7 @@ fn fetch_codex(stats: &mut BridgeStats, home: &PathBuf) {
 }
 
 /// All Codex session `.jsonl` files from the last `look_back` days, sorted newest-first.
-fn jsonl_files_in_recent_days(root: &PathBuf, look_back: u32) -> Vec<PathBuf> {
+fn jsonl_files_in_recent_days(root: &Path, look_back: u32) -> Vec<PathBuf> {
     let now = Local::now();
     let mut all: Vec<PathBuf> = Vec::new();
     for delta in 0..=look_back {
@@ -133,7 +133,7 @@ fn jsonl_files_in_recent_days(root: &PathBuf, look_back: u32) -> Vec<PathBuf> {
             let mut files: Vec<PathBuf> = entries
                 .flatten()
                 .map(|e| e.path())
-                .filter(|p| p.extension().map_or(false, |e| e == "jsonl"))
+                .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
                 .collect();
             files.sort_by(|a, b| b.cmp(a)); // newest first within each day
             all.extend(files);
@@ -144,7 +144,7 @@ fn jsonl_files_in_recent_days(root: &PathBuf, look_back: u32) -> Vec<PathBuf> {
 
 // ── Claude ───────────────────────────────────────────────────────────────────
 
-fn fetch_claude_rate_limits(stats: &mut BridgeStats, home: &PathBuf) {
+fn fetch_claude_rate_limits(stats: &mut BridgeStats, home: &Path) {
     let path = home.join(".claude/.rate-limits-cache.json");
     let Ok(content) = std::fs::read_to_string(&path) else {
         return;
@@ -161,7 +161,7 @@ fn fetch_claude_rate_limits(stats: &mut BridgeStats, home: &PathBuf) {
     stats.claude_weekly_pct = v["7d_pct"].as_f64();
 }
 
-fn fetch_claude(stats: &mut BridgeStats, home: &PathBuf) {
+fn fetch_claude(stats: &mut BridgeStats, home: &Path) {
     fetch_claude_rate_limits(stats, home);
     let root = home.join(".claude/projects");
     let now_secs = now_epoch();
