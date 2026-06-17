@@ -20,8 +20,6 @@ use crate::{Presenter, PresenterEvent};
 pub struct TuiPresenter {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     app: App,
-    /// Current inline viewport height; grows when the task/subagent panels are active.
-    height: u16,
 }
 
 impl TuiPresenter {
@@ -49,29 +47,9 @@ impl TuiPresenter {
         let mut me = Self {
             terminal,
             app: App::default(),
-            height: LIVE_H,
         };
         me.insert_lines(banner);
         Ok(me)
-    }
-
-    /// Recreate the inline viewport when the desired live height changes (panels appeared/left).
-    fn sync_viewport(&mut self, desired: u16) {
-        let desired = desired.max(LIVE_H);
-        if desired == self.height {
-            return;
-        }
-        let backend = CrosstermBackend::new(io::stdout());
-        if let Ok(t) = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(desired),
-            },
-        ) {
-            self.terminal = t;
-            let _ = self.terminal.clear();
-            self.height = desired;
-        }
     }
 
     fn insert_lines(&mut self, lines: Vec<TextLine<'static>>) {
@@ -92,7 +70,6 @@ impl TuiPresenter {
     }
 
     fn draw(&mut self) {
-        self.sync_viewport(self.app.live_height());
         let app = &self.app;
         let _ = self.terminal.draw(|f| app::render_live(f, app));
     }

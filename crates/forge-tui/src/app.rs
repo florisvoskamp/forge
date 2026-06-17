@@ -45,12 +45,16 @@ pub const STREAM_PREVIEW_H: u16 = 3;
 pub const PERMISSION_H: u16 = 1;
 pub const INPUT_H: u16 = 3;
 pub const STATUS_H: u16 = 1;
-/// Base pinned-region height with no active task/subagent panels. The live viewport grows beyond
-/// this when those panels are active (see [`App::live_height`]).
+/// Fixed inline-viewport height (the pinned region above scrollback). Constant — the inline
+/// viewport is never resized at runtime (resizing it pollutes the terminal scrollback).
 pub const LIVE_H: u16 = STREAM_PREVIEW_H + PERMISSION_H + INPUT_H + STATUS_H;
 /// Max task / running-subagent rows shown in their sticky panels before summarizing the overflow.
 const TASKS_PANEL_MAX: usize = 6;
 const SUBAGENTS_PANEL_MAX: usize = 4;
+/// Fixed height of the pinned region above the input (stream preview + the panels below it). Kept
+/// equal to the stream-preview height so the idle footprint matches the original (no gap), and the
+/// inline viewport never resizes (resizing pollutes scrollback).
+const PINNED_H: u16 = STREAM_PREVIEW_H;
 
 /// The Mesh routing decision currently displayed.
 #[derive(Debug, Clone, Default)]
@@ -353,10 +357,9 @@ impl App {
                 self.flush.push(TextLine::default());
             }
             PresenterEvent::Tasks(tasks) => {
-                self.flush.extend(crate::render::task_list_lines(&tasks));
-                self.flush.push(TextLine::default());
-                // Keep the latest list so the sticky panel stays visible during the turn (the
-                // scrollback copy scrolls away). An empty list collapses the panel.
+                // The task list lives ONLY in the sticky panel above the input — it does not scroll
+                // with the chat and is not part of history, so it is NOT flushed to scrollback.
+                // An empty list collapses the panel.
                 self.tasks = tasks;
             }
             PresenterEvent::McpStatus(servers) => {
@@ -402,21 +405,9 @@ impl App {
         1 + shown as u16 + overflow
     }
 
-    /// Total pinned live-region height for the current state. The I/O shell sizes the inline
-    /// viewport to this so the task/subagent panels get their own rows instead of being masked by
-    /// the streaming preview (the "always visible" requirement).
-    pub fn live_height(&self) -> u16 {
-        STREAM_PREVIEW_H
-            + PERMISSION_H
-            + INPUT_H
-            + STATUS_H
-            + self.tasks_panel_height()
-            + self.subagents_panel_height()
-    }
-
-    /// Owned snapshot of the current batch's subagents (running + just-finished), for the
-    /// full-screen scrollable transcript browser (Ctrl+O → [`crate::run_subagent_transcript`]).
-    /// In spawn order; empty when no batch has run yet / a new batch hasn't started.
+    /// Owned snapshot of the current batch's subagents (running + just-finished), in spawn order;
+    /// empty when no batch has run yet. Feeds the full-screen transcript browser (Ctrl+O), which
+    /// re-reads it as new progress is drained so a child's log updates live.
     pub fn subagent_views(&self) -> Vec<SubagentView> {
         self.subagents
             .iter()
@@ -795,41 +786,55 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Draw the pinned live region for the current state (the only thing in the viewport).
 pub fn render_live(frame: &mut Frame, app: &App) {
-    let sub_h = app.subagents_panel_height();
-    let task_h = app.tasks_panel_height();
-    // Subagent + task panels are their OWN rows (not the stream preview) so they stay visible
-    // while the model streams. Zero-length regions are skipped by the layout.
+    // Fixed-height inline viewport (no runtime resize — recreating an inline viewport pollutes the
+    // terminal scrollback). The pinned region above the input holds the in-flight reply on top and
+    // the sticky subagent + task panels BELOW it, so the panels sit just above the input and never
+    // scroll into history.
     let areas = Layout::vertical([
-        Constraint::Length(sub_h),  // running-subagents panel (0 when none)
-        Constraint::Length(task_h), // sticky task list (0 when empty)
-        Constraint::Length(STREAM_PREVIEW_H), // in-flight reply edge / palette / picker
+        Constraint::Length(PINNED_H), // stream preview + panels share this fixed region
         Constraint::Length(PERMISSION_H), // permission bar (blank when none)
-        Constraint::Length(INPUT_H), // input box
+        Constraint::Length(INPUT_H),  // input box
         Constraint::Length(STATUS_H), // statusline
     ])
     .split(frame.area());
 
+    if app.palette.open {
+        render_palette(frame, areas[0], app);
+    } else if app.picker.open {
+        render_picker(frame, areas[0], app);
+    } else {
+        render_pinned_region(frame, areas[0], app);
+    }
+    if app.prompt.is_some() {
+        render_permission(frame, areas[1], app);
+    }
+    render_input(frame, areas[2], app);
+    render_statusline(frame, areas[3], app);
+}
+
+/// The pinned region (above the permission/input rows): the streaming reply edge on top, then the
+/// running-subagent panel, then the sticky task panel BELOW it. Panels are capped to the fixed
+/// region so the input is never pushed off-screen; overflow is summarized by the panel renderers.
+fn render_pinned_region(frame: &mut Frame, area: Rect, app: &App) {
+    let max = area.height;
+    let sub_h = app.subagents_panel_height().min(max);
+    let task_h = app.tasks_panel_height().min(max.saturating_sub(sub_h));
+    let rows = Layout::vertical([
+        Constraint::Min(0), // streaming reply edge (shrinks as panels grow; blank when idle)
+        Constraint::Length(sub_h), // running subagents
+        Constraint::Length(task_h), // task list
+    ])
+    .split(area);
+    render_preview(frame, rows[0], app);
     if sub_h > 0 {
-        render_subagents_panel(frame, areas[0], app);
+        render_subagents_panel(frame, rows[1], app);
     }
     if task_h > 0 {
         frame.render_widget(
-            Paragraph::new(tasks_panel_lines(&app.tasks, areas[1].height)),
-            areas[1],
+            Paragraph::new(tasks_panel_lines(&app.tasks, rows[2].height)),
+            rows[2],
         );
     }
-    if app.palette.open {
-        render_palette(frame, areas[2], app);
-    } else if app.picker.open {
-        render_picker(frame, areas[2], app);
-    } else {
-        render_preview(frame, areas[2], app);
-    }
-    if app.prompt.is_some() {
-        render_permission(frame, areas[3], app);
-    }
-    render_input(frame, areas[4], app);
-    render_statusline(frame, areas[5], app);
 }
 
 /// The inline slash-command palette: a scrolling window of filtered commands, selected row
@@ -1237,7 +1242,7 @@ mod tests {
     /// Render the pinned live region at its natural (dynamic) live height — so the sticky task +
     /// subagent panels get their own rows, exactly as the real I/O shell sizes the viewport.
     fn screen(app: &App) -> String {
-        screen_wh(app, 80, app.live_height())
+        screen_wh(app, 80, LIVE_H)
     }
 
     fn screen_wh(app: &App, w: u16, h: u16) -> String {
@@ -1796,21 +1801,6 @@ mod tests {
         assert!(
             s.contains("subagents (1 running)"),
             "subagent panel stays visible while streaming: {s}"
-        );
-    }
-
-    #[test]
-    fn live_height_grows_for_active_panels() {
-        use forge_types::TodoStatus;
-        let mut app = App::default();
-        assert_eq!(app.live_height(), LIVE_H, "base height when idle");
-        app.apply(PresenterEvent::Tasks(vec![
-            todo("a", TodoStatus::InProgress),
-            todo("b", TodoStatus::Pending),
-        ]));
-        assert!(
-            app.live_height() > LIVE_H,
-            "viewport grows to fit the task panel"
         );
     }
 

@@ -210,39 +210,6 @@ fn severity_color(sev: forge_types::Severity) -> Color {
     }
 }
 
-/// Render the agent's task list (the `update_tasks` tool) as a styled checklist for scrollback:
-/// a header with progress count, then each item with a status glyph — done is dimmed +
-/// struck-through, the in-progress item is highlighted, pending is plain.
-pub fn task_list_lines(tasks: &[forge_types::TodoItem]) -> Vec<Line<'static>> {
-    use forge_types::TodoStatus;
-    if tasks.is_empty() {
-        return vec![Line::from(Span::styled(
-            "  ⚒ tasks cleared".to_string(),
-            Style::default().fg(DIM),
-        ))];
-    }
-    let done = tasks
-        .iter()
-        .filter(|t| t.status == TodoStatus::Done)
-        .count();
-    let mut out = vec![Line::from(Span::styled(
-        format!("  ⚒ tasks  ({done}/{} done)", tasks.len()),
-        Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
-    ))];
-    for t in tasks {
-        let style = match t.status {
-            TodoStatus::Done => Style::default().fg(DIM).add_modifier(Modifier::CROSSED_OUT),
-            TodoStatus::InProgress => Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
-            TodoStatus::Pending => Style::default().fg(CODEFG),
-        };
-        out.push(Line::from(Span::styled(
-            format!("    {} {}", t.status.marker(), t.title),
-            style,
-        )));
-    }
-    out
-}
-
 /// Render the MCP server listing (`/mcp`) as styled scrollback lines: a status glyph per server,
 /// its transport, and tool/resource/prompt counts (mcp-client.md §5.7).
 pub fn mcp_status_lines(servers: &[forge_types::McpServerLine]) -> Vec<Line<'static>> {

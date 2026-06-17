@@ -1996,12 +1996,28 @@ async fn run_chat_tui(
                 continue;
             }
 
-            // Ctrl+O opens the full-screen scrollable subagent transcript browser (a snapshot of
-            // the current batch's children — running or just-finished). No-op when none exist.
+            // Ctrl+O opens the full-screen subagent transcript browser on the ALTERNATE screen
+            // (never pollutes the chat scrollback). The refresh closure drains pending presenter
+            // events each frame so the selected child's log AUTO-UPDATES while open; a
+            // permission/question that can't be answered from the modal is safely declined.
             if matches!(key, KeyKind::ToggleSubagentDetail) {
-                let views = app.subagent_views();
-                if !views.is_empty() {
-                    tui.run_fullscreen(|| forge_tui::run_subagent_transcript(&views))?;
+                if !app.subagent_views().is_empty() {
+                    tui.run_fullscreen(|| {
+                        forge_tui::run_subagent_transcript(|| {
+                            while let Ok(msg) = rx.try_recv() {
+                                match msg {
+                                    UiMsg::Event(e) => app.apply(e),
+                                    UiMsg::Permission { reply, .. } => {
+                                        let _ = reply.send(false);
+                                    }
+                                    UiMsg::Question { reply, .. } => {
+                                        let _ = reply.send(forge_tui::NO_ANSWER.to_string());
+                                    }
+                                }
+                            }
+                            app.subagent_views()
+                        })
+                    })?;
                 }
                 dirty = true;
                 continue;
