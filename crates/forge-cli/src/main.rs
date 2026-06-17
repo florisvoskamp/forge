@@ -2106,9 +2106,18 @@ enum ChatAction {
 }
 
 fn chat_action(line: &str) -> ChatAction {
-    match line.trim() {
+    let t = line.trim();
+    match t {
         "" => ChatAction::Skip,
         "/quit" | "/exit" | "/q" => ChatAction::Quit,
+        // `//foo` escapes to a literal `/foo` prompt — mirrors the TUI behaviour.
+        _ if t.starts_with("//") => ChatAction::Run(format!("/{}", &t[2..])),
+        // Slash commands are TUI-only in plain mode; print a hint and skip.
+        _ if t.starts_with('/') => {
+            let cmd = t.split_whitespace().next().unwrap_or(t);
+            eprintln!("⚒ '{cmd}' is not supported in plain/headless mode — use `forge chat` for the interactive TUI.");
+            ChatAction::Skip
+        }
         task => ChatAction::Run(task.to_string()),
     }
 }
