@@ -295,7 +295,7 @@ mod tests {
     }
 
     // Windows cmd.exe mangles double-quoted JSON in `echo` output; the JSON-detection
-    // logic is pure Rust already exercised on Linux + macOS.
+    // logic is pure Rust and is exercised on Linux + macOS.
     #[cfg(not(windows))]
     #[tokio::test]
     async fn pretooluse_exit_zero_json_object_stdout_rewrites_args() {
