@@ -23,6 +23,9 @@ pub struct BridgeStats {
     pub claude_5h_out: u64,
     pub claude_weekly_in: u64,
     pub claude_weekly_out: u64,
+    /// Age (seconds) of the Claude rate-limit cache when it was read — `None` if the cache is
+    /// missing. Lets the overlay flag stale percentages instead of presenting them as live.
+    pub claude_rl_age_secs: Option<i64>,
 }
 
 /// Ensure `~/.claude/statusline.sh` writes rate-limit data to a cache file on each call.
@@ -157,6 +160,7 @@ fn fetch_claude_rate_limits(stats: &mut BridgeStats, home: &Path) {
     // nothing (which makes the overlay fall back to raw tokens and the mesh see the plan as 0%).
     // The cache only refreshes while Claude Code renders its statusline, so it routinely lags.
     let age = now_epoch() - v["ts"].as_i64().unwrap_or(0);
+    stats.claude_rl_age_secs = Some(age);
     if age <= 6 * 3600 {
         stats.claude_5h_pct = v["5h_pct"].as_f64();
     }

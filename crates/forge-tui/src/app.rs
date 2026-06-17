@@ -99,6 +99,9 @@ pub struct UsageOverlay {
     /// Claude tokens used this ISO week.
     pub claude_weekly_in: u64,
     pub claude_weekly_out: u64,
+    /// Age (seconds) of the Claude rate-limit cache, if present — drives a "Xh ago" staleness
+    /// note so the overlay never presents an old percentage as if it were live.
+    pub claude_rl_age_secs: Option<i64>,
     /// Animation tick counter (incremented each tick, used for spinner).
     pub anim_tick: u32,
 }
@@ -1547,22 +1550,19 @@ pub fn render_usage_overlay(f: &mut Frame, app: &App) {
     let (cost_week, in_week, out_week) = UsageOverlay::totals(&o.by_model_week);
 
     // Bridge-provider annotation for each period row.
+    // A staleness note for the Claude rate-limit %, so an old reading is never shown as live.
+    let claude_age = rl_age_note(o.claude_rl_age_secs);
     let bridge_5h = {
         let mut parts = Vec::new();
         if let Some(p) = o.codex_5h_pct {
             parts.push(format!("codex:{:.0}%", p));
         }
         if let Some(p) = o.claude_5h_pct {
-            parts.push(format!("claude:{:.0}%", p));
-        } else {
-            let ctok = o.claude_5h_in + o.claude_5h_out;
-            if ctok > 0 {
-                parts.push(format!(
-                    "claude:↑{} ↓{}",
-                    format_tok(o.claude_5h_in),
-                    format_tok(o.claude_5h_out)
-                ));
-            }
+            parts.push(format!("claude:{:.0}%{}", p, claude_age));
+        } else if o.claude_rl_age_secs.is_some() {
+            // Cache exists but the 5h reading is too old to trust (5h window) — say so plainly
+            // rather than falling back to a confusing multi-million raw-token sum.
+            parts.push(format!("claude:5h stale{claude_age}"));
         }
         if parts.is_empty() {
             String::new()
@@ -1576,16 +1576,9 @@ pub fn render_usage_overlay(f: &mut Frame, app: &App) {
             parts.push(format!("codex:{:.0}%", p));
         }
         if let Some(p) = o.claude_weekly_pct {
-            parts.push(format!("claude:{:.0}%", p));
-        } else {
-            let ctok = o.claude_weekly_in + o.claude_weekly_out;
-            if ctok > 0 {
-                parts.push(format!(
-                    "claude:↑{} ↓{}",
-                    format_tok(o.claude_weekly_in),
-                    format_tok(o.claude_weekly_out)
-                ));
-            }
+            parts.push(format!("claude:{:.0}%{}", p, claude_age));
+        } else if o.claude_rl_age_secs.is_some() {
+            parts.push(format!("claude:wk stale{claude_age}"));
         }
         if parts.is_empty() {
             String::new()
@@ -1869,6 +1862,16 @@ pub fn render_mesh_overlay(f: &mut Frame, app: &App) {
         Paragraph::new(Text::from(rows)).scroll((scroll, 0)),
         chunks[1],
     );
+}
+
+/// A compact " (Xm/Xh ago)" suffix for rate-limit data older than ~10 min; empty when fresh or
+/// unknown. Keeps the overlay honest about staleness instead of presenting old % as live.
+fn rl_age_note(age_secs: Option<i64>) -> String {
+    match age_secs {
+        Some(a) if a >= 3600 => format!(" ({}h ago)", a / 3600),
+        Some(a) if a >= 600 => format!(" ({}m ago)", a / 60),
+        _ => String::new(),
+    }
 }
 
 fn format_tok(n: u64) -> String {

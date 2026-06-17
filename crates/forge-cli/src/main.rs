@@ -4272,6 +4272,7 @@ async fn dispatch_command(
             app.usage_overlay.claude_5h_out = bstats.claude_5h_out;
             app.usage_overlay.claude_weekly_in = bstats.claude_weekly_in;
             app.usage_overlay.claude_weekly_out = bstats.claude_weekly_out;
+            app.usage_overlay.claude_rl_age_secs = bstats.claude_rl_age_secs;
             apply_quota_fallback(&mut app.usage_overlay, &bridge_fracs);
             app.usage_overlay.open = true;
         }
