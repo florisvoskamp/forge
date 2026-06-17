@@ -2162,17 +2162,45 @@ async fn chat(
     if std::io::stdin().is_terminal() {
         println!("forge chat — type a task and press enter; /quit to exit");
     }
+    {
+        let sid = session.session_id().to_string();
+        let hooks = session.hooks().to_vec();
+        forge_core::hooks::run_session_hooks(
+            &hooks,
+            forge_config::HookEvent::SessionStart,
+            &sid,
+        )
+        .await;
+    }
     while let Some(line) = session.read_line() {
         match chat_action(&line) {
             ChatAction::Quit => break,
             ChatAction::Skip => continue,
             ChatAction::Run(task) => {
+                let hooks = session.hooks().to_vec();
+                let task = match forge_core::hooks::run_prompt_hooks(&hooks, &task).await {
+                    Ok(t) => t,
+                    Err(reason) => {
+                        eprintln!("⎇ prompt blocked by hook: {reason}");
+                        continue;
+                    }
+                };
                 session
                     .run_turn(&task)
                     .await
                     .context("running agent turn")?;
             }
         }
+    }
+    {
+        let sid = session.session_id().to_string();
+        let hooks = session.hooks().to_vec();
+        forge_core::hooks::run_session_hooks(
+            &hooks,
+            forge_config::HookEvent::SessionEnd,
+            &sid,
+        )
+        .await;
     }
     Ok(())
 }
@@ -2231,6 +2259,18 @@ async fn run_chat_tui(
         app.note(&format!("⚠ {w}"));
     }
     let trust_project = session.lock().await.commands_trust_project();
+    {
+        let (hooks, sid) = {
+            let s = session.lock().await;
+            (s.hooks().to_vec(), s.session_id().to_string())
+        };
+        forge_core::hooks::run_session_hooks(
+            &hooks,
+            forge_config::HookEvent::SessionStart,
+            &sid,
+        )
+        .await;
+    }
     // Project-scope commands/skills can steer the model; their first use this session is gated
     // unless trusted. Re-running a gated command confirms it (its name lands here).
     let mut armed_project: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2629,16 +2669,25 @@ async fn run_chat_tui(
                         // `//foo` escapes to a literal prompt `/foo`; a bare `/cmd` typed without
                         // the palette still dispatches as a command; everything else is a prompt.
                         if let Some(rest) = line.strip_prefix("//") {
-                            turn_gen += 1;
-                            turn_handle = Some(spawn_turn(
-                                &format!("/{rest}"),
-                                &session,
-                                &done_tx,
-                                turn_gen,
-                                &mut app,
-                                &mut busy,
-                                &mut busy_since,
-                            ));
+                            let hooks = session.lock().await.hooks().to_vec();
+                            let escaped = format!("/{rest}");
+                            match forge_core::hooks::run_prompt_hooks(&hooks, &escaped).await {
+                                Err(reason) => {
+                                    app.note(&format!("⎇ prompt blocked by hook: {reason}"));
+                                }
+                                Ok(prompt) => {
+                                    turn_gen += 1;
+                                    turn_handle = Some(spawn_turn(
+                                        &prompt,
+                                        &session,
+                                        &done_tx,
+                                        turn_gen,
+                                        &mut app,
+                                        &mut busy,
+                                        &mut busy_since,
+                                    ));
+                                }
+                            }
                         } else if line.starts_with('/') {
                             match dispatch_command(
                                 &line,
@@ -2709,16 +2758,24 @@ async fn run_chat_tui(
                                 }
                             }
                         } else {
-                            turn_gen += 1;
-                            turn_handle = Some(spawn_turn(
-                                &line,
-                                &session,
-                                &done_tx,
-                                turn_gen,
-                                &mut app,
-                                &mut busy,
-                                &mut busy_since,
-                            ));
+                            let hooks = session.lock().await.hooks().to_vec();
+                            match forge_core::hooks::run_prompt_hooks(&hooks, &line).await {
+                                Err(reason) => {
+                                    app.note(&format!("⎇ prompt blocked by hook: {reason}"));
+                                }
+                                Ok(prompt) => {
+                                    turn_gen += 1;
+                                    turn_handle = Some(spawn_turn(
+                                        &prompt,
+                                        &session,
+                                        &done_tx,
+                                        turn_gen,
+                                        &mut app,
+                                        &mut busy,
+                                        &mut busy_since,
+                                    ));
+                                }
+                            }
                         }
                     }
                     InputOutcome::Quit => {
@@ -2854,6 +2911,18 @@ async fn run_chat_tui(
             dirty = true;
         }
         tokio::time::sleep(Duration::from_millis(16)).await;
+    }
+    {
+        let (hooks, sid) = {
+            let s = session.lock().await;
+            (s.hooks().to_vec(), s.session_id().to_string())
+        };
+        forge_core::hooks::run_session_hooks(
+            &hooks,
+            forge_config::HookEvent::SessionEnd,
+            &sid,
+        )
+        .await;
     }
     Ok(())
 }

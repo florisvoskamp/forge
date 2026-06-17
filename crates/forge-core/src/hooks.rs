@@ -1,8 +1,8 @@
-//! Pre/post tool-use shell hooks (docs/features/hooks.md). Each `[[hooks]]` entry runs via the
-//! OS shell (`sh -c` on Unix, `cmd /C` on Windows) around a matching tool call, receiving the
-//! call as JSON on stdin. A `PreToolUse` hook that exits non-zero **blocks** the tool (its output
-//! is the reason the model sees); `PostToolUse` hooks observe (their stdout surfaces as a note).
-//! Hooks are time-bounded so a wedged hook can't hang the agent.
+//! Shell hooks (docs/features/hooks.md). Each `[[hooks]]` entry runs via the OS shell around
+//! tool calls and session lifecycle events. A `PreToolUse` hook that exits non-zero **blocks**
+//! the tool; a `UserPromptSubmit` hook can rewrite the user's prompt (stdout replaces it on
+//! exit 0) or block the turn (non-zero). Session hooks (`SessionStart`/`SessionEnd`) observe
+//! only. Hooks are time-bounded so a wedged hook can't hang the agent.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -52,6 +52,69 @@ pub async fn run_hooks(
         }
     }
     outcome
+}
+
+/// Run `user_prompt_submit` hooks in declaration order.
+///
+/// Returns `Ok(prompt)` where `prompt` is either the original (no hook rewrote it) or the
+/// stdout from the first hook that exited 0 and produced non-empty output.
+/// Returns `Err(reason)` if any hook exits non-zero — the turn should be blocked.
+pub async fn run_prompt_hooks(hooks: &[HookConfig], prompt: &str) -> Result<String, String> {
+    let payload = format!("{{\"prompt\":{}}}", serde_json::to_string(prompt).unwrap_or_default());
+    let mut current = prompt.to_string();
+    for h in hooks.iter().filter(|h| h.event == HookEvent::UserPromptSubmit) {
+        match run_one(h, &payload).await {
+            Ok((code, stdout, stderr)) => {
+                if code != 0 {
+                    let reason = if !stderr.trim().is_empty() {
+                        truncate(stderr.trim(), 800)
+                    } else if !stdout.trim().is_empty() {
+                        truncate(stdout.trim(), 800)
+                    } else {
+                        format!("prompt blocked by hook (exit {code})")
+                    };
+                    return Err(reason);
+                }
+                let out = stdout.trim().to_string();
+                if !out.is_empty() {
+                    current = out;
+                }
+            }
+            Err(e) => {
+                // Launch failure is noted but doesn't block the turn.
+                eprintln!("⎇ hook error: {e}");
+            }
+        }
+    }
+    Ok(current)
+}
+
+/// Run session lifecycle hooks (`session_start` / `session_end`). Observe-only — exit code
+/// is advisory, output is printed to stderr as a note.
+pub async fn run_session_hooks(hooks: &[HookConfig], event: HookEvent, session_id: &str) {
+    debug_assert!(
+        matches!(event, HookEvent::SessionStart | HookEvent::SessionEnd),
+        "run_session_hooks called with non-session event"
+    );
+    let event_str = match event {
+        HookEvent::SessionStart => "session_start",
+        HookEvent::SessionEnd => "session_end",
+        _ => return,
+    };
+    let payload = format!("{{\"session_id\":{},\"event\":{}}}",
+        serde_json::to_string(session_id).unwrap_or_default(),
+        serde_json::to_string(event_str).unwrap_or_default());
+    for h in hooks.iter().filter(|h| h.event == event) {
+        match run_one(h, &payload).await {
+            Ok((_, stdout, _)) => {
+                let out = stdout.trim();
+                if !out.is_empty() {
+                    eprintln!("⎇ hook: {}", truncate(out, 800));
+                }
+            }
+            Err(e) => eprintln!("⎇ hook error: {e}"),
+        }
+    }
 }
 
 fn hook_shell() -> (&'static str, &'static str) {
@@ -168,5 +231,46 @@ mod tests {
         // Timeout is a launch error (noted), not a block.
         assert!(o.blocked.is_none());
         assert!(o.notes.iter().any(|n| n.contains("timed out")));
+    }
+
+    #[tokio::test]
+    async fn prompt_hook_exit_zero_passthrough_when_no_stdout() {
+        let hooks = vec![hook(HookEvent::UserPromptSubmit, "true")];
+        let result = run_prompt_hooks(&hooks, "hello world").await;
+        assert_eq!(result.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn prompt_hook_exit_zero_with_stdout_rewrites_prompt() {
+        let hooks = vec![hook(HookEvent::UserPromptSubmit, "echo rewritten")];
+        let result = run_prompt_hooks(&hooks, "original").await;
+        assert_eq!(result.unwrap(), "rewritten");
+    }
+
+    #[tokio::test]
+    async fn prompt_hook_nonzero_exit_blocks_turn() {
+        #[cfg(not(windows))]
+        let cmd = "echo blocked reason 1>&2; exit 1";
+        #[cfg(windows)]
+        let cmd = "echo blocked reason 1>&2 & exit /b 1";
+        let hooks = vec![hook(HookEvent::UserPromptSubmit, cmd)];
+        let result = run_prompt_hooks(&hooks, "hello").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked reason"));
+    }
+
+    #[tokio::test]
+    async fn session_hooks_observe_only_do_not_panic() {
+        let hooks = vec![hook(HookEvent::SessionStart, "true")];
+        run_session_hooks(&hooks, HookEvent::SessionStart, "test-session-id").await;
+        // No assertion needed — observe-only hooks must not panic or hang.
+    }
+
+    #[tokio::test]
+    async fn prompt_hooks_not_fired_for_tool_events() {
+        // A pre_tool_use hook must not fire when run_prompt_hooks is called.
+        let hooks = vec![hook(HookEvent::PreToolUse, "exit 1")];
+        let result = run_prompt_hooks(&hooks, "hello").await;
+        assert_eq!(result.unwrap(), "hello"); // no hook matched → prompt unchanged
     }
 }

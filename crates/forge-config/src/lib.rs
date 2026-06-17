@@ -72,7 +72,7 @@ pub struct Config {
     pub hooks: Vec<HookConfig>,
 }
 
-/// When a hook fires relative to a tool call.
+/// When a hook fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
@@ -80,17 +80,29 @@ pub enum HookEvent {
     PreToolUse,
     /// After the tool returns; output is surfaced as a note, exit code is advisory.
     PostToolUse,
+    /// After the user submits a message, before the agent turn starts.
+    /// Hook receives `{"prompt": "<user message>"}` on stdin.
+    /// Exit 0 + non-empty stdout → stdout replaces the prompt.
+    /// Exit non-zero → turn is blocked; stderr/stdout shown as the reason.
+    UserPromptSubmit,
+    /// When a session starts (first turn or resume). Observe-only — exit code advisory.
+    /// Receives `{"session_id": "<id>", "event": "session_start"}` on stdin.
+    SessionStart,
+    /// When the session loop exits cleanly. Observe-only.
+    /// Receives `{"session_id": "<id>", "event": "session_end"}` on stdin.
+    SessionEnd,
 }
 
 /// One `[[hooks]]` entry: a shell command run around tool calls matching `matcher`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookConfig {
     pub event: HookEvent,
-    /// Tool-name filter: absent or `"*"` = every tool; otherwise a comma-separated list of exact
-    /// tool names (e.g. `"shell"`, `"edit_file,write_file"`).
+    /// Tool-name filter for `pre_tool_use` / `post_tool_use`: absent or `"*"` = every tool;
+    /// otherwise a comma-separated list of exact tool names (e.g. `"shell"`).
+    /// Ignored for `user_prompt_submit`, `session_start`, `session_end`.
     #[serde(default)]
     pub matcher: Option<String>,
-    /// POSIX `sh -c` command line. Receives the tool call as JSON on stdin.
+    /// Shell command line. Receives event data as JSON on stdin.
     pub command: String,
     /// Kill the hook after this many seconds (default 30).
     #[serde(default = "default_hook_timeout")]

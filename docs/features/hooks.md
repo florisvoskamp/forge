@@ -1,8 +1,9 @@
 # Feature: pre/post tool-use shell hooks
 
-> **Status: MVP shipped.** `[[hooks]]` config entries run a POSIX `sh -c` command around tool
-> calls. `PreToolUse` can **block** a call; `PostToolUse` observes. Wired into the direct tool
-> path (`forge-core::Session::invoke_tool`). New `hooks` module + `[[hooks]]` config.
+> **Status: extended.** `[[hooks]]` config entries run a shell command around tool calls and
+> session lifecycle events. `PreToolUse` blocks a call; `PostToolUse` observes; `UserPromptSubmit`
+> can rewrite or block a user prompt; `SessionStart`/`SessionEnd` fire at session boundaries.
+> Wired into both the direct tool path and the plain/TUI chat loops.
 
 ## 1. Problem (JTBD)
 
@@ -27,14 +28,18 @@ load-bearing events.
 - Time-bounded: a hook that exceeds `timeout_secs` is killed (`kill_on_drop`) and noted, never
   hangs the turn. Inert (zero overhead) when no hooks are configured.
 
-**Deferred (not in this MVP)**
-- Input **rewriting** / context **injection** (a hook editing the tool args or adding model
-  context, e.g. an `rtk`-style command rewrite or a `graphify` context inject). MVP observes +
-  blocks only.
-- Hooks on the **CLI-bridge path** (`forge mcp-serve`) and for **MCP** tool calls — currently
-  the direct built-in tool path only.
-- Other events (session start/stop, user-prompt-submit, notification).
+**Shipped (follow-up)**
+- `UserPromptSubmit` — fires before each agent turn; hook stdout replaces the prompt on exit 0;
+  non-zero blocks the turn with stderr as the reason. Enables RTK-style prompt rewriting.
+- `SessionStart` / `SessionEnd` — observe-only lifecycle events; fire in both TUI and plain chat
+  loops. Payload: `{"session_id": "<id>", "event": "session_start|session_end"}`.
+
+**Deferred**
+- Input **rewriting** of tool args (a hook editing args before the tool runs). Currently
+  `PreToolUse` can only block, not rewrite.
+- **MCP tool call** hooks — `invoke_tool` only covers direct built-in tools.
 - Per-hook environment templating beyond the stdin JSON.
+- Other events: `notification`, `PostSessionCompact`.
 
 ## Non-goals
 - Changing the agent loop, permission model, or tool contract. Hooks wrap `invoke_tool`; a

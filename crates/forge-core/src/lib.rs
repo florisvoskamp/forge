@@ -461,6 +461,17 @@ impl Session {
         self.mode
     }
 
+    /// The hooks configured for this session. Used by the chat loop to fire lifecycle events
+    /// (`UserPromptSubmit`, `SessionStart`, `SessionEnd`) outside the tool path.
+    pub fn hooks(&self) -> &[forge_config::HookConfig] {
+        &self.config.hooks
+    }
+
+    /// The session id — used by lifecycle hooks to identify the session.
+    pub fn session_id(&self) -> &str {
+        &self.id
+    }
+
     /// The most recent assistant message's text, if any — used by `/loop` to decide whether the
     /// model signalled completion.
     pub fn last_assistant_text(&self) -> Option<&str> {
