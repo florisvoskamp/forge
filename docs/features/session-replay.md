@@ -48,9 +48,15 @@ turn does — every message (`role`, `content`, `model`, tool calls, timestamp) 
 - **`Tui::print_text`** — convenience method for pushing plain multi-line strings into the
   terminal scrollback without requiring callers to construct ratatui Line<'static> values.
 
+## Shipped (follow-up 2)
+
+- **`forge replay <id> --json`** — `render_json(id, entries)` in `replay.rs` emits a
+  structured JSON object: `{ session_id, summary, turns }`, with each turn carrying seq,
+  role, created_at, content, model, token counts, cost_usd, and tool_calls. Suitable for
+  external auditing, piping to `jq`, or feeding into analysis scripts.
+
 ## Deferred
 
 - **True re-execution** — re-issue the recorded prompts against the recorded model versions
   and diff the *new* output vs. the recorded one. Non-deterministic and needs live keys, so
   it can't be verified offline; the inspect/compare half is the verifiable, high-value 80%.
-- JSON export for external auditing.

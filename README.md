@@ -31,13 +31,15 @@ $ forge lattice query "UserRepository"
 | **Model Mesh** | Auto-discovery, cost-tiered routing, health-aware failover, subscription bridges, budget caps |
 | **Providers** | Anthropic, OpenAI, Ollama, Claude Code CLI, Codex CLI, Groq, Gemini, DeepSeek, OpenRouter, and more |
 | **Code Intelligence** | Lattice: tree-sitter symbol graph, semantic embeddings, hybrid retrieval, blast-radius, call-chain |
-| **MCP** | Client for external MCP servers (stdio + HTTP/SSE), OAuth, deferred loading, allowlist gating |
+| **Assay** | Parallel critic crew, adversarial verification, ranked findings, git scopes (diff/branch/since), lens selection, auto-diff vs prior run |
+| **MCP** | Client for external MCP servers (stdio + HTTP/SSE), OAuth 2.0 + PKCE, deferred loading, allowlist gating |
 | **TUI** | ratatui live progress, cost meter, token gauge, command palette, session picker, diff preview |
 | **Skills & Commands** | Markdown prompt templates, skill methodology injection, Claude Code format compatible |
 | **Subagents** | Parallel fan-out (`spawn_agents`), mesh-routed children, live TUI tree, depth-limited |
-| **Session Management** | Checkpoints, `/undo` with file restore, session replay, transcript diff |
+| **Session Management** | Checkpoints, `/undo` with file restore, session replay + JSON export, transcript diff, assay run history |
 | **Hooks** | Pre/post tool-use shell hooks — block (pre) or observe (post) any tool call |
 | **Safety** | Permission broker, per-tool rules, diff preview before write, shadow file snapshots |
+| **Shell Error Interceptor** | Failed commands auto-diagnosed; cause + fix injected as next-turn context |
 
 ---
 
@@ -138,9 +140,10 @@ forge chat --plain              # headless / CI mode
 | `/model [<id>]` | Pin a model for this session; no arg clears the pin |
 | `/models` | Browse all discovered models |
 | `/mcp [tools <server>]` | Show MCP server status |
-| `/assay` | Run code-quality analysis crew |
+| `/assay [--diff\|--branch <b>\|--since <ref>\|<path>] [--only <lens,…>] [--skip <lens,…>]` | Run code-quality analysis crew (scoped to diff, branch, ref, or path) |
 | `/goal <objective>` | Set a persistent goal the agent tracks |
 | `/loop <task>` | Run autonomously until complete (≤25 turns) |
+| `/replay <id> [<id2>]` | Show a session transcript inline, or diff two sessions |
 | `/lattice <symbol>` | Query code intelligence inline |
 | `/config` | Open configuration wizard |
 | `/` | Open command palette (fuzzy-find skills + commands) |
@@ -191,14 +194,17 @@ forge lattice embed                  # compute semantic embeddings for nodes
 
 The index is injected automatically as context before each agent turn (hybrid semantic + structural retrieval, budgeted).
 
-### `forge sessions` / `forge replay`
+### `forge sessions` / `forge replay` / `forge assay`
 
 Audit past work.
 
 ```bash
 forge sessions              # list sessions, newest first (cost, messages, preview)
 forge replay abc123         # reconstruct turn-by-turn transcript
-forge replay abc123 def456  # diff two session summaries
+forge replay abc123 def456  # diff two session summaries (summary + per-turn content diff)
+forge replay abc123 --json  # emit full transcript as machine-readable JSON
+forge assay list            # list past assay runs (id, date, scope, cost)
+forge assay compare a1b2 c3d4  # diff findings: fixed / new / still-open
 ```
 
 ### `forge mcp`
@@ -227,7 +233,7 @@ forge commands
 Migrate commands and skills from other AI CLIs.
 
 ```bash
-forge import claude          # copy ~/.claude/commands + ~/.claude/skills/
+forge import claude          # copy ~/.claude/commands + ~/.claude/skills/ + ~/.claude/agents/
 forge import codex           # copy ~/.codex/prompts/ as commands
 forge import claude --project  # import to ./.forge instead of user config
 ```
@@ -269,6 +275,33 @@ forge lattice path "main" "persist"
 ```
 
 **Context injection** is hybrid: embedding-based semantic neighbors + structural references, scaled by budget pressure (full context budget → reduced under cost pressure).
+
+---
+
+## Assay — Code Quality Analysis
+
+`/assay` runs a parallel **critic crew** that scans your codebase (or a scoped diff) and produces a ranked, adversarially-verified findings report. Every candidate finding is independently challenged by a refuter; false positives are dropped before the report is assembled.
+
+**Scopes:**
+```
+/assay                         # full repo
+/assay src/lib.rs              # single file or subtree
+/assay --diff                  # uncommitted working-tree changes only
+/assay --branch feature/x      # files changed vs main
+/assay --since HEAD~10         # files changed since a git ref
+```
+
+**Lens selection:**
+```
+/assay --only dead-weight,unsafe       # run only these critics
+/assay --skip documentation            # run all except these
+```
+
+**Available lenses:** `dead-weight`, `correctness`, `unsafe`, `test-coverage`, `design`, `architecture`, `documentation`, `over-engineering`.
+
+**Modes:** Choose *Analysis only* (read-only ranked report) or *Full cleanup (Refine)* — which hands the findings to a permission-gated, undoable fix turn.
+
+**Auto-diff:** Each assay run is persisted. Subsequent runs for the same scope automatically show *N fixed / N new / N still-open* vs the prior run. Use `forge assay compare <a> <b>` to compare any two runs by id.
 
 ---
 
@@ -331,7 +364,7 @@ token_env = "GITHUB_TOKEN"
 tools = ["create_issue", "list_prs"]
 ```
 
-Server tools are exposed to the agent via meta-tools (`mcp_search_tools`, `mcp_call`) — the server's full tool list is never loaded upfront, keeping the model's tool space small. All MCP calls pass through Forge's permission broker. Secrets come from env vars or the OS keyring, never from the config file.
+Server tools are exposed to the agent as namespaced `ToolSpec`s (e.g. `gitlab__list_merge_requests`). An optional allowlist keeps the model's tool space small. All MCP calls pass through Forge's permission broker. Secrets come from env vars or the OS keyring, never from the config file.
 
 **Import existing configs** from Claude Code, Cursor, Windsurf, VS Code, or Codex:
 

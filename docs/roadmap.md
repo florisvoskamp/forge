@@ -69,7 +69,7 @@ The v0.1 audit found three real gaps. All are now fixed:
 | Feature | Status | Notes |
 |---------|--------|-------|
 | **Subagent orchestration** | **done** | `spawn_agents` virtual tool, mesh-routed children, depth-1 guard, live TUI tree |
-| **Assay — analysis mode** ⚒ | **MVP done** | parallel critics + adversarial verify + ranked report; deferred: git scopes, fix hand-off |
+| **Assay — analysis mode** ⚒ | **done** | parallel critics + adversarial verify + ranked report + git scopes (--diff/--branch/--since) + --only/--skip lens selection + auto-diff vs prior run + `forge assay list/compare`; deferred: per-critic live progress rows (full U9), budget pre-estimate scope-down (U8) |
 | **Commands + skills** | **done** | palette + `forge-skills`, CC-compatible, `use_skill` virtual tool, `@path` deferred |
 | **MCP client** | **done** (+OAuth PR #93) | stdio + HTTP/SSE, deferred loading, allowlist, OAuth 2.0 Authorization Code + PKCE, `forge mcp login/logout` |
 | **Lattice** ⚒ | **done** | tree-sitter Rust + multi-language, resolved edges, impact/path, auto-retrieval injection, hybrid semantic+structural embeddings, file watcher, `/lattice`, `forge lattice why` |
@@ -106,7 +106,7 @@ wave approaches.
 | Feature | What | Source |
 |---------|------|--------|
 | **Skills/agents marketplace** | Publish/import skills, commands, agents — "npm for AI workflows" (25% rev share). | Helm note; designed to plug into the command/skill system |
-| **Session replay** — **done** | Record prompts + model versions + outputs; replay + diff; auditable, reproducible AI. **Shipped:** `forge replay <id>` (turn-by-turn transcript) + `forge replay <a> <b>` (summary diff + per-turn content diff) + `/replay` in-session chat command. **Deferred:** true model re-execution, JSON export. | [session-replay.md](features/session-replay.md); Helm note |
+| **Session replay** — **done** | Record prompts + model versions + outputs; replay + diff; auditable, reproducible AI. **Shipped:** `forge replay <id>` (turn-by-turn transcript) + `forge replay <a> <b>` (summary diff + per-turn content diff) + `/replay` in-session chat command + `forge replay <id> --json` (JSON export). **Deferred:** true model re-execution. | [session-replay.md](features/session-replay.md); Helm note |
 | **Import / migration layer** | **Claude + Codex done** (`forge import claude` / `codex`) | Auto-detect + import from Claude Code (skills/commands/agents), Codex CLI. **Shipped:** `forge import claude [--project]` copies `~/.claude/{commands,skills,agents}` (agents share the same .md format so it's a direct copy), and `forge import codex [--project]` copies `~/.codex/prompts/*.md` as commands. **Deferred:** Claude hooks/memory/settings import; Aider/Cursor/Continue. | Helm note; prerequisite for CC-compat in skills + MCP specs |
 | **Natural-language shell** | "show me what changed performance-wise since last week" → runs the right commands, diffs, explains. | Helm note |
 | **Shell error interceptor** — **done** | Command fails → AI auto-explains + offers a fix. **Shipped:** trivial-tier diagnosis on shell failure, transcript injection (model sees hint on next turn), usage recorded against budget. **Deferred:** one-key apply-fix, pattern cache. | [shell-error-interceptor.md](features/shell-error-interceptor.md); Helm note |
