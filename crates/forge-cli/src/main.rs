@@ -157,6 +157,20 @@ enum Command {
         #[command(subcommand)]
         cmd: GitCmd,
     },
+    /// Natural-language shell: describe what you want to know in plain English and Forge
+    /// runs the right shell commands, then explains the results.
+    ///
+    /// Examples:
+    ///   forge nl "what changed performance-wise since last week"
+    ///   forge nl "which tests are slowest"
+    ///   forge nl "show disk usage by directory"
+    Nl {
+        /// Your question in plain English.
+        query: Vec<String>,
+        /// Override the permission mode for this run.
+        #[arg(long, value_enum)]
+        mode: Option<Mode>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -429,6 +443,7 @@ async fn main() -> Result<()> {
         Command::Lattice { op } => lattice_cmd(op).await,
         Command::Import { source } => import_cmd(source),
         Command::Git { cmd } => git_cmd(cmd),
+        Command::Nl { query, mode } => nl_cmd(query.join(" "), mode).await,
     }
 }
 
@@ -2430,6 +2445,56 @@ async fn run(
     if tui {
         let _ = session.read_line();
     }
+    Ok(())
+}
+
+async fn nl_cmd(query: String, mode: Option<Mode>) -> Result<()> {
+    if query.trim().is_empty() {
+        anyhow::bail!("empty query — usage: forge nl \"what changed performance-wise since last week\"");
+    }
+    // Gather shell context so the model can run the right commands.
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let git_ctx = {
+        let branch = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string());
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline", "-8"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string());
+        match (branch, log) {
+            (Some(b), Some(l)) if !l.is_empty() => {
+                format!("\n- Git branch: {b}\n- Recent commits:\n{l}")
+            }
+            (Some(b), _) => format!("\n- Git branch: {b}"),
+            _ => String::new(),
+        }
+    };
+    let platform = std::env::consts::OS;
+    let guidance = format!(
+        "You are a shell expert. The user asks a natural-language question about their system \
+or codebase. Determine which shell commands answer it, run them with the shell tool, then \
+synthesize a clear, direct answer. Do not explain what you are about to do — just run \
+commands and explain the output. Be concise.\n\
+\n\
+Environment:\n\
+- Working directory: {cwd}\n\
+- Platform: {platform}{git_ctx}"
+    );
+    let mut session = build_session(false, mode, false, None, None).await?;
+    session
+        .run_turn_with(&query, &[guidance], None)
+        .await
+        .context("nl query")?;
     Ok(())
 }
 
