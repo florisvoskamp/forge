@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use forge_config::Config;
+use forge_core::hooks;
 use forge_core::permission;
 use forge_core::subagent::{self, AgentCtx};
 use forge_mesh::pricing::Pricing;
@@ -234,6 +235,24 @@ impl ServerHandler for ForgeMcp {
             ))]));
         };
 
+        // PreToolUse hooks (hooks.md): fire before the permission gate so user hooks can block
+        // calls on the CLI-bridge path the same way they do on the direct path.
+        if !self.config.hooks.is_empty() {
+            let payload = serde_json::json!({ "tool": name, "args": args }).to_string();
+            let outcome = hooks::run_hooks(
+                &self.config.hooks,
+                forge_config::HookEvent::PreToolUse,
+                &name,
+                &payload,
+            )
+            .await;
+            if let Some(reason) = outcome.blocked {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "blocked by hook: {reason}"
+                ))]));
+            }
+        }
+
         // Forge's permission gate — the unoverridable denylist always applies here.
         let decision = permission::decide(self.mode, tool.side_effect(), &name, &args, &self.rules);
         if decision == PermissionDecision::Deny {
@@ -253,15 +272,45 @@ impl ServerHandler for ForgeMcp {
             let _ = forge_core::snapshot::snapshot_from_env_before_write(path);
         }
 
-        match tool.run(&args).await {
+        let (out, ok) = match tool.run(&args).await {
             Ok(out) => {
                 if let Some(path) = &write_path {
                     let _ = forge_core::snapshot::record_from_env_after_write(path);
                 }
-                Ok(CallToolResult::success(vec![Content::text(out)]))
+                (out, true)
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+            Err(e) => (format!("error: {e}"), false),
+        };
+
+        // PostToolUse hooks (hooks.md): observe the completed call. Notes are surfaced as a
+        // prefix on the result the bridge model sees (no presenter available on this path).
+        let mut note_prefix = String::new();
+        if !self.config.hooks.is_empty() {
+            let payload =
+                serde_json::json!({ "tool": name, "args": args, "result": out, "ok": ok })
+                    .to_string();
+            let outcome = hooks::run_hooks(
+                &self.config.hooks,
+                forge_config::HookEvent::PostToolUse,
+                &name,
+                &payload,
+            )
+            .await;
+            for note in outcome.notes {
+                note_prefix.push_str(&format!("[hook note] {note}\n"));
+            }
         }
+
+        let result_text = if note_prefix.is_empty() {
+            out
+        } else {
+            format!("{note_prefix}{out}")
+        };
+        Ok(if ok {
+            CallToolResult::success(vec![Content::text(result_text)])
+        } else {
+            CallToolResult::error(vec![Content::text(result_text)])
+        })
     }
 }
 
