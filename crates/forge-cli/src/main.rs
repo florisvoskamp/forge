@@ -1975,6 +1975,10 @@ async fn build_session_with(
         }
     }
 
+    // Normalize legacy underscore-prefix aliases (codex_cli:: → codex-cli::) so that
+    // `--model codex_cli::gpt-5.4-mini` works identically to the canonical hyphen form.
+    let pin = pin.map(|p| forge_provider::normalize_model_id(&p).into_owned());
+
     // Auto-discovery: build a live model catalog so the mesh routes to the best usable model
     // (docs/features/auto-discovery-mesh.md). Skipped for the offline mock and when disabled.
     let catalog = if !mock && config.mesh.auto_discover {
@@ -1982,6 +1986,30 @@ async fn build_session_with(
     } else {
         None
     };
+
+    // Validate the pinned model against the catalog so unknown ids fail fast with a clear message
+    // rather than a confusing provider "Resolver error" at the first API call.
+    if let (Some(id), Some(cat)) = (pin.as_deref(), catalog.as_ref()) {
+        if !cat.models().contains(&id.to_string()) {
+            let provider_prefix = id.split("::").next().unwrap_or(id);
+            let suggestions: Vec<&str> = cat
+                .models()
+                .iter()
+                .filter(|m| m.starts_with(provider_prefix))
+                .map(String::as_str)
+                .take(5)
+                .collect();
+            let hint = if suggestions.is_empty() {
+                format!("no '{provider_prefix}' models in catalog — run `forge models` to see what's available")
+            } else {
+                format!("try: {}", suggestions.join(", "))
+            };
+            presenter.emit(forge_tui::PresenterEvent::Warning(format!(
+                "unknown model '{id}' — {hint}"
+            )));
+        }
+    }
+
     let (provider, router) = build_provider_and_router(&config, mock, pin, catalog.clone());
 
     // Build the code-intelligence index up front so it can be shared between the model-facing
@@ -3204,6 +3232,8 @@ async fn dispatch_command(
         // `/model <id>` pins a specific model for the rest of this session (or clears the pin).
         // Works while a turn is running (pin takes effect on the NEXT turn).
         CommandAction::PinModel(model_id) => {
+            let model_id = model_id
+                .map(|id| forge_provider::normalize_model_id(&id).into_owned());
             let mut s = session.lock().await;
             s.pin_model(model_id.clone());
             match model_id {
@@ -3875,7 +3905,8 @@ mod tests {
             "anthropic::claude-opus-4-8".into(),
             "groq::llama-3.1-8b-instant".into(),
             "groq::llama-3.3-70b-versatile".into(),
-            "claude-cli::".into(),
+            "claude-cli::".into(),      // bare default (hidden in browser, still counted in stats)
+            "claude-cli::opus".into(),  // named alias (shown in browser)
         ])
     }
 
@@ -3884,8 +3915,8 @@ mod tests {
         let cat = models_catalog();
         let pricing = forge_mesh::pricing::Pricing::default();
         let (heading, rows) = models_provider_view(&cat, &pricing, &Default::default());
-        assert!(heading.contains("4 total"), "heading counts: {heading}");
-        assert!(heading.contains("2 frontier") && heading.contains("1 subscription"));
+        assert!(heading.contains("5 total"), "heading counts: {heading}");
+        assert!(heading.contains("3 frontier") && heading.contains("2 subscription"));
         // groq has 2 models → it's the first (richest) provider row.
         assert_eq!(rows[0].id, "groq");
         assert!(rows[0].subtitle.contains("2 models"));
@@ -3904,9 +3935,11 @@ mod tests {
         assert!(rows.iter().all(|r| r.id.contains("::")));
         let frontier = rows.iter().find(|r| r.id.contains("70b")).unwrap();
         assert!(frontier.subtitle.contains("frontier") && frontier.subtitle.contains("free"));
-        // the bare subscription bridge shows "(default model)" as its name + a subscription badge.
+        // The subscription bridge shows its named alias; the bare `claude-cli::` default-model
+        // entry is hidden (it was confusingly empty in the browser).
         let (_, sub) = models_for_provider(&cat, &pricing, &Default::default(), "claude-cli");
-        assert_eq!(sub[0].title, "(default model)");
+        assert!(!sub.is_empty(), "named cli models shown");
+        assert!(sub.iter().all(|r| r.id != "claude-cli::"), "bare entry hidden");
         assert!(sub[0].subtitle.contains("subscription"));
     }
 

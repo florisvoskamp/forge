@@ -17,6 +17,18 @@ pub use embedder::{select_embedder, GenaiEmbedder};
 pub use genai_provider::{list_models, GenAiProvider};
 pub use mock::MockProvider;
 
+/// Normalize legacy underscore-prefixed bridge ids to the canonical hyphen form so
+/// `codex_cli::gpt-5.4-mini` and `claude_cli::opus` work identically to their hyphen forms.
+pub fn normalize_model_id(model: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = model.strip_prefix("claude_cli::") {
+        return std::borrow::Cow::Owned(format!("claude-cli::{rest}"));
+    }
+    if let Some(rest) = model.strip_prefix("codex_cli::") {
+        return std::borrow::Cow::Owned(format!("codex-cli::{rest}"));
+    }
+    std::borrow::Cow::Borrowed(model)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     /// A non-retryable failure: bad request, malformed response, context-length, etc. It
@@ -209,6 +221,8 @@ impl Provider for DispatchProvider {
         tools: &[ToolSpec],
         on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
+        let model = normalize_model_id(model);
+        let model = model.as_ref();
         if model.starts_with("claude-cli::") {
             self.cli_notice();
             self.claude_cli
