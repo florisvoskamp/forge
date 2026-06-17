@@ -3005,6 +3005,7 @@ fn spawn_turn(
     busy: &mut bool,
     busy_since: &mut std::time::Instant,
 ) -> tokio::task::JoinHandle<()> {
+    app.on_turn_start();
     app.submit_user(prompt);
     app.done = false;
     app.tick = 0;
@@ -3039,6 +3040,7 @@ fn spawn_turn_with(
     busy: &mut bool,
     busy_since: &mut std::time::Instant,
 ) -> tokio::task::JoinHandle<()> {
+    app.on_turn_start();
     app.submit_user(&prompt);
     app.done = false;
     app.tick = 0;

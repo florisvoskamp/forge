@@ -425,16 +425,26 @@ impl App {
         1 + n as u16
     }
 
-    /// Rows the running-subagents panel wants in the live region (0 = none running). Dedicated
-    /// region so active children stay visible during streaming.
+    /// Rows the running-subagents panel wants in the live region (0 = hidden). Counts the whole
+    /// current batch (running + done) so the panel stays visible after all agents finish — without
+    /// this, Start + Result events arriving in the same render drain leave the panel at height 0
+    /// forever. The batch is cleared by [`on_turn_start`] when the user sends the next message.
     pub fn subagents_panel_height(&self) -> u16 {
-        let n = self.running_subagents();
+        let n = self.subagents.len();
         if n == 0 {
             return 0;
         }
         let shown = n.min(SUBAGENTS_PANEL_MAX);
         let overflow = u16::from(n > SUBAGENTS_PANEL_MAX);
         1 + shown as u16 + overflow
+    }
+
+    /// Called at the start of each new user turn. Collapses the "done" subagent batch that the
+    /// panel was holding so it doesn't bleed into the new turn's live region.
+    pub fn on_turn_start(&mut self) {
+        if !self.subagents.is_empty() && self.subagents.iter().all(|r| r.done) {
+            self.subagents.clear();
+        }
     }
 
     /// Owned snapshot of the current batch's subagents (running + just-finished), in spawn order;
@@ -1070,30 +1080,50 @@ fn render_subagent_picker(frame: &mut Frame, area: Rect, app: &App) {
 /// The sticky running-subagents panel (its own live region): a header (with the Ctrl+O hint) then
 /// one animated row per running child, sized to `area.height`, overflow summarized.
 fn render_subagents_panel(frame: &mut Frame, area: Rect, app: &App) {
-    let running: Vec<&SubRow> = app.subagents.iter().filter(|r| !r.done).collect();
-    if running.is_empty() {
+    if app.subagents.is_empty() {
         return;
     }
-    let spin = SPINNER[app.tick % SPINNER.len()];
+    let running: Vec<&SubRow> = app.subagents.iter().filter(|r| !r.done).collect();
     let h = area.height as usize;
     let mut lines: Vec<TextLine> = Vec::with_capacity(h);
-    lines.push(TextLine::from(vec![
-        Span::styled(
-            format!("  ⚒ subagents ({} running)", running.len()),
-            Style::default().fg(TOOLCYAN).bold(),
-        ),
-        Span::styled("  ^O transcript", Style::default().fg(DIM)),
-    ]));
-    let body_h = h.saturating_sub(1);
-    for r in running.iter().take(body_h) {
-        lines.push(subagent_running_line(spin, &r.agent, &r.task, &r.last));
-    }
-    if running.len() > body_h {
-        lines.pop();
-        lines.push(TextLine::from(Span::styled(
-            format!("  … +{} more running", running.len() - body_h + 1),
-            Style::default().fg(DIM),
-        )));
+
+    if running.is_empty() {
+        // All agents in the batch finished — show a "done" summary until on_turn_start clears it.
+        let n = app.subagents.len();
+        lines.push(TextLine::from(vec![
+            Span::styled(
+                format!("  ⚒ subagents ({n} done)"),
+                Style::default().fg(TOOLCYAN).bold(),
+            ),
+            Span::styled("  ^O transcript", Style::default().fg(DIM)),
+        ]));
+        let body_h = h.saturating_sub(1);
+        for r in app.subagents.iter().take(body_h) {
+            lines.push(TextLine::from(Span::styled(
+                format!("    ✓ {}  {}", r.agent, r.task),
+                Style::default().fg(DIM),
+            )));
+        }
+    } else {
+        let spin = SPINNER[app.tick % SPINNER.len()];
+        lines.push(TextLine::from(vec![
+            Span::styled(
+                format!("  ⚒ subagents ({} running)", running.len()),
+                Style::default().fg(TOOLCYAN).bold(),
+            ),
+            Span::styled("  ^O transcript", Style::default().fg(DIM)),
+        ]));
+        let body_h = h.saturating_sub(1);
+        for r in running.iter().take(body_h) {
+            lines.push(subagent_running_line(spin, &r.agent, &r.task, &r.last));
+        }
+        if running.len() > body_h {
+            lines.pop();
+            lines.push(TextLine::from(Span::styled(
+                format!("  … +{} more running", running.len() - body_h + 1),
+                Style::default().fg(DIM),
+            )));
+        }
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -1465,10 +1495,16 @@ mod tests {
             cost_usd: 0.002,
         });
 
-        // Once all done the live list clears and the group box is in scrollback.
+        // Once all done: the live panel switches to "done" state (still shows agent names) and the
+        // group box also lands in scrollback. on_turn_start collapses the panel for the next turn.
+        let done_screen = screen(&app);
         assert!(
-            !screen(&app).contains("reviewer"),
-            "running list cleared after all complete"
+            done_screen.contains("subagents (2 done)"),
+            "panel shows done count: {done_screen}"
+        );
+        assert!(
+            done_screen.contains("reviewer"),
+            "done panel shows agent names: {done_screen}"
         );
         let sb = flush_text(&mut app);
         assert!(sb.contains("subagents"), "group header: {sb}");
@@ -1477,6 +1513,12 @@ mod tests {
             "branch: {sb}"
         );
         assert!(sb.contains("2 agents"), "footer with count: {sb}");
+        // Panel collapses at next turn start, not on completion.
+        app.on_turn_start();
+        assert!(
+            !screen(&app).contains("reviewer"),
+            "panel gone after on_turn_start"
+        );
     }
 
     #[test]
@@ -1951,7 +1993,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_panel_present_while_running_absent_when_done() {
+    fn subagent_panel_present_while_running_and_after_done_collapses_on_next_turn() {
         let mut app = App::default();
         assert_eq!(app.running_subagents(), 0);
         app.apply(PresenterEvent::SubagentStart {
@@ -1961,9 +2003,11 @@ mod tests {
         });
         assert_eq!(app.running_subagents(), 1);
         let s = screen(&app);
-        assert!(s.contains("subagents (1 running)"), "panel header: {s}");
+        assert!(s.contains("subagents (1 running)"), "panel header while running: {s}");
         assert!(s.contains("reviewer"), "agent label shown: {s}");
 
+        // After SubagentResult the panel stays visible (shows "done") so it's never invisible
+        // when Start+Result arrive in the same render drain (the common bridge case).
         app.apply(PresenterEvent::SubagentResult {
             id: "a".into(),
             agent: "reviewer".into(),
@@ -1971,14 +2015,18 @@ mod tests {
             summary: "ok".into(),
             cost_usd: 0.001,
         });
-        assert_eq!(
-            app.running_subagents(),
-            0,
-            "no running children after result"
+        assert_eq!(app.running_subagents(), 0, "no running children after result");
+        let s = screen(&app);
+        assert!(
+            s.contains("subagents (1 done)"),
+            "panel stays visible showing done state: {s}"
         );
+
+        // The panel collapses at the START of the next user turn, not immediately on result.
+        app.on_turn_start();
         assert!(
             !screen(&app).contains("subagents ("),
-            "panel collapses when the batch finishes"
+            "panel collapses after on_turn_start: {s}"
         );
     }
 
