@@ -209,7 +209,7 @@ fn collect_recent_jsonl(dir: &PathBuf, cutoff_secs: i64, out: &mut Vec<PathBuf>)
         let path = entry.path();
         if path.is_dir() {
             collect_recent_jsonl(&path, cutoff_secs, out);
-        } else if path.extension().map_or(false, |e| e == "jsonl") {
+        } else if path.extension().is_some_and(|e| e == "jsonl") {
             let recent = entry
                 .metadata()
                 .and_then(|m| m.modified())
