@@ -1025,7 +1025,7 @@ fn render_subagent_picker(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(
                 truncate(&v.task, 44),
-                Style::default().fg(if selected { DIM } else { DIM }),
+                Style::default().fg(DIM),
             ),
         ]));
     }

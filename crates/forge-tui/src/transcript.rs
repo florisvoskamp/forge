@@ -36,7 +36,10 @@ where
     res
 }
 
-fn browse<F: FnMut() -> Vec<SubagentView>>(refresh: &mut F, initial_selected: usize) -> io::Result<()> {
+fn browse<F: FnMut() -> Vec<SubagentView>>(
+    refresh: &mut F,
+    initial_selected: usize,
+) -> io::Result<()> {
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut selected = initial_selected;
     let mut scroll = 0usize;
