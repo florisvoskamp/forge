@@ -244,7 +244,10 @@ impl Catalog {
                     Some(p) => format!("{p}:{sub_ns}"),
                     None => sub_ns,
                 };
-                let sub_dir = ScopedDir { path: path.clone(), scope: dir.scope };
+                let sub_dir = ScopedDir {
+                    path: path.clone(),
+                    scope: dir.scope,
+                };
                 self.load_commands_dir_recurse(&sub_dir, Some(&new_ns));
                 continue;
             }

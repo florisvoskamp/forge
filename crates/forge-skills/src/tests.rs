@@ -595,8 +595,14 @@ fn nested_subdir_commands_get_deeply_namespaced_name() {
     )
     .unwrap();
     let cat = t.load();
-    let entry = cat.entries().into_iter().find(|e| e.name == "infra:terraform:apply");
-    assert!(entry.is_some(), "command 'infra:terraform:apply' not found in catalog");
+    let entry = cat
+        .entries()
+        .into_iter()
+        .find(|e| e.name == "infra:terraform:apply");
+    assert!(
+        entry.is_some(),
+        "command 'infra:terraform:apply' not found in catalog"
+    );
 }
 
 #[test]

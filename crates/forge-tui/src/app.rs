@@ -360,11 +360,7 @@ impl App {
             }
             PresenterEvent::AssayCriticRow(row) => {
                 // Update the live panel: insert on Queued, update status on Done/Skipped.
-                if let Some(existing) = self
-                    .assay_critics
-                    .iter_mut()
-                    .find(|r| r.lens == row.lens)
-                {
+                if let Some(existing) = self.assay_critics.iter_mut().find(|r| r.lens == row.lens) {
                     existing.status = row.status;
                 } else {
                     self.assay_critics.push(row);
@@ -1194,10 +1190,7 @@ fn render_assay_panel(frame: &mut Frame, area: Rect, app: &App) {
     let body_h = h.saturating_sub(1);
     for r in app.assay_critics.iter().take(body_h) {
         let (glyph, style) = match &r.status {
-            AssayCriticStatus::Queued => (
-                format!("{spin} {}", r.lens),
-                Style::default().fg(DIM),
-            ),
+            AssayCriticStatus::Queued => (format!("{spin} {}", r.lens), Style::default().fg(DIM)),
             AssayCriticStatus::Done { candidates } => (
                 format!("✓ {} ({candidates})", r.lens),
                 Style::default().fg(OKGREEN),
@@ -1207,10 +1200,7 @@ fn render_assay_panel(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(DIM),
             ),
         };
-        lines.push(TextLine::from(Span::styled(
-            format!("  {glyph}"),
-            style,
-        )));
+        lines.push(TextLine::from(Span::styled(format!("  {glyph}"), style)));
     }
     if app.assay_critics.len() > body_h {
         lines.pop();
@@ -2046,7 +2036,10 @@ mod tests {
         });
         assert_eq!(app.running_subagents(), 1);
         let s = screen(&app);
-        assert!(s.contains("subagents (1 running)"), "panel header while running: {s}");
+        assert!(
+            s.contains("subagents (1 running)"),
+            "panel header while running: {s}"
+        );
         assert!(s.contains("reviewer"), "agent label shown: {s}");
 
         // After SubagentResult the panel stays visible (shows "done") so it's never invisible
@@ -2058,7 +2051,11 @@ mod tests {
             summary: "ok".into(),
             cost_usd: 0.001,
         });
-        assert_eq!(app.running_subagents(), 0, "no running children after result");
+        assert_eq!(
+            app.running_subagents(),
+            0,
+            "no running children after result"
+        );
         let s = screen(&app);
         assert!(
             s.contains("subagents (1 done)"),

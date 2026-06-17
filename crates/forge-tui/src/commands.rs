@@ -25,7 +25,8 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "replay",
-        desc: "show a session transcript inline (/replay <id>) or diff two sessions (/replay <a> <b>)",
+        desc:
+            "show a session transcript inline (/replay <id>) or diff two sessions (/replay <a> <b>)",
         usage: "/replay <id> [<id2>]",
     },
     Command {
@@ -41,7 +42,8 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "assay",
         desc: "analyze code quality (AI-slop, dead/unsafe/untested) — or full cleanup",
-        usage: "/assay [--diff|--branch <b>|--since <ref>|<path>] [--only <lens,…>] [--skip <lens,…>]",
+        usage:
+            "/assay [--diff|--branch <b>|--since <ref>|<path>] [--only <lens,…>] [--skip <lens,…>]",
     },
     Command {
         name: "model",
@@ -138,7 +140,11 @@ pub enum CommandAction {
     /// Enter Assay mode — pick analysis-only vs full cleanup, then run the critic crew.
     /// `only`/`skip` are lens name lists; `scope` is `""` (repo), a path, `"--diff"`,
     /// `"--branch <b>"`, or `"--since <ref>"`.
-    Assay { only: Vec<String>, skip: Vec<String>, scope: String },
+    Assay {
+        only: Vec<String>,
+        skip: Vec<String>,
+        scope: String,
+    },
     /// Rewind the last turn (conversation + file edits).
     Undo,
     /// Save a checkpoint at the current point; `None` = an auto/unnamed checkpoint.
@@ -337,7 +343,11 @@ fn extract_flag(arg: &str, flag: &str) -> Vec<String> {
         if *tok == flag {
             if let Some(val) = tokens.get(i + 1) {
                 if !val.starts_with('-') {
-                    return val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                    return val
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                 }
             }
         }
@@ -407,7 +417,10 @@ pub fn parse_command(line: &str) -> CommandAction {
             // `/replay <id>` or `/replay <a> <b>`
             let mut ids = arg.splitn(2, char::is_whitespace);
             let id_a = ids.next().unwrap_or("").trim().to_string();
-            let id_b = ids.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let id_b = ids
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             CommandAction::Replay(id_a, id_b)
         }
         "clear" | "cls" => CommandAction::ClearScreen,

@@ -57,10 +57,14 @@ pub async fn run_hooks(
                         {
                             outcome.rewritten_args = Some(v);
                         } else {
-                            outcome.notes.push(format!("⎇ hook: {}", truncate(trimmed, 800)));
+                            outcome
+                                .notes
+                                .push(format!("⎇ hook: {}", truncate(trimmed, 800)));
                         }
                     } else {
-                        outcome.notes.push(format!("⎇ hook: {}", truncate(trimmed, 800)));
+                        outcome
+                            .notes
+                            .push(format!("⎇ hook: {}", truncate(trimmed, 800)));
                     }
                 }
             }
@@ -76,9 +80,15 @@ pub async fn run_hooks(
 /// stdout from the first hook that exited 0 and produced non-empty output.
 /// Returns `Err(reason)` if any hook exits non-zero — the turn should be blocked.
 pub async fn run_prompt_hooks(hooks: &[HookConfig], prompt: &str) -> Result<String, String> {
-    let payload = format!("{{\"prompt\":{}}}", serde_json::to_string(prompt).unwrap_or_default());
+    let payload = format!(
+        "{{\"prompt\":{}}}",
+        serde_json::to_string(prompt).unwrap_or_default()
+    );
     let mut current = prompt.to_string();
-    for h in hooks.iter().filter(|h| h.event == HookEvent::UserPromptSubmit) {
+    for h in hooks
+        .iter()
+        .filter(|h| h.event == HookEvent::UserPromptSubmit)
+    {
         match run_one(h, &payload).await {
             Ok((code, stdout, stderr)) => {
                 if code != 0 {
@@ -117,9 +127,11 @@ pub async fn run_session_hooks(hooks: &[HookConfig], event: HookEvent, session_i
         HookEvent::SessionEnd => "session_end",
         _ => return,
     };
-    let payload = format!("{{\"session_id\":{},\"event\":{}}}",
+    let payload = format!(
+        "{{\"session_id\":{},\"event\":{}}}",
         serde_json::to_string(session_id).unwrap_or_default(),
-        serde_json::to_string(event_str).unwrap_or_default());
+        serde_json::to_string(event_str).unwrap_or_default()
+    );
     for h in hooks.iter().filter(|h| h.event == event) {
         match run_one(h, &payload).await {
             Ok((_, stdout, _)) => {
@@ -282,9 +294,15 @@ mod tests {
         // No assertion needed — observe-only hooks must not panic or hang.
     }
 
+    // Windows cmd.exe mangles double-quoted JSON in `echo` output; the JSON-detection
+    // logic is pure Rust and is exercised on Linux + macOS.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn pretooluse_exit_zero_json_object_stdout_rewrites_args() {
-        let hooks = vec![hook(HookEvent::PreToolUse, "echo '{\"path\":\"rewritten.rs\"}'")];
+        let hooks = vec![hook(
+            HookEvent::PreToolUse,
+            "echo '{\"path\":\"rewritten.rs\"}'",
+        )];
         let o = run_hooks(&hooks, HookEvent::PreToolUse, "shell", "{}").await;
         assert!(o.blocked.is_none());
         assert!(o.notes.is_empty(), "json stdout should not become a note");

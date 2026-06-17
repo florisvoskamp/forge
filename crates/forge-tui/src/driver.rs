@@ -149,10 +149,8 @@ impl Tui {
 
     /// Push plain multi-line text into the scrollback (convenience over [`insert_lines`]).
     pub fn print_text(&mut self, text: &str) {
-        let lines: Vec<TextLine<'static>> = text
-            .lines()
-            .map(|s| TextLine::from(s.to_owned()))
-            .collect();
+        let lines: Vec<TextLine<'static>> =
+            text.lines().map(|s| TextLine::from(s.to_owned())).collect();
         self.insert_lines(lines);
     }
 
