@@ -834,6 +834,29 @@ impl Session {
             .with_conserve(self.config.mesh.subscription_conserve)
     }
 
+    /// The current budget snapshot (spend vs caps) used for routing decisions.
+    fn budget_snapshot(&self) -> BudgetState {
+        BudgetState {
+            spent_today_usd: self.store.spend_today_usd().unwrap_or(0.0),
+            daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_week_usd: self.store.spend_this_week_usd().unwrap_or(0.0),
+            weekly_cap_usd: self.config.mesh.weekly_budget_usd,
+            spent_month_usd: self.store.spend_this_month_usd().unwrap_or(0.0),
+            monthly_cap_usd: self.config.mesh.monthly_cap_usd,
+            warn_fraction: self.config.mesh.warn_threshold,
+        }
+    }
+
+    /// Explain how the mesh would route `prompt` right now, using this session's live catalog,
+    /// quota, benched-model health and budget — the data behind the `/mesh` inspector. `None` when
+    /// auto-discovery routing isn't active (no catalog), since the candidate table would be empty.
+    pub fn explain_routing(&self, prompt: &str) -> Option<forge_mesh::RoutingExplanation> {
+        let catalog = self.catalog.clone()?;
+        let router = forge_mesh::HeuristicRouter::new(self.config.clone()).with_catalog(catalog);
+        let health = self.store.current_benched().unwrap_or_default();
+        Some(router.explain(prompt, self.budget_snapshot(), &health, &self.live_quota()))
+    }
+
     pub async fn compact(&mut self) -> Result<(usize, usize), CoreError> {
         let before = self.transcript.len();
         if before <= COMPACT_KEEP_RECENT + COMPACT_MIN_OLDER {

@@ -116,6 +116,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/usage",
     },
     Command {
+        name: "mesh",
+        desc: "inspect mesh routing — classification, scores, quota, conservation",
+        usage: "/mesh [task prompt]",
+    },
+    Command {
         name: "quit",
         desc: "exit Forge",
         usage: "/quit",
@@ -168,6 +173,8 @@ pub enum CommandAction {
     Replay(String, Option<String>),
     /// Open the usage overlay showing API spend + token breakdown (`/usage`).
     Usage,
+    /// Open the mesh routing inspector; optional prompt to trace (`/mesh [task]`).
+    Mesh(Option<String>),
     Quit,
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
@@ -429,6 +436,7 @@ pub fn parse_command(line: &str) -> CommandAction {
         }
         "clear" | "cls" => CommandAction::ClearScreen,
         "usage" => CommandAction::Usage,
+        "mesh" => CommandAction::Mesh((!arg.is_empty()).then_some(arg)),
         "quit" | "exit" | "q" => CommandAction::Quit,
         other => CommandAction::Unknown(other.to_string()),
     }

@@ -3129,6 +3129,15 @@ async fn run_chat_tui(
                 continue;
             }
 
+            // Mesh inspector overlay captures all keys; Esc closes it.
+            if app.mesh_overlay.open {
+                if matches!(key, KeyKind::Esc) {
+                    app.mesh_overlay.open = false;
+                    dirty = true;
+                }
+                continue;
+            }
+
             // The @path file-path picker is modal while open.
             if app.at_picker.open {
                 match key {
@@ -3625,6 +3634,10 @@ async fn run_chat_tui(
         }
         if app.picker.open && app.picker.anim < 1.0 {
             app.picker.tick_anim();
+            dirty = true;
+        }
+        if app.mesh_overlay.open {
+            app.mesh_overlay.anim_tick = app.mesh_overlay.anim_tick.wrapping_add(1);
             dirty = true;
         }
         if app.usage_overlay.open {
@@ -4205,6 +4218,86 @@ async fn dispatch_command(
             app.usage_overlay.claude_weekly_out = bstats.claude_weekly_out;
             apply_quota_fallback(&mut app.usage_overlay, &bridge_fracs);
             app.usage_overlay.open = true;
+        }
+        CommandAction::Mesh(arg) => {
+            let prompt = arg.unwrap_or_default();
+            // Bare `/mesh` → a representative complex task for the overview; else the given prompt.
+            let to_explain = if prompt.trim().is_empty() {
+                "design and prove correct a concurrent lock-free algorithm".to_string()
+            } else {
+                prompt.clone()
+            };
+            let exp = {
+                let s = session.lock().await;
+                s.explain_routing(&to_explain)
+            };
+            match exp {
+                Some(e) => {
+                    let conserve_line = if !e.conserve.enabled {
+                        "off".to_string()
+                    } else if !e.conserve.eligible {
+                        "no frontier alternative → not applied".to_string()
+                    } else if e.conserve.fired {
+                        format!(
+                            "FIRED (roll {:.2} < P {:.2}) → spread to free frontier",
+                            e.conserve.roll, e.conserve.probability
+                        )
+                    } else {
+                        format!(
+                            "not fired (roll {:.2} ≥ P {:.2}) → subscription kept",
+                            e.conserve.roll, e.conserve.probability
+                        )
+                    };
+                    app.mesh_overlay = forge_tui::MeshOverlay {
+                        open: true,
+                        prompt: prompt.trim().to_string(),
+                        classified: e.classified_tier.as_str().to_string(),
+                        routed: e.routed_tier.as_str().to_string(),
+                        code_heavy: e.code_heavy,
+                        reasons: e.classify_reasons.join(", "),
+                        conserve_fired: e.conserve.fired,
+                        conserve_line,
+                        quota: e
+                            .quota
+                            .iter()
+                            .map(|q| forge_tui::MeshQuotaRow {
+                                provider: q.provider.clone(),
+                                fraction: q.fraction,
+                                plan: q.plan.clone(),
+                                status: format!("{:?}", q.status),
+                                spread_complex: q.spread_probability,
+                            })
+                            .collect(),
+                        candidates: e
+                            .candidates
+                            .iter()
+                            .take(12)
+                            .map(|c| forge_tui::MeshCandRow {
+                                rank: c.rank,
+                                model: c.row.model.clone(),
+                                score: c.row.final_score,
+                                cost_tag: match c.row.cost_class {
+                                    0 => "free",
+                                    1 => "subscription",
+                                    _ => "paid",
+                                }
+                                .to_string(),
+                                frontier: c.row.frontier,
+                                usable: c.usable,
+                                selected: c.selected,
+                                penalty: c.row.conserve_penalty,
+                            })
+                            .collect(),
+                        pick: e.pick.clone(),
+                        fallbacks: e.fallbacks.clone(),
+                        rationale: e.rationale.clone(),
+                        anim_tick: 0,
+                    };
+                }
+                None => tui.print_text(
+                    "mesh: auto-discovery routing is off (no model catalog) — nothing to inspect",
+                ),
+            }
         }
         // Not a builtin → try the file-based command/skill catalog.
         CommandAction::Unknown(_) => {
