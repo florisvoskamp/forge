@@ -35,7 +35,7 @@ claimed. Three real gaps, one of which breaks the headline differentiator:
 | D1 | ~~**Budget cap is fake**~~ → **fixed** — real daily + monthly aggregation across sessions, hard stop, downshift, warn threshold. | ~~The core product promise (bounded cost) is not enforced.~~ Fixed. | **done** | [fix-budget-cap.md](features/fix-budget-cap.md) |
 | D2 | ~~**Real provider path untested**~~ → **fixed** — `crates/forge-provider/tests/genai_contract.rs` has Layer 2 httpmock contract tests (streaming, tool-call translation, 5xx→Unavailable) + gated Ollama live. | Fixed. | **done** | [provider-test-strategy.md](features/provider-test-strategy.md) |
 | D3 | **Permission rules partial** — 4 global modes + TOML `[[permissions.rules]]` + builtin denylist (POSIX + Windows) all ship. **Still missing:** "always allow" writeback to config from TUI prompt. | Partial; writeback is a follow-up. | **partial** | [fix-permission-rules.md](features/fix-permission-rules.md) |
-| D4 | **Stale doc comments** — `forge-config/src/lib.rs:3` says keyring is "planned" (it's shipped); `forge-core/src/permission.rs:3` calls rules "planned" (accurate — see D3). | Misleads readers about what's done. | P2 | _(trivial; fix inline — no spec)_ |
+| D4 | ~~**Stale doc comments**~~ → **fixed** — `forge-config/src/lib.rs` correctly describes keyring as shipped; `forge-core/src/permission.rs` accurately describes the rule engine. | Fixed. | **done** | _(inline)_ |
 
 ### Shipped v0.1 status (from the audit)
 
