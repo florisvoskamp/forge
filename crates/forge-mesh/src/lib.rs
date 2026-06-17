@@ -7,11 +7,13 @@ use async_trait::async_trait;
 use forge_config::Config;
 use forge_types::{ModelHealth, SubscriptionQuota, TaskTier};
 
+pub mod bench;
 pub mod capability;
 pub mod catalog;
 pub mod explain;
 pub mod pricing;
 
+pub use bench::{BenchScore, BenchmarkScores};
 pub use catalog::{
     CatalogStats, ConserveDecision, ModelCatalog, ModelInfo, ProviderGroup, ScoreRow,
 };

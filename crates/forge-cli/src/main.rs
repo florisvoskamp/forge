@@ -18,6 +18,7 @@ use forge_tui::{HeadlessPresenter, Presenter, TuiPresenter};
 use forge_types::PermissionMode;
 use forge_types::TaskTier;
 
+mod benchmarks;
 mod bridge_stats;
 mod mcp_serve;
 mod replay;
@@ -130,6 +131,13 @@ enum Command {
         /// Emit the explanation as JSON instead of the formatted view.
         #[arg(long)]
         json: bool,
+    },
+    /// Show measured model benchmark scores (Artificial Analysis, ADR-0011) and how well they
+    /// cover the discovered catalog. `--refresh` forces a re-fetch (needs ARTIFICIALANALYSIS_API_KEY
+    /// or `forge auth artificialanalysis`).
+    Benchmarks {
+        #[arg(long)]
+        refresh: bool,
     },
     /// Internal: run Forge's tool registry as an MCP server on stdio (spawned by the CLI
     /// bridge so claude/codex use Forge's tools under Forge's permission gate). Not for direct use.
@@ -496,6 +504,7 @@ async fn main() -> Result<()> {
         Command::Commands => commands_cmd(),
         Command::Models { probe, clear } => models(probe, clear).await,
         Command::Mesh { prompt, json } => mesh_explain(prompt.join(" "), json).await,
+        Command::Benchmarks { refresh } => benchmarks_cmd(refresh).await,
         Command::Auth { provider, remove } => auth(&provider, remove),
         Command::Init => init(),
         Command::Mcp { cmd } => mcp_cmd(cmd).await,
@@ -1007,9 +1016,13 @@ async fn lattice_cmd(op: LatticeOp) -> Result<()> {
 fn auth(provider: &str, remove: bool) -> Result<()> {
     let known_provider = forge_config::known_key_providers().any(|p| p == provider);
     let known_search = forge_config::known_search_providers().any(|p| p == provider);
-    if !known_provider && !known_search {
+    // `artificialanalysis` is the benchmark Data API key (ADR-0011), not a model/search provider,
+    // but it stores/resolves via the same keyring entry name.
+    let known_data = provider == "artificialanalysis";
+    if !known_provider && !known_search && !known_data {
         let mut known: Vec<_> = forge_config::known_key_providers().collect();
         known.extend(forge_config::known_search_providers());
+        known.push("artificialanalysis");
         anyhow::bail!(
             "unknown provider '{provider}' — known providers are: {}",
             known.join(", ")
@@ -1716,7 +1729,10 @@ async fn discover_catalog(config: &forge_config::Config) -> forge_mesh::ModelCat
     // Drop any model/provider the user disabled (`[mesh] disabled`), so the mesh never routes to
     // or fails over onto it (known-issues.md: disable a flaky model without deleting its key).
     models.retain(|m| !forge_config::is_model_disabled(m, &config.mesh.disabled));
-    forge_mesh::ModelCatalog::new(models)
+    // Attach measured benchmark scores (ADR-0011) so the mesh ranks on real performance. Cache-
+    // first + incremental: only hits the API when a newly-discovered model has no rating yet.
+    let bench = benchmarks::ensure(config, &models, false).await;
+    forge_mesh::ModelCatalog::new(models).with_benchmarks(bench)
 }
 
 /// `forge models [--probe]`: discover the usable models + show the mesh's capability-ranked pick
@@ -1795,6 +1811,55 @@ async fn models(probe: bool, clear: bool) -> Result<()> {
     }
     if !probe {
         println!("\ntip: `forge models --probe` pings each model and benches the dead ones.");
+    }
+    Ok(())
+}
+
+/// `forge benchmarks [--refresh]` — show measured model scores + catalog coverage (ADR-0011).
+async fn benchmarks_cmd(refresh: bool) -> Result<()> {
+    forge_config::inject_provider_keys();
+    let config = forge_config::load().unwrap_or_default();
+    if !config.mesh.benchmark_ranking {
+        println!("benchmark ranking is disabled (`mesh.benchmark_ranking = false`).");
+        return Ok(());
+    }
+    let cat = discover_catalog(&config).await;
+    let models = cat.models().to_vec();
+    let scores = benchmarks::ensure(&config, &models, refresh).await;
+    let Some(scores) = scores.filter(|s| !s.is_empty()) else {
+        println!(
+            "no benchmark data yet. Set a free Artificial Analysis key to enable real-performance \
+             ranking:\n  export ARTIFICIALANALYSIS_API_KEY=…   (or `forge auth artificialanalysis`)\n\
+             then `forge benchmarks --refresh`. Until then the mesh ranks on the family heuristic."
+        );
+        return Ok(());
+    };
+    let (covered, total) = cat.benchmark_coverage();
+    println!(
+        "{} models scored · {covered}/{total} catalog models matched\n",
+        scores.len()
+    );
+    let mut rows: Vec<(String, Option<forge_mesh::BenchScore>)> = cat
+        .models()
+        .iter()
+        .filter(|m| forge_mesh::catalog::is_routable(m))
+        .map(|m| (m.clone(), scores.score_for(m)))
+        .collect();
+    // Scored first (by intelligence desc), then the unmatched (heuristic fallback).
+    rows.sort_by(|a, b| match (a.1, b.1) {
+        (Some(x), Some(y)) => y.intelligence.total_cmp(&x.intelligence),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.0.cmp(&b.0),
+    });
+    for (id, score) in rows {
+        match score {
+            Some(s) => println!(
+                "  {:<40} intelligence {:>5.1}  coding {:>5.1}",
+                id, s.intelligence, s.coding
+            ),
+            None => println!("  {:<40} —  (heuristic fallback)", id),
+        }
     }
     Ok(())
 }

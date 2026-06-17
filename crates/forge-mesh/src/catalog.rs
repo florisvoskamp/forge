@@ -5,13 +5,17 @@
 
 use forge_types::TaskTier;
 
-use crate::capability::{capability_score, is_frontier};
+use crate::bench::BenchmarkScores;
+use crate::capability::{capability_score_b, is_frontier};
 use crate::pricing::Pricing;
 
 /// Discovered `provider::model` ids the user can actually use right now.
 #[derive(Debug, Clone, Default)]
 pub struct ModelCatalog {
     models: Vec<String>,
+    /// Measured performance scores (ADR-0011), attached at discovery. When present the router ranks
+    /// on real benchmark data; when absent it falls back to the family-name heuristic.
+    bench: Option<BenchmarkScores>,
 }
 
 /// The provider prefix of a `provider::model` id (`"groq"` from `"groq::llama-3.1-8b"`).
@@ -130,8 +134,9 @@ fn route_score(
     cost: f64,
     code_heavy: bool,
     quota: &forge_types::SubscriptionQuota,
+    bench: Option<&BenchmarkScores>,
 ) -> f64 {
-    let base = capability_score(id, tier)
+    let base = capability_score_b(id, tier, code_heavy, bench)
         + cost_pref(tier, cost_class(id, cost))
         + code_prior(provider_of(id), code_heavy, tier);
     if is_subscription(id) {
@@ -435,7 +440,10 @@ impl ProviderGroup {
 
 impl ModelCatalog {
     pub fn new(models: Vec<String>) -> Self {
-        Self { models }
+        Self {
+            models,
+            bench: None,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -444,6 +452,27 @@ impl ModelCatalog {
 
     pub fn models(&self) -> &[String] {
         &self.models
+    }
+
+    /// Attach measured benchmark scores (ADR-0011) so ranking uses real performance data. A `None`
+    /// or empty set is a no-op — ranking stays on the family heuristic.
+    pub fn with_benchmarks(mut self, bench: Option<BenchmarkScores>) -> Self {
+        self.bench = bench.filter(|b| !b.is_empty());
+        self
+    }
+
+    /// How many of the catalog's models have a benchmark score (for `forge benchmarks` coverage).
+    pub fn benchmark_coverage(&self) -> (usize, usize) {
+        match &self.bench {
+            Some(b) => (
+                self.models
+                    .iter()
+                    .filter(|m| b.score_for(m).is_some())
+                    .count(),
+                self.models.len(),
+            ),
+            None => (0, self.models.len()),
+        }
     }
 
     /// The discovered models ranked best-first for `tier` (display / non-prompt callers): the
@@ -484,7 +513,7 @@ impl ModelCatalog {
             .filter(|m| is_routable(m))
             .map(|m| {
                 let cost = pricing.estimated_cost(m);
-                let mut score = route_score(m, tier, cost, code_heavy, quota);
+                let mut score = route_score(m, tier, cost, code_heavy, quota, self.bench.as_ref());
                 if conserve && is_subscription(m) {
                     score -= CONSERVE_PENALTY;
                 }
@@ -537,7 +566,7 @@ impl ModelCatalog {
             .filter(|m| is_routable(m))
             .map(|m| {
                 let cost = pricing.estimated_cost(m);
-                let base = route_score(m, tier, cost, code_heavy, quota);
+                let base = route_score(m, tier, cost, code_heavy, quota, self.bench.as_ref());
                 let sub = is_subscription(m);
                 let penalty = if decision.fired && sub {
                     CONSERVE_PENALTY
@@ -547,7 +576,7 @@ impl ModelCatalog {
                 ScoreRow {
                     model: m.clone(),
                     provider: provider_of(m).to_string(),
-                    capability: capability_score(m, tier),
+                    capability: capability_score_b(m, tier, code_heavy, self.bench.as_ref()),
                     cost_class: cost_class(m, cost),
                     conserve_penalty: penalty,
                     final_score: base - penalty,
@@ -656,6 +685,34 @@ mod tests {
     fn ranks_a_small_fast_model_first_for_trivial() {
         let r = catalog().ranked_for(TaskTier::Trivial, &Pricing::default(), 2);
         assert_eq!(r.first().unwrap(), "groq::llama-3.1-8b-instant");
+    }
+
+    #[test]
+    fn benchmark_scores_override_the_name_heuristic() {
+        use crate::bench::BenchmarkScores;
+        // By name heuristic, gpt-5.2 is frontier (q3) and "mystery-x" is unknown (q2) → gpt wins.
+        let cat = ModelCatalog::new(vec![
+            "openai::gpt-5.2".into(),
+            "openrouter::acme/mystery-x".into(),
+        ]);
+        let plain = cat.ranked_for(TaskTier::Complex, &Pricing::default(), 2);
+        assert_eq!(
+            plain[0], "openai::gpt-5.2",
+            "heuristic: named frontier leads"
+        );
+
+        // Now attach REAL scores where mystery-x measures far higher than gpt-5.2 → it must lead.
+        let mut b = BenchmarkScores::new();
+        b.insert("gpt-5.2", 35.0, 30.0);
+        b.insert("acme mystery-x", 68.0, 66.0);
+        let cat = cat.with_benchmarks(Some(b));
+        let ranked = cat.ranked_for(TaskTier::Complex, &Pricing::default(), 2);
+        assert_eq!(
+            ranked[0], "openrouter::acme/mystery-x",
+            "benchmark data must override the name heuristic: {ranked:?}"
+        );
+        let (covered, total) = cat.benchmark_coverage();
+        assert_eq!((covered, total), (2, 2));
     }
 
     #[test]

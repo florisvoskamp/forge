@@ -518,6 +518,11 @@ pub struct MeshConfig {
     /// the old greedy behaviour (always the subscription flagship until the hard limit).
     #[serde(default = "default_subscription_conserve")]
     pub subscription_conserve: bool,
+    /// Rank models on REAL measured performance (Artificial Analysis benchmark indices, ADR-0011)
+    /// instead of the family-name heuristic, when benchmark data is available. Default true; a
+    /// no-op without a cached dataset / API key (falls back to the heuristic).
+    #[serde(default = "default_benchmark_ranking")]
+    pub benchmark_ranking: bool,
     /// Which subscription plan backs each CLI bridge (`claude-cli` → "max-20x", `codex-cli` →
     /// "plus"), captured by `forge init`. Records the usage headroom the user has: the
     /// subscription-conservation layer reads it so a larger plan (more headroom) is spent more
@@ -554,6 +559,22 @@ fn default_auto_discover() -> bool {
 
 fn default_subscription_conserve() -> bool {
     true
+}
+
+fn default_benchmark_ranking() -> bool {
+    true
+}
+
+/// The Artificial Analysis Data API key (ADR-0011), for benchmark-driven ranking. Read from
+/// `ARTIFICIALANALYSIS_API_KEY` first, then the `artificialanalysis` keyring/file entry. `None`
+/// disables the live fetch (ranking falls back to a cached dataset, then the heuristic).
+pub fn benchmark_api_key() -> Option<String> {
+    if let Ok(k) = std::env::var("ARTIFICIALANALYSIS_API_KEY") {
+        if !k.is_empty() {
+            return Some(k);
+        }
+    }
+    secret_store::get("artificialanalysis").filter(|k| !k.is_empty())
 }
 
 fn default_failover() -> bool {
@@ -727,6 +748,7 @@ impl Default for Config {
                 failover_cooldown_secs: default_failover_cooldown_secs(),
                 stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
                 subscription_conserve: default_subscription_conserve(),
+                benchmark_ranking: default_benchmark_ranking(),
                 bridge_models: HashMap::new(),
                 subscriptions: HashMap::new(),
                 disabled: Vec::new(),
