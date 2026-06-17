@@ -82,7 +82,7 @@ The v0.1 audit found three real gaps. All are now fixed:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **Hooks system** | **done** | PreToolUse (block) + PostToolUse (observe), direct + CLI-bridge paths; deferred: rewrite/inject hooks |
+| **Hooks system** | **done** | PreToolUse (block + arg-rewrite) + PostToolUse (observe), direct + CLI-bridge paths; deferred: MCP tool hooks |
 | **Context compaction** | **done** | `/compact` manual + auto-trigger at 80% context gauge + compacted-view persisted on resume |
 | **Interactive clarification** | **done** | `ask_user` virtual tool — TUI selector + headless fallback + non-interactive sentinel |
 | **Model selection UX** | **done** | `/model <id>` in-session pin (clears with `/model`), mesh still classifies for tier stats |

@@ -1213,7 +1213,9 @@ impl Session {
             return self.invoke_mcp(msg_id, call).await;
         }
 
-        let args_json = serde_json::to_string(&call.args)?;
+        let mut args_json = serde_json::to_string(&call.args)?;
+        // `effective_args` may be replaced by a PreToolUse hook that rewrites the args.
+        let mut effective_args = call.args.clone();
 
         let Some(tool) = self.tools.get(&call.name) else {
             let result = format!("error: unknown tool '{}'", call.name);
@@ -1234,7 +1236,8 @@ impl Session {
         });
 
         // PreToolUse hooks (hooks.md): run user shell hooks before the tool. A non-zero exit
-        // blocks the call (the hook's output is the reason the model sees). Inert when no hooks.
+        // blocks the call (the hook's output is the reason the model sees). Exit 0 + JSON object
+        // on stdout rewrites the args before the tool runs. Inert when no hooks configured.
         if !self.config.hooks.is_empty() {
             let payload = serde_json::json!({ "tool": call.name, "args": call.args }).to_string();
             let outcome = hooks::run_hooks(
@@ -1259,18 +1262,22 @@ impl Session {
                 )?;
                 return Ok(result);
             }
+            if let Some(new_args) = outcome.rewritten_args {
+                args_json = serde_json::to_string(&new_args).unwrap_or_default();
+                effective_args = new_args;
+            }
         }
 
         // For a file-mutating tool, show the proposed change BEFORE the permission gate so
         // the user reviews a diff instead of approving a blind write.
         if side_effect == forge_types::SideEffect::Write {
-            if let Some(diff) = tool.preview(&call.args).await {
+            if let Some(diff) = tool.preview(&effective_args).await {
                 self.presenter.emit(PresenterEvent::Diff(diff));
             }
         }
 
         let allowed =
-            match permission::decide(self.mode, side_effect, &call.name, &call.args, &self.rules) {
+            match permission::decide(self.mode, side_effect, &call.name, &effective_args, &self.rules) {
                 PermissionDecision::Allow => true,
                 PermissionDecision::Deny => false,
                 PermissionDecision::Ask => self.presenter.confirm(&call.name, side_effect),
@@ -1280,7 +1287,7 @@ impl Session {
         // Snapshot the target's pre-edit bytes BEFORE a permitted write, so `/undo` can restore
         // it (PR3 shadow snapshots; first touch per path per turn wins).
         let write_path = (allowed && side_effect == forge_types::SideEffect::Write)
-            .then(|| call.args.get("path").and_then(|v| v.as_str()))
+            .then(|| effective_args.get("path").and_then(|v| v.as_str()))
             .flatten()
             .map(std::path::PathBuf::from);
         if let Some(path) = &write_path {
@@ -1293,7 +1300,7 @@ impl Session {
         }
 
         let (result, ok) = if allowed {
-            match tool.run(&call.args).await {
+            match tool.run(&effective_args).await {
                 Ok(out) => {
                     // Record what we wrote, so a later restore can warn on a manual edit.
                     if let Some(path) = &write_path {
