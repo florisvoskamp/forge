@@ -172,6 +172,8 @@ pub enum PresenterEvent {
     /// Live Assay progress (a critic finished/was skipped, verification started, …) so the run
     /// shows incremental activity instead of a silent spinner until the report.
     AssayProgress(String),
+    /// Structured per-critic status update for the live assay panel in the TUI.
+    AssayCriticRow(forge_types::AssayCriticRow),
     /// A finished Assay analysis report, for inline rendering (docs/features/analysis-mode.md).
     AssayReport(forge_types::AssayReport),
     /// The agent's task list changed (`update_tasks`); render the checklist into scrollback.
@@ -300,6 +302,15 @@ impl Presenter for HeadlessPresenter {
             }
             PresenterEvent::AssayProgress(msg) => {
                 println!("  {msg}");
+            }
+            PresenterEvent::AssayCriticRow(row) => {
+                use forge_types::AssayCriticStatus;
+                let status = match &row.status {
+                    AssayCriticStatus::Queued => "queued".to_string(),
+                    AssayCriticStatus::Done { candidates } => format!("done ({candidates})"),
+                    AssayCriticStatus::Skipped { reason } => format!("skipped ({reason})"),
+                };
+                println!("  {} — {status}", row.lens);
             }
             PresenterEvent::AssayReport(report) => {
                 print!("{}", render::assay_report_plain(&report));

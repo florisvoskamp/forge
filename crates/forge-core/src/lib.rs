@@ -522,7 +522,33 @@ impl Session {
         // Surface each critic/verifier as it finishes so the run shows live activity.
         let presenter = &mut self.presenter;
         let mut on_progress = |p: assay::AssayProgress| {
-            presenter.emit(PresenterEvent::AssayProgress(assay::progress_line(&p)));
+            match &p {
+                assay::AssayProgress::CriticQueued { lens } => {
+                    presenter.emit(PresenterEvent::AssayCriticRow(forge_types::AssayCriticRow {
+                        lens: lens.as_str().to_string(),
+                        status: forge_types::AssayCriticStatus::Queued,
+                    }));
+                }
+                assay::AssayProgress::CriticDone { lens, candidates } => {
+                    presenter.emit(PresenterEvent::AssayCriticRow(forge_types::AssayCriticRow {
+                        lens: lens.as_str().to_string(),
+                        status: forge_types::AssayCriticStatus::Done {
+                            candidates: *candidates,
+                        },
+                    }));
+                }
+                assay::AssayProgress::CriticSkipped { lens, reason } => {
+                    presenter.emit(PresenterEvent::AssayCriticRow(forge_types::AssayCriticRow {
+                        lens: lens.as_str().to_string(),
+                        status: forge_types::AssayCriticStatus::Skipped {
+                            reason: reason.clone(),
+                        },
+                    }));
+                }
+                _ => {
+                    presenter.emit(PresenterEvent::AssayProgress(assay::progress_line(&p)));
+                }
+            }
         };
         let mut report = assay::run_assay(
             scope,

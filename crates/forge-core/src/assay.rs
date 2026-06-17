@@ -85,6 +85,9 @@ pub enum AssayProgress {
     Started {
         critics: usize,
     },
+    CriticQueued {
+        lens: FindingCategory,
+    },
     CriticDone {
         lens: FindingCategory,
         candidates: usize,
@@ -106,6 +109,7 @@ const MAX_CONCURRENCY: usize = 2;
 pub fn progress_line(p: &AssayProgress) -> String {
     match p {
         AssayProgress::Started { critics } => format!("⚒ assay — running {critics} critics…"),
+        AssayProgress::CriticQueued { lens } => format!("⏳ {} queued", lens.as_str()),
         AssayProgress::CriticDone { lens, candidates } => {
             format!("✓ {} — {candidates} candidate(s)", lens.as_str())
         }
@@ -146,6 +150,7 @@ pub async fn run_assay(
     // 1. Critics — bounded concurrency (a semaphore), results surfaced as they finish (JoinSet).
     let mut critic_set = tokio::task::JoinSet::new();
     for lens in lenses {
+        on_progress(AssayProgress::CriticQueued { lens });
         let (provider, source, pricing, models, store, sem) = (
             provider.clone(),
             source.clone(),

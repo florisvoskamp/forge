@@ -392,6 +392,21 @@ impl AssayReport {
     }
 }
 
+/// Live status of one critic lens during an assay run, for per-row TUI progress tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AssayCriticStatus {
+    Queued,
+    Done { candidates: usize },
+    Skipped { reason: String },
+}
+
+/// One row in the live assay critics panel: the lens name + its current status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssayCriticRow {
+    pub lens: String,
+    pub status: AssayCriticStatus,
+}
+
 /// Session-level tool-safety posture (ADR-0008). Exposed in the UI as the **temper** (the
 /// forge/metallurgy framing for the agent's disposition); see `docs/features/temper-modes.md`.
 /// Serde accepts both the canonical kebab key and the temper-label alias.
