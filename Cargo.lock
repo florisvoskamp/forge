@@ -1155,6 +1155,7 @@ dependencies = [
  "forge-tui",
  "forge-types",
  "portable-pty",
+ "reqwest",
  "rmcp",
  "serde_json",
  "tokio",
