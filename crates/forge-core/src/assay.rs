@@ -105,6 +105,64 @@ pub enum AssayProgress {
 /// rate-limited) aren't burst over free-tier RPM limits — the cause of lenses skipping.
 const MAX_CONCURRENCY: usize = 2;
 
+/// Estimate the USD cost of running one lens (critic call + verifier call) over `source_len`
+/// bytes of source. Uses the first model in the lens's preferred tier chain; returns 0.0 when
+/// no priced model is available (local / gateway models → effectively free).
+pub fn estimate_lens_cost(
+    lens: FindingCategory,
+    source_len: usize,
+    models: &TierModels,
+    pricing: &Pricing,
+) -> f64 {
+    let input_tokens = (source_len / 4) as u64; // ~4 bytes per token
+    let tier_model = match lens.tier() {
+        TaskTier::Trivial => models.trivial.first(),
+        _ => models.complex.first(),
+    };
+    let Some(model) = tier_model else {
+        return 0.0;
+    };
+    // Critic: source input + ~200 output tokens; verifier: small finding summary + ~20 output.
+    pricing.cost_for(model, input_tokens, 200) + pricing.cost_for(model, 100, 20)
+}
+
+/// Scope down `lenses` to fit within `remaining_usd`. Returns `(kept, dropped, total_estimated)`.
+/// Lenses are sorted cheapest-first to maximise coverage within budget. When `remaining_usd` is
+/// `None` (no cap configured) all lenses are returned unchanged.
+pub fn scope_to_budget(
+    lenses: Vec<FindingCategory>,
+    source_len: usize,
+    models: &TierModels,
+    pricing: &Pricing,
+    remaining_usd: Option<f64>,
+) -> (Vec<FindingCategory>, usize, f64) {
+    let costs: Vec<(FindingCategory, f64)> = lenses
+        .iter()
+        .map(|&l| (l, estimate_lens_cost(l, source_len, models, pricing)))
+        .collect();
+    let total: f64 = costs.iter().map(|(_, c)| c).sum();
+
+    let Some(budget) = remaining_usd else {
+        return (lenses, 0, total);
+    };
+    if total <= budget {
+        return (lenses, 0, total);
+    }
+
+    let mut sorted = costs;
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut left = budget;
+    let mut kept = Vec::new();
+    for (lens, cost) in &sorted {
+        if left >= *cost {
+            left -= cost;
+            kept.push(*lens);
+        }
+    }
+    let dropped = lenses.len() - kept.len();
+    (kept, dropped, total)
+}
+
 /// A one-line, user-facing rendering of a progress event.
 pub fn progress_line(p: &AssayProgress) -> String {
     match p {
@@ -766,5 +824,72 @@ mod tests {
         let cands = parse_candidates(text);
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].file, "a.rs");
+    }
+
+    fn priced_models() -> TierModels {
+        TierModels {
+            trivial: vec!["openai::gpt-4o-mini".into()],
+            complex: vec!["anthropic::claude-opus-4-8".into()],
+        }
+    }
+
+    fn priced_pricing() -> Arc<Pricing> {
+        Arc::new(Pricing::from_config(&forge_config::Config::default()))
+    }
+
+    #[test]
+    fn estimate_lens_cost_is_positive_for_priced_models() {
+        let p = priced_pricing();
+        let cost = estimate_lens_cost(FindingCategory::DeadWeight, 10_000, &priced_models(), &p);
+        assert!(
+            cost > 0.0,
+            "trivial lens over a 10k-byte file costs something: {cost}"
+        );
+        let cost_complex =
+            estimate_lens_cost(FindingCategory::Design, 10_000, &priced_models(), &p);
+        assert!(
+            cost_complex > cost,
+            "judgment lens costs more than mechanical lens"
+        );
+    }
+
+    #[test]
+    fn scope_to_budget_no_cap_returns_all_lenses() {
+        let p = priced_pricing();
+        let lenses = FindingCategory::crew().to_vec();
+        let n = lenses.len();
+        let (kept, dropped, _) = scope_to_budget(lenses, 10_000, &priced_models(), &p, None);
+        assert_eq!(kept.len(), n);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn scope_to_budget_zero_remaining_drops_all_lenses() {
+        let p = priced_pricing();
+        let lenses = FindingCategory::crew().to_vec();
+        let n = lenses.len();
+        let (kept, dropped, _) = scope_to_budget(lenses, 10_000, &priced_models(), &p, Some(0.0));
+        assert!(kept.is_empty(), "no lenses fit when budget is 0");
+        assert_eq!(dropped, n);
+    }
+
+    #[test]
+    fn scope_to_budget_tight_budget_keeps_cheapest_lenses() {
+        let p = priced_pricing();
+        let lenses = vec![FindingCategory::Design, FindingCategory::DeadWeight];
+        // DeadWeight (trivial) is cheaper than Design (complex). Budget covers only one.
+        let dead_cost =
+            estimate_lens_cost(FindingCategory::DeadWeight, 10_000, &priced_models(), &p);
+        let design_cost = estimate_lens_cost(FindingCategory::Design, 10_000, &priced_models(), &p);
+        let budget = dead_cost * 1.5; // fits DeadWeight but not both
+        assert!(dead_cost < design_cost, "precondition: trivial < complex");
+        let (kept, dropped, total) =
+            scope_to_budget(lenses, 10_000, &priced_models(), &p, Some(budget));
+        assert_eq!(kept, vec![FindingCategory::DeadWeight]);
+        assert_eq!(dropped, 1);
+        assert!(
+            total > budget,
+            "total exceeded the budget (that's why we scoped down)"
+        );
     }
 }

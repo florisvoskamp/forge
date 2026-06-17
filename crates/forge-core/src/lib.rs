@@ -520,6 +520,46 @@ impl Session {
         let cooldown = std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
         let provider = Arc::clone(&self.provider);
         let store = Arc::clone(&self.store);
+
+        // U8 — budget pre-estimate: scope down lenses to fit within remaining daily/monthly cap.
+        let remaining_usd = {
+            let spent_today = self.store.spend_today_usd().unwrap_or(0.0);
+            let spent_month = self.store.spend_this_month_usd().unwrap_or(0.0);
+            let daily = self
+                .config
+                .mesh
+                .daily_budget_usd
+                .map(|cap| (cap - spent_today).max(0.0));
+            let monthly = self
+                .config
+                .mesh
+                .monthly_cap_usd
+                .map(|cap| (cap - spent_month).max(0.0));
+            match (daily, monthly) {
+                (Some(d), Some(m)) => Some(d.min(m)),
+                (Some(d), None) => Some(d),
+                (None, Some(m)) => Some(m),
+                (None, None) => None,
+            }
+        };
+        let (lenses, dropped, estimated_cost) =
+            assay::scope_to_budget(lenses, source.len(), &models, &pricing, remaining_usd);
+        if dropped > 0 {
+            self.presenter.emit(PresenterEvent::Warning(format!(
+                "assay: estimated cost ~${estimated_cost:.3} exceeds remaining budget \
+                 ${:.3} — dropped {dropped} expensive lens(es) to fit",
+                remaining_usd.unwrap_or(0.0),
+            )));
+        }
+        if lenses.is_empty() {
+            self.presenter.emit(PresenterEvent::Warning(
+                "assay: estimated cost exceeds remaining budget — \
+                 add a free model or raise [mesh] daily_budget_usd / monthly_cap_usd"
+                    .to_string(),
+            ));
+            return Ok(());
+        }
+
         // Surface each critic/verifier as it finishes so the run shows live activity.
         let presenter = &mut self.presenter;
         let mut on_progress = |p: assay::AssayProgress| match &p {
