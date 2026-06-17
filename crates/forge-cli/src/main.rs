@@ -928,6 +928,7 @@ fn commands_cmd() -> Result<()> {
 async fn spawn_assay(
     cleanup: bool,
     lenses: Vec<forge_types::FindingCategory>,
+    scope: forge_types::AssayScope,
     session: &Arc<tokio::sync::Mutex<Session>>,
     done_tx: &std::sync::mpsc::Sender<u64>,
     gen: u64,
@@ -935,7 +936,13 @@ async fn spawn_assay(
     busy: &mut bool,
     busy_since: &mut std::time::Instant,
 ) -> Result<Option<tokio::task::JoinHandle<()>>> {
-    let source = bundle_source(Path::new("."), 200_000);
+    let source = match bundle_scoped_source(&scope, 200_000) {
+        Ok(s) => s,
+        Err(e) => {
+            app.note(&format!("assay: {e}"));
+            return Ok(None);
+        }
+    };
     if source.trim().is_empty() {
         app.note("assay: no analyzable source files under the working directory");
         return Ok(None);
@@ -989,7 +996,7 @@ async fn spawn_assay(
     Ok(Some(tokio::spawn(async move {
         let _done = DoneGuard(dt, gen);
         let mut sess = s.lock().await;
-        if let Err(e) = sess.assay(src, models, lenses, cleanup).await {
+        if let Err(e) = sess.assay(src, models, lenses, scope, cleanup).await {
             sess.notify_error(&format!("assay failed: {e}"));
         }
     })))
@@ -1072,6 +1079,74 @@ fn bundle_source(root: &Path, max_bytes: usize) -> String {
         }
     }
     out.truncate(floor_char_boundary(&out, max_bytes));
+    out
+}
+
+/// Bundle source for the given scope. For git-backed scopes (Diff/Branch/Since) the changed-file
+/// list is resolved via `git diff --name-only`; only those files are bundled. Returns an error
+/// string when a git scope is requested outside a repo or the git command fails.
+fn bundle_scoped_source(
+    scope: &forge_types::AssayScope,
+    max_bytes: usize,
+) -> Result<String, String> {
+    use forge_types::AssayScope::*;
+    let git_files = |args: &[&str]| -> Result<Vec<std::path::PathBuf>, String> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|e| format!("git: {e}"))?;
+        if !out.status.success() {
+            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(format!("git {}: {msg}", args.join(" ")));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect())
+    };
+    match scope {
+        Repo => Ok(bundle_source(std::path::Path::new("."), max_bytes)),
+        Path(p) => Ok(bundle_source(std::path::Path::new(p), max_bytes)),
+        Diff => {
+            let files = git_files(&["diff", "--name-only"])?;
+            if files.is_empty() {
+                return Err("no uncommitted changes (git diff --name-only returned nothing)".into());
+            }
+            Ok(bundle_file_list(&files, max_bytes))
+        }
+        Branch(base) => {
+            let files = git_files(&["diff", "--name-only", &format!("{base}...HEAD")])?;
+            if files.is_empty() {
+                return Err(format!("no changes vs {base} (git diff --name-only {base}...HEAD returned nothing)"));
+            }
+            Ok(bundle_file_list(&files, max_bytes))
+        }
+        Since(ref_) => {
+            let files = git_files(&["diff", "--name-only", ref_])?;
+            if files.is_empty() {
+                return Err(format!("no changes since {ref_} (git diff --name-only {ref_} returned nothing)"));
+            }
+            Ok(bundle_file_list(&files, max_bytes))
+        }
+    }
+}
+
+/// Bundle a specific list of file paths (e.g. from a git diff) with `// FILE:` headers.
+fn bundle_file_list(files: &[std::path::PathBuf], max_bytes: usize) -> String {
+    let mut out = String::new();
+    for p in files {
+        if out.len() >= max_bytes {
+            break;
+        }
+        if let Ok(content) = std::fs::read_to_string(p) {
+            out.push_str(&format!("// FILE: {}\n{content}\n\n", p.display()));
+            if out.len() > max_bytes {
+                out.truncate(floor_char_boundary(&out, max_bytes));
+                break;
+            }
+        }
+    }
     out
 }
 
@@ -2087,6 +2162,8 @@ async fn run_chat_tui(
     let mut pending_question: Option<std::sync::mpsc::Sender<String>> = None;
     // Lens filter set by `/assay --only`/`--skip`; consumed when the AssayChoice picker resolves.
     let mut assay_lenses: Vec<forge_types::FindingCategory> = Vec::new();
+    // Scope set by `/assay --diff/--branch/--since/<path>`; consumed when picker resolves.
+    let mut assay_scope: forge_types::AssayScope = forge_types::AssayScope::Repo;
     // Baseline for the spinner: deriving the tick from elapsed time keeps the animation
     // speed independent of the loop frequency (one frame per 60ms, exactly as before).
     let mut busy_since = Instant::now();
@@ -2176,6 +2253,7 @@ async fn run_chat_tui(
                             trust_project,
                             busy,
                             &mut assay_lenses,
+                            &mut assay_scope,
                         )
                         .await?
                         {
@@ -2285,9 +2363,14 @@ async fn run_chat_tui(
                                 // ticks while critics + verification run.
                                 turn_gen += 1;
                                 let lenses = std::mem::take(&mut assay_lenses);
+                                let scope = std::mem::replace(
+                                    &mut assay_scope,
+                                    forge_types::AssayScope::Repo,
+                                );
                                 turn_handle = spawn_assay(
                                     row.id == "cleanup",
                                     lenses,
+                                    scope,
                                     &session,
                                     &done_tx,
                                     turn_gen,
@@ -2472,6 +2555,7 @@ async fn run_chat_tui(
                                 trust_project,
                                 busy,
                                 &mut assay_lenses,
+                                &mut assay_scope,
                             )
                             .await?
                             {
@@ -2804,6 +2888,7 @@ async fn dispatch_command(
     trust_project: bool,
     busy: bool,
     assay_lenses: &mut Vec<forge_types::FindingCategory>,
+    assay_scope: &mut forge_types::AssayScope,
 ) -> Result<DispatchOutcome> {
     use forge_tui::CommandAction;
     let action = forge_tui::parse_command(line);
@@ -2870,7 +2955,7 @@ async fn dispatch_command(
         }
         // `/assay` enters Assay mode: pick analysis-only vs full cleanup; the crew then runs as a
         // background task (spawned in the picker-Enter handler so the spinner ticks).
-        CommandAction::Assay { only, skip } => {
+        CommandAction::Assay { only, skip, scope } => {
             // Compute the lens set from --only/--skip and store for picker resolution.
             let crew = forge_types::FindingCategory::crew();
             *assay_lenses = if !only.is_empty() {
@@ -2885,6 +2970,18 @@ async fn dispatch_command(
                     .collect()
             } else {
                 Vec::new() // empty = use full crew (default)
+            };
+            // Resolve the scope string into a typed AssayScope.
+            *assay_scope = if scope == "--diff" {
+                forge_types::AssayScope::Diff
+            } else if let Some(b) = scope.strip_prefix("--branch ") {
+                forge_types::AssayScope::Branch(b.to_string())
+            } else if let Some(r) = scope.strip_prefix("--since ") {
+                forge_types::AssayScope::Since(r.to_string())
+            } else if !scope.is_empty() {
+                forge_types::AssayScope::Path(scope)
+            } else {
+                forge_types::AssayScope::Repo
             };
             let rows = vec![
                 forge_tui::PickerRow {

@@ -41,7 +41,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "assay",
         desc: "analyze code quality (AI-slop, dead/unsafe/untested) — or full cleanup",
-        usage: "/assay [--only <lens,…>] [--skip <lens,…>]",
+        usage: "/assay [--diff|--branch <b>|--since <ref>|<path>] [--only <lens,…>] [--skip <lens,…>]",
     },
     Command {
         name: "model",
@@ -136,8 +136,9 @@ pub enum CommandAction {
     /// Open the operating-mode (temper) picker.
     Mode,
     /// Enter Assay mode — pick analysis-only vs full cleanup, then run the critic crew.
-    /// `only` and `skip` are lens name lists (comma-separated in the command args).
-    Assay { only: Vec<String>, skip: Vec<String> },
+    /// `only`/`skip` are lens name lists; `scope` is `""` (repo), a path, `"--diff"`,
+    /// `"--branch <b>"`, or `"--since <ref>"`.
+    Assay { only: Vec<String>, skip: Vec<String>, scope: String },
     /// Rewind the last turn (conversation + file edits).
     Undo,
     /// Save a checkpoint at the current point; `None` = an auto/unnamed checkpoint.
@@ -234,6 +235,11 @@ fn extract_flag(arg: &str, flag: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Check whether a boolean flag (no value) is present in `arg`.
+fn has_flag(arg: &str, flag: &str) -> bool {
+    arg.split_whitespace().any(|t| t == flag)
+}
+
 /// Parse a submitted command line (`"/resume ab12"`). The leading `/` is required; a `//`
 /// prefix is NOT a command (it escapes to a literal prompt — handled by the caller).
 pub fn parse_command(line: &str) -> CommandAction {
@@ -259,12 +265,26 @@ pub fn parse_command(line: &str) -> CommandAction {
         "new" | "n" => CommandAction::New,
         "mode" | "m" | "temper" => CommandAction::Mode,
         "assay" | "analyze" | "analyse" => {
-            // `/assay [--only <lens,lens,…>] [--skip <lens,lens,…>]`
-            // Lens names: dead-weight, correctness, unsafe, test-coverage,
-            //             design, architecture, documentation, over-engineering
+            // `/assay [--diff|--branch <b>|--since <ref>|<path>] [--only <lens,…>] [--skip <lens,…>]`
             let only = extract_flag(&arg, "--only");
             let skip = extract_flag(&arg, "--skip");
-            CommandAction::Assay { only, skip }
+            // Scope: --diff, --branch <b>, --since <ref>, a path, or empty (full repo).
+            let scope = if has_flag(&arg, "--diff") {
+                "--diff".to_string()
+            } else if let Some(b) = extract_flag(&arg, "--branch").into_iter().next() {
+                format!("--branch {b}")
+            } else if let Some(r) = extract_flag(&arg, "--since").into_iter().next() {
+                format!("--since {r}")
+            } else {
+                // Remaining tokens that aren't flags → treat as path.
+                let path: String = arg
+                    .split_whitespace()
+                    .filter(|t| !t.starts_with("--"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                path
+            };
+            CommandAction::Assay { only, skip, scope }
         }
         "undo" | "u" => CommandAction::Undo,
         "checkpoint" | "cp" => CommandAction::Checkpoint((!arg.is_empty()).then_some(arg)),

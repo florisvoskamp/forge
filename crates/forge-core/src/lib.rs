@@ -496,6 +496,7 @@ impl Session {
         source: Arc<str>,
         models: assay::TierModels,
         lenses: Vec<forge_types::FindingCategory>,
+        scope: forge_types::AssayScope,
         cleanup: bool,
     ) -> Result<(), CoreError> {
         let pricing = Arc::new(self.pricing.clone());
@@ -513,7 +514,7 @@ impl Session {
             presenter.emit(PresenterEvent::AssayProgress(assay::progress_line(&p)));
         };
         let mut report = assay::run_assay(
-            forge_types::AssayScope::Repo,
+            scope,
             source,
             lenses,
             models,
@@ -3910,8 +3911,9 @@ mod tests {
                     trivial: vec!["m".into()],
                     complex: vec!["m".into()],
                 },
-                vec![], // default: full crew
-                false,  // analysis-only
+                vec![],                      // default: full crew
+                forge_types::AssayScope::Repo,
+                false,                       // analysis-only
             )
             .await
             .unwrap();
