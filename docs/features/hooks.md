@@ -34,9 +34,11 @@ load-bearing events.
 - `SessionStart` / `SessionEnd` — observe-only lifecycle events; fire in both TUI and plain chat
   loops. Payload: `{"session_id": "<id>", "event": "session_start|session_end"}`.
 
+**Shipped (arg rewriting)**
+- `PreToolUse` exit 0 + JSON object on stdout → rewrites tool args before the tool runs.
+  Exit 0 + plain text → note only (unchanged args). Exit non-zero → block.
+
 **Deferred**
-- Input **rewriting** of tool args (a hook editing args before the tool runs). Currently
-  `PreToolUse` can only block, not rewrite.
 - **MCP tool call** hooks — `invoke_tool` only covers direct built-in tools.
 - Per-hook environment templating beyond the stdin JSON.
 - Other events: `notification`, `PostSessionCompact`.

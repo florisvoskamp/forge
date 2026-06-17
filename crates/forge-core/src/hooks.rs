@@ -17,6 +17,10 @@ pub struct HookOutcome {
     pub blocked: Option<String>,
     /// Lines to surface to the user (hook stdout / errors).
     pub notes: Vec<String>,
+    /// Rewritten tool args from a `PreToolUse` hook that exited 0 and emitted a JSON object on
+    /// stdout. The core substitutes these args for the model's original args before running the
+    /// tool. `None` means use the original args unchanged.
+    pub rewritten_args: Option<serde_json::Value>,
 }
 
 /// Run every hook matching `event` + `tool`, in declaration order. The first `PreToolUse` hook
@@ -31,21 +35,33 @@ pub async fn run_hooks(
     for h in hooks.iter().filter(|h| h.event == event && h.matches(tool)) {
         match run_one(h, payload).await {
             Ok((code, stdout, stderr)) => {
-                let out = truncate(stdout.trim(), 800);
-                if !out.is_empty() {
-                    outcome.notes.push(format!("⎇ hook: {out}"));
-                }
+                let trimmed = stdout.trim();
                 if event == HookEvent::PreToolUse && code != 0 {
                     let err = stderr.trim();
                     let reason = if !err.is_empty() {
                         truncate(err, 800)
-                    } else if !out.is_empty() {
-                        out
+                    } else if !trimmed.is_empty() {
+                        truncate(trimmed, 800)
                     } else {
                         format!("{tool} blocked by hook (exit {code})")
                     };
                     outcome.blocked = Some(reason);
                     break;
+                }
+                // exit 0 + non-empty stdout: if it's a JSON object, treat it as rewritten args;
+                // otherwise surface it as a note (same as PostToolUse observe output).
+                if !trimmed.is_empty() {
+                    if event == HookEvent::PreToolUse {
+                        if let Ok(v @ serde_json::Value::Object(_)) =
+                            serde_json::from_str::<serde_json::Value>(trimmed)
+                        {
+                            outcome.rewritten_args = Some(v);
+                        } else {
+                            outcome.notes.push(format!("⎇ hook: {}", truncate(trimmed, 800)));
+                        }
+                    } else {
+                        outcome.notes.push(format!("⎇ hook: {}", truncate(trimmed, 800)));
+                    }
                 }
             }
             Err(e) => outcome.notes.push(format!("⎇ hook error: {e}")),
@@ -264,6 +280,25 @@ mod tests {
         let hooks = vec![hook(HookEvent::SessionStart, "true")];
         run_session_hooks(&hooks, HookEvent::SessionStart, "test-session-id").await;
         // No assertion needed — observe-only hooks must not panic or hang.
+    }
+
+    #[tokio::test]
+    async fn pretooluse_exit_zero_json_object_stdout_rewrites_args() {
+        let hooks = vec![hook(HookEvent::PreToolUse, "echo '{\"path\":\"rewritten.rs\"}'")];
+        let o = run_hooks(&hooks, HookEvent::PreToolUse, "shell", "{}").await;
+        assert!(o.blocked.is_none());
+        assert!(o.notes.is_empty(), "json stdout should not become a note");
+        let rewritten = o.rewritten_args.expect("should have rewritten args");
+        assert_eq!(rewritten["path"], "rewritten.rs");
+    }
+
+    #[tokio::test]
+    async fn pretooluse_exit_zero_plain_text_stdout_is_a_note_not_rewrite() {
+        let hooks = vec![hook(HookEvent::PreToolUse, "echo 'just a message'")];
+        let o = run_hooks(&hooks, HookEvent::PreToolUse, "shell", "{}").await;
+        assert!(o.blocked.is_none());
+        assert!(o.rewritten_args.is_none());
+        assert!(o.notes.iter().any(|n| n.contains("just a message")));
     }
 
     #[tokio::test]
