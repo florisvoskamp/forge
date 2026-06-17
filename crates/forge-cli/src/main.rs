@@ -641,8 +641,7 @@ fn import_cursor(project: bool) -> Result<()> {
 /// Strip `.mdc` YAML front-matter down to just `description:`, preserving the body.
 /// Unknown YAML fields (`globs`, `alwaysApply`, etc.) are dropped.
 fn convert_mdc_to_command_md(raw: &str, fallback_name: &str) -> String {
-    let (description, body) = if raw.starts_with("---") {
-        let rest = &raw[3..];
+    let (description, body) = if let Some(rest) = raw.strip_prefix("---") {
         if let Some(end) = rest.find("\n---") {
             let fm = &rest[..end];
             let description = fm
