@@ -758,6 +758,115 @@ mod tests {
         .model
     }
 
+    async fn route_model_q(r: &HeuristicRouter, prompt: &str, q: &SubscriptionQuota) -> String {
+        r.route(prompt, BudgetState::default(), &ModelHealth::default(), q)
+            .await
+            .model
+    }
+
+    /// A conservation-enabled quota: both subs at `frac` of their window, given plan slugs, Ok
+    /// status (so we isolate proactive spreading from the hard Warning/Exhausted backstops).
+    fn conserve_quota(frac: f64, plan_claude: &str, plan_codex: &str) -> SubscriptionQuota {
+        let mut fr = std::collections::HashMap::new();
+        fr.insert("claude-cli".to_string(), frac);
+        fr.insert("codex-cli".to_string(), frac);
+        let mut pl = std::collections::HashMap::new();
+        pl.insert("claude-cli".to_string(), plan_claude.to_string());
+        pl.insert("codex-cli".to_string(), plan_codex.to_string());
+        SubscriptionQuota::new(std::collections::HashMap::new())
+            .with_fractions(fr)
+            .with_plans(pl)
+            .with_conserve(true)
+    }
+
+    /// Distinct complex prompts (varying the seed) for measuring routing spread.
+    fn complex_workload(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                format!(
+                    "prove the correctness and analyze the asymptotic complexity of this \
+                     distributed consensus approach, scenario {i}"
+                )
+            })
+            .collect()
+    }
+
+    async fn subscription_share(r: &HeuristicRouter, q: &SubscriptionQuota, prompts: &[String]) -> usize {
+        let mut sub = 0;
+        for p in prompts {
+            if is_subscription(&route_model_q(r, p, q).await) {
+                sub += 1;
+            }
+        }
+        sub
+    }
+
+    #[tokio::test]
+    async fn conservation_spreads_some_complex_off_subscriptions_while_fresh() {
+        // The core ask: even with subscriptions fresh, NOT every complex task hits the best-2
+        // subscriptions — a share spreads to the free-frontier pool to preserve the plan.
+        let r = mixed_router();
+        let prompts = complex_workload(80);
+        let q = conserve_quota(0.0, "plus", "plus");
+        let sub = subscription_share(&r, &q, &prompts).await;
+        let free = prompts.len() - sub;
+        assert!(free > 0, "some complex tasks must spread to free frontier: free={free}");
+        assert!(sub > free, "but subscriptions still take the majority while fresh: sub={sub} free={free}");
+    }
+
+    #[tokio::test]
+    async fn conservation_grows_as_the_weekly_window_fills() {
+        let r = mixed_router();
+        let prompts = complex_workload(80);
+        let fresh_free = prompts.len() - subscription_share(&r, &conserve_quota(0.0, "plus", "plus"), &prompts).await;
+        let full_free = prompts.len() - subscription_share(&r, &conserve_quota(0.7, "plus", "plus"), &prompts).await;
+        assert!(
+            full_free > fresh_free,
+            "more tasks must spread off subscriptions as the window fills: fresh={fresh_free} full={full_free}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigger_plan_is_spent_more_than_a_smaller_one() {
+        // A larger plan has more headroom → conserved less → used more. (Consumes the initializer
+        // subscription type.)
+        let r = mixed_router();
+        let prompts = complex_workload(80);
+        let big = subscription_share(&r, &conserve_quota(0.5, "max-20x", "max-20x"), &prompts).await;
+        let small = subscription_share(&r, &conserve_quota(0.5, "plus", "plus"), &prompts).await;
+        assert!(
+            big > small,
+            "the bigger plan should be used for more complex tasks: max-20x={big} plus={small}"
+        );
+    }
+
+    #[tokio::test]
+    async fn conservation_disabled_keeps_the_greedy_flagship() {
+        // Opt-out (config.mesh.subscription_conserve = false): old behaviour, always the flagship.
+        let r = mixed_router();
+        let prompts = complex_workload(40);
+        let q = SubscriptionQuota::default(); // conserve = false
+        let sub = subscription_share(&r, &q, &prompts).await;
+        assert_eq!(sub, prompts.len(), "with conservation off every complex task uses a subscription");
+    }
+
+    #[tokio::test]
+    async fn conservation_never_drops_a_complex_task_onto_a_weak_model() {
+        // Guard: when the only frontier-calibre option IS the subscription (no frontier free
+        // alternative), conservation must not fire — quality wins over conservation.
+        let r = HeuristicRouter::new(Config::default())
+            .with_availability(|_| true)
+            .with_catalog(ModelCatalog::new(vec![
+                "claude-cli::opus".into(),
+                "codex-cli::gpt-5.5".into(),
+                "groq::llama-3.1-8b-instant".into(), // small, NOT a frontier alternative
+            ]));
+        let prompts = complex_workload(30);
+        let q = conserve_quota(0.7, "plus", "plus"); // high pressure + conserve on
+        let sub = subscription_share(&r, &q, &prompts).await;
+        assert_eq!(sub, prompts.len(), "no frontier alternative → keep using the subscription");
+    }
+
     #[tokio::test]
     async fn route_hinted_pins_the_given_tier_over_classification() {
         let r = mixed_router();

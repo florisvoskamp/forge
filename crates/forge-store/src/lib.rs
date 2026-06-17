@@ -723,7 +723,20 @@ impl Store {
                 (st != forge_types::QuotaStatus::Ok).then_some((provider, st))
             })
             .collect::<std::collections::HashMap<_, _>>();
-        Ok(forge_types::SubscriptionQuota::new(map))
+        // Also carry the strictest fraction per provider (incl. still-Ok ones) so the router's
+        // graduated conservation can spread off a subscription before it crosses Warning.
+        let mut frac_stmt = conn.prepare(
+            "SELECT provider, MAX(fraction) FROM subscription_usage
+             WHERE fraction IS NOT NULL AND (resets_at IS NULL OR resets_at > ?1)
+             GROUP BY provider",
+        )?;
+        let fractions = frac_stmt
+            .query_map([now], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?
+            .filter_map(std::result::Result::ok)
+            .collect::<std::collections::HashMap<_, _>>();
+        Ok(forge_types::SubscriptionQuota::new(map).with_fractions(fractions))
     }
 
     /// Number of messages in a session.

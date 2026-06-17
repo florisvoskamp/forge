@@ -144,6 +144,90 @@ fn route_score(
     base
 }
 
+/// Soft demotion applied to subscription models when this prompt is chosen for conservation.
+/// Large enough to drop an `Ok` subscription below the best free-frontier alternative, small
+/// enough that the subscription stays in the shortlist as a fallback if every alternative fails.
+const CONSERVE_PENALTY: f64 = 4.0;
+
+/// How freely a plan may be spent: a bigger plan has more headroom, so it is conserved *less*
+/// (lower factor → lower spread probability). Unknown/unset plans stay neutral (1.0) — we don't
+/// over-conserve a plan the user never told us about.
+fn plan_factor(slug: &str) -> f64 {
+    let s = slug.to_lowercase();
+    if s.contains("20x") {
+        0.8
+    } else if s.contains("max") || s.contains("pro") {
+        0.85
+    } else {
+        1.0 // plus / team / unknown
+    }
+}
+
+/// Probability that this prompt routes OFF the subscriptions onto a free-frontier model, given the
+/// tier, how full the strictest window is (`fraction`), the plan headroom, and code-heaviness.
+/// Trivial always spreads (subs are never worth spending on it); Standard mostly spreads; Complex
+/// spreads a minority while fresh and ramps to ~1.0 as the window approaches the 80% Warning line.
+fn conserve_probability(tier: TaskTier, fraction: f64, plan: &str, code_heavy: bool) -> f64 {
+    let base = match tier {
+        TaskTier::Trivial => 1.0,
+        TaskTier::Standard => 0.65,
+        TaskTier::Complex if code_heavy => 0.15, // code-heavy complex: subscriptions earn their keep
+        TaskTier::Complex => 0.30,
+    };
+    let ramp = (fraction / 0.80).clamp(0.0, 1.0) * (1.0 - base);
+    ((base + ramp) * plan_factor(plan)).clamp(0.0, 1.0)
+}
+
+/// Whether a genuine non-subscription alternative of the right calibre exists for `tier` — a
+/// guard so conservation never drops a hard task onto a weak model when the only capable option
+/// IS the subscription. Complex needs a frontier alternative; Standard a capable (mid+) one.
+fn has_nonsub_alternative(models: &[String], tier: TaskTier) -> bool {
+    models.iter().any(|m| {
+        if is_subscription(m) || !is_routable(m) {
+            return false;
+        }
+        match tier {
+            TaskTier::Complex => crate::capability::quality_class(m) >= 3,
+            TaskTier::Standard => crate::capability::quality_class(m) >= 2,
+            TaskTier::Trivial => true,
+        }
+    })
+}
+
+/// Decide — deterministically for this prompt — whether to spread off the subscriptions. Takes the
+/// strongest conservation pull across the present subscription providers (protect whichever is most
+/// pressured / smallest-plan), then draws a stable per-prompt value against it. Returns false when
+/// disabled, when there are no subscriptions, or when no capable alternative exists.
+fn conserve_subscriptions(
+    models: &[String],
+    tier: TaskTier,
+    code_heavy: bool,
+    seed: u64,
+    quota: &forge_types::SubscriptionQuota,
+) -> bool {
+    if !quota.conserve_enabled() {
+        return false;
+    }
+    let mut sub_providers: Vec<&str> = models
+        .iter()
+        .filter(|m| is_subscription(m))
+        .map(|m| provider_of(m))
+        .collect();
+    sub_providers.sort_unstable();
+    sub_providers.dedup();
+    if sub_providers.is_empty() || !has_nonsub_alternative(models, tier) {
+        return false;
+    }
+    let p = sub_providers
+        .iter()
+        .map(|prov| {
+            conserve_probability(tier, quota.fraction_for(prov), quota.plan_for(prov), code_heavy)
+        })
+        .fold(0.0_f64, f64::max);
+    let roll = (stable_hash(&format!("{seed}:conserve")) % 10_000) as f64 / 10_000.0;
+    roll < p
+}
+
 /// A per-prompt provider ordering key: hashing `seed:provider` means different prompts rotate
 /// which provider wins a genuine score tie, so a workload spreads across equally-good providers
 /// (claude ↔ codex) instead of always picking the alphabetically-first one — while staying fully
@@ -317,14 +401,23 @@ impl ModelCatalog {
         seed: u64,
         quota: &forge_types::SubscriptionQuota,
     ) -> Vec<String> {
+        // Proactive subscription conservation: for this prompt, decide whether to spread off the
+        // subscription bridges onto a free-frontier model (so a complex/standard-heavy workload
+        // doesn't exhaust the plan). When it fires, subscriptions take a soft penalty so the best
+        // alternative leads while the subscription stays available as a fallback.
+        let conserve = conserve_subscriptions(&self.models, tier, code_heavy, seed, quota);
         let mut scored: Vec<(f64, u8, u64, f64, &String)> = self
             .models
             .iter()
             .filter(|m| is_routable(m))
             .map(|m| {
                 let cost = pricing.estimated_cost(m);
+                let mut score = route_score(m, tier, cost, code_heavy, quota);
+                if conserve && is_subscription(m) {
+                    score -= CONSERVE_PENALTY;
+                }
                 (
-                    route_score(m, tier, cost, code_heavy, quota),
+                    score,
                     cost_class(m, cost),
                     provider_rotation(provider_of(m), seed),
                     fine_capability(m),

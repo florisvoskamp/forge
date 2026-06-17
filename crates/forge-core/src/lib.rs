@@ -823,6 +823,17 @@ impl Session {
     /// subsequent turns send to the model. In-memory only — the full transcript stays in the store
     /// for audit/resume (persisting the compacted view across resume is a follow-up). No-op when
     /// the transcript is already short. Returns `(messages_before, messages_after)`.
+    /// Current subscription quota, enriched with the configured plan slugs and the conservation
+    /// opt-out, so the router can spread complex/standard load off a subscription proactively
+    /// (not just react at the hard limit). Defaults to an empty quota when the store read fails.
+    fn live_quota(&self) -> forge_types::SubscriptionQuota {
+        self.store
+            .current_quota()
+            .unwrap_or_default()
+            .with_plans(self.config.mesh.subscriptions.clone())
+            .with_conserve(self.config.mesh.subscription_conserve)
+    }
+
     pub async fn compact(&mut self) -> Result<(usize, usize), CoreError> {
         let before = self.transcript.len();
         if before <= COMPACT_KEEP_RECENT + COMPACT_MIN_OLDER {
@@ -847,7 +858,7 @@ impl Session {
             warn_fraction: self.config.mesh.warn_threshold,
         };
         let health = self.store.current_benched().unwrap_or_default();
-        let quota = self.store.current_quota().unwrap_or_default();
+        let quota = self.live_quota();
         let decision = self
             .router
             .route_hinted(
@@ -922,7 +933,7 @@ impl Session {
             return;
         }
         let health = self.store.current_benched().unwrap_or_default();
-        let quota = self.store.current_quota().unwrap_or_default();
+        let quota = self.live_quota();
         let decision = self
             .router
             .route_hinted(
@@ -1074,7 +1085,7 @@ impl Session {
         let health = self.store.current_benched().unwrap_or_default();
         // Quota-aware routing (L3): demote/skip a subscription that the bridge reported is near or
         // over its plan limit (recorded after earlier turns from the CLI's rate-limit events).
-        let quota = self.store.current_quota().unwrap_or_default();
+        let quota = self.live_quota();
         let decision = self
             .router
             .route_hinted(prompt, budget, &health, &quota, tier_override)

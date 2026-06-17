@@ -510,10 +510,18 @@ pub struct MeshConfig {
     /// connection) and fail over, instead of hanging the turn forever. `0` disables the watchdog.
     #[serde(default = "default_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
+    /// Proactively spread complex/standard tasks off the subscription bridges (claude-cli/
+    /// codex-cli) onto the free-frontier pool, scaling with how full the weekly/session window is
+    /// and how much headroom the plan has (subscription-conservation routing). When true (default)
+    /// a fraction of complex/standard tasks route to a free frontier model even while the
+    /// subscription is fresh, so a complex-heavy workload doesn't exhaust the plan. Set false for
+    /// the old greedy behaviour (always the subscription flagship until the hard limit).
+    #[serde(default = "default_subscription_conserve")]
+    pub subscription_conserve: bool,
     /// Which subscription plan backs each CLI bridge (`claude-cli` → "max-20x", `codex-cli` →
-    /// "plus"), captured by `forge init`. Records the usage headroom the user has so the mesh can
-    /// (in the quota-aware layer, provider-cost-routing.md L3) avoid overrunning a plan. Currently
-    /// informational + shown by `forge init`/`forge models`.
+    /// "plus"), captured by `forge init`. Records the usage headroom the user has: the
+    /// subscription-conservation layer reads it so a larger plan (more headroom) is spent more
+    /// freely than a smaller one. Also shown by `forge init`/`forge models`.
     #[serde(default)]
     pub subscriptions: HashMap<String, String>,
     /// Override which models a CLI bridge exposes to auto-discovery, keyed by bridge prefix
@@ -541,6 +549,10 @@ pub fn is_model_disabled(model_id: &str, disabled: &[String]) -> bool {
 }
 
 fn default_auto_discover() -> bool {
+    true
+}
+
+fn default_subscription_conserve() -> bool {
     true
 }
 
@@ -714,6 +726,7 @@ impl Default for Config {
                 failover: default_failover(),
                 failover_cooldown_secs: default_failover_cooldown_secs(),
                 stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+                subscription_conserve: default_subscription_conserve(),
                 bridge_models: HashMap::new(),
                 subscriptions: HashMap::new(),
                 disabled: Vec::new(),

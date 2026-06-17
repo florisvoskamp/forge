@@ -686,11 +686,40 @@ pub struct QuotaHint {
 #[derive(Debug, Default, Clone)]
 pub struct SubscriptionQuota {
     by_provider: std::collections::HashMap<String, QuotaStatus>,
+    /// Fraction (0.0–1.0) of the strictest active window consumed, per provider. Drives the
+    /// graduated subscription-conservation spreading (distinct from the coarse `QuotaStatus`).
+    fraction: std::collections::HashMap<String, f64>,
+    /// Subscription plan slug per provider (`claude-cli` → `max-20x`, `codex-cli` → `plus`), from
+    /// config. A larger plan has more headroom, so it is spent more freely.
+    plans: std::collections::HashMap<String, String>,
+    /// Whether proactive subscription-conservation spreading is enabled (config opt-out).
+    conserve: bool,
 }
 
 impl SubscriptionQuota {
     pub fn new(by_provider: std::collections::HashMap<String, QuotaStatus>) -> Self {
-        Self { by_provider }
+        Self {
+            by_provider,
+            ..Default::default()
+        }
+    }
+
+    /// Attach per-provider usage fractions (the strictest active window).
+    pub fn with_fractions(mut self, fraction: std::collections::HashMap<String, f64>) -> Self {
+        self.fraction = fraction;
+        self
+    }
+
+    /// Attach per-provider subscription plan slugs (from `config.mesh.subscriptions`).
+    pub fn with_plans(mut self, plans: std::collections::HashMap<String, String>) -> Self {
+        self.plans = plans;
+        self
+    }
+
+    /// Enable/disable proactive conservation spreading (`config.mesh.subscription_conserve`).
+    pub fn with_conserve(mut self, on: bool) -> Self {
+        self.conserve = on;
+        self
     }
 
     /// The pressure for a provider prefix (defaults to `Ok` when unknown/unconstrained).
@@ -699,6 +728,21 @@ impl SubscriptionQuota {
             .get(provider)
             .copied()
             .unwrap_or(QuotaStatus::Ok)
+    }
+
+    /// Fraction of the strictest window consumed for a provider (0.0 when unknown).
+    pub fn fraction_for(&self, provider: &str) -> f64 {
+        self.fraction.get(provider).copied().unwrap_or(0.0)
+    }
+
+    /// The configured plan slug for a provider (`""` when unset).
+    pub fn plan_for(&self, provider: &str) -> &str {
+        self.plans.get(provider).map(String::as_str).unwrap_or("")
+    }
+
+    /// Whether proactive conservation spreading is enabled.
+    pub fn conserve_enabled(&self) -> bool {
+        self.conserve
     }
 
     /// At/over the limit — route around it.
