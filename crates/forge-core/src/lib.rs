@@ -842,6 +842,7 @@ impl Session {
             self.presenter.emit(PresenterEvent::ShellDiagnosis {
                 command: command.to_string(),
                 diagnosis: cached.to_string(),
+                fix: None,
             });
             return;
         }

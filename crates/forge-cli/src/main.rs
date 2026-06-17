@@ -169,6 +169,22 @@ enum ImportSource {
         #[arg(long)]
         project: bool,
     },
+    /// Import Cursor AI rules (`~/.cursor/rules/*.mdc`) into Forge as commands. Each `.mdc`
+    /// rule becomes one command; `globs`/`alwaysApply` fields are dropped — only `description`
+    /// and the rule body are kept. Existing commands are not overwritten.
+    Cursor {
+        /// Import into the project (`./.forge`) instead of the user config dir.
+        #[arg(long)]
+        project: bool,
+    },
+    /// Import Aider AI convention files into Forge as commands. Looks for
+    /// `CONVENTIONS.md` / `.aider.md` / `.aider.conventions.md` in `~` and then `$PWD`.
+    /// Each file becomes one command named after the file. Existing commands are not overwritten.
+    Aider {
+        /// Import into the project (`./.forge`) instead of the user config dir.
+        #[arg(long)]
+        project: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -412,6 +428,13 @@ struct ImportCounts {
 /// Forge scope, reusing the CC-compatible readers to validate before copying. Claude imports
 /// commands + skills + agents; Codex imports its prompts as commands.
 fn import_cmd(source: ImportSource) -> Result<()> {
+    // Cursor and Aider have non-standard directory/format layouts — handled separately.
+    match &source {
+        ImportSource::Cursor { project } => return import_cursor(*project),
+        ImportSource::Aider { project } => return import_aider(*project),
+        _ => {}
+    }
+
     let (label, project, home, commands_sub, skills_sub, agents_sub) = match source {
         ImportSource::Claude { project } => (
             "claude",
@@ -429,6 +452,7 @@ fn import_cmd(source: ImportSource) -> Result<()> {
             None,
             None,
         ),
+        ImportSource::Cursor { .. } | ImportSource::Aider { .. } => unreachable!(),
     };
     if !home.exists() {
         println!("nothing to import: {} does not exist", home.display());
@@ -555,6 +579,154 @@ fn copy_catalog_assets(
         }
     }
     counts
+}
+
+/// Import Cursor AI rules (`~/.cursor/rules/*.mdc`) as Forge commands.
+/// Each `.mdc` file is converted to a CC-compatible `.md` command: the YAML front-matter
+/// `description:` is kept, while `globs` / `alwaysApply` are dropped.
+fn import_cursor(project: bool) -> Result<()> {
+    let rules_dir = forge_config::cursor_dir()
+        .context("no home directory — cannot locate ~/.cursor")?
+        .join("rules");
+    if !rules_dir.exists() {
+        println!("nothing to import: {} does not exist", rules_dir.display());
+        return Ok(());
+    }
+    let cmd_dst = if project {
+        std::path::PathBuf::from("./.forge/commands")
+    } else {
+        forge_config::config_dir()
+            .context("no config directory on this platform")?
+            .join("commands")
+    };
+    std::fs::create_dir_all(&cmd_dst).ok();
+
+    let mut copied = 0usize;
+    let mut skipped = 0usize;
+    let Ok(entries) = std::fs::read_dir(&rules_dir) else {
+        println!("nothing to import: cannot read {}", rules_dir.display());
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        if from.extension().and_then(|e| e.to_str()) != Some("mdc") {
+            continue;
+        }
+        let stem = from
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("cursor-rule");
+        let dest = cmd_dst.join(format!("{stem}.md"));
+        if dest.exists() {
+            skipped += 1;
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&from) else {
+            continue;
+        };
+        let converted = convert_mdc_to_command_md(&raw, stem);
+        if std::fs::write(&dest, converted).is_ok() {
+            copied += 1;
+        }
+    }
+    let scope = if project {
+        "./.forge"
+    } else {
+        "the user config"
+    };
+    println!("✓ imported {copied} command(s) from cursor into {scope} ({skipped} already present, skipped)");
+    Ok(())
+}
+
+/// Strip `.mdc` YAML front-matter down to just `description:`, preserving the body.
+/// Unknown YAML fields (`globs`, `alwaysApply`, etc.) are dropped.
+fn convert_mdc_to_command_md(raw: &str, fallback_name: &str) -> String {
+    let (description, body) = if let Some(rest) = raw.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            let fm = &rest[..end];
+            let description = fm
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    l.strip_prefix("description:")
+                        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
+                })
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| format!("Cursor rule: {fallback_name}"));
+            let body = rest[end + 4..].trim_start_matches('\n').to_string();
+            (description, body)
+        } else {
+            (format!("Cursor rule: {fallback_name}"), raw.to_string())
+        }
+    } else {
+        (format!("Cursor rule: {fallback_name}"), raw.to_string())
+    };
+    format!("---\ndescription: \"{description}\"\n---\n{body}")
+}
+
+/// Import Aider convention files as Forge commands. Looks for `CONVENTIONS.md`,
+/// `.aider.md`, and `.aider.conventions.md` in `$HOME` then `$PWD`.
+fn import_aider(project: bool) -> Result<()> {
+    let cmd_dst = if project {
+        std::path::PathBuf::from("./.forge/commands")
+    } else {
+        forge_config::config_dir()
+            .context("no config directory on this platform")?
+            .join("commands")
+    };
+    std::fs::create_dir_all(&cmd_dst).ok();
+
+    let search_dirs: Vec<std::path::PathBuf> =
+        [forge_config::home_dir(), std::env::current_dir().ok()]
+            .into_iter()
+            .flatten()
+            .collect();
+
+    let candidates = ["CONVENTIONS.md", ".aider.md", ".aider.conventions.md"];
+    let mut copied = 0usize;
+    let mut skipped = 0usize;
+
+    for dir in &search_dirs {
+        for name in candidates {
+            let from = dir.join(name);
+            if !from.is_file() {
+                continue;
+            }
+            let dest = cmd_dst.join(name);
+            if dest.exists() {
+                skipped += 1;
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&from) else {
+                continue;
+            };
+            // Wrap the file as a CC-compatible command if it lacks front-matter.
+            let content = if raw.starts_with("---") {
+                raw
+            } else {
+                let stem = from
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("aider-conventions");
+                format!("---\ndescription: \"Aider conventions ({stem})\"\n---\n{raw}")
+            };
+            if std::fs::write(&dest, content).is_ok() {
+                copied += 1;
+            }
+        }
+    }
+
+    if copied == 0 && skipped == 0 {
+        println!("nothing to import: no Aider convention files found (CONVENTIONS.md, .aider.md, .aider.conventions.md)");
+        return Ok(());
+    }
+    let scope = if project {
+        "./.forge"
+    } else {
+        "the user config"
+    };
+    println!("✓ imported {copied} command(s) from aider into {scope} ({skipped} already present, skipped)");
+    Ok(())
 }
 
 /// Recursively copy a directory tree (used to import a skill's SKILL.md + its resource files).
@@ -4067,6 +4239,38 @@ mod tests {
         assert!(!out.contains("GENERATED"), "target/ skipped");
         assert!(!out.contains("ignored ext"), "non-source ext skipped");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn convert_mdc_strips_globs_and_keeps_description() {
+        let mdc = "---\ndescription: \"My rule\"\nglobs: \"**/*.rs\"\nalwaysApply: false\n---\nDo this thing.";
+        let out = convert_mdc_to_command_md(mdc, "my-rule");
+        assert!(
+            out.starts_with("---\ndescription: \"My rule\""),
+            "description kept: {out}"
+        );
+        assert!(!out.contains("globs"), "globs dropped: {out}");
+        assert!(!out.contains("alwaysApply"), "alwaysApply dropped: {out}");
+        assert!(out.contains("Do this thing."), "body kept: {out}");
+    }
+
+    #[test]
+    fn convert_mdc_uses_fallback_name_when_no_description() {
+        let mdc = "---\nglobs: \"*.ts\"\n---\nContent.";
+        let out = convert_mdc_to_command_md(mdc, "fallback");
+        assert!(out.contains("fallback"), "fallback name used: {out}");
+        assert!(out.contains("Content."), "body kept: {out}");
+    }
+
+    #[test]
+    fn convert_mdc_handles_no_frontmatter() {
+        let mdc = "Just a plain rule with no frontmatter.";
+        let out = convert_mdc_to_command_md(mdc, "plain");
+        assert!(
+            out.starts_with("---\ndescription:"),
+            "wraps with frontmatter: {out}"
+        );
+        assert!(out.contains("Just a plain rule"), "body kept: {out}");
     }
 
     #[test]

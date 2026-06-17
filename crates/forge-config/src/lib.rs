@@ -765,6 +765,18 @@ pub fn codex_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|b| b.home_dir().join(".codex"))
 }
 
+/// Cursor AI's home directory (`~/.cursor`), source for `forge import cursor`. Rules live under
+/// `~/.cursor/rules/*.mdc`. `None` if no home directory resolves on this platform.
+pub fn cursor_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|b| b.home_dir().join(".cursor"))
+}
+
+/// Home directory, `None` if not resolvable. Used by `forge import aider` to locate convention
+/// files that don't follow a fixed tool-specific directory structure.
+pub fn home_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf())
+}
+
 /// The command/skill discovery sources, scope-tagged: user scope (`<config>/forge/{commands,
 /// skills}`, present only when a config dir resolves) then project scope (`./.forge/{commands,
 /// skills}`). Project wins on a name collision (see `forge_skills::Catalog`).
