@@ -67,7 +67,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all --all-features
-      - run: cargo build --release
+      # No release build in CI: tests already compile the whole workspace (debug), and the
+      # `lto = "thin"` release profile is slow to link ×3 OSes. Release binaries are built on demand
+      # (tags / manual), not on every PR.
 
   CI:
     needs: [guard, fmt, clippy, test]

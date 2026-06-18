@@ -856,6 +856,13 @@ pub fn config_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "forge", "forge").map(|d| d.config_dir().to_path_buf())
 }
 
+/// Per-OS data directory: `<data>/forge` (e.g. `~/.local/share/forge`). The session + usage store
+/// lives here so spend/budget and history persist across restarts and are shared regardless of the
+/// directory `forge` is launched from (FR-5 budget is global, not per-project).
+pub fn data_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "forge", "forge").map(|d| d.data_dir().to_path_buf())
+}
+
 /// Claude Code's home directory (`~/.claude`), source for `forge import claude`. `None` if no
 /// home directory resolves on this platform.
 pub fn claude_dir() -> Option<PathBuf> {

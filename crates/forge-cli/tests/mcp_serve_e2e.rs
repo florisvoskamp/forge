@@ -56,6 +56,8 @@ fn bridge_advertises_and_serves_use_skill() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_forge"))
         .arg("mcp-serve")
         .current_dir(&dir)
+        // Isolate the store from the developer's real per-user DB (see open_store).
+        .env("FORGE_DB", dir.join("forge.db"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

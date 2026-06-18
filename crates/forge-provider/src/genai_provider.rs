@@ -10,8 +10,8 @@ use forge_types::{Message, Role, ToolCall, Usage};
 use futures::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
-    ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, Tool, ToolCall as GenAiToolCall,
-    ToolResponse,
+    Binary, CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatStreamEvent,
+    ContentPart, MessageContent, Tool, ToolCall as GenAiToolCall, ToolResponse,
 };
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
@@ -124,7 +124,22 @@ fn to_genai_messages(messages: &[Message]) -> Vec<ChatMessage> {
     for m in messages {
         match m.role {
             Role::System => out.push(ChatMessage::system(m.content.clone())),
-            Role::User => out.push(ChatMessage::user(m.content.clone())),
+            Role::User if m.images.is_empty() => out.push(ChatMessage::user(m.content.clone())),
+            Role::User => {
+                // Multimodal user turn: text part (if any) followed by each image as a binary part.
+                let mut parts: Vec<ContentPart> = Vec::new();
+                if !m.content.is_empty() {
+                    parts.push(ContentPart::from_text(m.content.clone()));
+                }
+                for img in &m.images {
+                    parts.push(ContentPart::Binary(Binary::from_base64(
+                        img.media_type.clone(),
+                        img.data_base64.clone(),
+                        None,
+                    )));
+                }
+                out.push(ChatMessage::user(MessageContent::from_parts(parts)));
+            }
             Role::Assistant => {
                 if !m.content.is_empty() {
                     out.push(ChatMessage::assistant(m.content.clone()));
@@ -150,6 +165,23 @@ fn to_genai_messages(messages: &[Message]) -> Vec<ChatMessage> {
         }
     }
     out
+}
+
+/// Mark Anthropic/OpenAI prompt-cache breakpoints on the stable prefix of the transcript: the
+/// system message (system prompt + persona) and the final message (the whole conversation up to
+/// this turn). On the next turn that prefix is read from cache instead of re-billed at full input
+/// price — the single biggest cost lever for a long agent loop. Providers without prompt caching
+/// (and sub-threshold prefixes, e.g. Anthropic's 1024-token minimum) silently ignore the hint, so
+/// this is always safe to set.
+fn mark_cache_breakpoints(msgs: &mut [ChatMessage]) {
+    if msgs.is_empty() {
+        return;
+    }
+    let sys = msgs.iter().position(|m| m.role == ChatRole::System);
+    let last = msgs.len() - 1;
+    for idx in [sys, Some(last)].into_iter().flatten() {
+        msgs[idx].options = Some(CacheControl::Ephemeral.into());
+    }
 }
 
 fn to_genai_tool(spec: &ToolSpec) -> Tool {
@@ -383,7 +415,9 @@ impl Provider for GenAiProvider {
     ) -> Result<ModelResponse, ProviderError> {
         let model_name = to_genai_model(model);
 
-        let mut req = ChatRequest::new(to_genai_messages(messages));
+        let mut genai_messages = to_genai_messages(messages);
+        mark_cache_breakpoints(&mut genai_messages);
+        let mut req = ChatRequest::new(genai_messages);
         if !tools.is_empty() {
             req = req.with_tools(tools.iter().map(to_genai_tool).collect::<Vec<_>>());
         }
@@ -433,9 +467,19 @@ impl Provider for GenAiProvider {
                 }
                 ChatStreamEvent::End(end) => {
                     if let Some(u) = &end.captured_usage {
+                        // Cache-read tokens (subset of prompt_tokens) are billed at a fraction of
+                        // the input rate; capture them so the mesh prices them correctly instead of
+                        // charging the full rate (which diverges from the provider's actual bill).
+                        let cached = u
+                            .prompt_tokens_details
+                            .as_ref()
+                            .and_then(|d| d.cached_tokens)
+                            .unwrap_or(0)
+                            .max(0) as u64;
                         usage = Usage {
                             input_tokens: u.prompt_tokens.unwrap_or(0).max(0) as u64,
                             output_tokens: u.completion_tokens.unwrap_or(0).max(0) as u64,
+                            cached_input_tokens: cached,
                             cost_usd: 0.0, // priced by the mesh from token counts (FR-5)
                         };
                     }
@@ -474,6 +518,34 @@ impl Provider for GenAiProvider {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cache_breakpoints_mark_system_and_last_message() {
+        let msgs = [
+            Message::system("you are forge"),
+            Message::user("hi"),
+            Message::assistant("hello"),
+            Message::user("fix this bug"),
+        ];
+        let mut genai = to_genai_messages(&msgs);
+        mark_cache_breakpoints(&mut genai);
+        // System (idx 0) and final user message (idx 3) carry a cache breakpoint; the middle
+        // turns don't, so the cache reads the largest stable prefix.
+        assert!(genai[0].options.is_some(), "system should be a breakpoint");
+        assert!(genai[1].options.is_none());
+        assert!(genai[2].options.is_none());
+        assert!(
+            genai[genai.len() - 1].options.is_some(),
+            "last message should be a breakpoint"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoints_on_empty_is_noop() {
+        let mut empty: Vec<ChatMessage> = Vec::new();
+        mark_cache_breakpoints(&mut empty);
+        assert!(empty.is_empty());
+    }
 
     /// Live reproduction (needs an OpenRouter key; run with `--ignored`). Proves both halves of the
     /// context-overflow diagnosis against the SAME model from the failed turn

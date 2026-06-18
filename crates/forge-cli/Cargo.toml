@@ -37,6 +37,9 @@ futures.workspace = true
 axum = { workspace = true }
 tokio-tungstenite = { workspace = true }
 qrcode = { workspace = true }
+base64 = "0.22"
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 portable-pty = "0.9"

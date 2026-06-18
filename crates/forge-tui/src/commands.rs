@@ -66,6 +66,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/thinking",
     },
     Command {
+        name: "image",
+        desc: "attach an image file to your next message (vision input)",
+        usage: "/image <path>",
+    },
+    Command {
         name: "mcp",
         desc: "list connected MCP servers (or one server's tools: /mcp <server>)",
         usage: "/mcp [server]",
@@ -192,6 +197,8 @@ pub enum CommandAction {
     },
     /// Toggle display of model reasoning/thinking blocks (`/thinking`).
     Thinking,
+    /// Attach an image file to the next prompt (vision input) — `/image <path>`.
+    Image(String),
     Quit,
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
@@ -481,6 +488,7 @@ pub fn parse_command(line: &str) -> CommandAction {
             CommandAction::Remote { mode }
         }
         "thinking" | "think" => CommandAction::Thinking,
+        "image" | "img" => CommandAction::Image(arg),
         "quit" | "exit" | "q" => CommandAction::Quit,
         other => CommandAction::Unknown(other.to_string()),
     }

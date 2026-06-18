@@ -22,6 +22,7 @@ mod balance;
 mod benchmarks;
 mod bridge_stats;
 mod context_windows;
+mod image_input;
 mod mcp_serve;
 mod remote;
 mod replay;
@@ -1072,7 +1073,7 @@ fn provider_label(provider: &str) -> &'static str {
         "deepseek" => "DeepSeek — paid",
         "openrouter" => "OpenRouter (gateway, many models) — paid + some :free",
         "groq" => "Groq — free tier (fast)",
-        "opencode_go" => "OpenCode Zen — free curated coding models",
+        "opencode_go" => "OpenCode Zen — paid credit (curated coding models)",
         "github_copilot" => "GitHub Models — free inference",
         "mimo" => "Xiaomi MiMo — free",
         "minimax" => "MiniMax — free tier",
@@ -1205,8 +1206,30 @@ fn apply_wizard_outcome(outcome: &forge_tui::WizardOutcome) -> Result<std::path:
 }
 
 fn open_store() -> Result<Store> {
-    std::fs::create_dir_all(".forge").context("creating .forge directory")?;
-    Store::open(Path::new(".forge/forge.db")).context("opening session store")
+    // The store lives in a stable per-user data dir so usage/budget and session history persist
+    // across restarts and don't reset when `forge` is launched from a different directory (the
+    // budget is global per FR-5). Fall back to the legacy cwd-local path only if no data dir
+    // resolves. `FORGE_DB` overrides both (tests / power users).
+    if let Ok(custom) = std::env::var("FORGE_DB") {
+        let path = std::path::PathBuf::from(custom);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).context("creating store directory")?;
+        }
+        return Store::open(&path).context("opening session store");
+    }
+    let Some(dir) = forge_config::data_dir() else {
+        std::fs::create_dir_all(".forge").context("creating .forge directory")?;
+        return Store::open(Path::new(".forge/forge.db")).context("opening session store");
+    };
+    std::fs::create_dir_all(&dir).context("creating data directory")?;
+    let db = dir.join("forge.db");
+    // One-time migration: if there's no global store yet but a legacy `./.forge/forge.db` exists in
+    // this directory, move its history over so the switch doesn't appear to wipe past usage.
+    let legacy = Path::new(".forge/forge.db");
+    if !db.exists() && legacy.exists() {
+        let _ = std::fs::copy(legacy, &db);
+    }
+    Store::open(&db).context("opening session store")
 }
 
 /// Resolve a (possibly abbreviated) session id to a single full id, git-style.
@@ -3268,6 +3291,16 @@ async fn run_chat_tui(
             dirty = true;
             let key = match ev {
                 forge_tui::InputEvent::Paste(s) => {
+                    // Pasting an image: terminals deliver an empty/whitespace bracketed-paste for
+                    // image clipboard content, so on an empty payload probe the OS clipboard for an
+                    // image and drop it in as an attachment block. Otherwise it's a normal text paste.
+                    if s.trim().is_empty() {
+                        if let Some((att, label)) = crate::image_input::clipboard_image() {
+                            app.attach_image(att, &label);
+                            app.note(&format!("📎 attached image ({label})"));
+                            continue;
+                        }
+                    }
                     app.handle_paste(s);
                     continue;
                 }
@@ -3757,7 +3790,7 @@ async fn run_chat_tui(
                 };
                 match outcome {
                     InputOutcome::Submit(raw_line) => {
-                        let line = app.substitute_paste_blocks(raw_line);
+                        let (line, submit_images) = app.resolve_paste_blocks(raw_line);
                         history_pos = None;
                         if !line.trim().is_empty() && prompt_history.last() != Some(&line) {
                             prompt_history.push(line.clone());
@@ -3870,6 +3903,11 @@ async fn run_chat_tui(
                                     app.note(&format!("⎇ prompt blocked by hook: {reason}"));
                                 }
                                 Ok(prompt) => {
+                                    // Attach any images pasted/added into this prompt as vision
+                                    // input for the turn about to run.
+                                    if !submit_images.is_empty() {
+                                        session.lock().await.attach_images(submit_images);
+                                    }
                                     turn_gen += 1;
                                     turn_handle = Some(spawn_turn(
                                         &prompt,
@@ -4794,6 +4832,18 @@ async fn dispatch_command(
             app.show_thinking = !app.show_thinking;
             let state = if app.show_thinking { "on" } else { "off" };
             app.note(&format!("thinking display: {state}"));
+        }
+        // `/image <path>` attaches an image file to the next prompt as an input block.
+        CommandAction::Image(path) => {
+            let path = path.trim();
+            if path.is_empty() {
+                app.note("usage: /image <path>");
+            } else {
+                match crate::image_input::load_image_file(path) {
+                    Ok((att, label)) => app.attach_image(att, &label),
+                    Err(e) => app.note(&format!("⚠ {e}")),
+                }
+            }
         }
         CommandAction::Mcp(server) => {
             let s = session.lock().await;

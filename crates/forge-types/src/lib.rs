@@ -38,6 +38,15 @@ impl Role {
     }
 }
 
+/// An image attached to a user message (vision input). `data_base64` is the raw image bytes,
+/// base64-encoded; `media_type` is the MIME type (e.g. "image/png"). Carried on the user `Message`
+/// and mapped to the provider's multimodal content parts at request time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageAttachment {
+    pub media_type: String,
+    pub data_base64: String,
+}
+
 /// A single message in a session transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -50,6 +59,10 @@ pub struct Message {
     /// For a `Tool` message, the id of the call this result answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Images attached to a user message (vision input). Empty for non-user messages and
+    /// text-only turns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
 }
 
 impl Message {
@@ -59,10 +72,21 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
         Self::new(Role::User, content)
+    }
+    /// A user message carrying attached images (vision input) alongside the text.
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            images,
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::new(Role::Assistant, content)
@@ -77,6 +101,7 @@ impl Message {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
     /// A tool result answering a specific call.
@@ -86,6 +111,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
+            images: Vec::new(),
         }
     }
 }
@@ -104,6 +130,11 @@ pub struct ToolCall {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Of `input_tokens`, how many were served from the provider's prompt cache (billed at a
+    /// fraction of the input rate). 0 when caching is unused/unsupported. Subset of `input_tokens`,
+    /// not additive. Used so cost reflects the cache-read discount the provider actually bills.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
     pub cost_usd: f64,
 }
 
@@ -822,6 +853,7 @@ mod tests {
         let u = Usage {
             input_tokens: 10,
             output_tokens: 5,
+            cached_input_tokens: 0,
             cost_usd: 0.01,
         };
         assert_eq!(u.total_tokens(), 15);

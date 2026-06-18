@@ -86,6 +86,9 @@ pub enum StoreError {
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+/// A fetched per-model price row: `(model, input_per_1k, output_per_1k, cache_read_per_1k)` in USD.
+pub type ModelPriceRow = (String, f64, f64, Option<f64>);
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -633,6 +636,47 @@ impl Store {
             )
             .optional()?;
         Ok(row.map(|w| w.max(0) as u32))
+    }
+
+    /// Persist a model's fetched USD price (per 1k tokens), from a provider's model API. Upsert so a
+    /// later discovery refreshes it. `cache_read_per_1k` is the discounted prompt-cache-read rate
+    /// (None if the provider didn't report one).
+    pub fn set_model_pricing(
+        &self,
+        model: &str,
+        input_per_1k: f64,
+        output_per_1k: f64,
+        cache_read_per_1k: Option<f64>,
+    ) -> Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO model_pricing (model, input_per_1k, output_per_1k, cache_read_per_1k, updated_at)
+             VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))
+             ON CONFLICT(model) DO UPDATE SET input_per_1k = excluded.input_per_1k,
+                 output_per_1k = excluded.output_per_1k, cache_read_per_1k = excluded.cache_read_per_1k,
+                 updated_at = excluded.updated_at",
+            (model, input_per_1k, output_per_1k, cache_read_per_1k),
+        )?;
+        Ok(())
+    }
+
+    /// Every fetched per-model price: `model -> (input_per_1k, output_per_1k, cache_read_per_1k)` in
+    /// USD. Fed into the mesh's `Pricing` as overrides so gateway/credit spend is tracked, not $0.
+    pub fn all_model_pricing(&self) -> Result<Vec<ModelPriceRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT model, input_per_1k, output_per_1k, cache_read_per_1k FROM model_pricing",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Clear every model bench (the `forge models --clear` rescan reset). Returns the number of
@@ -1527,6 +1571,7 @@ mod tests {
                 &Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cached_input_tokens: 0,
                     cost_usd: 0.02,
                 },
             )
@@ -1549,6 +1594,7 @@ mod tests {
                 &Usage {
                     input_tokens: 1,
                     output_tokens: 1,
+                    cached_input_tokens: 0,
                     cost_usd: cost,
                 },
             )
@@ -1647,6 +1693,7 @@ mod tests {
                 &Usage {
                     input_tokens: 12,
                     output_tokens: 7,
+                    cached_input_tokens: 0,
                     cost_usd: 0.03,
                 },
             )
@@ -1995,6 +2042,29 @@ mod tests {
             store.model_context("openrouter::x:free").unwrap(),
             Some(65_536)
         );
+    }
+
+    #[test]
+    fn model_pricing_round_trips_and_upserts() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.all_model_pricing().unwrap().is_empty());
+        store
+            .set_model_pricing("openrouter::vendor/m", 0.0002, 0.0008, Some(0.00005))
+            .unwrap();
+        let rows = store.all_model_pricing().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "openrouter::vendor/m");
+        assert!((rows[0].1 - 0.0002).abs() < 1e-12);
+        assert!((rows[0].2 - 0.0008).abs() < 1e-12);
+        assert!((rows[0].3.unwrap() - 0.00005).abs() < 1e-12);
+        // Upsert refreshes in place, including clearing the cache-read rate.
+        store
+            .set_model_pricing("openrouter::vendor/m", 0.001, 0.002, None)
+            .unwrap();
+        let rows = store.all_model_pricing().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].1 - 0.001).abs() < 1e-12);
+        assert!(rows[0].3.is_none());
     }
 
     #[test]

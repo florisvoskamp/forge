@@ -188,14 +188,23 @@ impl MeshOverlay {
     }
 }
 
-/// A bracketed-paste insertion: the placeholder string currently in `App::input` and the real
-/// multiline content it stands in for. Placeholders look like `[pasted text (3 lines)]`.
-#[derive(Debug, Clone, Default)]
+/// What a paste-block placeholder stands in for: a chunk of pasted text (substituted back into the
+/// prompt on submit) or an attached image (sent out-of-band as vision input, the placeholder
+/// stripped from the text).
+#[derive(Debug, Clone)]
+enum PasteKind {
+    Text(String),
+    Image(forge_types::ImageAttachment),
+}
+
+/// An attachment shown inline in the input as a one-line placeholder (e.g. `[pasted text (3 lines)]`
+/// or `[image (PNG 800x600)]`). The placeholder is deletable as a single unit and is resolved on
+/// submit: text is substituted back in, images are pulled out as vision input.
+#[derive(Debug, Clone)]
 struct PasteBlock {
     /// The exact placeholder string inserted into `input`.
     placeholder: String,
-    /// The real (possibly multiline) content.
-    content: String,
+    kind: PasteKind,
 }
 
 /// All state the TUI needs to render the pinned live region, plus the scrollback outbox.
@@ -280,9 +289,13 @@ pub struct App {
     /// When true, model reasoning/thinking blocks are shown in scrollback. Default false (hidden).
     /// Toggled by `/thinking`.
     pub show_thinking: bool,
-    /// Paste blocks inserted by bracketed-paste: placeholder in `input`, real content here.
-    /// On submit, `substitute_paste_blocks()` replaces each placeholder with its real content.
+    /// Attachment blocks shown inline as placeholders (pasted text or images): the placeholder
+    /// lives in `input`, the backing content here. On submit, `resolve_paste_blocks()` substitutes
+    /// text back inline and pulls images out as vision input.
     paste_blocks: Vec<PasteBlock>,
+    /// Images resolved from the last submitted prompt, stashed so the user-turn echo can show a
+    /// marker line per image (the placeholder was stripped from the text). Cleared by `submit_user`.
+    last_submit_images: Vec<forge_types::ImageAttachment>,
 }
 
 /// How many recent scrollback lines the remote snapshot keeps (a phone screen shows ~6–8).
@@ -933,10 +946,22 @@ impl App {
         self.flush.push(TextLine::default());
     }
 
+    /// Clamp `input_cursor` into a valid byte index: never past the end, and always on a UTF-8
+    /// char boundary. The cursor can drift out of sync (e.g. a cleared input left it > 0, or it
+    /// landed inside a multibyte char) — slicing `input` at such a position panics, which is the
+    /// class of crash this guards. Cheap to call before any slice into `input`.
+    fn sanitize_cursor(&mut self) {
+        self.input_cursor = self.input_cursor.min(self.input.len());
+        if !self.input.is_char_boundary(self.input_cursor) {
+            self.input_cursor = prev_char_boundary(&self.input, self.input_cursor);
+        }
+    }
+
     /// Insert a bracketed paste at the cursor. Single-line pastes are inserted as plain text;
     /// multiline pastes show a `[pasted text (N lines)]` placeholder so the input stays on one
     /// line and won't accidentally auto-submit when the pasted text contains newlines.
     pub fn handle_paste(&mut self, content: String) {
+        self.sanitize_cursor();
         if !content.contains('\n') {
             // Single-line: insert directly as if the user typed it.
             self.input.insert_str(self.input_cursor, &content);
@@ -945,17 +970,29 @@ impl App {
         }
         let n = content.lines().count();
         let placeholder = format!("[pasted text ({n} lines)]");
+        self.insert_block(placeholder, PasteKind::Text(content));
+    }
+
+    /// Attach an image as an input block: a `[image (<label>)]` placeholder is inserted at the
+    /// cursor (deletable as a unit, like a text paste), and the image is sent as vision input when
+    /// the prompt is submitted. `label` is a short human descriptor, e.g. "PNG 800x600".
+    pub fn attach_image(&mut self, image: forge_types::ImageAttachment, label: &str) {
+        self.sanitize_cursor();
+        let placeholder = format!("[image ({label})]");
+        self.insert_block(placeholder, PasteKind::Image(image));
+    }
+
+    /// Insert a placeholder at the cursor and register its backing paste-block.
+    fn insert_block(&mut self, placeholder: String, kind: PasteKind) {
         self.input.insert_str(self.input_cursor, &placeholder);
         self.input_cursor += placeholder.len();
-        self.paste_blocks.push(PasteBlock {
-            placeholder: placeholder.clone(),
-            content,
-        });
+        self.paste_blocks.push(PasteBlock { placeholder, kind });
     }
 
     /// If cursor is immediately after (Backspace) or at (DeleteForward) a paste-block placeholder,
     /// delete the entire placeholder in one action. Returns `true` if consumed.
     pub fn try_delete_paste_block(&mut self, key: KeyKind) -> bool {
+        self.sanitize_cursor();
         match key {
             KeyKind::Backspace => {
                 let found = {
@@ -996,23 +1033,49 @@ impl App {
         }
     }
 
-    /// Replace each paste-block placeholder in `text` with its real content, returning the
-    /// substituted string. Call with the line returned by `handle_key`'s Submit. Drains `paste_blocks`.
-    pub fn substitute_paste_blocks(&mut self, text: String) -> String {
+    /// Resolve every paste-block placeholder in `text`: text blocks are substituted back inline,
+    /// image blocks are stripped from the text and their attachments returned (for vision input).
+    /// Call with the line from `handle_key`'s Submit. Drains `paste_blocks`.
+    pub fn resolve_paste_blocks(
+        &mut self,
+        text: String,
+    ) -> (String, Vec<forge_types::ImageAttachment>) {
         let mut result = text;
+        let mut images = Vec::new();
         for block in self.paste_blocks.drain(..) {
-            if let Some(pos) = result.find(&block.placeholder) {
-                result.replace_range(pos..pos + block.placeholder.len(), &block.content);
+            let Some(pos) = result.find(&block.placeholder) else {
+                // Placeholder was deleted from the input — drop the block (and its image) too.
+                continue;
+            };
+            let span = pos..pos + block.placeholder.len();
+            match block.kind {
+                PasteKind::Text(content) => result.replace_range(span, &content),
+                PasteKind::Image(img) => {
+                    result.replace_range(span, "");
+                    images.push(img);
+                }
             }
         }
-        result
+        // Stash a copy so the user-turn echo (submit_user) can show a marker per image, since the
+        // placeholders were just stripped from the text.
+        self.last_submit_images = images.clone();
+        (result, images)
     }
 
-    /// Echo a just-submitted user message into scrollback.
+    /// Echo a just-submitted user message into scrollback. Any images attached to this prompt
+    /// (stashed by `resolve_paste_blocks`) are shown as a marker line each, so the conversation
+    /// history reflects that an image was sent (terminals can't render the pixels inline here).
     pub fn submit_user(&mut self, line: &str) {
         self.flush.push(header_line("you", USER));
         for l in line.lines() {
             self.flush.push(body_line(l));
+        }
+        for img in std::mem::take(&mut self.last_submit_images) {
+            let kb = (img.data_base64.len() * 3 / 4).div_ceil(1024);
+            self.flush.push(body_line(&format!(
+                "🖼 image attached ({}, ~{kb} KB)",
+                img.media_type
+            )));
         }
         self.flush.push(TextLine::default());
     }
@@ -2207,13 +2270,8 @@ pub fn render_usage_overlay(f: &mut Frame, app: &App) {
                 Style::default()
             };
             Row::new(vec![
-                Cell::from(display).style(style),
-                Cell::from(if *cost > 0.0 {
-                    format!("${:.5}", cost)
-                } else {
-                    "subscription".to_string()
-                })
-                .style(style),
+                Cell::from(display.clone()).style(style),
+                Cell::from(cost_cell(&display, *cost)).style(style),
                 Cell::from(format_tok(*inp)).style(style),
                 Cell::from(format_tok(*out)).style(style),
             ])
@@ -2231,6 +2289,21 @@ pub fn render_usage_overlay(f: &mut Frame, app: &App) {
     .header(header)
     .block(Block::default());
     f.render_widget(table, chunks[1]);
+}
+
+/// Honest cost label for a per-model row. A flat-rate subscription bridge (Claude Code / Codex
+/// CLI) genuinely costs $0 per call, so it reads "subscription". A priced model shows its dollar
+/// cost. Anything else at $0 is a model we have NO price for (gateway/credit providers like
+/// OpenCode Zen, OpenRouter pass-through) — it may still burn real credit, so we say "untracked"
+/// rather than lie that it's a subscription.
+fn cost_cell(model: &str, cost: f64) -> String {
+    if model.starts_with("claude-cli") || model.starts_with("codex-cli") {
+        "subscription".to_string()
+    } else if cost > 0.0 {
+        format!("${cost:.5}")
+    } else {
+        "untracked".to_string()
+    }
 }
 
 /// A 14-cell colour-coded meter for a fraction, eased by `ease` (animation grow-in).
@@ -2622,6 +2695,153 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    #[test]
+    fn cost_cell_distinguishes_subscription_priced_and_untracked() {
+        assert_eq!(cost_cell("claude-cli::", 0.0), "subscription");
+        assert_eq!(cost_cell("codex-cli::gpt-5.5", 0.0), "subscription");
+        assert_eq!(cost_cell("openai::gpt-4o-mini", 0.0123), "$0.01230");
+        // Unpriced gateway/credit model: not a bridge, $0 only because we lack a price.
+        assert_eq!(cost_cell("opencode_go::glm-5.2", 0.0), "untracked");
+    }
+
+    #[test]
+    fn resolve_paste_blocks_substitutes_text_and_extracts_images() {
+        let mut app = App::default();
+        app.input.clear();
+        app.input_cursor = 0;
+        // Type "see ", paste a multiline text block, type " and ", attach an image.
+        for c in "see ".chars() {
+            handle_key(&mut app.input, &mut app.input_cursor, KeyKind::Char(c));
+        }
+        app.handle_paste("line1\nline2\nline3".to_string());
+        for c in " and ".chars() {
+            handle_key(&mut app.input, &mut app.input_cursor, KeyKind::Char(c));
+        }
+        app.attach_image(
+            forge_types::ImageAttachment {
+                media_type: "image/png".to_string(),
+                data_base64: "Zm9v".to_string(),
+            },
+            "PNG 2x2",
+        );
+        let raw = std::mem::take(&mut app.input);
+        let (resolved, images) = app.resolve_paste_blocks(raw);
+        // Text block restored inline; image placeholder stripped; image returned out-of-band.
+        assert_eq!(resolved, "see line1\nline2\nline3 and ");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data_base64, "Zm9v");
+        // Blocks are drained.
+        let (again, imgs2) = app.resolve_paste_blocks("nothing".to_string());
+        assert_eq!(again, "nothing");
+        assert!(imgs2.is_empty());
+    }
+
+    #[test]
+    fn submitted_image_shows_a_marker_in_history() {
+        let mut app = App::default();
+        app.attach_image(
+            forge_types::ImageAttachment {
+                media_type: "image/png".to_string(),
+                data_base64: "Zm9vYmFy".to_string(),
+            },
+            "PNG 4x4",
+        );
+        let raw = std::mem::take(&mut app.input);
+        let (_text, images) = app.resolve_paste_blocks(raw);
+        assert_eq!(images.len(), 1);
+        app.submit_user("look at this");
+        let echoed = flush_text(&mut app);
+        assert!(echoed.contains("look at this"));
+        assert!(
+            echoed.contains("🖼 image attached"),
+            "history should mark the attached image, got: {echoed}"
+        );
+        // Marker is one-shot: a later plain turn doesn't repeat it.
+        app.submit_user("next");
+        let again = flush_text(&mut app);
+        assert!(!again.contains("🖼"));
+    }
+
+    #[test]
+    fn paste_into_empty_input_with_stale_cursor_does_not_panic() {
+        // Regression: input_cursor could outlive the input contents (e.g. after a submit clears
+        // input but a key path left the cursor > 0), making a `&input[..cursor]` slice panic.
+        let mut app = App::default();
+        app.input.clear();
+        app.input_cursor = 5; // stale: past end of empty input
+        app.handle_paste("x".to_string());
+        app.input_cursor = 5;
+        app.handle_paste("a\nb\nc".to_string());
+        let _ = app.try_delete_paste_block(KeyKind::Backspace);
+        let _ = app.try_delete_paste_block(KeyKind::DeleteForward);
+    }
+
+    #[test]
+    fn input_handling_never_panics_and_keeps_cursor_valid() {
+        // Deterministic fuzz: drive the input line with a long pseudo-random sequence of edits,
+        // pastes (single- and multi-line, multibyte) and paste-block deletes, asserting after
+        // every op that the cursor stays in-bounds and on a char boundary. No rand crate — a
+        // small LCG keeps it reproducible. Guards the class of panic the paste crash belonged to.
+        let mut app = App::default();
+        let chars = ['a', 'é', '你', '🦀', ' ', '\n', '/'];
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % n
+        };
+        for _ in 0..20_000 {
+            match next(10) {
+                0..=4 => {
+                    let c = chars[next(chars.len() as u64) as usize];
+                    let key = if c == '\n' {
+                        KeyKind::InsertNewline
+                    } else {
+                        KeyKind::Char(c)
+                    };
+                    let _ = handle_key(&mut app.input, &mut app.input_cursor, key);
+                }
+                5 => {
+                    let key = match next(9) {
+                        0 => KeyKind::Backspace,
+                        1 => KeyKind::DeleteForward,
+                        2 => KeyKind::Left,
+                        3 => KeyKind::Right,
+                        4 => KeyKind::Home,
+                        5 => KeyKind::End,
+                        6 => KeyKind::DeleteWordBack,
+                        7 => KeyKind::KillLineBack,
+                        _ => KeyKind::KillLineForward,
+                    };
+                    let _ = handle_key(&mut app.input, &mut app.input_cursor, key);
+                }
+                6 => app.handle_paste("single line paste".to_string()),
+                7 => app.handle_paste("multi\nline\né你🦀\npaste".to_string()),
+                8 => {
+                    let _ = app.try_delete_paste_block(KeyKind::Backspace);
+                }
+                _ => {
+                    // Occasionally desync the cursor to simulate the bug's precondition.
+                    app.input_cursor = app.input_cursor.wrapping_add(next(4) as usize);
+                    let _ = app.try_delete_paste_block(KeyKind::DeleteForward);
+                }
+            }
+            assert!(
+                app.input_cursor <= app.input.len(),
+                "cursor {} > len {}",
+                app.input_cursor,
+                app.input.len()
+            );
+            assert!(
+                app.input.is_char_boundary(app.input_cursor),
+                "cursor {} not on a char boundary in {:?}",
+                app.input_cursor,
+                app.input
+            );
+        }
     }
 
     /// Concatenated text of everything queued for scrollback.

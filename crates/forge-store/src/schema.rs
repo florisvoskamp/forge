@@ -114,6 +114,18 @@ CREATE TABLE IF NOT EXISTS model_context (
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 
+-- Per-model USD prices (per 1k tokens), fetched from provider APIs at discovery (e.g. OpenRouter's
+-- /api/v1/models `pricing`). Most gateway/credit models aren't in the bundled default rate table,
+-- so without this their spend computes to $0 and the budget cap can't see it. A model absent here
+-- falls back to the bundled defaults, then to $0 (unpriced).
+CREATE TABLE IF NOT EXISTS model_pricing (
+    model             TEXT PRIMARY KEY,
+    input_per_1k      REAL NOT NULL,    -- USD per 1,000 input tokens
+    output_per_1k     REAL NOT NULL,    -- USD per 1,000 output tokens
+    cache_read_per_1k REAL,             -- USD per 1,000 cached (prompt-cache read) tokens; NULL if unknown
+    updated_at        INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
 -- Subscription quota windows (quota-aware routing, L3). One row per bridge provider per window;
 -- composite PK so 5h and weekly windows are tracked independently.
 -- The row stops constraining once `resets_at` passes (the window rolled over).

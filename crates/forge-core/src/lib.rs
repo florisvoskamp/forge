@@ -234,6 +234,9 @@ pub struct Session {
     /// False for fresh sessions so it's injected on the first turn; true for resumed sessions
     /// (the content is already in the stored transcript) and after injection.
     project_prompt_injected: bool,
+    /// Images attached to the *next* user turn (vision input, e.g. via `/image <path>`). Drained
+    /// when that turn's user message is built; empty for text-only turns.
+    pending_images: Vec<forge_types::ImageAttachment>,
 }
 
 impl Session {
@@ -284,6 +287,7 @@ impl Session {
                 content: m.content,
                 tool_calls: m.tool_calls,
                 tool_call_id: m.tool_call_id,
+                images: Vec::new(),
             })
             .collect();
         // Restore the permission mode that was active when the session was last saved.
@@ -326,7 +330,11 @@ impl Session {
         seq: i64,
     ) -> Self {
         let mode = config.permission_mode;
-        let pricing = Pricing::from_config(&config);
+        // Layer fetched per-model prices (OpenRouter etc., persisted at discovery) under the config
+        // overrides, so gateway/credit spend is priced instead of silently $0 (the budget cap and
+        // the /usage breakdown both read these computed costs).
+        let fetched_prices = store.all_model_pricing().unwrap_or_default();
+        let pricing = Pricing::from_config_with_fetched(&config, fetched_prices);
         let rules = config.permission_rules();
         // Rehydrate the task list (empty for a fresh session; restored on resume).
         let tasks = store.tasks(&id).unwrap_or_default();
@@ -357,6 +365,7 @@ impl Session {
             pending_hints: vec![],
             always_compact_on_switch: false,
             project_prompt_injected,
+            pending_images: Vec::new(),
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -365,6 +374,12 @@ impl Session {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Queue images to attach to the next user turn (vision input). Consumed when that turn's user
+    /// message is built; a turn with no images behaves exactly as before.
+    pub fn attach_images(&mut self, images: Vec<forge_types::ImageAttachment>) {
+        self.pending_images.extend(images);
     }
 
     /// Whether project-scope (`./.forge/`) commands/skills run without a first-use confirmation.
@@ -570,6 +585,7 @@ impl Session {
                 content: m.content,
                 tool_calls: m.tool_calls,
                 tool_call_id: m.tool_call_id,
+                images: Vec::new(),
             })
             .collect();
         self.id = session_id.to_string();
@@ -1420,7 +1436,15 @@ impl Session {
         self.current_turn_seq = seq;
         self.store
             .add_message(&self.id, seq, Role::User, prompt, None)?;
-        self.transcript.push(Message::user(prompt));
+        // Attach any images queued for this turn (vision). They ride on the in-memory transcript
+        // for the provider call; the persisted row stays text-only (images are transient input).
+        let images = std::mem::take(&mut self.pending_images);
+        if images.is_empty() {
+            self.transcript.push(Message::user(prompt));
+        } else {
+            self.transcript
+                .push(Message::user_with_images(prompt, images));
+        }
         // Auto-checkpoint at the turn boundary, labeled with the prompt preview, so `/undo` can
         // offer a list of past messages to rewind to (no manual /checkpoint needed).
         let _ = self
@@ -1648,12 +1672,9 @@ impl Session {
                 }
             };
 
-            // Compute the real cost from token counts and the model's price (FR-5, A-7).
-            resp.usage.cost_usd = self.pricing.cost_for(
-                &active_model,
-                resp.usage.input_tokens,
-                resp.usage.output_tokens,
-            );
+            // Compute the real cost from token counts and the model's price (FR-5, A-7), pricing
+            // cache-read tokens at the discounted rate so it tracks the provider's actual bill.
+            resp.usage.cost_usd = self.pricing.cost_for_usage(&active_model, &resp.usage);
             // The last call's input size is the live context fill (tui-token-counter.md).
             context_tokens = resp.usage.input_tokens;
 
@@ -3987,6 +4008,7 @@ mod tests {
             let usage = Usage {
                 input_tokens: 30,
                 output_tokens: 12,
+                cached_input_tokens: 0,
                 cost_usd: 0.0,
             };
             if is_subagent {
@@ -4179,6 +4201,7 @@ mod tests {
             let usage = Usage {
                 input_tokens: 5,
                 output_tokens: 2,
+                cached_input_tokens: 0,
                 cost_usd: 0.0,
             };
             if used_tool {

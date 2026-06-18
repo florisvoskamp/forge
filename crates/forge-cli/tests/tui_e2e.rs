@@ -52,6 +52,9 @@ fn drive_pty(script: &[(&str, u64)]) -> (bool, String) {
     cmd.arg("chat");
     cmd.arg("--mock");
     cmd.cwd(&dir);
+    // Isolate the store in the temp dir — the real store now lives in a per-user data dir, so
+    // without this the e2e would read/write the developer's actual session+usage DB.
+    cmd.env("FORGE_DB", dir.join("forge.db"));
 
     let mut child = pair.slave.spawn_command(cmd).expect("spawn forge");
     drop(pair.slave);
