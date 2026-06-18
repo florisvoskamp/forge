@@ -226,6 +226,10 @@ pub struct Session {
     /// System hints queued by side-call diagnostics (e.g. shell error interceptor) to be injected
     /// into the transcript immediately after the tool result that triggered them. Cleared each time.
     pending_hints: Vec<String>,
+    /// Session-scoped "always" answer to the auto-compact-on-switch consent prompt: once the user
+    /// picks "always", a mesh failover to a model that needs compaction proceeds silently for the
+    /// rest of this session (reset next launch). `false` = ask each time.
+    always_compact_on_switch: bool,
 }
 
 impl Session {
@@ -331,6 +335,7 @@ impl Session {
             skills: None,
             pinned_model: None,
             pending_hints: vec![],
+            always_compact_on_switch: false,
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -1021,6 +1026,76 @@ impl Session {
         fit_messages(&self.transcript, budget_chars.max(2048))
     }
 
+    /// Rough token estimate of the current transcript (chars / [`CHARS_PER_TOKEN`], + small
+    /// per-message framing). Used to decide compaction; not billed.
+    fn estimated_transcript_tokens(&self) -> u64 {
+        let chars: usize = self
+            .transcript
+            .iter()
+            .map(|m| m.content.chars().count() + 16)
+            .sum();
+        (chars / CHARS_PER_TOKEN) as u64
+    }
+
+    /// Whether the transcript comfortably fits `model`'s window — under 80% of the post-reply room.
+    /// Below this, the turn proceeds as-is; at/over it, auto-compaction kicks in (and a failover to
+    /// a model that fails this check triggers the consent prompt).
+    fn transcript_fits(&self, model: &str) -> bool {
+        let window = self.effective_context_window(model) as u64;
+        let reserve = self.config.mesh.max_output_tokens.max(1024) as u64;
+        let usable = window.saturating_sub(reserve) * 8 / 10;
+        self.estimated_transcript_tokens() <= usable
+    }
+
+    /// Decide whether to admit a mesh-chosen failover `model`. If the transcript already fits, use
+    /// it. Otherwise it's a switch to a smaller-window model that needs (lossy) compaction: proceed
+    /// silently when the user picked "always" this session, else ask Yes/No/Always. `Ok(false)` =
+    /// the user declined (skip this model; the caller advances to the next fallback that fits).
+    async fn admit_failover_model(&mut self, model: &str) -> Result<bool, CoreError> {
+        if self.transcript_fits(model) {
+            return Ok(true);
+        }
+        if !self.always_compact_on_switch {
+            let window_k = (self.effective_context_window(model) / 1000).max(1);
+            let q = format!(
+                "Mesh switched to {model} (~{window_k}k context) — too small for this conversation. \
+                 Compact (summarize older messages) and continue on it?"
+            );
+            let opts = [
+                forge_tui::QChoice {
+                    label: "Yes".into(),
+                    description: "Compact now and continue on this model".into(),
+                },
+                forge_tui::QChoice {
+                    label: "No".into(),
+                    description: "Skip it — try the next model that fits".into(),
+                },
+                forge_tui::QChoice {
+                    label: "Always".into(),
+                    description: "Compact on every such switch for the rest of this session".into(),
+                },
+            ];
+            let ans = self.presenter.ask(&q, &opts, false).trim().to_lowercase();
+            if ans == "always" {
+                self.always_compact_on_switch = true;
+            } else if ans != "yes" {
+                return Ok(false); // No / cancelled → skip this model
+            }
+        }
+        self.compact().await?;
+        Ok(true)
+    }
+
+    /// Auto-compact (silently) when the transcript has grown past 80% of `model`'s window — the
+    /// normal "conversation got long" case for the routed model, no prompt (the `compact` call
+    /// emits its own one-line note). No-op when it already fits or the transcript is too short to
+    /// compact. Distinct from the failover consent path ([`admit_failover_model`]).
+    async fn auto_compact_if_needed(&mut self, model: &str) {
+        if !self.transcript_fits(model) {
+            let _ = self.compact().await;
+        }
+    }
+
     pub async fn compact(&mut self) -> Result<(usize, usize), CoreError> {
         let before = self.transcript.len();
         if before <= COMPACT_KEEP_RECENT + COMPACT_MIN_OLDER {
@@ -1359,6 +1434,11 @@ impl Session {
             });
         }
 
+        // Silent auto-compaction: if the conversation has grown past ~80% of the routed model's
+        // (fetched/heuristic) context window, summarize older messages now so the turn doesn't ride
+        // the hard-trim floor and lose recent context. Transparent — `compact` emits its own note.
+        self.auto_compact_if_needed(&routed_model).await;
+
         let specs = self.tool_specs();
         let mut final_text = String::new();
         // Tokens in the live context after the latest call (the statusline gauge).
@@ -1471,7 +1551,26 @@ impl Session {
                                 "{active_model} {reason} — failing over"
                             )));
                         }
-                        match chain.next() {
+                        // Advance down the chain to the next model we can use. A model whose window
+                        // still holds the conversation is used immediately; one that's too small is
+                        // a switch that needs (lossy) compaction, so it's gated by consent
+                        // (Yes/No/Always) — "No" skips it and we keep looking for one that fits.
+                        let mut picked = None;
+                        for next in chain.by_ref() {
+                            match self.admit_failover_model(&next).await {
+                                Ok(true) => {
+                                    picked = Some(next);
+                                    break;
+                                }
+                                Ok(false) => {
+                                    self.presenter.emit(PresenterEvent::Warning(format!(
+                                        "skipped {next} (declined compaction) — trying the next model"
+                                    )));
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        match picked {
                             Some(next) => {
                                 self.presenter.emit(PresenterEvent::Routing {
                                     tier: decision.tier.as_str().to_string(),
@@ -2535,6 +2634,91 @@ mod tests {
         fn read_line(&mut self) -> Option<String> {
             None
         }
+    }
+
+    /// A presenter whose `ask` always returns a scripted label, counting how many times it was
+    /// asked — for the auto-compact-on-switch consent tests.
+    #[derive(Clone)]
+    struct ScriptedPresenter {
+        answer: String,
+        asks: Arc<Mutex<usize>>,
+    }
+    impl Presenter for ScriptedPresenter {
+        fn emit(&mut self, _event: PresenterEvent) {}
+        fn confirm(&mut self, _tool: &str, _side_effect: SideEffect) -> bool {
+            true
+        }
+        fn ask(&mut self, _q: &str, _options: &[forge_tui::QChoice], _allow_other: bool) -> String {
+            *self.asks.lock().unwrap() += 1;
+            self.answer.clone()
+        }
+        fn read_line(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    fn scripted_session(answer: &str, asks: Arc<Mutex<usize>>) -> Session {
+        let config = Config::default();
+        Session::start(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(ScriptedPresenter {
+                answer: answer.to_string(),
+                asks,
+            }),
+            config,
+            ".",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn small_transcript_fits_any_window_no_prompt() {
+        let asks = Arc::new(Mutex::new(0));
+        let mut s = scripted_session("No", asks.clone());
+        s.transcript.push(Message::user("hi there"));
+        assert!(s.transcript_fits("ollama::tiny")); // unknown → 32k floor, easily fits
+        assert!(
+            s.admit_failover_model("ollama::tiny").await.unwrap(),
+            "a fitting model is admitted"
+        );
+        assert_eq!(*asks.lock().unwrap(), 0, "no consent prompt when it fits");
+    }
+
+    #[tokio::test]
+    async fn oversized_transcript_prompts_and_no_skips() {
+        let asks = Arc::new(Mutex::new(0));
+        let mut s = scripted_session("No", asks.clone());
+        // One giant message: over 80% of the 32k floor in tokens, but too few messages for
+        // compact() to do real work (so the gate's decision is what we're testing).
+        s.transcript.push(Message::user("x".repeat(200_000)));
+        assert!(
+            !s.transcript_fits("ollama::tiny"),
+            "overflows the small window"
+        );
+        assert!(
+            !s.admit_failover_model("ollama::tiny").await.unwrap(),
+            "\"No\" skips the model"
+        );
+        assert_eq!(*asks.lock().unwrap(), 1, "asked exactly once");
+    }
+
+    #[tokio::test]
+    async fn always_answer_silences_further_prompts() {
+        let asks = Arc::new(Mutex::new(0));
+        let mut s = scripted_session("Always", asks.clone());
+        s.transcript.push(Message::user("x".repeat(200_000)));
+        assert!(
+            s.admit_failover_model("ollama::tiny").await.unwrap(),
+            "Always → admit"
+        );
+        assert!(s.always_compact_on_switch, "the session flag is set");
+        // A second over-window switch proceeds silently (no further prompt).
+        s.transcript.push(Message::user("x".repeat(200_000)));
+        assert!(s.admit_failover_model("ollama::tiny").await.unwrap());
+        assert_eq!(*asks.lock().unwrap(), 1, "asked only the first time");
     }
 
     /// A provider that calls `ask_user` once, then answers using whatever came back.

@@ -475,6 +475,44 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Live reproduction (needs an OpenRouter key; run with `--ignored`). Proves both halves of the
+    /// context-overflow diagnosis against the SAME model from the failed turn
+    /// (`cohere/north-mini-code:free`, which appeared as "unavailable" in the user's log):
+    ///   1. an oversized prompt fails as a retryable `Unavailable` (the cascade cause), and
+    ///   2. an in-window prompt to that same model succeeds (the model itself is healthy — the
+    ///      fix is to trim to the window, not to avoid the model).
+    /// `cargo test -p forge-provider -- --ignored openrouter_overflow`.
+    #[tokio::test]
+    #[ignore = "hits the live OpenRouter API; needs a key"]
+    async fn openrouter_overflow_is_retryable_then_in_window_succeeds() {
+        forge_config::inject_provider_keys();
+        let provider = GenAiProvider::new().with_max_output_tokens(64);
+        let model = "openrouter::cohere/north-mini-code:free";
+        let mut sink = |_: StreamEvent| {};
+
+        // 1. Overflow: ~1.6M chars ≈ 400k tokens, well over this model's ~256k window.
+        let big = [Message::user("word ".repeat(330_000))];
+        let err = provider
+            .complete(model, &big, &[], &mut sink)
+            .await
+            .expect_err("an oversized prompt must fail");
+        assert!(
+            err.is_retryable() && !err.is_permanent(),
+            "overflow should fail over (transient), got: {err:?}"
+        );
+
+        // 2. In-window: a normal prompt to the SAME model answers fine.
+        let ok = [Message::user("Reply with the single word: pong")];
+        let resp = provider
+            .complete(model, &ok, &[], &mut sink)
+            .await
+            .expect("an in-window prompt to a healthy free model should succeed");
+        assert!(
+            !resp.content.trim().is_empty(),
+            "expected a non-empty reply, got empty"
+        );
+    }
+
     #[test]
     fn to_genai_model_passes_namespaced_ids_through() {
         // Native providers: namespace kept verbatim so genai selects the adapter explicitly.
