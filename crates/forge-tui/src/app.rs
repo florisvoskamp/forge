@@ -1257,7 +1257,8 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     // The input box grows with wrapped/multiline content (capped); the stream area absorbs the
     // change, so the inline viewport's total height is untouched (never resized at runtime).
     let input_h = input_box_height(&app.input, frame.area().width);
-    let fixed = PERMISSION_H + input_h + STATUS_H;
+    let status_h = statusline_height(app);
+    let fixed = PERMISSION_H + input_h + status_h;
     let avail = frame.area().height.saturating_sub(fixed);
     let panel_avail = avail.saturating_sub(MIN_STREAM);
 
@@ -1279,7 +1280,7 @@ pub fn render_live(frame: &mut Frame, app: &App) {
         Constraint::Length(task_h),
         Constraint::Length(PERMISSION_H),
         Constraint::Length(input_h),
-        Constraint::Length(STATUS_H),
+        Constraint::Length(status_h),
     ])
     .split(frame.area());
 
@@ -2288,6 +2289,20 @@ fn format_tok(n: u64) -> String {
     }
 }
 
+/// Returns 1 when idle (no session data), 2 once context / token data is available.
+/// Used by [`render_live`] to allocate the right number of rows for the status area.
+pub fn statusline_height(app: &App) -> u16 {
+    if app.context_tokens > 0
+        || app.context_limit.is_some()
+        || app.session_in > 0
+        || app.session_out > 0
+    {
+        2
+    } else {
+        1
+    }
+}
+
 fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
     let bg = Style::default().bg(STATUSBG);
     let w = area.width;
@@ -2300,48 +2315,35 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
         .unwrap_or("—");
     let tier = app.routing.as_ref().map(|r| r.tier.as_str());
 
-    let mut left: Vec<Span> = vec![Span::styled(" ", bg)];
+    // Line 1: spinner · [tier] model · $cost · ◆ temper · ◉ remote   (hint right-aligned)
+    let mut line1: Vec<Span> = vec![Span::styled(" ", bg)];
     if app.busy && w >= 40 {
         let f = SPINNER[app.tick % SPINNER.len()];
-        left.push(Span::styled(
+        line1.push(Span::styled(
             format!("{f} working"),
             Style::default().fg(ORANGE).bg(STATUSBG),
         ));
-        left.push(sep());
+        line1.push(sep());
     }
     if let (Some(t), true) = (tier, w >= 52) {
-        left.push(Span::styled(
+        line1.push(Span::styled(
             format!("[{t}] "),
             Style::default().fg(ORANGE).bold().bg(STATUSBG),
         ));
     }
-    left.push(Span::styled(
+    line1.push(Span::styled(
         model.to_string(),
         Style::default().fg(Color::White).bg(STATUSBG),
     ));
-    left.push(sep());
-    left.push(Span::styled(
+    line1.push(sep());
+    line1.push(Span::styled(
         format!("${:.4}", app.cost_usd),
         Style::default().fg(OKGREEN).bold().bg(STATUSBG),
     ));
-    // Live token counter + context-window gauge (tui-token-counter.md). Width-gated so on a
-    // shrinking terminal the gauge drops first, then the token segment, before tier/model/cost.
-    if (app.session_in > 0 || app.session_out > 0) && w >= 76 {
-        left.push(sep());
-        left.push(Span::styled(
-            format!("↑{} ↓{}", human(app.session_in), human(app.session_out)),
-            Style::default().fg(DIM).bg(STATUSBG),
-        ));
-    }
-    if app.context_tokens > 0 && w >= 70 {
-        left.push(sep());
-        left.extend(context_gauge_spans(app.context_tokens, app.context_limit));
-    }
-    // The active temper (operating mode), color-coded by how permissive it is so the current
-    // posture reads at a glance: Read-only=blue, Ask=yellow, Auto-edit=green, Full=red.
+    // The active temper (operating mode), color-coded by how permissive it is.
     if !app.temper.is_empty() && w >= 46 {
-        left.push(sep());
-        left.push(Span::styled(
+        line1.push(sep());
+        line1.push(Span::styled(
             format!("◆ {}", app.temper),
             Style::default()
                 .fg(temper_color(&app.temper))
@@ -2349,26 +2351,25 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
                 .bg(STATUSBG),
         ));
     }
-    // Remote control active: a green `◉ remote` segment so it's visible a browser can drive the
-    // session. Shown only when on (and wide enough); dropped on narrow terminals like the temper.
     if app.remote_active && w >= 52 {
-        left.push(sep());
-        left.push(Span::styled(
+        line1.push(sep());
+        line1.push(Span::styled(
             "◉ remote",
             Style::default().fg(OKGREEN).bold().bg(STATUSBG),
         ));
     }
 
+    let hint = if app.busy {
+        "esc stop "
+    } else if app.done {
+        "done · esc quit "
+    } else {
+        "⇧⇥ temper · esc quit "
+    };
+    let row1 = Rect { height: 1, ..area };
     if w >= 70 {
-        let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(24)]).split(area);
-        frame.render_widget(Paragraph::new(TextLine::from(left)).style(bg), cols[0]);
-        let hint = if app.busy {
-            "esc stop "
-        } else if app.done {
-            "done · esc quit "
-        } else {
-            "⇧⇥ temper · esc quit "
-        };
+        let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(24)]).split(row1);
+        frame.render_widget(Paragraph::new(TextLine::from(line1)).style(bg), cols[0]);
         frame.render_widget(
             Paragraph::new(TextLine::from(Span::styled(
                 hint,
@@ -2379,7 +2380,30 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
             cols[1],
         );
     } else {
-        frame.render_widget(Paragraph::new(TextLine::from(left)).style(bg), area);
+        frame.render_widget(Paragraph::new(TextLine::from(line1)).style(bg), row1);
+    }
+
+    // Line 2: ↑in ↓out · ◷ bar used/limit pct% — always untruncated on its own row.
+    if area.height >= 2 {
+        let row2 = Rect {
+            y: area.y + 1,
+            height: 1,
+            ..area
+        };
+        let mut line2: Vec<Span> = vec![Span::styled(" ", bg)];
+        if app.session_in > 0 || app.session_out > 0 {
+            line2.push(Span::styled(
+                format!("↑{} ↓{}", human(app.session_in), human(app.session_out)),
+                Style::default().fg(DIM).bg(STATUSBG),
+            ));
+        }
+        if app.context_tokens > 0 || app.context_limit.is_some() {
+            if app.session_in > 0 || app.session_out > 0 {
+                line2.push(sep());
+            }
+            line2.extend(context_gauge_spans(app.context_tokens, app.context_limit));
+        }
+        frame.render_widget(Paragraph::new(TextLine::from(line2)).style(bg), row2);
     }
 }
 
@@ -2858,7 +2882,7 @@ mod tests {
     }
 
     #[test]
-    fn token_segments_drop_on_narrow_terminals_before_cost() {
+    fn token_and_gauge_always_on_second_statusline_row() {
         let mut app = App::default();
         app.apply(PresenterEvent::Cost {
             session_total_usd: 0.0033,
@@ -2867,14 +2891,11 @@ mod tests {
             context_tokens: 18_200,
             context_limit: Some(200_000),
         });
-        // Narrow: gauge + token segment gone, but model+cost stay.
+        // Gauge + token counter live on line 2 — visible regardless of terminal width.
         let narrow = screen_wh(&app, 60, LIVE_H);
-        assert!(!narrow.contains("18.2k/200.0k"), "gauge dropped: {narrow}");
-        assert!(
-            !narrow.contains("↑12.3k"),
-            "token segment dropped: {narrow}"
-        );
-        assert!(narrow.contains("$0.0033"), "cost stays: {narrow}");
+        assert!(narrow.contains("18.2k/200.0k"), "gauge on line 2: {narrow}");
+        assert!(narrow.contains("↑12.3k"), "tokens on line 2: {narrow}");
+        assert!(narrow.contains("$0.0033"), "cost on line 1: {narrow}");
     }
 
     #[test]

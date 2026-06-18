@@ -3210,6 +3210,9 @@ async fn run_chat_tui(
     // session-management). The current gen gates the done-signal so an aborted turn's late
     // signal is ignored once a new turn has started.
     let mut turn_gen: u64 = 0;
+    // Generation of the last auto-compact turn; prevents re-firing before a new user turn updates
+    // context_tokens (compact's own Cost event still reflects the old full-context size).
+    let mut last_auto_compact_gen: u64 = 0;
     let mut turn_handle: Option<tokio::task::JoinHandle<()>> = None;
     // `/loop` state: when set, each completed turn of this generation is re-run until the model
     // signals completion or the iteration cap is hit.
@@ -4113,7 +4116,10 @@ async fn run_chat_tui(
                 // Auto-compact: when no new turn was spawned (not a loop iteration) and the
                 // context gauge is above AUTO_COMPACT_THRESHOLD, quietly run /compact so the
                 // user doesn't need to do it manually (context-compaction.md).
-                if turn_handle.is_none() {
+                // Guard: only fire once per user turn — compact's own Cost event still carries
+                // the old full-context size, so context_tokens won't drop until the next real
+                // turn. Without the gen guard this would re-fire on every compact completion.
+                if turn_handle.is_none() && turn_gen > last_auto_compact_gen {
                     if let Some(lim) = app.context_limit {
                         let fill = app.context_tokens as f64 / lim as f64;
                         if fill > AUTO_COMPACT_THRESHOLD {
@@ -4122,6 +4128,7 @@ async fn run_chat_tui(
                                 fill * 100.0
                             ));
                             turn_gen += 1;
+                            last_auto_compact_gen = turn_gen;
                             turn_handle = Some(spawn_compact(
                                 &session,
                                 &done_tx,
