@@ -3750,7 +3750,12 @@ async fn run_chat_tui(
                 dirty = true;
             } else {
                 let pre_edit_len = app.input.len();
-                match handle_key(&mut app.input, &mut app.input_cursor, key) {
+                let outcome = if app.try_delete_paste_block(key) {
+                    InputOutcome::Editing
+                } else {
+                    handle_key(&mut app.input, &mut app.input_cursor, key)
+                };
+                match outcome {
                     InputOutcome::Submit(raw_line) => {
                         let line = app.substitute_paste_blocks(raw_line);
                         history_pos = None;

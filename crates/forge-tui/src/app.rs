@@ -962,6 +962,49 @@ impl App {
         });
     }
 
+    /// If cursor is immediately after (Backspace) or at (DeleteForward) a paste-block placeholder,
+    /// delete the entire placeholder in one action. Returns `true` if consumed.
+    pub fn try_delete_paste_block(&mut self, key: KeyKind) -> bool {
+        match key {
+            KeyKind::Backspace => {
+                let found = {
+                    let before = &self.input[..self.input_cursor];
+                    self.paste_blocks
+                        .iter()
+                        .position(|b| before.ends_with(&b.placeholder))
+                        .map(|i| (i, self.paste_blocks[i].placeholder.len()))
+                };
+                if let Some((idx, ph_len)) = found {
+                    let start = self.input_cursor - ph_len;
+                    self.input.drain(start..self.input_cursor);
+                    self.input_cursor = start;
+                    self.paste_blocks.remove(idx);
+                    true
+                } else {
+                    false
+                }
+            }
+            KeyKind::DeleteForward => {
+                let found = {
+                    let after = &self.input[self.input_cursor..];
+                    self.paste_blocks
+                        .iter()
+                        .position(|b| after.starts_with(&b.placeholder))
+                        .map(|i| (i, self.paste_blocks[i].placeholder.len()))
+                };
+                if let Some((idx, ph_len)) = found {
+                    let end = self.input_cursor + ph_len;
+                    self.input.drain(self.input_cursor..end);
+                    self.paste_blocks.remove(idx);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Replace each paste-block placeholder in `text` with its real content, returning the
     /// substituted string. Call with the line returned by `handle_key`'s Submit. Drains `paste_blocks`.
     pub fn substitute_paste_blocks(&mut self, text: String) -> String {
