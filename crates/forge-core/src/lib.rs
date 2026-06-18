@@ -4213,14 +4213,10 @@ mod tests {
         // Default config now starts at AcceptEdits (Smith).
         assert_eq!(session.temper(), PermissionMode::AcceptEdits); // Smith
         assert_eq!(session.cycle_temper(), PermissionMode::Plan); // → Survey
-        assert_eq!(
-            store.session_mode(&id).unwrap(),
-            "Plan",
-            "switch persisted"
-        );
+        assert_eq!(store.session_mode(&id).unwrap(), "Plan", "switch persisted");
         assert_eq!(session.cycle_temper(), PermissionMode::Default); // → Guarded
         assert_eq!(session.cycle_temper(), PermissionMode::AcceptEdits); // wraps → Smith
-        // Cycling never lands on the dangerous Unfettered temper.
+                                                                         // Cycling never lands on the dangerous Unfettered temper.
         for _ in 0..6 {
             assert_ne!(session.cycle_temper(), PermissionMode::Bypass);
         }

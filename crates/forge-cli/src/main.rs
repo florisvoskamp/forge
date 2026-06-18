@@ -1129,11 +1129,9 @@ fn init() -> Result<()> {
         anyhow::bail!("`forge init` is interactive — run it in a terminal");
     }
     let cfg = forge_config::load().unwrap_or_default();
-    let outcome = forge_tui::init_wizard::run(wizard_input(
-        cfg.permission_mode,
-        cfg.mesh.credit_mode,
-    ))
-    .context("running the setup wizard")?;
+    let outcome =
+        forge_tui::init_wizard::run(wizard_input(cfg.permission_mode, cfg.mesh.credit_mode))
+            .context("running the setup wizard")?;
     if outcome.cancelled {
         println!("Setup cancelled — run `forge init` anytime.");
         return Ok(());
@@ -1667,7 +1665,8 @@ pub(crate) fn build_provider_and_router(
         // bridge. `harness` mode runs the bridge's tools through Forge's MCP server (RFC Phase 2).
         let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
         Arc::new(
-            DispatchProvider::new(harness).with_max_output_tokens(config.mesh.effective_max_output_tokens()),
+            DispatchProvider::new(harness)
+                .with_max_output_tokens(config.mesh.effective_max_output_tokens()),
         )
     };
     let mut heuristic = HeuristicRouter::new(config.clone()).with_pin(pin);
@@ -1694,7 +1693,8 @@ pub(crate) fn build_provider_and_router(
             // classification needs no tools/harness; cap output (one tier word) so a free
             // classifier model isn't 402'd on a huge default max-token request.
             Arc::new(
-                DispatchProvider::new(false).with_max_output_tokens(config.mesh.effective_max_output_tokens()),
+                DispatchProvider::new(false)
+                    .with_max_output_tokens(config.mesh.effective_max_output_tokens()),
             )
         };
         let hybrid = config.mesh.classifier == ClassifierKind::Hybrid;
@@ -2235,8 +2235,8 @@ async fn probe_models(
 ) -> Result<()> {
     use std::time::Duration;
     let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
-    let provider =
-        DispatchProvider::new(harness).with_max_output_tokens(config.mesh.effective_max_output_tokens());
+    let provider = DispatchProvider::new(harness)
+        .with_max_output_tokens(config.mesh.effective_max_output_tokens());
     let default_cooldown = Duration::from_secs(config.mesh.failover_cooldown_secs);
     let ping = [forge_types::Message::user("ping")];
     // Probe WITH a representative tool: the real agent loop always advertises tools, so a model
@@ -4767,8 +4767,7 @@ async fn dispatch_command(
         // Keys go to the OS keyring; all other settings are written to the user config file.
         CommandAction::Config => {
             let current_permission = session.lock().await.temper();
-            let current_credit_mode =
-                forge_config::load().unwrap_or_default().mesh.credit_mode;
+            let current_credit_mode = forge_config::load().unwrap_or_default().mesh.credit_mode;
             let outcome = tui
                 .run_fullscreen(|| {
                     forge_tui::init_wizard::run(wizard_input(

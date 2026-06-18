@@ -1277,7 +1277,10 @@ fn tool_result_line(name: &str, ok: bool, summary: &str) -> TextLine<'static> {
 pub fn banner_lines(width: u16) -> Vec<TextLine<'static>> {
     let mut lines = vec![TextLine::default()];
     if width < WORDMARK_WIDTH {
-        lines.push(TextLine::from(Span::styled("⚒ FORGE", Style::default().fg(ORANGE).bold())));
+        lines.push(TextLine::from(Span::styled(
+            "⚒ FORGE",
+            Style::default().fg(ORANGE).bold(),
+        )));
         lines.push(TextLine::from(Span::styled(
             "model-mesh coding agent",
             Style::default().fg(DIM),
@@ -1915,8 +1918,10 @@ fn line_spans_with_cursor(line: &str, col: usize, first_line: bool) -> Vec<Span<
         .next()
         .map(|c| (c, c.len_utf8()))
         .unwrap_or((' ', 0));
-    let cursor_span =
-        Span::styled(cursor_ch.to_string(), Style::default().fg(STATUSBG).bg(ORANGE));
+    let cursor_span = Span::styled(
+        cursor_ch.to_string(),
+        Style::default().fg(STATUSBG).bg(ORANGE),
+    );
 
     match tok {
         Some(ref tok) => {

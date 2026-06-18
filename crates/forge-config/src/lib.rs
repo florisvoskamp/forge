@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
-use forge_types::{CreditMode, PermissionDecision, PermissionMode, PermissionRule, RuleSource, TaskTier};
+use forge_types::{
+    CreditMode, PermissionDecision, PermissionMode, PermissionRule, RuleSource, TaskTier,
+};
 use serde::{Deserialize, Serialize};
 
 pub mod agents;
