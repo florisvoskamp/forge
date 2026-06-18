@@ -123,7 +123,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "remote",
         desc: "toggle remote control — drive this session from a phone/desktop browser",
-        usage: "/remote [--lan | --local]",
+        usage: "/remote [--lan | --local | --anywhere]",
     },
     Command {
         name: "quit",
@@ -180,15 +180,27 @@ pub enum CommandAction {
     Usage,
     /// Open the mesh routing inspector; optional prompt to trace (`/mesh [task]`).
     Mesh(Option<String>),
-    /// Toggle remote control on/off. When turning on, `lan` selects `0.0.0.0` (LAN-reachable,
-    /// the default) vs `127.0.0.1` (loopback-only). The render loop prints the connect URL +
-    /// QR code and lights the statusline indicator.
+    /// Toggle remote control on/off. When turning on, `mode` selects how the server is exposed.
+    /// The render loop prints the connect URL + QR code and lights the statusline indicator.
     Remote {
-        lan: bool,
+        mode: RemoteMode,
     },
     Quit,
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
+}
+
+/// How `/remote` exposes the control server to a browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteMode {
+    /// Bind `0.0.0.0` — reachable from the LAN (the default).
+    Lan,
+    /// Bind `127.0.0.1` only — control from this machine.
+    Local,
+    /// Bind loopback and pipe it through a public tunnel (cloudflared/ngrok/bore) so any browser,
+    /// anywhere, can reach it — no manual router port-forwarding. The token gate is then the only
+    /// thing standing between the public internet and the session.
+    Anywhere,
 }
 
 /// A `/command` token detected somewhere in the input line, used to drive highlighting and
@@ -449,10 +461,17 @@ pub fn parse_command(line: &str) -> CommandAction {
         "usage" => CommandAction::Usage,
         "mesh" => CommandAction::Mesh((!arg.is_empty()).then_some(arg)),
         "remote" | "rc" => {
-            // `/remote` toggles. `--lan` (default) binds 0.0.0.0 so a phone on the same network
-            // can connect; `--local` binds loopback only (control from this machine, never LAN).
-            let lan = !has_flag(&arg, "--local");
-            CommandAction::Remote { lan }
+            // `/remote` toggles. `--anywhere`/`-a` pipes through a public tunnel (reachable from
+            // any network, no port-forward); `--local` binds loopback only (this machine);
+            // default `--lan` binds 0.0.0.0 so a phone on the same network can connect.
+            let mode = if has_flag(&arg, "--anywhere") || has_flag(&arg, "-a") {
+                RemoteMode::Anywhere
+            } else if has_flag(&arg, "--local") {
+                RemoteMode::Local
+            } else {
+                RemoteMode::Lan
+            };
+            CommandAction::Remote { mode }
         }
         "quit" | "exit" | "q" => CommandAction::Quit,
         other => CommandAction::Unknown(other.to_string()),
@@ -763,17 +782,41 @@ mod tests {
         // `/remote` (and alias `/rc`) toggle on with LAN binding by default.
         assert_eq!(
             parse_command("/remote"),
-            CommandAction::Remote { lan: true }
+            CommandAction::Remote {
+                mode: RemoteMode::Lan
+            }
         );
-        assert_eq!(parse_command("/rc"), CommandAction::Remote { lan: true });
+        assert_eq!(
+            parse_command("/rc"),
+            CommandAction::Remote {
+                mode: RemoteMode::Lan
+            }
+        );
         // `--local` binds loopback only; `--lan` is the explicit default.
         assert_eq!(
             parse_command("/remote --local"),
-            CommandAction::Remote { lan: false }
+            CommandAction::Remote {
+                mode: RemoteMode::Local
+            }
         );
         assert_eq!(
             parse_command("/rc --lan"),
-            CommandAction::Remote { lan: true }
+            CommandAction::Remote {
+                mode: RemoteMode::Lan
+            }
+        );
+        // `--anywhere` (and `-a`) pipe through a public tunnel.
+        assert_eq!(
+            parse_command("/remote --anywhere"),
+            CommandAction::Remote {
+                mode: RemoteMode::Anywhere
+            }
+        );
+        assert_eq!(
+            parse_command("/rc -a"),
+            CommandAction::Remote {
+                mode: RemoteMode::Anywhere
+            }
         );
     }
 

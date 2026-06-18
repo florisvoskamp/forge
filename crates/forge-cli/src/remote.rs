@@ -6,12 +6,17 @@
 //! WebSocket carries the live [`Snapshot`] (model · busy · cost · context · statusline · the
 //! recent transcript edge) to the browser and [`RemoteInput`] (prompt / answer / interrupt) back.
 //!
+//! `--local` binds loopback only (control from this machine); `--anywhere` binds loopback and
+//! pipes it through a public tunnel (cloudflared / ngrok / bore, whichever is installed) so the
+//! page is reachable from any network with NO manual router port-forwarding — the connect URL is
+//! then a public `https://…/<token>`. See [`Exposure`] + [`start_anywhere`].
+//!
 //! The design goals are: *easy* (one slash command, no install, works from any browser), and
 //! *accessible on mobile + desktop* (a responsive, low-friction control page that needs no app).
 //! The server is in-process so it reuses the running Session + presenter channel — no second
-//! process, no IPC, no keys to configure. Security is a random token in the URL path (a LAN peer
-//! without the token can't drive the session); bind-to-loopback is a one-line config knob for
-//! users who never want it on the LAN.
+//! process, no IPC, no keys to configure. Security is a random token in the URL path: a LAN peer
+//! (or, under `--anywhere`, anyone on the internet) without the token can't drive the session —
+//! so the token is genuinely load-bearing once a public tunnel is open.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,6 +28,253 @@ use axum::routing::get;
 use axum::Router;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+
+/// How the local server is exposed to a browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Exposure {
+    /// Bind `0.0.0.0` — reachable from the LAN (the original `/remote` default).
+    #[default]
+    Lan,
+    /// Bind `127.0.0.1` only — control from this machine.
+    Local,
+    /// Bind loopback and pipe it through a public tunnel so any browser, anywhere, can reach it.
+    /// No manual router port-forwarding: the tunnel (cloudflared/ngrok/bore) punches through NAT.
+    Anywhere,
+}
+
+/// A public-tunnel provider Forge can drive if it's installed. Probed in priority order: the
+/// first one found on `PATH` is used. Each is free to run for a session; cloudflared/ngrok give
+/// HTTPS (the page's JS auto-picks `wss://`), bore gives plain TCP (`ws://`). All three proxy the
+/// HTTP WebSocket upgrade transparently, so the existing control page + token gate work unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelKind {
+    /// `cloudflared tunnel --url http://localhost:PORT` → `https://<rand>.trycloudflare.com`.
+    /// Free, no account, HTTPS, supports WebSocket. Preferred.
+    Cloudflared,
+    /// `ngrok http PORT` → `https://<id>.ngrok-free.app` (needs a one-time `ngrok config add-authtoken`).
+    Ngrok,
+    /// `bore local PORT --to bore.pub` → `bore.pub:<port>` (plain TCP, no TLS, no account).
+    Bore,
+}
+
+impl TunnelKind {
+    /// All providers in probe priority order.
+    const ALL: [Self; 3] = [Self::Cloudflared, Self::Ngrok, Self::Bore];
+
+    /// The binary name to look for on `PATH`.
+    fn binary(self) -> &'static str {
+        match self {
+            Self::Cloudflared => "cloudflared",
+            Self::Ngrok => "ngrok",
+            Self::Bore => "bore",
+        }
+    }
+
+    /// A one-line human label for scrollback notes.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cloudflared => "cloudflared (trycloudflare.com)",
+            Self::Ngrok => "ngrok",
+            Self::Bore => "bore.pub",
+        }
+    }
+
+    /// Build the argv that points the tunnel at `local_port`.
+    fn argv(self, local_port: u16) -> Vec<String> {
+        match self {
+            Self::Cloudflared => vec![
+                "tunnel".into(),
+                "--url".into(),
+                format!("http://localhost:{local_port}"),
+            ],
+            Self::Ngrok => vec!["http".into(), local_port.to_string()],
+            // bore: `local <port> --to bore.pub` — the public instance. No account, no secret.
+            Self::Bore => vec![
+                "local".into(),
+                local_port.to_string(),
+                "--to".into(),
+                "bore.pub".into(),
+            ],
+        }
+    }
+
+    /// Pull the public URL out of a line of the tunnel's stdout/stderr. Each provider prints it
+    /// differently; these patterns are matched against the *verified* output formats:
+    /// - cloudflared logs the `https://…trycloudflare.com` URL in a log line on stderr.
+    /// - ngrok prints `Forwarding  https://<id>.ngrok-free.app -> http://localhost:PORT`.
+    /// - bore logs `listening at bore.pub:<port>` (plain TCP → an http:// URL).
+    fn parse_url(self, line: &str) -> Option<String> {
+        match self {
+            Self::Cloudflared => {
+                // e.g. `... INF +-----------------------------------------+` then a line with the URL,
+                // or `Your quick Tunnel has been created ... https://x.trycloudflare.com`. Match any
+                // trycloudflare.com https URL on the line.
+                line.split_whitespace()
+                    .find(|tok| tok.starts_with("https://") && tok.contains("trycloudflare.com"))
+                    .map(|t| {
+                        t.trim_matches(|c: char| {
+                            !c.is_ascii_alphanumeric()
+                                && c != ':'
+                                && c != '/'
+                                && c != '.'
+                                && c != '-'
+                        })
+                        .to_string()
+                    })
+            }
+            Self::Ngrok => {
+                // `Forwarding  https://abc.ngrok-free.app -> http://localhost:8080`
+                line.split_whitespace()
+                    .find(|tok| {
+                        tok.starts_with("https://")
+                            && (tok.contains("ngrok.io")
+                                || tok.contains("ngrok-free.app")
+                                || tok.contains("ngrok.app"))
+                    })
+                    .map(|t| t.trim_end_matches(',').to_string())
+            }
+            Self::Bore => {
+                // `listening at bore.pub:40123` → http URL (plain TCP, no TLS).
+                if let Some(idx) = line.find("bore.pub:") {
+                    let rest = &line[idx..];
+                    let port: String = rest
+                        .chars()
+                        .skip("bore.pub:".len())
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() {
+                        return Some(format!("http://bore.pub:{port}"));
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Which tunnel provider (if any) is installed and on `PATH`. Probes each in priority order.
+fn detect_tunnel() -> Option<TunnelKind> {
+    TunnelKind::ALL
+        .into_iter()
+        .find(|k| which(k.binary()).is_some())
+}
+
+/// Best-effort `which`: is `bin` resolvable on `PATH`? Uses `std::env::var` + a manual search so
+/// we don't pull a `which` crate; on Windows it also checks for `.exe`/`.cmd`/`.bat` suffixes.
+fn which(bin: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let exts = if cfg!(windows) {
+        vec!["", ".exe", ".cmd", ".bat"]
+    } else {
+        vec![""]
+    };
+    for dir in std::env::split_paths(&path) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{bin}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Spawn a tunnel of `kind` pointing at `local_port`. Returns the public URL (parsed from the
+/// tunnel's output) + the child handle (so the caller can kill it when remote control turns off).
+/// Fails if the child can't start or no URL appears within the timeout (the tunnel is then killed).
+async fn spawn_tunnel(
+    kind: TunnelKind,
+    local_port: u16,
+) -> std::io::Result<(String, tokio::process::Child)> {
+    use tokio::io::AsyncReadExt;
+
+    let bin = which(kind.binary()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{} not on PATH", kind.binary()),
+        )
+    })?;
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(kind.argv(local_port))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+
+    // Merge stdout + stderr so the URL (whichever stream it lands on) is seen. cloudflared prints
+    // the URL on stderr; ngrok on stdout; bore on stderr (via tracing). Read both concurrently.
+    // The readers drain to EOF (the child's exit) regardless of whether anyone is still receiving:
+    // once we have the URL we stop reading `rx`, but a chatty tunnel keeps logging — if we stopped
+    // draining its pipe, a full pipe buffer would block the tunnel process and stall forwarding.
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    // Generous buffer: the URL appears within the first handful of log lines, but the receiver
+    // may not be polling yet — a deep buffer means an early burst can't drop the URL line.
+    let (tx, mut rx) = mpsc::channel::<String>(256);
+
+    let tx1 = tx.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdout.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                    for line in chunk.lines() {
+                        // Non-blocking: drop the line if the buffer is full or rx is gone, but NEVER
+                        // block the reader — a blocked reader stops draining the pipe (deadlock).
+                        let _ = tx1.try_send(line.to_string());
+                    }
+                }
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                    for line in chunk.lines() {
+                        // Non-blocking (see stdout reader): keep draining stderr to EOF regardless.
+                        let _ = tx.try_send(line.to_string());
+                    }
+                }
+            }
+        }
+    });
+
+    // Wait up to 20s for a recognizable public URL line. Tunnels take a few seconds to register;
+    // 20s is generous without hanging forever on a broken/misconfigured install.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill().await;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{} did not print a public URL within 20s", kind.binary()),
+            ));
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(line)) => {
+                if let Some(url) = kind.parse_url(&line) {
+                    return Ok((url, child));
+                }
+            }
+            Ok(None) => break, // both readers closed (child exited early)
+            Err(_) => {}       // timeout on this recv; loop checks the deadline
+        }
+    }
+    let status = child.try_wait().ok().flatten();
+    let _ = child.kill().await;
+    Err(std::io::Error::other(format!(
+        "{} exited before printing a URL{}",
+        kind.binary(),
+        status.map(|s| format!(" (status {s})")).unwrap_or_default()
+    )))
+}
 
 /// A token-gated URL is printed into the TUI so the user can scan/click to connect.
 #[derive(Debug, Clone)]
@@ -112,6 +364,11 @@ pub struct RemoteControl {
     pub url: RemoteUrl,
     /// Abort the server task on drop so the port frees immediately.
     _server: JoinHandle<()>,
+    /// The public-tunnel child process (`--anywhere` only). `kill_on_drop`, so dropping the
+    /// handle tears the tunnel down with the server. `None` for LAN/loopback exposure.
+    _tunnel: Option<tokio::process::Child>,
+    /// The tunnel provider's human label (`--anywhere` only), for the scrollback note.
+    pub tunnel: Option<&'static str>,
 }
 
 impl Drop for RemoteControl {
@@ -154,14 +411,15 @@ fn lan_host(addr: SocketAddr) -> String {
 }
 
 /// Start the remote-control server. The returned [`RemoteControl`] is moved into the render loop;
-/// dropping it stops the server and frees the port. `lan` selects `0.0.0.0` (LAN-reachable) vs
-/// `127.0.0.1` (loopback-only) — the latter for users who only want to control from this machine.
-pub fn start(lan: bool) -> std::io::Result<RemoteControl> {
+/// dropping it stops the server and frees the port. [`Exposure`] selects the bind address:
+/// `Lan` → `0.0.0.0` (LAN-reachable), `Local`/`Anywhere` → `127.0.0.1` (loopback). `Anywhere`
+/// binds loopback because the public tunnel ([`start_anywhere`]) provides the public exposure;
+/// this fn does NOT spawn the tunnel (it's sync) — use [`start_anywhere`] for that.
+pub fn start(exposure: Exposure) -> std::io::Result<RemoteControl> {
     let token = random_token();
-    let bind_ip: std::net::IpAddr = if lan {
-        std::net::Ipv4Addr::UNSPECIFIED.into()
-    } else {
-        std::net::Ipv4Addr::LOCALHOST.into()
+    let bind_ip: std::net::IpAddr = match exposure {
+        Exposure::Lan => std::net::Ipv4Addr::UNSPECIFIED.into(),
+        Exposure::Local | Exposure::Anywhere => std::net::Ipv4Addr::LOCALHOST.into(),
     };
     // Port 0 → the OS picks a free ephemeral port (no clashes, no config).
     let listener = std::net::TcpListener::bind((bind_ip, 0))?;
@@ -200,7 +458,33 @@ pub fn start(lan: bool) -> std::io::Result<RemoteControl> {
         input_rx,
         url: RemoteUrl { url, addr, token },
         _server: server,
+        _tunnel: None,
+        tunnel: None,
     })
+}
+
+/// Start the server on loopback and pipe it through a public tunnel so any browser, anywhere, can
+/// reach it — no manual router port-forwarding. Probes for an installed tunnel CLI
+/// (cloudflared → ngrok → bore) and points it at the bound port; the returned [`RemoteControl`]'s
+/// `url` is the PUBLIC `https://…/<token>` (or `http://bore.pub:port/<token>`), and it owns the
+/// tunnel child (killed on drop). Errors if no tunnel tool is installed or the tunnel never
+/// publishes a URL — the caller surfaces an install hint.
+pub async fn start_anywhere() -> std::io::Result<RemoteControl> {
+    let kind = detect_tunnel().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no tunnel tool found on PATH — install one of: cloudflared, ngrok, or bore",
+        )
+    })?;
+    let mut rc = start(Exposure::Anywhere)?;
+    let port = rc.url.addr.port();
+    let (public, child) = spawn_tunnel(kind, port).await?;
+    // The control page lives at `/<token>`; the tunnel forwards the whole path, so the public
+    // connect URL is the tunnel base + the same token gate.
+    rc.url.url = format!("{}/{}", public.trim_end_matches('/'), rc.url.token);
+    rc._tunnel = Some(child);
+    rc.tunnel = Some(kind.label());
+    Ok(rc)
 }
 
 #[derive(Clone)]
@@ -551,6 +835,61 @@ mod tests {
     }
 
     #[test]
+    fn cloudflared_url_parses_from_a_log_line() {
+        // cloudflared prints the quick-tunnel URL in a boxed stderr log line.
+        let line = "2026-06-18T17:00:00Z INF |  https://random-words-here.trycloudflare.com  |";
+        assert_eq!(
+            TunnelKind::Cloudflared.parse_url(line).as_deref(),
+            Some("https://random-words-here.trycloudflare.com")
+        );
+        // A non-URL log line yields nothing.
+        assert_eq!(
+            TunnelKind::Cloudflared.parse_url("INF Starting tunnel"),
+            None
+        );
+    }
+
+    #[test]
+    fn ngrok_url_parses_from_forwarding_line() {
+        let line = "Forwarding   https://abc123.ngrok-free.app -> http://localhost:8080";
+        assert_eq!(
+            TunnelKind::Ngrok.parse_url(line).as_deref(),
+            Some("https://abc123.ngrok-free.app")
+        );
+        // Legacy ngrok.io domain still matches.
+        assert_eq!(
+            TunnelKind::Ngrok
+                .parse_url("Forwarding https://x.ngrok.io -> localhost")
+                .as_deref(),
+            Some("https://x.ngrok.io")
+        );
+    }
+
+    #[test]
+    fn bore_url_parses_to_an_http_address() {
+        // bore logs `listening at bore.pub:<port>`; it's plain TCP, so the connect URL is http://.
+        let line = "2026-06-18 INFO bore_cli::client: listening at bore.pub:40123";
+        assert_eq!(
+            TunnelKind::Bore.parse_url(line).as_deref(),
+            Some("http://bore.pub:40123")
+        );
+        assert_eq!(TunnelKind::Bore.parse_url("connecting…"), None);
+    }
+
+    #[test]
+    fn tunnel_argv_points_at_the_local_port() {
+        assert_eq!(
+            TunnelKind::Cloudflared.argv(8080),
+            vec!["tunnel", "--url", "http://localhost:8080"]
+        );
+        assert_eq!(TunnelKind::Ngrok.argv(8080), vec!["http", "8080"]);
+        assert_eq!(
+            TunnelKind::Bore.argv(8080),
+            vec!["local", "8080", "--to", "bore.pub"]
+        );
+    }
+
+    #[test]
     fn qr_lines_render_for_a_url() {
         let lines = qr_lines("http://192.168.1.10:4123/0123456789abcdef").unwrap();
         assert!(lines.len() > 2, "QR has a header + rows: {lines:?}");
@@ -580,7 +919,7 @@ mod tests {
         // once the assertions pass. Gated behind --ignored so it never runs in CI.
         let _outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             use futures::StreamExt;
-            let rc = start(false).expect("start loopback server");
+            let rc = start(Exposure::Local).expect("start loopback server");
             let port = rc.url.addr.port();
             let token = rc.url.token.clone();
 

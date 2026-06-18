@@ -48,7 +48,8 @@ pub use app::{
 };
 pub use commands::{
     at_token_at, filter_commands, parse_command, slash_token_at, AtPathPicker, AtToken, Command,
-    CommandAction, Palette, PaletteEntry, Picker, PickerKind, PickerRow, SlashToken, COMMANDS,
+    CommandAction, Palette, PaletteEntry, Picker, PickerKind, PickerRow, RemoteMode, SlashToken,
+    COMMANDS,
 };
 pub use driver::{ChannelPresenter, Tui, UiMsg};
 pub use init_wizard::{BridgeItem, ProviderItem, WizardInput, WizardOutcome};

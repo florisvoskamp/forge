@@ -3373,8 +3373,8 @@ async fn run_chat_tui(
                             DispatchOutcome::PendingUsage(rx) => {
                                 usage_load_rx = Some(rx);
                             }
-                            DispatchOutcome::ToggleRemote { lan } => {
-                                toggle_remote(&mut remote, &mut app, &mut tui, lan)?;
+                            DispatchOutcome::ToggleRemote { exposure } => {
+                                toggle_remote(&mut remote, &mut app, &mut tui, exposure).await?;
                             }
                         }
                     }
@@ -3770,8 +3770,9 @@ async fn run_chat_tui(
                                 DispatchOutcome::PendingUsage(rx) => {
                                     usage_load_rx = Some(rx);
                                 }
-                                DispatchOutcome::ToggleRemote { lan } => {
-                                    toggle_remote(&mut remote, &mut app, &mut tui, lan)?;
+                                DispatchOutcome::ToggleRemote { exposure } => {
+                                    toggle_remote(&mut remote, &mut app, &mut tui, exposure)
+                                        .await?;
                                 }
                             }
                         } else {
@@ -4362,32 +4363,53 @@ fn spawn_compact(
 }
 
 /// Start or stop remote control in response to `/remote`. On: bind the server (LAN-reachable by
-/// default, loopback with `--local`), print the connect URL + a scan-to-connect QR code into
-/// scrollback, and light the statusline indicator. Off: drop the handle (stops the server +
-/// frees the port) and clear the indicator. Idempotent: `/remote` toggles, so running it again
-/// turns it off.
-fn toggle_remote(
+/// default, loopback with `--local`, or piped through a public tunnel with `--anywhere`), print
+/// the connect URL + a scan-to-connect QR code into scrollback, and light the statusline
+/// indicator. Off: drop the handle (stops the server + tunnel, frees the port) and clear the
+/// indicator. Idempotent: `/remote` toggles, so running it again turns it off.
+async fn toggle_remote(
     remote: &mut Option<remote::RemoteControl>,
     app: &mut forge_tui::App,
     _tui: &mut forge_tui::Tui,
-    lan: bool,
+    exposure: remote::Exposure,
 ) -> Result<()> {
     if let Some(rc) = remote.take() {
-        // Turning it off: the handle's Drop aborts the server task + sends a `closed` snapshot
-        // so any connected browser stops reconnecting.
+        // Turning it off: the handle's Drop aborts the server task + tunnel and sends a `closed`
+        // snapshot so any connected browser stops reconnecting.
         app.remote_active = false;
         app.note("◉ remote control off — browser disconnected");
         drop(rc);
         return Ok(());
     }
-    match remote::start(lan) {
+    let anywhere = exposure == remote::Exposure::Anywhere;
+    if anywhere {
+        app.note("◉ remote control — opening a public tunnel (this can take a few seconds)…");
+    }
+    let started = match exposure {
+        remote::Exposure::Anywhere => remote::start_anywhere().await,
+        other => remote::start(other),
+    };
+    match started {
         Ok(rc) => {
             app.remote_active = true;
+            let where_ = match exposure {
+                remote::Exposure::Lan => "LAN".to_string(),
+                remote::Exposure::Local => "loopback".to_string(),
+                remote::Exposure::Anywhere => {
+                    format!("public tunnel via {}", rc.tunnel.unwrap_or("tunnel"))
+                }
+            };
             app.note(&format!(
-                "◉ remote control on — listening on {} ({})",
+                "◉ remote control on — listening on {} ({where_})",
                 rc.url.addr,
-                if lan { "LAN" } else { "loopback" }
             ));
+            if anywhere {
+                // A public URL is reachable from the whole internet; the path token is the only
+                // gate. Make that explicit so the user knows what they've opened.
+                app.note(
+                    "  ⚠ anyone with the link can drive this session — the token is the only gate",
+                );
+            }
             app.note(&format!("  connect: {}", rc.url.url));
             if let Some(qr) = remote::qr_lines(&rc.url.url) {
                 app.print_lines(qr);
@@ -4422,9 +4444,9 @@ enum DispatchOutcome {
     PendingMesh(tokio::sync::oneshot::Receiver<Option<forge_tui::MeshOverlay>>),
     /// `/usage` — overlay opened immediately; receiver delivers `BridgeStats` when ready.
     PendingUsage(tokio::sync::oneshot::Receiver<bridge_stats::BridgeStats>),
-    /// `/remote [--lan|--local]` — toggle remote control on (start the server) or off (stop it).
-    /// `lan` selects the bind address (LAN-reachable vs loopback-only).
-    ToggleRemote { lan: bool },
+    /// `/remote [--lan|--local|--anywhere]` — toggle remote control on (start the server) or off
+    /// (stop it). The [`remote::Exposure`] selects bind address / public-tunnel mode.
+    ToggleRemote { exposure: remote::Exposure },
 }
 
 /// Build a fully-populated [`forge_tui::MeshOverlay`] from a routing explanation.
@@ -4902,7 +4924,14 @@ async fn dispatch_command(
         // `/remote` toggles remote control. The render loop owns the `RemoteControl` handle (it
         // needs the presenter channel + App state to broadcast snapshots + drain inputs), so the
         // command just signals the desired bind mode; the loop starts/stops the server there.
-        CommandAction::Remote { lan } => return Ok(DispatchOutcome::ToggleRemote { lan }),
+        CommandAction::Remote { mode } => {
+            let exposure = match mode {
+                forge_tui::RemoteMode::Lan => remote::Exposure::Lan,
+                forge_tui::RemoteMode::Local => remote::Exposure::Local,
+                forge_tui::RemoteMode::Anywhere => remote::Exposure::Anywhere,
+            };
+            return Ok(DispatchOutcome::ToggleRemote { exposure });
+        }
         // Not a builtin → try the file-based command/skill catalog.
         CommandAction::Unknown(_) => {
             return dispatch_catalog(line, catalog, session, app, armed, trust_project, busy).await
