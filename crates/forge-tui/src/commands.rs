@@ -121,6 +121,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/mesh [task prompt]",
     },
     Command {
+        name: "remote",
+        desc: "toggle remote control — drive this session from a phone/desktop browser",
+        usage: "/remote [--lan | --local]",
+    },
+    Command {
         name: "quit",
         desc: "exit Forge",
         usage: "/quit",
@@ -175,6 +180,12 @@ pub enum CommandAction {
     Usage,
     /// Open the mesh routing inspector; optional prompt to trace (`/mesh [task]`).
     Mesh(Option<String>),
+    /// Toggle remote control on/off. When turning on, `lan` selects `0.0.0.0` (LAN-reachable,
+    /// the default) vs `127.0.0.1` (loopback-only). The render loop prints the connect URL +
+    /// QR code and lights the statusline indicator.
+    Remote {
+        lan: bool,
+    },
     Quit,
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
@@ -437,6 +448,12 @@ pub fn parse_command(line: &str) -> CommandAction {
         "clear" | "cls" => CommandAction::ClearScreen,
         "usage" => CommandAction::Usage,
         "mesh" => CommandAction::Mesh((!arg.is_empty()).then_some(arg)),
+        "remote" | "rc" => {
+            // `/remote` toggles. `--lan` (default) binds 0.0.0.0 so a phone on the same network
+            // can connect; `--local` binds loopback only (control from this machine, never LAN).
+            let lan = !has_flag(&arg, "--local");
+            CommandAction::Remote { lan }
+        }
         "quit" | "exit" | "q" => CommandAction::Quit,
         other => CommandAction::Unknown(other.to_string()),
     }
@@ -738,6 +755,25 @@ mod tests {
         assert_eq!(
             parse_command("/loop fix all warnings"),
             CommandAction::Loop("fix all warnings".into())
+        );
+    }
+
+    #[test]
+    fn parses_remote_command_and_alias() {
+        // `/remote` (and alias `/rc`) toggle on with LAN binding by default.
+        assert_eq!(
+            parse_command("/remote"),
+            CommandAction::Remote { lan: true }
+        );
+        assert_eq!(parse_command("/rc"), CommandAction::Remote { lan: true });
+        // `--local` binds loopback only; `--lan` is the explicit default.
+        assert_eq!(
+            parse_command("/remote --local"),
+            CommandAction::Remote { lan: false }
+        );
+        assert_eq!(
+            parse_command("/rc --lan"),
+            CommandAction::Remote { lan: true }
         );
     }
 

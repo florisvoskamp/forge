@@ -207,6 +207,9 @@ pub struct App {
     question: Option<(Vec<QChoice>, bool)>,
     /// A pending permission question shown while the loop blocks on the user's y/n.
     pub prompt: Option<String>,
+    /// The text of a pending AskUserQuestion (set by `set_question`, cleared on resolve), so a
+    /// remote-control snapshot can tell the phone what's being asked without the private options.
+    pub question_prompt: Option<String>,
     /// The current input-line buffer (shown in the input box).
     pub input: String,
     /// The current *partial* (un-flushed, newline-free) line of the streaming reply.
@@ -254,6 +257,62 @@ pub struct App {
     pub usage_overlay: UsageOverlay,
     /// The `/mesh` routing-inspector overlay state.
     pub mesh_overlay: MeshOverlay,
+    /// True while remote control is active (a browser can drive the session via `/remote`). Shown
+    /// as a `◉ remote` segment in the statusline so it's visible at a glance that the session is
+    /// remotely controllable.
+    pub remote_active: bool,
+    /// A bounded plain-text ring buffer of the most recent finalized scrollback lines, so a
+    /// remote-control snapshot can show the phone the tail of the conversation. Kept small (the
+    /// full transcript lives in the terminal's native scrollback); newest is last.
+    pub recent_transcript: std::collections::VecDeque<String>,
+}
+
+/// How many recent scrollback lines the remote snapshot keeps (a phone screen shows ~6–8).
+const REMOTE_TRANSCRIPT_MAX: usize = 12;
+
+impl App {
+    /// Build a [`remote::Snapshot`]-shaped view of the live state, for the remote-control WS to
+    /// broadcast. Plain fields only (no ratatui types), so `forge-tui` needn't depend on the
+    /// remote module — the caller maps this into the snapshot type.
+    pub fn remote_snapshot(&self) -> RemoteSnapshot {
+        RemoteSnapshot {
+            busy: self.busy,
+            done: self.done,
+            temper: self.temper.clone(),
+            tier: self.routing.as_ref().map(|r| r.tier.clone()),
+            model: self
+                .routing
+                .as_ref()
+                .map(|r| r.model.clone())
+                .unwrap_or_else(|| "—".to_string()),
+            cost_usd: self.cost_usd,
+            context_tokens: self.context_tokens,
+            context_limit: self.context_limit,
+            streaming: self.streaming.clone(),
+            transcript: self.recent_transcript.iter().cloned().collect(),
+            permission_prompt: self.prompt.clone(),
+            question: self.question_prompt.clone(),
+        }
+    }
+}
+
+/// A plain-data view of the live state, produced by [`App::remote_snapshot`] and mapped into the
+/// `remote::Snapshot` JSON by the render loop. Defined here (in forge-tui) so the pure render
+/// crate owns the projection without depending on the server module.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteSnapshot {
+    pub busy: bool,
+    pub done: bool,
+    pub temper: String,
+    pub tier: Option<String>,
+    pub model: String,
+    pub cost_usd: f64,
+    pub context_tokens: u64,
+    pub context_limit: Option<u32>,
+    pub streaming: String,
+    pub transcript: Vec<String>,
+    pub permission_prompt: Option<String>,
+    pub question: Option<String>,
 }
 
 /// One subagent's live row in the TUI.
@@ -649,6 +708,7 @@ impl App {
             "type the number of your choice".to_string()
         });
         self.question = Some((options.to_vec(), allow_other));
+        self.question_prompt = Some(question.to_string());
     }
 
     /// True while a question is awaiting an answer.
@@ -660,6 +720,7 @@ impl App {
     pub fn clear_question(&mut self) {
         self.question = None;
         self.prompt = None;
+        self.question_prompt = None;
     }
 
     /// Try to resolve a submitted line against the active question. `Some(answer)` clears the
@@ -669,6 +730,7 @@ impl App {
         let ans = crate::resolve_answer(line, opts, *allow_other)?;
         self.question = None;
         self.prompt = None;
+        self.question_prompt = None;
         self.flush.push(TextLine::from(vec![
             Span::styled("  ↳ ", Style::default().fg(DIM)),
             Span::styled(ans.clone(), Style::default().fg(OKGREEN)),
@@ -725,9 +787,39 @@ impl App {
         )));
     }
 
+    /// Push plain (unstyled) multi-line text into the scrollback outbox — for verbatim blocks
+    /// like a QR code whose alignment must not be restyled. Drained with the next flush.
+    pub fn print_lines(&mut self, lines: Vec<String>) {
+        for l in lines {
+            self.flush.push(TextLine::from(l));
+        }
+    }
+
     /// Take the finalized scrollback lines queued since the last call.
     pub fn drain_flush(&mut self) -> Vec<TextLine<'static>> {
         std::mem::take(&mut self.flush)
+    }
+
+    /// Like [`drain_flush`], but also folds each line's plain text into the remote transcript ring
+    /// buffer so the remote-control snapshot mirrors the conversation tail. Use this when remote
+    /// control is active; otherwise [`drain_flush`] is cheaper.
+    pub fn drain_flush_remote(&mut self) -> Vec<TextLine<'static>> {
+        let lines = std::mem::take(&mut self.flush);
+        for l in &lines {
+            self.push_remote_transcript_line(l);
+        }
+        lines
+    }
+
+    fn push_remote_transcript_line(&mut self, line: &TextLine<'static>) {
+        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        if plain.trim().is_empty() {
+            return;
+        }
+        self.recent_transcript.push_back(plain);
+        while self.recent_transcript.len() > REMOTE_TRANSCRIPT_MAX {
+            self.recent_transcript.pop_front();
+        }
     }
 }
 
@@ -2076,6 +2168,15 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
                 .bg(STATUSBG),
         ));
     }
+    // Remote control active: a green `◉ remote` segment so it's visible a browser can drive the
+    // session. Shown only when on (and wide enough); dropped on narrow terminals like the temper.
+    if app.remote_active && w >= 52 {
+        left.push(sep());
+        left.push(Span::styled(
+            "◉ remote",
+            Style::default().fg(OKGREEN).bold().bg(STATUSBG),
+        ));
+    }
 
     if w >= 70 {
         let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(24)]).split(area);
@@ -2420,6 +2521,31 @@ mod tests {
         assert!(text.contains("openai::gpt-4o-mini"), "model in statusline");
         assert!(text.contains("$0.0042"), "cost in statusline");
         assert!(text.contains("standard"), "tier in statusline");
+    }
+
+    #[test]
+    fn remote_active_shows_indicator_in_statusline() {
+        // Remote control off → no indicator.
+        let app = App::default();
+        assert!(
+            !screen_wh(&app, 90, LIVE_H).contains("◉ remote"),
+            "no indicator when remote control is off"
+        );
+        // On → the green `◉ remote` segment appears alongside the statusline.
+        let app = App {
+            remote_active: true,
+            ..Default::default()
+        };
+        assert!(
+            screen_wh(&app, 90, LIVE_H).contains("◉ remote"),
+            "indicator shown when remote control is on"
+        );
+        // On a narrow terminal the segment drops out (like the temper).
+        let narrow = screen_wh(&app, 48, LIVE_H);
+        assert!(
+            !narrow.contains("◉ remote"),
+            "indicator dropped on narrow terminal: {narrow}"
+        );
     }
 
     #[test]

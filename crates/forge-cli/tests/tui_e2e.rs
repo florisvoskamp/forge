@@ -238,6 +238,42 @@ fn tui_config_opens_wizard_fullscreen_and_returns_to_chat() {
     );
 }
 
+#[test]
+#[ignore = "needs a DSR-answering pty; run locally with --ignored"]
+fn tui_remote_control_toggles_and_shows_statusline_indicator() {
+    // /remote turns on the server: prints the connect URL + a QR code into scrollback and lights
+    // the `◉ remote` statusline indicator. Running /remote again turns it off. No model keys are
+    // needed (the server is pure UI infra), so this works under --mock.
+    let (clean, plain) = drive_pty(&[
+        ("/remote\r", 1200),
+        ("/remote\r", 600), // toggle off again
+        ("/quit\r", 600),
+    ]);
+    assert!(clean, "clean exit: {plain}");
+    assert!(!plain.to_lowercase().contains("panic"), "no panic: {plain}");
+    assert!(
+        plain.contains("remote control on"),
+        "turning on printed the on-note: {plain}"
+    );
+    assert!(
+        plain.contains("http://127.0.0.1:") || plain.contains("http://"),
+        "the connect URL was printed: {plain}"
+    );
+    assert!(
+        plain.contains("scan to connect") || plain.contains('█'),
+        "a QR code was rendered into scrollback: {plain}"
+    );
+    assert!(
+        plain.contains("remote control off"),
+        "the second /remote turned it off: {plain}"
+    );
+    // The `◉ remote` segment appears in the statusline while on (and the frame is redrawn).
+    assert!(
+        plain.contains("remote"),
+        "the statusline showed the remote indicator: {plain}"
+    );
+}
+
 fn forge_id() -> String {
     format!("{}-{:?}", std::process::id(), std::thread::current().id()).replace(['(', ')', ' '], "")
 }

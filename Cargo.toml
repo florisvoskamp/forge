@@ -26,7 +26,7 @@ forge-tools = { path = "crates/forge-tools", version = "0.1.0" }
 forge-tui = { path = "crates/forge-tui", version = "0.1.0" }
 
 # External (pinned to current stable as of 2026-06; see ADRs)
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "fs", "process", "io-util", "time"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "fs", "process", "io-util", "time", "net"] }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -61,6 +61,12 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 similar = "2"
 # default-features off + rustls: reuse genai's existing rustls stack (no OpenSSL C dep).
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "form", "rustls"] }
+# Remote control: a tiny HTTP + WebSocket server so a phone/desktop browser can drive the
+# running `forge chat` session. axum bundles hyper + tokio-tungstenite; the WS layer needs
+# `ws` (axum) which pulls tungstenite. qrcode renders a scan-to-connect matrix into the TUI.
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.26"
+qrcode = "0.14"
 
 [profile.release]
 lto = "thin"

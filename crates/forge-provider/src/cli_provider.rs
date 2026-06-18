@@ -207,13 +207,13 @@ fn forge_mcp_config(forge_exe: &str) -> String {
     )
 }
 
-fn build_args(
-    kind: CliKind,
-    bare_model: &str,
-    prompt: &str,
-    harness: bool,
-    forge_exe: &str,
-) -> Vec<String> {
+/// Build the CLI argv for a bridge turn. The prompt is NOT included here — it is streamed to the
+/// child's stdin by [`CliProvider::complete`] instead of passed as an argument, because a turn's
+/// flattened transcript (system preamble + injected Lattice context + history) easily exceeds the
+/// OS `ARG_MAX`, which surfaced as `failed to start codex: Argument list too long (os error 7)`.
+/// Both `claude --print` and `codex exec` read their instructions from stdin when no prompt
+/// positional is given.
+fn build_args(kind: CliKind, bare_model: &str, harness: bool, forge_exe: &str) -> Vec<String> {
     let mut args: Vec<String> = match (kind, harness) {
         // Phase 2 harness: Forge serves its tools via `forge mcp-serve`. `--allowedTools
         // "mcp__forge"` permits ONLY Forge's tools, so claude can't use its built-ins (they'd
@@ -221,8 +221,8 @@ fn build_args(
         // server + permission gate. NOTE: do NOT use --permission-mode bypassPermissions here —
         // it bypasses the allowlist and re-enables the built-ins. No secrets passed.
         (CliKind::ClaudeCode, true) => vec![
+            // `-p`/--print with no positional → claude reads the prompt from stdin (see build_args).
             "-p".into(),
-            prompt.into(),
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
@@ -239,8 +239,8 @@ fn build_args(
         // Phase 1: claude as its own full agent (its own tools), acceptEdits so it doesn't
         // block on prompts headless. Forge parses its rich event stream either way.
         (CliKind::ClaudeCode, false) => vec![
+            // `-p`/--print with no positional → claude reads the prompt from stdin (see build_args).
             "-p".into(),
-            prompt.into(),
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
@@ -301,10 +301,8 @@ fn build_args(
         args.push("--model".into());
         args.push(bare_model.into());
     }
-    // Codex takes the prompt as the trailing positional argument.
-    if kind == CliKind::Codex {
-        args.push(prompt.into());
-    }
+    // The prompt is fed via stdin (see build_args doc), so no trailing positional: `codex exec`
+    // with no PROMPT reads instructions from stdin.
     args
 }
 
@@ -865,13 +863,7 @@ impl Provider for CliProvider {
             .ok()
             .and_then(|p| p.to_str().map(str::to_string))
             .unwrap_or_else(|| "forge".to_string());
-        let args = build_args(
-            self.kind,
-            bare_model(model),
-            &prompt,
-            self.harness,
-            &forge_exe,
-        );
+        let args = build_args(self.kind, bare_model(model), self.harness, &forge_exe);
 
         // Harness turns can spawn subagents inside `forge mcp-serve`; give it an out-of-band
         // JSONL sink to report their lifecycle so we can surface them in the TUI (Phase 3c).
@@ -889,7 +881,8 @@ impl Provider for CliProvider {
 
         let mut cmd = Command::new(&self.binary);
         cmd.args(&args)
-            .stdin(Stdio::null())
+            // The prompt is written to stdin (not argv) to avoid `ARG_MAX` on big transcripts.
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -911,6 +904,17 @@ impl Provider for CliProvider {
         })?;
 
         let pgid = child.id().map(|id| id as i32);
+        // Feed the prompt to the child's stdin on a separate task so a large prompt can't deadlock
+        // against the child filling its stdout pipe before it finishes reading stdin. Dropping the
+        // handle after the write closes stdin (EOF), which both CLIs need to start processing.
+        if let Some(mut stdin) = child.stdin.take() {
+            let bytes = prompt.into_bytes();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(&bytes).await;
+                let _ = stdin.shutdown().await;
+            });
+        }
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let err_task = tokio::spawn(read_to_cap(stderr));
@@ -1277,16 +1281,18 @@ mod tests {
 
     #[test]
     fn claude_harness_args_route_tools_through_forge_mcp() {
-        let args = build_args(
-            CliKind::ClaudeCode,
-            "sonnet",
-            "hi there",
-            true,
-            "/bin/forge",
-        );
+        let args = build_args(CliKind::ClaudeCode, "sonnet", true, "/bin/forge");
         // Forge owns the tools: strict MCP + only mcp__forge tools.
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(args.contains(&"mcp__forge".to_string()));
+        // The prompt is fed via stdin, never as an argv entry (ARG_MAX fix): -p has no value.
+        assert!(args.contains(&"-p".to_string()));
+        let p = args.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(
+            args[p + 1],
+            "--output-format",
+            "no prompt positional after -p"
+        );
         // bypassPermissions must NOT be set — it overrides the allowlist and re-enables built-ins.
         assert!(!args.iter().any(|a| a == "bypassPermissions"));
         let mc = args.iter().position(|a| a == "--mcp-config").unwrap();
@@ -1299,13 +1305,7 @@ mod tests {
 
     #[test]
     fn claude_text_mode_runs_a_self_agent_with_accept_edits() {
-        let args = build_args(
-            CliKind::ClaudeCode,
-            "sonnet",
-            "hi there",
-            false,
-            "/bin/forge",
-        );
+        let args = build_args(CliKind::ClaudeCode, "sonnet", false, "/bin/forge");
         assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
         let i = args.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(args[i + 1], "acceptEdits");
@@ -1314,7 +1314,7 @@ mod tests {
 
     #[test]
     fn codex_harness_args_wire_forge_mcp_and_approve_tools() {
-        let args = build_args(CliKind::Codex, "", "do a thing", true, "/bin/forge");
+        let args = build_args(CliKind::Codex, "", true, "/bin/forge");
         assert_eq!(args[0], "exec");
         assert!(args.contains(&"--json".to_string()));
         // Sandbox stays read-only: codex's OWN shell can't write, so every write/side-effect
@@ -1337,7 +1337,8 @@ mod tests {
         assert!(args.contains(&"--ignore-user-config".to_string()));
         // Native web search must stay off — Forge's web_search is the only search path.
         assert!(!args.contains(&"--search".to_string()));
-        assert_eq!(args.last().unwrap(), "do a thing");
+        // The prompt is fed via stdin, never as an argv positional (ARG_MAX fix).
+        assert!(!args.iter().any(|a| a == "do a thing"));
         assert!(!args.contains(&"--model".to_string()));
     }
 
@@ -1359,13 +1360,14 @@ mod tests {
 
     #[test]
     fn codex_text_mode_is_a_plain_read_only_agent() {
-        let args = build_args(CliKind::Codex, "", "do a thing", false, "/bin/forge");
+        let args = build_args(CliKind::Codex, "", false, "/bin/forge");
         assert_eq!(args[0], "exec");
         assert!(args.contains(&"--json".to_string()));
         assert!(args.contains(&"read-only".to_string()));
         // text mode does NOT wire the Forge MCP server.
         assert!(!args.join(" ").contains("mcp_servers.forge"));
-        assert_eq!(args.last().unwrap(), "do a thing");
+        // The prompt is fed via stdin, never as an argv positional (ARG_MAX fix).
+        assert!(!args.iter().any(|a| a == "do a thing"));
     }
 
     #[test]
