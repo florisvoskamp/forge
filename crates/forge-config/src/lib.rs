@@ -510,6 +510,12 @@ pub struct MeshConfig {
     /// connection) and fail over, instead of hanging the turn forever. `0` disables the watchdog.
     #[serde(default = "default_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
+    /// Max model↔tool rounds in a single turn. This is a *runaway guard*, not a functional limit:
+    /// like Claude Code / Codex, the agent loop runs until the model stops calling tools — a turn
+    /// should normally finish well under this. Hitting it pauses the turn with a visible warning
+    /// (type `continue` to resume), never a silent stop. Raise for very long agentic turns.
+    #[serde(default = "default_max_steps")]
+    pub max_steps: usize,
     /// Proactively spread complex/standard tasks off the subscription bridges (claude-cli/
     /// codex-cli) onto the free-frontier pool, scaling with how full the weekly/session window is
     /// and how much headroom the plan has (subscription-conservation routing). When true (default)
@@ -568,6 +574,13 @@ fn default_auto_discover() -> bool {
 /// output yet small enough that a free / low-credit account can afford it (avoids the 402 churn).
 fn default_max_output_tokens() -> u32 {
     8192
+}
+
+/// Default per-turn step cap (runaway guard). 100 model↔tool rounds is far above what a normal
+/// agentic turn needs — the loop ends naturally when the model stops calling tools — while still
+/// bounding a model stuck in a tool-call loop. Configurable via `mesh.max_steps`.
+fn default_max_steps() -> usize {
+    100
 }
 
 fn default_subscription_conserve() -> bool {
@@ -765,6 +778,7 @@ impl Default for Config {
                 failover: default_failover(),
                 failover_cooldown_secs: default_failover_cooldown_secs(),
                 stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+                max_steps: default_max_steps(),
                 subscription_conserve: default_subscription_conserve(),
                 benchmark_ranking: default_benchmark_ranking(),
                 bridge_models: HashMap::new(),

@@ -24,9 +24,6 @@ pub mod subagent;
 
 pub use llm_router::LlmRouter;
 
-/// Hard cap on model<->tool round trips within a single turn.
-pub(crate) const MAX_STEPS: usize = 8;
-
 /// Compaction (`/compact`): keep this many of the most recent messages verbatim; summarize the
 /// rest. Only compact when there are at least `COMPACT_MIN_OLDER` older messages to fold.
 pub(crate) const COMPACT_KEEP_RECENT: usize = 6;
@@ -1286,8 +1283,12 @@ impl Session {
         // One-shot guard for the last-resort attempt when the whole chain is exhausted (below).
         let mut last_resort_used = false;
 
-        // 3. Model <-> tool loop.
-        for step in 0..MAX_STEPS {
+        // 3. Model <-> tool loop. The cap is a runaway guard, not a functional limit — the loop
+        // ends naturally when the model stops calling tools. `hit_step_cap` stays true only if we
+        // run out of steps mid-task, so we can warn instead of stopping silently.
+        let max_steps = self.config.mesh.max_steps.max(1);
+        let mut hit_step_cap = true;
+        for step in 0..max_steps {
             // Stream the reply, with transparent failover for this step's completion.
             let mut resp = loop {
                 // Tight scope: borrow provider + presenter only for the streamed call, so the
@@ -1457,6 +1458,15 @@ impl Session {
 
             if !resp.wants_tools() {
                 final_text = resp.content;
+                hit_step_cap = false;
+                // A response with neither text nor a tool call is a silent dead-end (a model
+                // glitch / refusal parsed as empty). Surface it so the turn never just "stops".
+                if final_text.trim().is_empty() {
+                    self.presenter.emit(PresenterEvent::Warning(
+                        "model returned an empty response (no text, no tool call) — stopping the turn"
+                            .to_string(),
+                    ));
+                }
                 break;
             }
 
@@ -1485,6 +1495,16 @@ impl Session {
                     self.transcript.push(Message::system(hint));
                 }
             }
+        }
+
+        // Ran the full step budget while the model still wanted tools: pause loudly instead of
+        // ending silently mid-task (the #1 "stops responding" bug). The work so far is persisted,
+        // so the user can resume by sending `continue`.
+        if hit_step_cap {
+            self.presenter.emit(PresenterEvent::Warning(format!(
+                "reached the {max_steps}-step limit — turn paused mid-task; send `continue` to keep going \
+                 (raise `mesh.max_steps` in config to allow longer turns)"
+            )));
         }
 
         // A CLI-bridge turn may have called `update_tasks` inside `forge mcp-serve` (a separate

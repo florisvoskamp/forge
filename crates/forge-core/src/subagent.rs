@@ -29,7 +29,7 @@ use forge_types::{
     Message, PermissionDecision, PermissionMode, PermissionRule, Role, TaskTier, Usage,
 };
 
-use crate::{permission, CoreError, MAX_STEPS};
+use crate::{permission, CoreError};
 
 /// The virtual tool name the parent model calls to delegate subtasks.
 pub const SPAWN_AGENTS_TOOL: &str = "spawn_agents";
@@ -265,7 +265,8 @@ pub async fn run_subagent(
     let mut chain = decision.fallbacks.clone().into_iter();
     let mut active_model = decision.model.clone();
 
-    for step in 0..MAX_STEPS {
+    let max_steps = ctx.config.mesh.max_steps.max(1);
+    for step in 0..max_steps {
         // Forward the child's streamed deltas so the orchestrator can show live per-child
         // activity (RFC subagent-orchestration Phase 3b), with transparent failover.
         let mut resp = loop {

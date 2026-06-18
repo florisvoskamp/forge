@@ -43,7 +43,12 @@ const TAGLINE: &str = "model-mesh coding agent · type a task to begin";
 /// bar, the input box, and the statusline are pinned — finalized lines flow to scrollback.
 pub const STREAM_PREVIEW_H: u16 = 3;
 pub const PERMISSION_H: u16 = 1;
+/// Minimum input box height (1 text row + 2 border rows). The box grows up to [`INPUT_MAX_H`] as
+/// the (wrapped/multiline) input gets taller, then scrolls internally.
 pub const INPUT_H: u16 = 3;
+/// Max input box height: up to [`INPUT_MAX_ROWS`] visible text rows + 2 border rows.
+pub const INPUT_MAX_ROWS: u16 = 6;
+pub const INPUT_MAX_H: u16 = INPUT_MAX_ROWS + 2;
 pub const STATUS_H: u16 = 1;
 /// Fixed inline-viewport height. Large enough to give the task + subagent panels their own rows
 /// (each sized dynamically within `render_live`) while keeping a small idle footprint.
@@ -998,7 +1003,10 @@ fn truncate(s: &str, max: usize) -> String {
 /// The stream area shrinks as panels grow but always keeps ≥1 row (MIN_STREAM guarantee).
 pub fn render_live(frame: &mut Frame, app: &App) {
     const MIN_STREAM: u16 = 1;
-    let fixed = PERMISSION_H + INPUT_H + STATUS_H;
+    // The input box grows with wrapped/multiline content (capped); the stream area absorbs the
+    // change, so the inline viewport's total height is untouched (never resized at runtime).
+    let input_h = input_box_height(&app.input, frame.area().width);
+    let fixed = PERMISSION_H + input_h + STATUS_H;
     let avail = frame.area().height.saturating_sub(fixed);
     let panel_avail = avail.saturating_sub(MIN_STREAM);
 
@@ -1019,7 +1027,7 @@ pub fn render_live(frame: &mut Frame, app: &App) {
         Constraint::Length(assay_h),
         Constraint::Length(task_h),
         Constraint::Length(PERMISSION_H),
-        Constraint::Length(INPUT_H),
+        Constraint::Length(input_h),
         Constraint::Length(STATUS_H),
     ])
     .split(frame.area());
@@ -1436,16 +1444,68 @@ fn render_permission(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// Inner text width available to the input: box width minus the two borders, the 1-col horizontal
+/// padding each side. The leading `› ` prompt (2 cols) eats into the first row, handled by callers.
+fn input_inner_width(box_width: u16) -> usize {
+    (box_width as usize).saturating_sub(4).max(1)
+}
+
+/// How many visual text rows the input occupies once wrapped at `box_width` (accounting for the
+/// `› ` prompt on the first row and any explicit newlines), before clamping. Drives both the box
+/// height and the scroll-to-cursor offset, so wrapping never hides what's being typed.
+fn input_text_rows(input: &str, box_width: u16) -> u16 {
+    let inner = input_inner_width(box_width);
+    let mut rows = 0usize;
+    for (i, line) in input.split('\n').enumerate() {
+        let cols = line.chars().count() + if i == 0 { 2 } else { 0 }; // prompt on row 0
+        rows += cols.saturating_sub(1) / inner + 1; // ≥1 row per logical line
+    }
+    rows.max(1) as u16
+}
+
+/// Dynamic input-box height: grows from [`INPUT_H`] to [`INPUT_MAX_H`] with the wrapped content.
+pub fn input_box_height(input: &str, box_width: u16) -> u16 {
+    (input_text_rows(input, box_width) + 2).clamp(INPUT_H, INPUT_MAX_H)
+}
+
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ORANGE))
         .padding(Padding::horizontal(1))
         .title(Span::styled(" message ", Style::default().fg(ORANGE)));
-    let mut spans = vec![Span::styled("› ", Style::default().fg(ORANGE).bold())];
-    spans.extend(input_spans(&app.input));
-    spans.push(Span::styled("▌", Style::default().fg(ORANGE)));
-    frame.render_widget(Paragraph::new(TextLine::from(spans)).block(block), area);
+
+    // Build one ratatui Line per explicit input line so pasted newlines render as separate rows;
+    // long lines are then soft-wrapped by `Wrap`. Slash-command highlighting applies to the first
+    // line (where a leading `/command` lives); later lines render plain.
+    let lines: Vec<&str> = app.input.split('\n').collect();
+    let last = lines.len().saturating_sub(1);
+    let mut text_lines: Vec<TextLine> = Vec::with_capacity(lines.len().max(1));
+    for (i, line) in lines.iter().enumerate() {
+        let mut spans = Vec::new();
+        if i == 0 {
+            spans.push(Span::styled("› ", Style::default().fg(ORANGE).bold()));
+            spans.extend(input_spans(line));
+        } else {
+            spans.push(Span::raw(line.to_string()));
+        }
+        if i == last {
+            spans.push(Span::styled("▌", Style::default().fg(ORANGE)));
+        }
+        text_lines.push(TextLine::from(spans));
+    }
+
+    // Scroll so the cursor row (bottom) stays visible once content exceeds the visible rows.
+    let visible_rows = area.height.saturating_sub(2).max(1);
+    let total_rows = input_text_rows(&app.input, area.width);
+    let scroll = total_rows.saturating_sub(visible_rows);
+    frame.render_widget(
+        Paragraph::new(ratatui::text::Text::from(text_lines))
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
 }
 
 /// Build the styled spans for the input buffer, highlighting a `/command` token wherever it
@@ -1490,33 +1550,44 @@ fn human(n: u64) -> String {
 
 /// The context-window gauge spans: `◷ used/limit N%` (N% colored dim<70 / yellow≥70 / red≥90),
 /// or just `◷ used` when the model's limit is unknown (no fabricated denominator).
+/// Assumed context window when the model's real limit is unknown (not in the pricing table), so a
+/// percentage + bar can still be shown. Marked approximate (`~`) in the UI. 128k is a common
+/// mid-size window — conservative enough to warn before most models actually overflow.
+const CONTEXT_FALLBACK_LIMIT: u64 = 128_000;
+
+/// Render the context gauge: a small bar + `used/limit` + `pct%`, colored by fill. When the model's
+/// real window is unknown, a conservative fallback is assumed and the reading is marked `~approx`.
 fn context_gauge_spans(used: u64, limit: Option<u32>) -> Vec<Span<'static>> {
-    match limit {
-        Some(limit) if limit > 0 => {
-            let pct = ((used as f64 / limit as f64) * 100.0).round() as u64;
-            let color = if pct >= 90 {
-                ERRRED
-            } else if pct >= 70 {
-                WARNYEL
-            } else {
-                DIM
-            };
-            vec![
-                Span::styled(
-                    format!("◷ {}/{} ", human(used), human(limit as u64)),
-                    Style::default().fg(DIM).bg(STATUSBG),
-                ),
-                Span::styled(
-                    format!("{pct}%"),
-                    Style::default().fg(color).bold().bg(STATUSBG),
-                ),
-            ]
-        }
-        _ => vec![Span::styled(
-            format!("◷ {}", human(used)),
+    let (limit, approx) = match limit {
+        Some(l) if l > 0 => (l as u64, false),
+        _ => (CONTEXT_FALLBACK_LIMIT, true),
+    };
+    let frac = (used as f64 / limit as f64).clamp(0.0, 1.0);
+    let pct = (frac * 100.0).round() as u64;
+    let color = if pct >= 90 {
+        ERRRED
+    } else if pct >= 70 {
+        WARNYEL
+    } else {
+        DIM
+    };
+    // A compact 10-cell bar: filled cells scale with the fill fraction.
+    const CELLS: usize = 10;
+    let filled = (frac * CELLS as f64).round() as usize;
+    let bar: String = "█".repeat(filled) + &"░".repeat(CELLS - filled);
+    let tail = if approx { " ~approx" } else { "" };
+    vec![
+        Span::styled("◷ ", Style::default().fg(DIM).bg(STATUSBG)),
+        Span::styled(bar, Style::default().fg(color).bg(STATUSBG)),
+        Span::styled(
+            format!(" {}/{} ", human(used), human(limit)),
             Style::default().fg(DIM).bg(STATUSBG),
-        )],
-    }
+        ),
+        Span::styled(
+            format!("{pct}%{tail}"),
+            Style::default().fg(color).bold().bg(STATUSBG),
+        ),
+    ]
 }
 
 /// Render the `/usage` overlay as a centered popup over the terminal.
@@ -1989,7 +2060,7 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM).bg(STATUSBG),
         ));
     }
-    if app.context_tokens > 0 && w >= 96 {
+    if app.context_tokens > 0 && w >= 70 {
         left.push(sep());
         left.extend(context_gauge_spans(app.context_tokens, app.context_limit));
     }
@@ -2443,7 +2514,7 @@ mod tests {
     }
 
     #[test]
-    fn context_gauge_omits_denominator_when_limit_unknown() {
+    fn context_gauge_uses_fallback_limit_when_unknown() {
         let mut app = App::default();
         app.apply(PresenterEvent::Cost {
             session_total_usd: 0.01,
@@ -2453,8 +2524,29 @@ mod tests {
             context_limit: None,
         });
         let wide = screen_wh(&app, 120, LIVE_H);
-        assert!(wide.contains("◷ 6.0k"), "used tokens shown: {wide}");
-        assert!(!wide.contains('%'), "no fabricated percentage: {wide}");
+        // Unknown limit → conservative fallback so a % + bar still show, marked approximate.
+        assert!(
+            wide.contains("6.0k/128.0k"),
+            "fallback denominator shown: {wide}"
+        );
+        assert!(
+            wide.contains('%'),
+            "percentage shown against fallback: {wide}"
+        );
+        assert!(
+            wide.contains("approx"),
+            "fallback marked approximate: {wide}"
+        );
+    }
+
+    #[test]
+    fn input_box_grows_with_wrapped_content_then_caps() {
+        // Empty input → minimum height. A very long single line → wraps and grows, capped.
+        assert_eq!(input_box_height("", 80), INPUT_H);
+        let long = "x".repeat(80 * 10); // far exceeds the cap
+        assert_eq!(input_box_height(&long, 80), INPUT_MAX_H);
+        // A short line stays at the minimum.
+        assert_eq!(input_box_height("hello", 80), INPUT_H);
     }
 
     #[test]
