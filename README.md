@@ -2,7 +2,7 @@
 
 # ⚒ Forge
 
-**A fast, model-agnostic AI coding assistant — built in Rust.**
+**A fast, model-agnostic AI coding agent for the terminal — built in Rust.**
 
 *You don't pick a model. Forge routes every task to the optimal model for cost × capability.*
 
@@ -13,7 +13,7 @@
 
 ---
 
-Forge is a self-hosted AI coding assistant for the terminal — like Claude Code, but not locked to one provider and not locked to one model. Its **Model Mesh** automatically classifies every task by complexity and routes it to the cheapest model that can handle it well. Trivial edits go to a local or free model; hard reasoning goes frontier. You set a budget; Forge stays under it.
+Forge is a self-hosted AI coding agent for the terminal — like Claude Code, but not locked to one provider and not locked to one model. Its **Model Mesh** classifies every task by complexity and routes it to the cheapest model that can handle it well: trivial edits go to a local or free model, hard reasoning goes frontier. You set a budget; Forge stays under it, and falls back automatically when a model is rate-limited or down.
 
 ```
 $ forge chat
@@ -28,29 +28,60 @@ $ forge lattice query "UserRepository"
 
 | Category | Features |
 |----------|----------|
-| **Model Mesh** | Auto-discovery, cost-tiered routing, health-aware failover, subscription bridges, budget caps |
-| **Providers** | Anthropic, OpenAI, Ollama, Claude Code CLI, Codex CLI, Groq, Gemini, DeepSeek, OpenRouter, and more |
-| **Code Intelligence** | Lattice: tree-sitter symbol graph, semantic embeddings, hybrid retrieval, blast-radius, call-chain |
+| **Model Mesh** | Auto-discovery, cost-tiered routing, benchmark ranking, health-aware failover, subscription bridges, daily/weekly/monthly budget caps, credit-conservation modes |
+| **Providers** | Anthropic, OpenAI, Ollama, Claude Code CLI, Codex CLI, Groq, Gemini, DeepSeek, OpenRouter, xAI, Cerebras, and more |
+| **Planning mode** | `/plan` investigates read-only and proposes a plan; `/execute` approves it and carries it out |
+| **Code Intelligence** | Lattice: tree-sitter symbol graph (9 languages), semantic embeddings, hybrid retrieval, blast-radius, call-chain, git provenance |
+| **Context** | `@file` mentions inject file contents; project memory auto-loaded from `.forge/AGENTS.md` (scaffold with `/init`); Lattice auto-injection |
+| **Vision** | Attach images by `/image <path>` or paste them straight into the input bar as inline blocks |
 | **Assay** | Parallel critic crew, adversarial verification, ranked findings, git scopes (diff/branch/since), lens selection, auto-diff vs prior run |
 | **MCP** | Client for external MCP servers (stdio + HTTP/SSE), OAuth 2.0 + PKCE, deferred loading, allowlist gating |
-| **TUI** | ratatui live progress, cost meter, token gauge, command palette, session picker, diff preview |
-| **Skills & Commands** | Markdown prompt templates, skill methodology injection, Claude Code format compatible |
+| **TUI** | ratatui live progress, cost meter, context-window token gauge, fuzzy command palette, session/checkpoint pickers, `/usage` + `/mesh` overlays, focus-aware blinking cursor |
+| **Skills & Commands** | Markdown prompt templates + skill methodology injection; Claude Code format compatible |
 | **Subagents** | Parallel fan-out (`spawn_agents`), mesh-routed children, live TUI tree, depth-limited |
 | **Session Management** | Checkpoints, `/undo` with file restore, session replay + JSON export, transcript diff, assay run history |
+| **Remote control** | Drive a session from a phone/desktop browser (`/remote`) — LAN, loopback, or public tunnel |
 | **Hooks** | Pre/post tool-use shell hooks — block (pre) or observe (post) any tool call; fires on both direct and CLI-bridge paths |
-| **Safety** | Permission broker, per-tool rules, diff preview before write, shadow file snapshots |
-| **Shell Error Interceptor** | Failed commands auto-diagnosed; cause + fix injected as next-turn context |
+| **Cost** | Prompt caching, per-model pricing fetched from OpenRouter (cache-read aware), persistent cross-restart usage store |
+| **Git** | Optional model-aware co-author attribution on commits + PR bodies |
+| **Safety** | Permission broker, per-tool rules, diff preview before write, shadow file snapshots, unoverridable denylist |
+
+---
+
+## Install
+
+### Prebuilt binaries (recommended)
+
+Grab the latest release for your OS from the [**Releases**](https://github.com/florisvoskamp/forge/releases) page:
+
+| OS | Asset |
+|----|-------|
+| Linux (x86-64) | `forge-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS (Apple Silicon) | `forge-aarch64-apple-darwin.tar.gz` |
+| macOS (Intel) | `forge-x86_64-apple-darwin.tar.gz` |
+| Windows (x86-64) | `forge-x86_64-pc-windows-msvc.zip` |
+
+Unpack and put `forge` on your `PATH`.
+
+### From source
+
+```bash
+cargo build --release          # produces target/release/forge
+cp target/release/forge ~/.local/bin/   # or anywhere on PATH
+```
+
+Requires a recent stable Rust toolchain.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Build
-cargo build --release
-
 # First-run wizard (API keys + subscription plans)
 forge init
+
+# Generate project memory the agent auto-loads next session
+forge chat          # then type: /init
 
 # Interactive chat
 forge chat
@@ -85,14 +116,16 @@ Forge's routing engine classifies every task into a tier, then picks the cheapes
 | **Standard** | Multi-file refactors, code review | Mid-tier cloud model |
 | **Complex** | Architecture, deep debugging, new features | Frontier model |
 
-The mesh is **health-aware**: rate-limited or unavailable models are benched with a cooldown and the next fallback is tried automatically. Under budget pressure the mesh downshifts tiers.
+The mesh is **health-aware**: rate-limited or unavailable models are benched with a cooldown and the next fallback is tried automatically (down the full ranked catalog, not a fixed top-5). It is **benchmark-ranked** against real Artificial Analysis intelligence + coding scores, and **conservation-aware** — under budget pressure or to spare a metered subscription, it spreads work onto free frontier models.
+
+Inspect any routing decision live with `/mesh [task]` or `forge mesh "<task>"`.
 
 ### Supported Providers
 
 | Provider | Mode | Notes |
 |----------|------|-------|
 | Anthropic | Direct (API key) | Claude family |
-| OpenAI | Direct (API key) | GPT-4 family |
+| OpenAI | Direct (API key) | GPT-5 family |
 | Ollama | Local (no key) | Any local model |
 | Claude Code CLI | Subscription bridge | Uses your Claude subscription |
 | Codex CLI | Subscription bridge | Uses your OpenAI subscription |
@@ -120,42 +153,55 @@ Interactive multi-turn session with the full TUI.
 
 ```bash
 forge chat
-forge chat --resume abc123      # resume a previous session
-forge chat --model anthropic::claude-opus-4-8  # pin a model
-forge chat --mode accept-edits  # auto-allow file writes
-forge chat --plain              # headless / CI mode
+forge chat --resume abc123                      # resume a previous session
+forge chat --model anthropic::claude-opus-4-8   # pin a model
+forge chat --mode accept-edits                  # auto-allow file writes
+forge chat --plain                              # headless / CI mode
 ```
 
 **In-session slash commands:**
 
 | Command | Description |
 |---------|-------------|
+| `/plan <task>` | Planning mode — investigate read-only and propose a plan (no edits) |
+| `/execute` | Approve the proposed plan and carry it out (switches to Auto-edit); aliases `/approve`, `/go` |
+| `/init` | Scan the repo and write `.forge/AGENTS.md` project memory |
 | `/new` | Start a fresh session |
 | `/resume [id]` | Resume a previous session |
 | `/sessions` | Browse + pick a past session |
 | `/undo` | Revert last turn (restores edited files) |
-| `/checkpoints [label]` | Browse + rewind to any checkpoint |
+| `/checkpoint [label]` | Save a named checkpoint here |
+| `/checkpoints` | Browse + rewind to any checkpoint |
 | `/compact` | Summarize older context to free the window (also auto-triggers at 80% gauge) |
-| `/mode` | Switch permission mode interactively |
+| `/mode` | Switch permission mode (temper) interactively |
 | `/model [<id>]` | Pin a model for this session; no arg clears the pin |
 | `/models` | Browse all discovered models |
-| `/mcp [tools <server>]` | Show MCP server status |
-| `/assay [--diff\|--branch <b>\|--since <ref>\|<path>] [--only <lens,…>] [--skip <lens,…>]` | Run code-quality analysis crew (scoped to diff, branch, ref, or path) |
+| `/usage` | API spend + token usage across providers (incl. subscription %) |
+| `/mesh [task]` | Inspect mesh routing — classification, scores, quota, conservation |
+| `/mcp [server]` | Show MCP server status (or one server's tools) |
+| `/assay [--diff\|--branch <b>\|--since <ref>\|<path>] [--only <lens,…>] [--skip <lens,…>]` | Run code-quality analysis crew |
 | `/goal <objective>` | Set a persistent goal the agent tracks |
 | `/loop <task>` | Run autonomously until complete (≤25 turns) |
 | `/replay <id> [<id2>]` | Show a session transcript inline, or diff two sessions |
 | `/lattice <symbol>` | Query code intelligence inline |
+| `/image <path>` | Attach an image to the next message (vision) |
+| `/thinking` | Toggle display of model reasoning/thinking blocks |
+| `/remote [--lan\|--local\|--anywhere]` | Toggle browser remote control |
 | `/config` | Open configuration wizard |
+| `/clear` | Clear the screen (keep the session) |
 | `/` | Open command palette (fuzzy-find skills + commands) |
+
+Type `@` to fuzzy-pick a file; the `@path` token's **contents** are injected into the turn on submit.
 
 **Keyboard shortcuts:**
 
 | Key | Action |
 |-----|--------|
-| `SHIFT+TAB` | Cycle permission mode (Read-only → Ask → Auto-edit → Full) |
+| `SHIFT+TAB` | Cycle temper (Read-only → Ask → Auto-edit); the chosen temper is remembered as your default |
 | `Ctrl+O` | Open subagent viewer (↑↓ select agent, Enter open transcript, Esc close) |
-| `Esc` | Close palette / cancel |
-| `↑ / ↓` | Navigate palettes and pickers |
+| `Ctrl+J` | Insert a newline without submitting |
+| `Esc` | Close palette / cancel / stop a running turn |
+| `↑ / ↓` | Navigate palettes and pickers (or prompt history in the input) |
 | `y / n / a` | Allow / deny / always-allow a permission prompt (`a` persists to config) |
 
 ### `forge run`
@@ -170,10 +216,8 @@ forge run --mode bypass "apply all the diffs"  # no prompts
 
 ### `forge models`
 
-Show all discovered models and the mesh's auto-pick per tier.
-
 ```bash
-forge models            # catalog overview
+forge models            # catalog overview + auto-pick per tier
 forge models --probe    # ping every model, persist health results
 forge models --clear    # forget all benched/rate-limited marks
 ```
@@ -192,74 +236,71 @@ forge lattice why "authenticate"     # git provenance — who last changed it
 forge lattice embed                  # compute semantic embeddings for nodes
 ```
 
-The index is injected automatically as context before each agent turn (hybrid semantic + structural retrieval, budgeted).
-
-### `forge sessions` / `forge replay` / `forge assay`
-
-Audit past work.
+### `forge git`
 
 ```bash
-forge sessions              # list sessions, newest first (cost, messages, preview)
-forge replay abc123         # reconstruct turn-by-turn transcript
-forge replay abc123 def456  # diff two session summaries (summary + per-turn content diff)
-forge replay abc123 --json  # emit full transcript as machine-readable JSON
-forge assay list            # list past assay runs (id, date, scope, cost)
-forge assay compare a1b2 c3d4  # diff findings: fixed / new / still-open
+forge git setup          # install the model-aware co-author commit hook
 ```
 
-### `forge mcp`
-
-Manage external MCP server connections.
+### Audit + migrate
 
 ```bash
-forge mcp                   # show server status
-forge mcp tools myserver    # list tools on a specific server
-forge mcp import            # wizard: scan installed AI CLIs, pick servers to import
-forge mcp import path/to/.mcp.json  # import a specific file
-forge mcp login myserver   # OAuth 2.0 browser login (for OAuth-protected HTTP servers)
-forge mcp logout myserver  # clear stored OAuth tokens
+forge sessions               # list sessions, newest first
+forge replay abc123          # reconstruct turn-by-turn transcript
+forge replay abc123 def456   # diff two session summaries
+forge replay abc123 --json   # emit full transcript as JSON
+forge assay list             # list past assay runs
+forge assay compare a1 b2    # diff findings: fixed / new / still-open
+forge commands               # list discovered commands + skills
+forge import claude          # migrate ~/.claude commands/skills/agents
+forge import codex           # migrate ~/.codex/prompts as commands
+forge mcp                    # MCP server status
+forge mcp import             # wizard: scan installed AI CLIs
+forge auth anthropic         # store an API key in the OS keyring
 ```
 
-### `forge commands`
+---
 
-List all discovered slash commands and skills with scope and conflict markers.
+## Planning Mode
 
-```bash
-forge commands
+For non-trivial work, plan before you act:
+
+```
+/plan migrate the store layer from rusqlite to sqlx
 ```
 
-### `forge import`
+Forge switches to **read-only (Plan)** temper, investigates the codebase using its tools, and presents an ordered, step-by-step plan — making **no edits**. Review it, then:
 
-Migrate commands and skills from other AI CLIs.
-
-```bash
-forge import claude          # copy ~/.claude/commands + ~/.claude/skills/ + ~/.claude/agents/
-forge import codex           # copy ~/.codex/prompts/ as commands
-forge import claude --project  # import to ./.forge instead of user config
+```
+/execute        (or /approve, /go)
 ```
 
-### `forge init`
+Forge switches to **Auto-edit** and carries out the plan it proposed, step by step.
 
-First-run setup wizard — API keys, subscription plans, provider selection.
+---
 
-```bash
-forge init
+## `@file` Context & Project Memory
+
+- **`@file` mentions** — type `@` to fuzzy-pick a file; on submit the file's contents are read and injected into the turn as context (size- and binary-capped). The `@path` stays in your prompt; the contents ride along behind the scenes.
+- **Project memory** — `/init` scans the repo and writes `.forge/AGENTS.md` (overview, build/test/run, layout, conventions). On every future session Forge auto-loads `.forge/AGENTS.md` (or a top-level `AGENTS.md`) as a standing system prompt.
+
+---
+
+## Vision Input
+
+Forge accepts images as vision input:
+
+```
+/image screenshots/bug.png        # attach a file
 ```
 
-### `forge auth`
-
-Manage API keys in your OS keyring.
-
-```bash
-forge auth anthropic     # store key (read from stdin)
-forge auth --remove groq # remove key
-```
+You can also **paste an image directly** into the input bar — it appears as an inline `[image …]` block (deletable as a unit), and is sent as vision input on submit. Costs are priced and tracked like any other usage.
 
 ---
 
 ## Lattice — Code Intelligence
 
-Lattice is Forge's built-in code graph. It parses your repo with **tree-sitter** (40+ languages), stores the symbol graph in SQLite, computes **semantic embeddings**, and injects relevant context before each agent turn automatically.
+Lattice is Forge's built-in code graph. It parses your repo with **tree-sitter** across **9 languages** — Rust, Python, JavaScript, TypeScript (+TSX), Go, Java, C, C++, Ruby — stores the symbol graph in SQLite, optionally computes **semantic embeddings**, and injects relevant context before each agent turn automatically.
 
 ```
 forge lattice update .
@@ -268,48 +309,38 @@ forge lattice update .
 forge lattice impact "UserRepository"
 →  UserService  (calls, 3 refs)
 →  AuthMiddleware  (uses, 1 ref)
-→  SessionStore  (inherits, 1 ref)
 
 forge lattice path "main" "persist"
 →  main → run_session → agent_loop → tool_registry → persist
 ```
 
-**Context injection** is hybrid: embedding-based semantic neighbors + structural references, scaled by budget pressure (full context budget → reduced under cost pressure).
+Context injection is hybrid (embedding-based semantic neighbors + structural references), scaled down under budget pressure.
 
 ---
 
 ## Assay — Code Quality Analysis
 
-`/assay` runs a parallel **critic crew** that scans your codebase (or a scoped diff) and produces a ranked, adversarially-verified findings report. Every candidate finding is independently challenged by a refuter; false positives are dropped before the report is assembled.
+`/assay` runs a parallel **critic crew** that scans your codebase (or a scoped diff) and produces a ranked, adversarially-verified findings report. Every candidate is independently challenged by a refuter; false positives are dropped before the report is assembled.
 
-**Scopes:**
 ```
 /assay                         # full repo
 /assay src/lib.rs              # single file or subtree
 /assay --diff                  # uncommitted working-tree changes only
 /assay --branch feature/x      # files changed vs main
 /assay --since HEAD~10         # files changed since a git ref
+/assay --only dead-weight,unsafe   # run only these critics
+/assay --skip documentation        # run all except these
 ```
 
-**Lens selection:**
-```
-/assay --only dead-weight,unsafe       # run only these critics
-/assay --skip documentation            # run all except these
-```
+**Lenses:** `dead-weight`, `correctness`, `unsafe`, `test-coverage`, `design`, `architecture`, `documentation`, `over-engineering`.
 
-**Available lenses:** `dead-weight`, `correctness`, `unsafe`, `test-coverage`, `design`, `architecture`, `documentation`, `over-engineering`.
-
-**Modes:** Choose *Analysis only* (read-only ranked report) or *Full cleanup (Refine)* — which hands the findings to a permission-gated, undoable fix turn.
-
-**Auto-diff:** Each assay run is persisted. Subsequent runs for the same scope automatically show *N fixed / N new / N still-open* vs the prior run. Use `forge assay compare <a> <b>` to compare any two runs by id.
+**Modes:** *Analysis only* (read-only ranked report) or *Full cleanup (Refine)* — hands findings to a permission-gated, undoable fix turn. Each run is persisted; subsequent runs for the same scope show *N fixed / N new / N still-open* vs the prior run.
 
 ---
 
 ## Subagent Orchestration
 
-The agent can spawn concurrent child agents via `spawn_agents` for decomposed parallel work. Each child gets its own mesh-routed session, persisted to the store, with live progress visible in the TUI as an expandable tree.
-
-Depth is bounded (`max_depth = 2` by default). Subscription CLI bridges (claude, codex) can also fan out via `spawn_agents` — they receive Forge's tools through MCP.
+The agent can spawn concurrent child agents via `spawn_agents` for decomposed parallel work. Each child gets its own mesh-routed session, persisted to the store, with live progress visible in the TUI as an expandable tree. Depth is bounded (`max_depth = 2` by default). Subscription CLI bridges (claude, codex) can also fan out — they receive Forge's tools through MCP.
 
 ---
 
@@ -320,11 +351,9 @@ Forge supports reusable prompt templates (commands) and methodology guides (skil
 **Command** — expands a template with your args:
 ```markdown
 ---
-title: Refactor
+name: refactor
 description: Clean up code structure
-args:
-  - name: scope
-    required: true
+args: [scope]
 tier: standard
 ---
 
@@ -334,16 +363,14 @@ Refactor $1 for readability and maintainability.
 **Skill** — injects a methodology into the agent's context:
 ```markdown
 ---
-title: TDD
+name: tdd
 description: Red-green-refactor workflow
 ---
 
 Write a failing test first. Then make it pass with the simplest code possible. Then refactor.
 ```
 
-Type `/` in the TUI to open the fuzzy command palette. Use `/skill <name>` to load a skill explicitly, or `/command args` to expand a command.
-
-**Scope precedence:** Project (`./.forge`) shadows User (`~/.config/forge`) shadows Builtin. Project-scope commands are confirmed on first use.
+Type `/` to open the fuzzy palette. Use `/skill <name>` to load a skill explicitly, or `/command args` to expand a command. **Scope precedence:** Project (`./.forge`) shadows User (`~/.config/forge`) shadows Builtin. Project-scope commands are confirmed on first use.
 
 ---
 
@@ -364,13 +391,7 @@ token_env = "GITHUB_TOKEN"
 tools = ["create_issue", "list_prs"]
 ```
 
-Server tools are exposed to the agent as namespaced `ToolSpec`s (e.g. `gitlab__list_merge_requests`). An optional allowlist keeps the model's tool space small. All MCP calls pass through Forge's permission broker. Secrets come from env vars or the OS keyring, never from the config file.
-
-**Import existing configs** from Claude Code, Cursor, Windsurf, VS Code, or Codex:
-
-```bash
-forge mcp import   # wizard: auto-scan installed AI CLIs
-```
+Server tools are exposed to the agent as namespaced `ToolSpec`s (e.g. `github__create_issue`). An optional allowlist keeps the tool space small. All MCP calls pass through Forge's permission broker; secrets come from env vars or the OS keyring. OAuth 2.0 + PKCE is supported for protected HTTP servers (`forge mcp login <server>`). Import existing configs from Claude Code, Cursor, Windsurf, VS Code, or Codex with `forge mcp import`.
 
 ---
 
@@ -392,34 +413,48 @@ tool_pattern = "*"
 command = "bash -c 'echo done >> hooks.log'"
 ```
 
-`pre_tool_use` hooks can **block** a call by exiting non-zero (stderr becomes the reason shown to the model). `post_tool_use` hooks observe only. Both receive the tool call as JSON on stdin, time-bounded.
+`pre_tool_use` hooks can **block** a call by exiting non-zero (stderr becomes the reason shown to the model). `post_tool_use` hooks observe only. Both receive the tool call as JSON on stdin, time-bounded, and run on **both** the direct path and the CLI-bridge path. On Windows hooks use `cmd /C`; on Unix, `sh -c`.
 
-Hooks run on **both** the direct path (`forge chat` / `forge run`) and the CLI-bridge path (`forge mcp-serve` + claude/codex). On Windows, hooks use `cmd /C`; on Unix, `sh -c`.
+---
+
+## Git Attribution
+
+Enable model-aware co-author attribution on commits and PRs:
+
+```toml
+# .forge/config.toml
+[git]
+coauthor = true
+```
+
+When enabled, Forge auto-installs a `prepare-commit-msg` hook that strips any Claude/Codex/Anthropic co-author lines and adds `Co-Authored-By: Forge (<model>) <noreply@forge.dev>` — where `<model>` is whichever model actually ran the turn. The agent is also primed to credit Forge in PR bodies it opens. Run `forge git setup` to (re)install the hook manually.
 
 ---
 
 ## Session Safety
 
-- **Permission broker** — every side-effecting tool call requires confirmation (or is auto-allowed based on mode + per-tool rules)
+- **Permission broker** — every side-effecting tool call requires confirmation (or is auto-allowed based on temper + per-tool rules)
 - **Diff preview** — file writes show a unified diff *before* the permission prompt
 - **Shadow snapshots** — pre-edit bytes are captured before each permitted write; `/undo` restores them
 - **Checkpoints** — every turn creates a checkpoint; rewind to any point with `/checkpoints`
 - **Audit trail** — all tool calls, routing decisions, and permission outcomes are persisted
 
-**Permission modes** (cycle with `SHIFT+TAB` or `/mode`):
+**Tempers** (cycle with `SHIFT+TAB`, or pick with `/mode`; the choice is remembered as your default):
 
-| Mode | File writes | Shell | External |
-|------|-------------|-------|----------|
+| Temper | File writes | Shell | External |
+|--------|-------------|-------|----------|
 | **Read-only** | Denied | Denied | Denied |
 | **Ask** | Prompt | Prompt | Prompt |
 | **Auto-edit** | Allowed | Prompt | Prompt |
 | **Full** | Allowed | Allowed | Allowed |
 
+`Full` is opt-in only (`--mode full` / config) — never reachable by cycling. An unoverridable denylist always applies.
+
 ---
 
-## Budget Control
+## Cost & Budget Control
 
-Set daily and monthly caps in config:
+Forge prices every turn from per-model rates fetched at discovery (OpenRouter, cache-read aware) and tracks spend in a persistent store that survives restarts. Prompt caching is used where the provider supports it. See live spend and token usage with `/usage`.
 
 ```toml
 [mesh]
@@ -427,15 +462,13 @@ daily_budget_usd = 5.0
 monthly_cap_usd = 50.0
 ```
 
-Forge tracks spend across both axes. At 80% it warns; at the cap it stops (overridable with `FORGE_BUDGET_OVERRIDE=1`). Under budget pressure, the mesh automatically downshifts to cheaper models and reduces Lattice context injection.
-
-**Context auto-compaction:** when the context gauge reaches 80% of the model's window at turn-end, Forge automatically runs `/compact` — no manual action needed. A note is shown in the TUI.
+At 80% Forge warns; at the cap it stops (override with `FORGE_BUDGET_OVERRIDE=1`). Under budget pressure the mesh downshifts to cheaper models and reduces Lattice context. **Context auto-compaction:** when the token gauge reaches 80% of the model's window at turn-end, Forge runs `/compact` automatically.
 
 ---
 
 ## Configuration
 
-Forge uses layered config — defaults → user → project → env vars:
+Layered config — defaults → user → project → env vars:
 
 | Layer | Path |
 |-------|------|
@@ -443,10 +476,11 @@ Forge uses layered config — defaults → user → project → env vars:
 | Project | `./.forge/config.toml` |
 | MCP servers | `./.forge/mcp.toml` |
 | Agent types | `./.forge/agents/<name>.toml` |
+| Project memory | `./.forge/AGENTS.md` |
 | Env override | `FORGE_*` prefix |
 | API keys | OS keyring (via `forge auth`) |
 
-Key config sections: `[mesh]` (routing, budget, failover), `[[permissions]]` (per-tool rules), `[lattice]` (indexing + embeddings), `[shell]` (error interceptor), `[[hooks]]`, `[mcp]`.
+Key sections: `[mesh]` (routing, budget, conservation, failover), `[permissions]` (per-tool rules), `[lattice]` (indexing + embeddings), `[shell]` (error interceptor), `[[hooks]]`, `[mcp]`, `[git]`, `[commands]`.
 
 ---
 
@@ -457,7 +491,7 @@ Key config sections: `[mesh]` (routing, budget, failover), `[[permissions]]` (pe
 | [`docs/architecture/01-requirements.md`](./docs/architecture/01-requirements.md) | Confirmed requirements |
 | [`docs/architecture/02-architecture.md`](./docs/architecture/02-architecture.md) | System design with C4 diagrams |
 | [`docs/architecture/decisions/`](./docs/architecture/decisions/) | Architecture Decision Records |
-| [`docs/features/`](./docs/features/) | Per-feature design docs (30+ features) |
+| [`docs/features/`](./docs/features/) | Per-feature design docs |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | How to build, test, and contribute |
 
 ---
@@ -466,12 +500,12 @@ Key config sections: `[mesh]` (routing, budget, failover), `[[permissions]]` (pe
 
 ```
 crates/
-├── forge-cli        # binary, clap commands, init wizard
+├── forge-cli        # binary, clap commands, init wizard, TUI render loop
 ├── forge-core       # agent loop, session lifecycle, permission broker
-├── forge-mesh       # model router — classification, health, failover, budget
+├── forge-mesh       # model router — classification, ranking, health, failover, budget
 ├── forge-provider   # provider trait — Anthropic, OpenAI, Ollama, CLI bridges
 ├── forge-tools      # tool registry — read, write, edit, shell, search, web
-├── forge-store      # SQLite persistence — sessions, messages, usage, tasks
+├── forge-store      # SQLite persistence — sessions, messages, usage, pricing, tasks
 ├── forge-tui        # ratatui renderer + headless presenter
 ├── forge-config     # layered config + OS keyring secret resolution
 ├── forge-index      # Lattice — tree-sitter extraction, graph, embeddings
