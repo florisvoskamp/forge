@@ -137,11 +137,25 @@ const COMPLEX_HINTS: &[&str] = &[
     "ultrathink",
     "think carefully",
     "step by step",
+    "in depth",
+    "in-depth",
+    "deep dive",
+    "comprehensive",
+    "thorough",
 ];
-/// Explicit "this is easy" hints — a strong pull toward Trivial.
-const TRIVIAL_HINTS: &[&str] = &["quick", "simple", "one-liner", "one liner"];
-/// Reasoning / algorithmic / architectural terms — the load is cognitive, not length. A
-/// single one can carry a *short* prompt to Complex (the headline fix).
+/// Explicit "this is easy" hints — a strong pull toward Trivial (-5 pts).
+const TRIVIAL_HINTS: &[&str] = &[
+    "quick",
+    "simple",
+    "one-liner",
+    "one liner",
+    "minor",
+    "briefly",
+    "small fix",
+    "small change",
+];
+/// Reasoning / algorithmic / architectural terms — cognitive load, not length. A single one
+/// carries a short prompt to Complex (+5 pts, threshold is 5).
 const REASONING_TERMS: &[&str] = &[
     "architect",
     "architecture",
@@ -167,6 +181,23 @@ const REASONING_TERMS: &[&str] = &[
     "trade-off",
     "tradeoff",
     "algorithm",
+    "investigate",
+    "audit",
+    "diagnose",
+    "evaluate",
+    "vulnerabilit",
+    "memory leak",
+];
+/// Medium-weight analytical signals (+3 pts each). A single term lifts to Standard; two
+/// or one + another signal reach Complex.
+const ANALYSIS_TERMS: &[&str] = &[
+    "performance",
+    "security",
+    "compare",
+    "review",
+    "bottleneck",
+    "scalab",
+    "understand",
 ];
 /// Dev-action verbs that imply real (non-trivial) work. Phrases ("add a"/"write a") avoid
 /// matching trivial requests like "add a comment" (handled by TRIVIAL_PATTERNS first).
@@ -179,17 +210,21 @@ const ACTION_VERBS: &[&str] = &[
     "parallelize",
     "deploy",
     "wire ",
+    "port ",
+    "convert ",
     "add a ",
     "write a ",
     "create a ",
     "build a ",
 ];
-/// Trivial-edit patterns — a strong pull toward Trivial regardless of length.
+/// Trivial-edit patterns — a strong pull toward Trivial (-4 pts) regardless of length.
 const TRIVIAL_PATTERNS: &[&str] = &[
     "typo",
     "rename",
     "bump version",
     "bump the version",
+    "update the version",
+    "change the version",
     "reformat",
     "add a comment",
     "fix import",
@@ -197,6 +232,8 @@ const TRIVIAL_PATTERNS: &[&str] = &[
     "whitespace",
     "one-liner",
     "one liner",
+    "delete this line",
+    "remove this line",
 ];
 /// Code-vs-prose markers (besides a fenced ```code block```). Symbol-based on purpose —
 /// natural-language words like "function"/"class"/"import" appear in prose and would false-
@@ -241,6 +278,10 @@ fn is_subscription(model: &str) -> bool {
 /// Tier classification with the human-readable signals that drove it.
 struct Classification {
     tier: TaskTier,
+    /// Raw weighted score. ≤0 → Trivial, ≥5 → Complex, else Standard. Exposed so callers
+    /// can measure confidence: a score far from both boundaries is a high-confidence call;
+    /// a near-boundary score means an LLM classifier should be consulted.
+    score: i32,
     reasons: Vec<&'static str>,
 }
 
@@ -280,9 +321,11 @@ fn score_prompt(prompt: &str) -> Classification {
     let lower = prompt.to_lowercase();
 
     // An explicit "think hard" hint is a hard override — the user told us it's hard.
+    // score=i32::MAX signals "certain Complex" so hybrid mode never second-guesses it.
     if COMPLEX_HINTS.iter().any(|h| lower.contains(h)) {
         return Classification {
             tier: TaskTier::Complex,
+            score: i32::MAX,
             reasons: vec!["explicit 'think hard' hint"],
         };
     }
@@ -325,6 +368,11 @@ fn score_prompt(prompt: &str) -> Classification {
         pts += 1;
         reasons.push("error/stack trace");
     }
+    let analysis_hits = ANALYSIS_TERMS.iter().filter(|t| lower.contains(*t)).count() as i32;
+    if analysis_hits > 0 {
+        pts += analysis_hits * 3;
+        reasons.push("analytical signal");
+    }
 
     // Trivial pulls (strong, regardless of length).
     if TRIVIAL_HINTS.iter().any(|h| lower.contains(h)) {
@@ -351,7 +399,11 @@ fn score_prompt(prompt: &str) -> Classification {
             TaskTier::Complex => "complex task",
         });
     }
-    Classification { tier, reasons }
+    Classification {
+        tier,
+        score: pts,
+        reasons,
+    }
 }
 
 fn is_multistep(lower: &str) -> bool {
@@ -359,6 +411,8 @@ fn is_multistep(lower: &str) -> bool {
         || lower.contains("\n- ")
         || lower.contains("\n* ")
         || (lower.contains("1.") && lower.contains("2."))
+        || (lower.contains("1)") && lower.contains("2)"))
+        || lower.contains("after that")
 }
 
 impl HeuristicRouter {
@@ -425,6 +479,21 @@ impl HeuristicRouter {
     fn classify(prompt: &str) -> (TaskTier, String) {
         let c = score_prompt(prompt);
         (c.tier, c.reasons.join(", "))
+    }
+
+    /// Like [`classify`] but also reports whether the heuristic is confident enough that an
+    /// LLM second-opinion would add little value. High confidence means the score is far from
+    /// both tier boundaries (≤−4 for Trivial, ≥8 for Complex) OR a COMPLEX_HINTS hard-override
+    /// fired. A near-boundary score (−3…7) is "uncertain" — hybrid classifiers should call an
+    /// LLM to decide. This is the hook that makes [`ClassifierKind::Hybrid`] cheap: obvious
+    /// Trivial / strongly-signalled Complex skip the extra model call entirely.
+    pub fn classify_confident(prompt: &str) -> (TaskTier, bool, String) {
+        let c = score_prompt(prompt);
+        // score == i32::MAX → COMPLEX_HINTS hard override (always confident).
+        // score ≤ −4 → strong Trivial pull (TRIVIAL_PATTERNS or double TRIVIAL_HINTS).
+        // score ≥ 8  → two or more strong Complex signals (REASONING_TERM + something else).
+        let confident = c.score == i32::MAX || c.score <= -4 || c.score >= 8;
+        (c.tier, confident, c.reasons.join(", "))
     }
 
     /// A model is usable if its provider key is present (or it's keyless) AND it isn't
@@ -1783,5 +1852,141 @@ mod tests {
             .await;
         assert!(d.fallbacks.is_empty());
         assert!(d.rationale.contains("no usable key"), "{}", d.rationale);
+    }
+
+    // --- Classification signal coverage ---
+
+    #[test]
+    fn investigation_terms_are_complex() {
+        for p in [
+            "investigate why the cache warms slowly",
+            "audit the permission checks in the auth module",
+            "diagnose the memory issue in the worker process",
+            "evaluate the design of the new token store API",
+            "is there a vulnerability in this authentication code",
+            "there is a memory leak in the connection pool",
+        ] {
+            assert_eq!(
+                score_prompt(p).tier,
+                TaskTier::Complex,
+                "expected Complex for {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn analysis_terms_alone_lift_to_standard_not_trivial() {
+        for p in [
+            "review the authentication flow",
+            "check the performance of this endpoint",
+            "compare these two data structures",
+            "help me understand how the scheduler works",
+            "is there a security issue here",
+            "find the bottleneck in the rendering path",
+        ] {
+            let tier = score_prompt(p).tier;
+            assert_ne!(
+                tier,
+                TaskTier::Trivial,
+                "expected Standard or Complex for {p:?}, got Trivial"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_analysis_terms_reach_complex() {
+        // Two ANALYSIS_TERMS signals (3+3 = 6 ≥ 5) → Complex.
+        assert_eq!(
+            score_prompt("there is a performance bottleneck in the hot path").tier,
+            TaskTier::Complex,
+            "performance + bottleneck → Complex"
+        );
+        // ANALYSIS_TERM + reasoning term → Complex.
+        assert_eq!(
+            score_prompt("review and analyze the trade-offs in this design").tier,
+            TaskTier::Complex,
+            "review + analyze + trade-off → Complex"
+        );
+        // ANALYSIS_TERM + code → 3+3 = 6 → Complex.
+        assert_eq!(
+            score_prompt("security review of this ```rust\nfn login() {}\n```").tier,
+            TaskTier::Complex,
+            "security + code → Complex"
+        );
+    }
+
+    #[test]
+    fn depth_hints_force_complex_regardless_of_prompt_length() {
+        for p in [
+            "explain this in depth",
+            "give an in-depth analysis",
+            "deep dive into the scheduler",
+            "comprehensive review of the auth module",
+            "do a thorough audit of the codebase",
+        ] {
+            assert_eq!(
+                HeuristicRouter::classify(p).0,
+                TaskTier::Complex,
+                "depth hint must force Complex for {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn minor_qualifier_cancels_complexity_signal() {
+        // "minor" (−5) cancels a REASONING_TERM (+5) → net 0 → Trivial.
+        assert_eq!(
+            score_prompt("minor refactor of this helper function").tier,
+            TaskTier::Trivial,
+            "minor + refactor: trivial qualifier must win"
+        );
+        // "small fix" (−5) cancels a reasoning term.
+        assert_eq!(
+            score_prompt("small fix for the debug output").tier,
+            TaskTier::Trivial,
+            "small fix + debug: trivial qualifier must win"
+        );
+        // "briefly" (−5) cancels "explain" (+5).
+        assert_eq!(
+            score_prompt("briefly explain this function").tier,
+            TaskTier::Trivial,
+            "briefly + explain: trivial qualifier must win"
+        );
+    }
+
+    #[test]
+    fn port_and_convert_are_standard_action_verbs() {
+        assert_ne!(
+            score_prompt("port this Python module to Rust").tier,
+            TaskTier::Trivial,
+            "porting is non-trivial work"
+        );
+        assert_ne!(
+            score_prompt("convert the callback API to async").tier,
+            TaskTier::Trivial,
+            "conversion is non-trivial work"
+        );
+    }
+
+    #[test]
+    fn multistep_with_parenthesised_numbers_is_detected() {
+        let p = "1) add the migration 2) update the handler 3) write tests";
+        assert!(is_multistep(&p.to_lowercase()), "1) 2) format not detected");
+    }
+
+    #[test]
+    fn new_trivial_patterns_stay_trivial() {
+        for p in [
+            "update the version to 2.0.0",
+            "change the version in Cargo.toml",
+            "delete this line from the config",
+            "remove this line and nothing else",
+        ] {
+            assert_eq!(
+                score_prompt(p).tier,
+                TaskTier::Trivial,
+                "expected Trivial for {p:?}"
+            );
+        }
     }
 }

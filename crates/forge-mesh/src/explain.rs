@@ -49,6 +49,9 @@ pub struct RoutingExplanation {
     pub pick: String,
     pub fallbacks: Vec<String>,
     pub rationale: String,
+    /// Human-readable label for which classifier produced this tier — set by the caller (forge-core)
+    /// based on the configured `mesh.classifier`. Defaults to `"heuristic"`.
+    pub classifier_label: String,
 }
 
 impl HeuristicRouter {
@@ -141,6 +144,7 @@ impl HeuristicRouter {
             pick: decision.model,
             fallbacks: decision.fallbacks,
             rationale: decision.rationale,
+            classifier_label: "heuristic".to_string(),
         }
     }
 }

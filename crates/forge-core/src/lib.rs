@@ -884,7 +884,50 @@ impl Session {
         let catalog = self.catalog.clone()?;
         let router = forge_mesh::HeuristicRouter::new(self.config.clone()).with_catalog(catalog);
         let health = self.store.current_benched().unwrap_or_default();
-        Some(router.explain(prompt, self.budget_snapshot(), &health, &self.live_quota()))
+        let mut exp = router.explain(prompt, self.budget_snapshot(), &health, &self.live_quota());
+        use forge_config::ClassifierKind;
+        exp.classifier_label = match self.config.mesh.classifier {
+            ClassifierKind::Heuristic => "heuristic".to_string(),
+            ClassifierKind::Llm => {
+                let m = self
+                    .config
+                    .mesh
+                    .classifier_model
+                    .as_deref()
+                    .unwrap_or("trivial-tier fallback");
+                format!("llm ({m}) — actual tier may differ from this heuristic preview")
+            }
+            ClassifierKind::Hybrid => {
+                let (_, confident, reason) =
+                    forge_mesh::HeuristicRouter::classify_confident(prompt);
+                if confident {
+                    format!("hybrid — heuristic confident ({reason}), no llm call")
+                } else {
+                    let m = self
+                        .config
+                        .mesh
+                        .classifier_model
+                        .as_deref()
+                        .unwrap_or("trivial-tier fallback");
+                    format!("hybrid — uncertain zone, llm ({m}) will classify at turn time")
+                }
+            }
+        };
+        Some(exp)
+    }
+
+    /// The last-resort model to try when the routed fallback chain is exhausted: the non-excluded
+    /// model whose transient bench expires soonest (the "least dead"). Returns `None` once already
+    /// used, or when the only candidate is the model that just failed (`just_failed`), or when
+    /// nothing transient is benched — so the caller falls through to [`CoreError::NoHealthyModel`].
+    fn last_resort_model(&self, just_failed: &str, already_used: bool) -> Option<String> {
+        if already_used {
+            return None;
+        }
+        match self.store.soonest_unbenched() {
+            Ok(Some(m)) if m != just_failed => Some(m),
+            _ => None,
+        }
     }
 
     pub async fn compact(&mut self) -> Result<(usize, usize), CoreError> {
@@ -1240,6 +1283,8 @@ impl Session {
         let stream_idle = std::time::Duration::from_secs(self.config.mesh.stream_idle_timeout_secs);
         let mut chain = decision.fallbacks.clone().into_iter();
         let mut active_model = routed_model;
+        // One-shot guard for the last-resort attempt when the whole chain is exhausted (below).
+        let mut last_resort_used = false;
 
         // 3. Model <-> tool loop.
         for step in 0..MAX_STEPS {
@@ -1309,14 +1354,24 @@ impl Session {
                     }
                     Err(e) if failover_enabled && e.is_retryable() => {
                         let reason = e.reason();
-                        let _ = self.store.bench_for(
-                            &active_model,
-                            e.cooldown(default_cooldown),
-                            reason,
-                        );
-                        self.presenter.emit(PresenterEvent::Warning(format!(
-                            "{active_model} {reason} — failing over"
-                        )));
+                        // A PERMANENT incapability (no tool support / unaffordable) excludes the
+                        // model for a long window so it isn't re-tried every turn (the "every model
+                        // failing" churn); a transient failure benches it on the short cooldown.
+                        if e.is_permanent() {
+                            let _ = self.store.exclude_model(&active_model, reason);
+                            self.presenter.emit(PresenterEvent::Warning(format!(
+                                "{active_model} {reason} — excluded from routing"
+                            )));
+                        } else {
+                            let _ = self.store.bench_for(
+                                &active_model,
+                                e.cooldown(default_cooldown),
+                                reason,
+                            );
+                            self.presenter.emit(PresenterEvent::Warning(format!(
+                                "{active_model} {reason} — failing over"
+                            )));
+                        }
                         match chain.next() {
                             Some(next) => {
                                 self.presenter.emit(PresenterEvent::Routing {
@@ -1327,8 +1382,26 @@ impl Session {
                                 active_model = next;
                                 continue;
                             }
-                            // Nothing healthy left to try (AC-6).
-                            None => return Err(CoreError::NoHealthyModel),
+                            // The routed chain is exhausted. Rather than hard-fail, make ONE
+                            // last-resort attempt on the "least dead" model — the non-excluded
+                            // model whose transient bench expires soonest. This keeps a turn
+                            // working when every model is briefly rate-limited but none is
+                            // permanently incapable. Guarded by `last_resort_used` so a model that
+                            // fails again can't loop.
+                            None => match self.last_resort_model(&active_model, last_resort_used) {
+                                Some(m) => {
+                                    last_resort_used = true;
+                                    self.presenter.emit(PresenterEvent::Routing {
+                                        tier: decision.tier.as_str().to_string(),
+                                        model: m.clone(),
+                                        rationale: "last-resort: least-recently-benched model"
+                                            .to_string(),
+                                    });
+                                    active_model = m;
+                                    continue;
+                                }
+                                None => return Err(CoreError::NoHealthyModel),
+                            },
                         }
                     }
                     Err(e) => return Err(e.into()),

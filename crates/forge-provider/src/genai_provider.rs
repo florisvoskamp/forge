@@ -21,19 +21,32 @@ use crate::{EventSink, ModelResponse, Provider, ProviderError, StreamEvent, Tool
 #[derive(Default)]
 pub struct GenAiProvider {
     client: Client,
+    /// Per-completion output cap (`mesh.max_output_tokens`). `None` → no cap (provider default,
+    /// often a model's full 65k max — too much for a free/low-credit account, see the 402 churn).
+    max_output_tokens: Option<u32>,
 }
 
 impl GenAiProvider {
     pub fn new() -> Self {
         Self {
             client: build_client(),
+            max_output_tokens: None,
         }
     }
 
     /// Construct with a caller-supplied `genai::Client`. Used by the HTTP contract tests to
     /// point genai at a local mock server; otherwise identical to [`GenAiProvider::new`].
     pub fn with_client(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            max_output_tokens: None,
+        }
+    }
+
+    /// Cap the output tokens requested per completion. `0` disables the cap (provider default).
+    pub fn with_max_output_tokens(mut self, cap: u32) -> Self {
+        self.max_output_tokens = (cap > 0).then_some(cap);
+        self
     }
 }
 
@@ -184,6 +197,7 @@ fn classify_genai_error(err: &genai::Error) -> ProviderError {
         genai::Error::HttpError { status, body, .. } => classify_status(
             status.as_u16(),
             err.to_string(),
+            body,
             parse_retry_after_body(body),
         ),
         genai::Error::WebModelCall { webc_error, .. }
@@ -205,7 +219,7 @@ fn classify_genai_error(err: &genai::Error) -> ProviderError {
                             .or_else(|| parse_secs(t).map(std::time::Duration::from_secs_f64))
                     })
                     .or_else(|| parse_retry_after_body(body));
-                classify_status(status.as_u16(), err.to_string(), retry_after)
+                classify_status(status.as_u16(), err.to_string(), body, retry_after)
             }
             other => ProviderError::Unavailable(short(&other.to_string())),
         },
@@ -229,14 +243,63 @@ fn quota_is_exhausted(s: &str) -> bool {
     l.contains("limit: 0") || l.contains("perday") || l.contains("per day") || l.contains("per-day")
 }
 
-/// Classify from an HTTP status code. `message` is shortened to a single line for the UI.
+/// Markers of a PERMANENT, model-specific incapability — this model can never serve Forge's
+/// tool-using turns, or the account can't afford it. These errors recur identically on every
+/// call, so the model is *excluded* rather than benched-and-retried (the source of the
+/// "every model is failing" churn). Checked against the raw error body, which carries the
+/// provider's real message even when the HTTP status is generic (400/404).
+fn is_capability_failure(text: &str) -> bool {
+    let l = text.to_lowercase();
+    // Standalone markers that unambiguously mean "this model can't serve us".
+    const MARKERS: &[&str] = &[
+        // OpenRouter: no provider endpoint exposes tool use for this model.
+        "no endpoints found that support tool use",
+        // OpenRouter / generic: feature explicitly unsupported.
+        "does not support feature: function-calling",
+        // MiniMax (via opencode_go): rejects our tool payload outright.
+        "function name or parameters is empty",
+        // Account can't afford the request (OpenRouter 402 free tier).
+        "requires more credits",
+        "can only afford",
+        "insufficient credit",
+        "insufficient_quota",
+    ];
+    if MARKERS.iter().any(|m| l.contains(m)) {
+        return true;
+    }
+    // Tool/function-calling unsupported, robust to punctuation/wording: a tool-or-function term
+    // co-occurring with a "not supported / does not support" phrase. Catches e.g.
+    // "`tool calling` is not supported with this model" and "model does not support tool use".
+    let mentions_tools = l.contains("tool calling")
+        || l.contains("tool use")
+        || l.contains("tool_use")
+        || l.contains("tool calls")
+        || l.contains("function calling")
+        || l.contains("function-calling")
+        || l.contains("function call");
+    let unsupported = l.contains("not supported")
+        || l.contains("does not support")
+        || l.contains("isn't supported")
+        || l.contains("unsupported");
+    mentions_tools && unsupported
+}
+
+/// Classify from an HTTP status code. `body` is the raw provider response (inspected for
+/// capability markers that a generic 400/404 status hides); `message` is the shortened display
+/// string for the UI.
 fn classify_status(
     code: u16,
     message: String,
+    body: &str,
     retry_after: Option<std::time::Duration>,
 ) -> ProviderError {
-    let exhausted = quota_is_exhausted(&message);
+    let exhausted = quota_is_exhausted(&message) || quota_is_exhausted(body);
     let message = short(&message);
+    // A permanent incapability (no tool support / unaffordable) regardless of status code: 402
+    // is always "can't afford", and 400/404 bodies often carry "tool calling not supported".
+    if code == 402 || is_capability_failure(body) || is_capability_failure(&message) {
+        return ProviderError::Capability(message);
+    }
     match code {
         429 => ProviderError::RateLimited {
             message,
@@ -256,7 +319,12 @@ fn classify_text(text: &str, message: String) -> ProviderError {
     // zero quota drops the (useless) tiny delay so the longer default bench applies.
     let retry_after = parse_retry_after_body(text).filter(|_| !quota_is_exhausted(text));
     let message = short(&message);
-    if has("429") || has("resource_exhausted") || has("rate limit") || has("quota") {
+    // Permanent incapability first — a streamed "tool calling is not supported" / "402 requires
+    // more credits" must NOT be mistaken for a transient dropped stream (the misclassification
+    // bug that benched-and-retried dead models forever).
+    if is_capability_failure(text) {
+        ProviderError::Capability(message)
+    } else if has("429") || has("resource_exhausted") || has("rate limit") || has("quota") {
         ProviderError::RateLimited {
             message,
             retry_after,
@@ -321,10 +389,15 @@ impl Provider for GenAiProvider {
         }
 
         // Capture flags so the terminal End event carries usage + tool calls.
-        let options = ChatOptions::default()
+        let mut options = ChatOptions::default()
             .with_capture_usage(true)
             .with_capture_content(true)
             .with_capture_tool_calls(true);
+        // Bound the output so a free / low-credit account isn't billed (or 402'd) for a model's
+        // full max-token default (mesh.max_output_tokens).
+        if let Some(cap) = self.max_output_tokens {
+            options = options.with_max_tokens(cap);
+        }
 
         // Stall guards: a hung connection or a stream that goes silent must not freeze the
         // turn forever. A timeout surfaces as `Unavailable` (retryable), so the mesh fails over
@@ -576,21 +649,62 @@ mod tests {
     fn classify_status_maps_codes() {
         let none = None;
         assert!(matches!(
-            classify_status(429, "x".into(), none),
+            classify_status(429, "x".into(), "", none),
             ProviderError::RateLimited { .. }
         ));
         assert!(matches!(
-            classify_status(401, "x".into(), None),
+            classify_status(401, "x".into(), "", None),
             ProviderError::Auth(_)
         ));
         assert!(matches!(
-            classify_status(503, "x".into(), None),
+            classify_status(503, "x".into(), "", None),
             ProviderError::Unavailable(_)
         ));
         // 400 misuse is non-retryable — must not fail over.
-        let bad = classify_status(400, "x".into(), None);
+        let bad = classify_status(400, "x".into(), "", None);
         assert!(matches!(bad, ProviderError::Request(_)));
         assert!(!bad.is_retryable());
+    }
+
+    #[test]
+    fn capability_failures_are_permanent_and_fail_over() {
+        // 402 (can't afford) → permanent exclusion, but still fails over to another model.
+        let credit = classify_status(402, "x".into(), "requires more credits", None);
+        assert!(matches!(credit, ProviderError::Capability(_)));
+        assert!(credit.is_permanent());
+        assert!(
+            credit.is_retryable(),
+            "must still fail over to another model"
+        );
+
+        // 400 body that names a tool-support problem → Capability, not a plain Request.
+        let no_tools = classify_status(
+            400,
+            "x".into(),
+            "`tool calling` is not supported with this model",
+            None,
+        );
+        assert!(matches!(no_tools, ProviderError::Capability(_)));
+        assert!(no_tools.is_permanent());
+
+        // Streaming path: the same markers in free text.
+        for body in [
+            "No endpoints found that support tool use",
+            "function name or parameters is empty (2013)",
+            "model does not support feature: function-calling",
+        ] {
+            let e = classify_text(body, body.to_string());
+            assert!(
+                matches!(e, ProviderError::Capability(_)),
+                "expected Capability for {body:?}, got {e:?}"
+            );
+            assert!(e.is_permanent());
+        }
+
+        // A genuine dropped stream is still transient (not permanent).
+        let dropped = classify_text("connection reset by peer", "stream dropped".into());
+        assert!(matches!(dropped, ProviderError::Unavailable(_)));
+        assert!(!dropped.is_permanent());
     }
 
     #[test]

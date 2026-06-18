@@ -7,9 +7,15 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone};
 use forge_types::{Role, TaskTier, ToolCall, Usage};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 mod schema;
+
+/// How long a permanently-failed model (a [`Store::exclude_model`] capability exclusion) stays out
+/// of routing before it's re-probed: 7 days. Long enough to stop the per-session churn of
+/// re-trying models that can't do tool calling, short enough that a provider adding support is
+/// picked up within a week.
+const CAPABILITY_EXCLUSION_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Half-open `[start, end)` epoch-second bounds of `now`'s **local** calendar day. Computed
 /// in Rust (not SQLite `strftime`) so the day rolls at the user's midnight and survives DST.
@@ -557,6 +563,34 @@ impl Store {
     ) -> Result<()> {
         let until = chrono::Utc::now().timestamp() + cooldown.as_secs() as i64;
         self.bench_model(model, until, reason)
+    }
+
+    /// Exclude a model that failed *permanently* (no tool-calling support, unaffordable, malformed
+    /// tool payload — see [`ProviderError::Capability`](forge_provider::ProviderError::Capability)).
+    /// Modeled as a long bench window so it reuses the `model_health` table and naturally
+    /// *re-probes* after the window elapses (a provider may add tool support later). The reason is
+    /// prefixed `excluded:` so the UI / report can distinguish it from a transient bench.
+    pub fn exclude_model(&self, model: &str, reason: &str) -> Result<()> {
+        let until = chrono::Utc::now().timestamp() + CAPABILITY_EXCLUSION_SECS;
+        self.bench_model(model, until, &format!("excluded: {reason}"))
+    }
+
+    /// The non-excluded model whose bench expires soonest (the "least dead" model), as a
+    /// last-resort fallback when every routable model is currently benched but none is a permanent
+    /// capability exclusion. `None` when nothing is benched or all benches are permanent
+    /// exclusions. Used by the core loop so a turn never hard-fails while a transient bench exists.
+    pub fn soonest_unbenched(&self) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT model FROM model_health
+                 WHERE reason NOT LIKE 'excluded:%'
+                 ORDER BY cooldown_until ASC LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Currently-benched snapshot as of *now* (convenience over [`benched_models`]).
@@ -1915,6 +1949,53 @@ mod tests {
         );
         store.clear_model_health("m").unwrap();
         assert!(store.benched_models(500).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exclude_model_benches_long_and_soonest_skips_exclusions() {
+        let store = Store::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        // A permanent exclusion: benched far into the future, reason prefixed "excluded:".
+        store
+            .exclude_model("dead::no-tools", "no tool calling")
+            .unwrap();
+        assert!(
+            store
+                .current_benched()
+                .unwrap()
+                .is_benched("dead::no-tools"),
+            "excluded model is benched now"
+        );
+        let report = store.current_benched_report().unwrap();
+        let row = report
+            .iter()
+            .find(|(m, _, _)| m == "dead::no-tools")
+            .unwrap();
+        assert!(
+            row.1 > now + 6 * 24 * 60 * 60,
+            "exclusion window is ~7 days"
+        );
+        assert!(row.2.starts_with("excluded:"));
+
+        // A transient bench alongside it.
+        store
+            .bench_for(
+                "rl::model",
+                std::time::Duration::from_secs(120),
+                "rate-limited",
+            )
+            .unwrap();
+
+        // soonest_unbenched returns the transient one, never the permanent exclusion.
+        assert_eq!(
+            store.soonest_unbenched().unwrap().as_deref(),
+            Some("rl::model")
+        );
+
+        // With only exclusions left, there's no last-resort candidate.
+        store.clear_model_health("rl::model").unwrap();
+        assert_eq!(store.soonest_unbenched().unwrap(), None);
     }
 
     #[test]

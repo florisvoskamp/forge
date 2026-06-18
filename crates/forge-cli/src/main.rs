@@ -18,6 +18,7 @@ use forge_tui::{HeadlessPresenter, Presenter, TuiPresenter};
 use forge_types::PermissionMode;
 use forge_types::TaskTier;
 
+mod balance;
 mod benchmarks;
 mod bridge_stats;
 mod mcp_serve;
@@ -1650,15 +1651,22 @@ pub(crate) fn build_provider_and_router(
         // Routes API models to genai and `claude-cli::`/`codex-cli::` to the subscription CLI
         // bridge. `harness` mode runs the bridge's tools through Forge's MCP server (RFC Phase 2).
         let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
-        Arc::new(DispatchProvider::new(harness))
+        Arc::new(
+            DispatchProvider::new(harness).with_max_output_tokens(config.mesh.max_output_tokens),
+        )
     };
     let mut heuristic = HeuristicRouter::new(config.clone()).with_pin(pin);
     if let Some(cat) = catalog {
         heuristic = heuristic.with_catalog(cat);
     }
-    let router: Arc<dyn Router> = if config.mesh.classifier == ClassifierKind::Llm {
-        // Opt-in cheap-LLM classifier: a separate (stateless) provider labels the tier, then
-        // the heuristic router does the cost-aware selection; any failure falls back to it.
+    let router: Arc<dyn Router> = if matches!(
+        config.mesh.classifier,
+        ClassifierKind::Llm | ClassifierKind::Hybrid
+    ) {
+        // LLM / Hybrid classifier: a cheap model labels the tier; the heuristic router
+        // does cost-aware selection; any failure falls back to the heuristic.
+        // Hybrid additionally skips the LLM call when the heuristic is already confident
+        // (score ≤−4 or ≥8), keeping zero added latency for obvious cases.
         let classifier_model = config
             .mesh
             .classifier_model
@@ -1668,13 +1676,14 @@ pub(crate) fn build_provider_and_router(
         let classify_provider: Arc<dyn Provider> = if mock {
             Arc::new(MockProvider)
         } else {
-            Arc::new(DispatchProvider::new(false)) // classification needs no tools/harness
+            // classification needs no tools/harness; cap output (one tier word) so a free
+            // classifier model isn't 402'd on a huge default max-token request.
+            Arc::new(
+                DispatchProvider::new(false).with_max_output_tokens(config.mesh.max_output_tokens),
+            )
         };
-        Arc::new(LlmRouter::new(
-            classify_provider,
-            classifier_model,
-            heuristic,
-        ))
+        let hybrid = config.mesh.classifier == ClassifierKind::Hybrid;
+        Arc::new(LlmRouter::new(classify_provider, classifier_model, heuristic).with_hybrid(hybrid))
     } else {
         Arc::new(heuristic)
     };
@@ -1729,10 +1738,53 @@ async fn discover_catalog(config: &forge_config::Config) -> forge_mesh::ModelCat
     // Drop any model/provider the user disabled (`[mesh] disabled`), so the mesh never routes to
     // or fails over onto it (known-issues.md: disable a flaky model without deleting its key).
     models.retain(|m| !forge_config::is_model_disabled(m, &config.mesh.disabled));
+    // Pre-flight balance: for each provider that exposes a key-authenticated balance API, drop its
+    // PAID models when the account is out of credit — so the mesh never tries (and 402s on) a model
+    // it can't pay for (e.g. OpenRouter at $0 balance). Free variants + providers without a balance
+    // API are untouched (fail open). Probes run concurrently across providers; each is short-timed.
+    drop_unaffordable_models(&mut models).await;
     // Attach measured benchmark scores (ADR-0011) so the mesh ranks on real performance. Cache-
     // first + incremental: only hits the API when a newly-discovered model has no rating yet.
     let bench = benchmarks::ensure(config, &models, false).await;
     forge_mesh::ModelCatalog::new(models).with_benchmarks(bench)
+}
+
+/// Remove a provider's metered models from `models` when its account balance is confirmed below
+/// [`balance::MIN_CREDIT_USD`]. Only providers exposing a key-authenticated balance API are probed
+/// (others return `None` → kept); genuinely-free variants (e.g. OpenRouter `:free`) are kept too.
+async fn drop_unaffordable_models(models: &mut Vec<String>) {
+    let mut providers: Vec<String> = models
+        .iter()
+        .map(|m| forge_config::provider_of(m).to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    providers.sort();
+    providers.dedup();
+
+    // Probe every provider concurrently; collect the ones confirmed broke.
+    let checks = providers.into_iter().map(|p| async move {
+        match balance::remaining_credit(&p).await {
+            Some(bal) if bal < balance::MIN_CREDIT_USD => Some((p, bal)),
+            _ => None,
+        }
+    });
+    let broke: Vec<(String, f64)> = futures::future::join_all(checks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+
+    for (p, bal) in broke {
+        let before = models.len();
+        models.retain(|m| forge_config::provider_of(m) != p || balance::is_free_model_id(m));
+        let dropped = before - models.len();
+        if dropped > 0 {
+            tracing::info!(
+                "{p} balance {bal:.2} < {:.2} — dropped {dropped} paid model(s) from discovery (free variants kept)",
+                balance::MIN_CREDIT_USD
+            );
+        }
+    }
 }
 
 /// `forge models [--probe]`: discover the usable models + show the mesh's capability-ranked pick
@@ -2164,22 +2216,38 @@ async fn probe_models(
 ) -> Result<()> {
     use std::time::Duration;
     let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
-    let provider = DispatchProvider::new(harness);
+    let provider =
+        DispatchProvider::new(harness).with_max_output_tokens(config.mesh.max_output_tokens);
     let default_cooldown = Duration::from_secs(config.mesh.failover_cooldown_secs);
     let ping = [forge_types::Message::user("ping")];
+    // Probe WITH a representative tool: the real agent loop always advertises tools, so a model
+    // that can't do function calling (groq compound-mini, many OpenRouter models) must fail the
+    // probe too — a no-tool ping would falsely pass it. This is what *confirms* a model (incl. any
+    // marked "free") can actually serve a turn, not just answer a bare prompt.
+    let probe_tool = [forge_provider::ToolSpec {
+        name: "noop".to_string(),
+        description: "A no-op used to verify the model accepts tool calls.".to_string(),
+        schema: serde_json::json!({"type": "object", "properties": {}}),
+    }];
     let mut sink = |_: forge_provider::StreamEvent| {};
 
     println!("probing {} models…", cat.models().len());
     for m in cat.models() {
         let res = tokio::time::timeout(
             Duration::from_secs(20),
-            provider.complete(m, &ping, &[], &mut sink),
+            provider.complete(m, &ping, &probe_tool, &mut sink),
         )
         .await;
         match res {
             Ok(Ok(_)) => {
                 store.clear_model_health(m).ok();
                 println!("  ✓ {m}");
+            }
+            // A PERMANENT incapability (no tool support / unaffordable) → exclude for a long window
+            // so discovery stops resurrecting it every run.
+            Ok(Err(e)) if e.is_permanent() => {
+                store.exclude_model(m, e.reason()).ok();
+                println!("  ⊘ {m} — {} (excluded)", e.reason());
             }
             Ok(Err(e)) if e.is_retryable() => {
                 let cooldown = e.cooldown(default_cooldown);
@@ -3147,6 +3215,10 @@ async fn run_chat_tui(
     // Baseline for the spinner: deriving the tick from elapsed time keeps the animation
     // speed independent of the loop frequency (one frame per 60ms, exactly as before).
     let mut busy_since = Instant::now();
+    // Receivers for overlay background loads (mesh/usage open instantly; data fills in async).
+    let mut mesh_load_rx: Option<tokio::sync::oneshot::Receiver<Option<forge_tui::MeshOverlay>>> =
+        None;
+    let mut usage_load_rx: Option<tokio::sync::oneshot::Receiver<bridge_stats::BridgeStats>> = None;
     // Only redraw when state actually changed: idle frames cost nothing and the whole
     // conversation isn't rebuilt 16×/sec for no reason.
     let mut dirty = true;
@@ -3289,6 +3361,12 @@ async fn run_chat_tui(
                                     &mut busy,
                                     &mut busy_since,
                                 ));
+                            }
+                            DispatchOutcome::PendingMesh(rx) => {
+                                mesh_load_rx = Some(rx);
+                            }
+                            DispatchOutcome::PendingUsage(rx) => {
+                                usage_load_rx = Some(rx);
                             }
                         }
                     }
@@ -3678,6 +3756,12 @@ async fn run_chat_tui(
                                         &mut busy_since,
                                     ));
                                 }
+                                DispatchOutcome::PendingMesh(rx) => {
+                                    mesh_load_rx = Some(rx);
+                                }
+                                DispatchOutcome::PendingUsage(rx) => {
+                                    usage_load_rx = Some(rx);
+                                }
                             }
                         } else {
                             let hooks = session.lock().await.hooks().to_vec();
@@ -3888,6 +3972,55 @@ async fn run_chat_tui(
             }
         }
 
+        // Poll mesh background load (opened with loading=true; result populates when ready).
+        if let Some(rx) = &mut mesh_load_rx {
+            match rx.try_recv() {
+                Ok(Some(overlay)) => {
+                    let tick = app.mesh_overlay.anim_tick;
+                    app.mesh_overlay = overlay;
+                    app.mesh_overlay.anim_tick = tick;
+                    mesh_load_rx = None;
+                    dirty = true;
+                }
+                Ok(None) => {
+                    app.mesh_overlay.open = false;
+                    mesh_load_rx = None;
+                    tui.print_text(
+                        "mesh: auto-discovery routing is off (no model catalog) — nothing to inspect",
+                    );
+                    dirty = true;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    app.mesh_overlay.open = false;
+                    mesh_load_rx = None;
+                    dirty = true;
+                }
+            }
+        }
+        // Poll usage background load (bridge stats; session data was already populated on open).
+        if let Some(rx) = &mut usage_load_rx {
+            match rx.try_recv() {
+                Ok(bstats) => {
+                    let fracs = session.lock().await.bridge_fractions();
+                    app.usage_overlay.claude_5h_in = bstats.claude_5h_in;
+                    app.usage_overlay.claude_5h_out = bstats.claude_5h_out;
+                    app.usage_overlay.claude_weekly_in = bstats.claude_weekly_in;
+                    app.usage_overlay.claude_weekly_out = bstats.claude_weekly_out;
+                    fill_subscription_pcts(&mut app.usage_overlay, &fracs, &bstats);
+                    app.usage_overlay.loading = false;
+                    usage_load_rx = None;
+                    dirty = true;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    app.usage_overlay.loading = false;
+                    usage_load_rx = None;
+                    dirty = true;
+                }
+            }
+        }
+
         // Push any finalized lines into native scrollback (above the pinned live region).
         let flushed = app.drain_flush();
         if !flushed.is_empty() {
@@ -4041,6 +4174,79 @@ enum DispatchOutcome {
     RunCompact,
     /// `/loop <task>` — run the task, then re-run each turn until the model signals completion.
     StartLoop { prompt: String },
+    /// `/mesh` — overlay opened immediately; receiver delivers the computed `MeshOverlay` (None =
+    /// no catalog).
+    PendingMesh(tokio::sync::oneshot::Receiver<Option<forge_tui::MeshOverlay>>),
+    /// `/usage` — overlay opened immediately; receiver delivers `BridgeStats` when ready.
+    PendingUsage(tokio::sync::oneshot::Receiver<bridge_stats::BridgeStats>),
+}
+
+/// Build a fully-populated [`forge_tui::MeshOverlay`] from a routing explanation.
+/// Extracted so both the sync path and the background-task path can share the logic.
+fn build_mesh_overlay(e: forge_mesh::RoutingExplanation, prompt: &str) -> forge_tui::MeshOverlay {
+    let conserve_line = if !e.conserve.enabled {
+        "off".to_string()
+    } else if !e.conserve.eligible {
+        "no frontier alternative → not applied".to_string()
+    } else if e.conserve.fired {
+        format!(
+            "FIRED (roll {:.2} < P {:.2}) → spread to free frontier",
+            e.conserve.roll, e.conserve.probability
+        )
+    } else {
+        format!(
+            "not fired (roll {:.2} ≥ P {:.2}) → subscription kept",
+            e.conserve.roll, e.conserve.probability
+        )
+    };
+    forge_tui::MeshOverlay {
+        open: true,
+        loading: false,
+        prompt: prompt.to_string(),
+        classified: e.classified_tier.as_str().to_string(),
+        classifier: e.classifier_label.clone(),
+        routed: e.routed_tier.as_str().to_string(),
+        code_heavy: e.code_heavy,
+        reasons: e.classify_reasons.join(", "),
+        conserve_fired: e.conserve.fired,
+        conserve_line,
+        quota: e
+            .quota
+            .iter()
+            .map(|q| forge_tui::MeshQuotaRow {
+                provider: q.provider.clone(),
+                fraction: q.fraction,
+                plan: q.plan.clone(),
+                status: format!("{:?}", q.status),
+                spread_complex: q.spread_probability,
+            })
+            .collect(),
+        candidates: e
+            .candidates
+            .iter()
+            .take(12)
+            .map(|c| forge_tui::MeshCandRow {
+                rank: c.rank,
+                model: c.row.model.clone(),
+                score: c.row.final_score,
+                cost_tag: match c.row.cost_class {
+                    0 => "free",
+                    1 => "subscription",
+                    _ => "paid",
+                }
+                .to_string(),
+                frontier: c.row.frontier,
+                usable: c.usable,
+                selected: c.selected,
+                penalty: c.row.conserve_penalty,
+            })
+            .collect(),
+        pick: e.pick.clone(),
+        fallbacks: e.fallbacks.clone(),
+        rationale: e.rationale.clone(),
+        anim_tick: 0,
+        scroll: 0,
+    }
 }
 
 /// Execute a slash command (command-skill-system.md). Builtins are matched first; an unrecognised
@@ -4359,6 +4565,7 @@ async fn dispatch_command(
             tui.print_text(&text);
         }
         CommandAction::Usage => {
+            // Open immediately with fast session data; bridge stats load in background.
             let (
                 (
                     month_usd,
@@ -4366,30 +4573,25 @@ async fn dispatch_command(
                     by_model,
                     by_model_week,
                     (daily_cap, monthly_cap, weekly_cap),
-                    bridge_fracs,
+                    _,
                 ),
                 (session_in, session_out, session_usd),
-                bstats,
             ) = {
-                let (db_data, session_data) = {
-                    let s = session.lock().await;
+                let s = session.lock().await;
+                (
                     (
-                        (
-                            s.spend_this_month_usd(),
-                            s.spend_by_model_5h(),
-                            s.spend_by_model_today(),
-                            s.spend_by_model_week(),
-                            s.budget_caps(),
-                            s.bridge_fractions(),
-                        ),
-                        s.session_usage_db(),
-                    )
-                };
-                let bstats = tokio::task::spawn_blocking(bridge_stats::fetch)
-                    .await
-                    .unwrap_or_default();
-                (db_data, session_data, bstats)
+                        s.spend_this_month_usd(),
+                        s.spend_by_model_5h(),
+                        s.spend_by_model_today(),
+                        s.spend_by_model_week(),
+                        s.budget_caps(),
+                        s.bridge_fractions(),
+                    ),
+                    s.session_usage_db(),
+                )
             };
+            app.usage_overlay.open = true;
+            app.usage_overlay.loading = true;
             app.usage_overlay.month_usd = month_usd;
             app.usage_overlay.session_usd = session_usd;
             app.usage_overlay.session_in = session_in;
@@ -4400,111 +4602,55 @@ async fn dispatch_command(
             app.usage_overlay.daily_cap = daily_cap;
             app.usage_overlay.weekly_cap = weekly_cap;
             app.usage_overlay.monthly_cap = monthly_cap;
-            app.usage_overlay.claude_5h_in = bstats.claude_5h_in;
-            app.usage_overlay.claude_5h_out = bstats.claude_5h_out;
-            app.usage_overlay.claude_weekly_in = bstats.claude_weekly_in;
-            app.usage_overlay.claude_weekly_out = bstats.claude_weekly_out;
-            fill_subscription_pcts(&mut app.usage_overlay, &bridge_fracs, &bstats);
-            app.usage_overlay.open = true;
-            // The store is kept fresh by the startup probe + live turns, so the overlay opens with
-            // current data (no stale flash). If it's been >5 min, refresh in the background; the
-            // overlay's ~3s auto-refresh then picks up the new value from the store.
+            // Bridge stats (subscription %s) fill in via the PendingUsage receiver.
+            let (tx, rx) = tokio::sync::oneshot::channel::<bridge_stats::BridgeStats>();
+            tokio::spawn(async move {
+                let bstats = tokio::task::spawn_blocking(bridge_stats::fetch)
+                    .await
+                    .unwrap_or_default();
+                let _ = tx.send(bstats);
+            });
+            // Claude quota refresh is fire-and-forget; tick-based auto-refresh picks it up.
             if claude_quota_is_stale(session, 300).await {
                 let s = session.clone();
                 tokio::spawn(async move { refresh_claude_quota(&s).await });
             }
+            return Ok(DispatchOutcome::PendingUsage(rx));
         }
         CommandAction::Mesh(arg) => {
             let prompt = arg.unwrap_or_default();
-            // Bare `/mesh` → a representative complex task for the overview; else the given prompt.
             let to_explain = if prompt.trim().is_empty() {
                 "design and prove correct a concurrent lock-free algorithm".to_string()
             } else {
                 prompt.clone()
             };
-            // The inspector is a one-shot snapshot, so it must be fresh AT open: refresh codex from
-            // its rollout and — if the stored claude quota is stale (>5 min) — probe claude's live
-            // limits synchronously before explaining. Usually fresh (startup probe), so it no-ops.
-            let bstats = tokio::task::spawn_blocking(bridge_stats::fetch)
-                .await
-                .unwrap_or_default();
-            if claude_quota_is_stale(session, 300).await {
-                refresh_claude_quota(session).await;
-            }
-            let exp = {
-                let s = session.lock().await;
-                s.seed_subscription_quota("codex-cli", "five_hour", bstats.codex_5h_pct);
-                s.seed_subscription_quota("codex-cli", "weekly", bstats.codex_weekly_pct);
-                s.explain_routing(&to_explain)
+            // Open immediately with loading spinner; bridge stats + routing compute in background.
+            app.mesh_overlay = forge_tui::MeshOverlay {
+                open: true,
+                loading: true,
+                prompt: prompt.trim().to_string(),
+                ..Default::default()
             };
-            match exp {
-                Some(e) => {
-                    let conserve_line = if !e.conserve.enabled {
-                        "off".to_string()
-                    } else if !e.conserve.eligible {
-                        "no frontier alternative → not applied".to_string()
-                    } else if e.conserve.fired {
-                        format!(
-                            "FIRED (roll {:.2} < P {:.2}) → spread to free frontier",
-                            e.conserve.roll, e.conserve.probability
-                        )
-                    } else {
-                        format!(
-                            "not fired (roll {:.2} ≥ P {:.2}) → subscription kept",
-                            e.conserve.roll, e.conserve.probability
-                        )
-                    };
-                    app.mesh_overlay = forge_tui::MeshOverlay {
-                        open: true,
-                        prompt: prompt.trim().to_string(),
-                        classified: e.classified_tier.as_str().to_string(),
-                        routed: e.routed_tier.as_str().to_string(),
-                        code_heavy: e.code_heavy,
-                        reasons: e.classify_reasons.join(", "),
-                        conserve_fired: e.conserve.fired,
-                        conserve_line,
-                        quota: e
-                            .quota
-                            .iter()
-                            .map(|q| forge_tui::MeshQuotaRow {
-                                provider: q.provider.clone(),
-                                fraction: q.fraction,
-                                plan: q.plan.clone(),
-                                status: format!("{:?}", q.status),
-                                spread_complex: q.spread_probability,
-                            })
-                            .collect(),
-                        candidates: e
-                            .candidates
-                            .iter()
-                            .take(12)
-                            .map(|c| forge_tui::MeshCandRow {
-                                rank: c.rank,
-                                model: c.row.model.clone(),
-                                score: c.row.final_score,
-                                cost_tag: match c.row.cost_class {
-                                    0 => "free",
-                                    1 => "subscription",
-                                    _ => "paid",
-                                }
-                                .to_string(),
-                                frontier: c.row.frontier,
-                                usable: c.usable,
-                                selected: c.selected,
-                                penalty: c.row.conserve_penalty,
-                            })
-                            .collect(),
-                        pick: e.pick.clone(),
-                        fallbacks: e.fallbacks.clone(),
-                        rationale: e.rationale.clone(),
-                        anim_tick: 0,
-                        scroll: 0,
-                    };
+            let (tx, rx) = tokio::sync::oneshot::channel::<Option<forge_tui::MeshOverlay>>();
+            let session_c = session.clone();
+            let prompt_str = prompt.trim().to_string();
+            tokio::spawn(async move {
+                let bstats = tokio::task::spawn_blocking(bridge_stats::fetch)
+                    .await
+                    .unwrap_or_default();
+                if claude_quota_is_stale(&session_c, 300).await {
+                    let sc = session_c.clone();
+                    tokio::spawn(async move { refresh_claude_quota(&sc).await });
                 }
-                None => tui.print_text(
-                    "mesh: auto-discovery routing is off (no model catalog) — nothing to inspect",
-                ),
-            }
+                let exp = {
+                    let s = session_c.lock().await;
+                    s.seed_subscription_quota("codex-cli", "five_hour", bstats.codex_5h_pct);
+                    s.seed_subscription_quota("codex-cli", "weekly", bstats.codex_weekly_pct);
+                    s.explain_routing(&to_explain)
+                };
+                let _ = tx.send(exp.map(|e| build_mesh_overlay(e, &prompt_str)));
+            });
+            return Ok(DispatchOutcome::PendingMesh(rx));
         }
         // Not a builtin → try the file-based command/skill catalog.
         CommandAction::Unknown(_) => {

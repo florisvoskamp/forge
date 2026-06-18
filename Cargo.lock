@@ -1320,6 +1320,7 @@ dependencies = [
  "forge-tools",
  "forge-tui",
  "forge-types",
+ "futures",
  "portable-pty",
  "reqwest",
  "rmcp",

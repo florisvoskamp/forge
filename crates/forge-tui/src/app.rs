@@ -65,6 +65,8 @@ pub struct RoutingView {
 #[derive(Debug, Default, Clone)]
 pub struct UsageOverlay {
     pub open: bool,
+    /// True while bridge stats are still loading in the background (subscription %s absent).
+    pub loading: bool,
     /// Per-model rows for the last 5 hours: (model, cost_usd, input_tokens, output_tokens).
     pub by_model_5h: Vec<(String, f64, u64, u64)>,
     /// Per-model rows for today: (model, cost_usd, input_tokens, output_tokens).
@@ -148,9 +150,13 @@ pub struct MeshCandRow {
 #[derive(Debug, Default, Clone)]
 pub struct MeshOverlay {
     pub open: bool,
+    /// True while bridge stats + routing explanation are loading in the background.
+    pub loading: bool,
     /// The explained prompt ("" = overview mode).
     pub prompt: String,
     pub classified: String,
+    /// Human-readable classifier label: "heuristic" / "llm (model)" / "hybrid — …".
+    pub classifier: String,
     pub routed: String,
     pub code_heavy: bool,
     pub reasons: String,
@@ -1533,7 +1539,11 @@ pub fn render_usage_overlay(f: &mut Frame, app: &App) {
     f.render_widget(ratatui::widgets::Clear, popup);
 
     let spinner = SPINNER[(app.usage_overlay.anim_tick as usize) % SPINNER.len()];
-    let title = format!(" {spinner} Usage ");
+    let title = if app.usage_overlay.loading {
+        format!(" {spinner} Usage  loading… ")
+    } else {
+        format!(" {spinner} Usage ")
+    };
     let block = Block::bordered()
         .title(title)
         .border_style(Style::default().fg(TOOLCYAN));
@@ -1756,6 +1766,17 @@ pub fn render_mesh_overlay(f: &mut Frame, app: &App) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
+    // Show loading spinner while bridge stats + routing explanation are fetched in background.
+    if o.loading {
+        let spinner = SPINNER[(o.anim_tick as usize) % SPINNER.len()];
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(format!(" {spinner} analyzing routing…"))
+                .style(Style::default().fg(DIM)),
+            inner,
+        );
+        return;
+    }
+
     let ease = ((o.anim_tick as f32) / 6.0).min(1.0);
 
     // --- header + quota gauges + conservation verdict ---
@@ -1782,6 +1803,12 @@ pub fn render_mesh_overlay(f: &mut Frame, app: &App) {
             tier,
             Style::default().fg(Color::Cyan),
         )));
+        if !o.classifier.is_empty() {
+            top.push(Line::from(vec![
+                Span::styled("cls   ", Style::default().fg(DIM)),
+                Span::styled(o.classifier.clone(), Style::default().fg(DIM)),
+            ]));
+        }
     }
     top.push(Line::from(""));
     for q in &o.quota {
@@ -2635,8 +2662,10 @@ mod tests {
     fn mesh_overlay_renders_without_panic() {
         let mesh_overlay = MeshOverlay {
             open: true,
+            loading: false,
             prompt: "design a lock-free queue".into(),
             classified: "complex".into(),
+            classifier: "heuristic".into(),
             routed: "complex".into(),
             code_heavy: false,
             reasons: "reasoning term".into(),

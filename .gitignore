@@ -24,3 +24,6 @@ Thumbs.db
 # Diagrams: keep .puml sources, ignore local renders unless committed deliberately
 docs/architecture/**/*.tmp.png
 graphify-out/
+
+# Stray nested forge runtime dirs (root /.forge already ignored above)
+**/.forge/

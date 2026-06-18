@@ -542,6 +542,13 @@ pub struct MeshConfig {
     /// disabled model never enters the catalog, so the mesh won't route to or fail over onto it.
     #[serde(default)]
     pub disabled: Vec<String>,
+    /// Cap on the output tokens requested per completion. Providers otherwise default to a
+    /// model's full max (often 65k), which a free / low-credit account can't afford — OpenRouter
+    /// then returns HTTP 402 ("requested 65536 tokens, can only afford 669") and the model looks
+    /// "down". Capping keeps free-tier models usable and bounds runaway generations. `0` = no cap
+    /// (use the provider default).
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
 }
 
 /// Whether `model_id` is excluded by a `[mesh] disabled` list — exact id match or a bare provider
@@ -555,6 +562,12 @@ pub fn is_model_disabled(model_id: &str, disabled: &[String]) -> bool {
 
 fn default_auto_discover() -> bool {
     true
+}
+
+/// Default per-completion output cap. 8192 is comfortably above any single agent step's real
+/// output yet small enough that a free / low-credit account can afford it (avoids the 402 churn).
+fn default_max_output_tokens() -> u32 {
+    8192
 }
 
 fn default_subscription_conserve() -> bool {
@@ -668,9 +681,14 @@ pub enum ClassifierKind {
     /// Deterministic weighted-signal heuristic — zero added cost/latency (default).
     #[default]
     Heuristic,
-    /// Opt-in: ask a cheap model to label the tier (one extra call per turn), falling back
-    /// to the heuristic on any error. Off by default (A-2).
+    /// Ask a cheap model to label the tier on every turn, falling back to the heuristic on
+    /// any error. One extra round-trip per turn regardless of how obvious the task is.
     Llm,
+    /// Best of both: run the heuristic first; only call the LLM when the heuristic score is
+    /// near a tier boundary (score −3…7, i.e. the uncertain middle). Clear Trivial or
+    /// strongly-signalled Complex tasks skip the LLM entirely — zero added latency for them.
+    /// Recommended when a fast $0 model (subscription bridge or local ollama) is available.
+    Hybrid,
 }
 
 /// What Forge does once a budget cap is reached (FR-5).
@@ -752,6 +770,7 @@ impl Default for Config {
                 bridge_models: HashMap::new(),
                 subscriptions: HashMap::new(),
                 disabled: Vec::new(),
+                max_output_tokens: default_max_output_tokens(),
             },
             permissions: PermissionsConfig::default(),
             mcp: McpConfig::default(),

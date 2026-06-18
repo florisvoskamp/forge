@@ -49,6 +49,13 @@ pub enum ProviderError {
     /// the sense that *another provider* may work; the bad one is benched.
     #[error("provider auth failed: {0}")]
     Auth(String),
+    /// A PERMANENT, model-specific incapability: this model can't serve Forge's (tool-using)
+    /// turns at all — it rejects function calling, has no tool-supporting endpoint, mangles tool
+    /// params, or the account can't afford it (HTTP 402 / "requires more credits"). Failing over
+    /// to *another* model is correct, but retrying THIS one will fail identically every time, so
+    /// the mesh excludes it (a long bench window) rather than benching it on a short cooldown.
+    #[error("model unsupported: {0}")]
+    Capability(String),
 }
 
 impl ProviderError {
@@ -58,8 +65,15 @@ impl ProviderError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::RateLimited { .. } | Self::Unavailable(_) | Self::Auth(_)
+            Self::RateLimited { .. } | Self::Unavailable(_) | Self::Auth(_) | Self::Capability(_)
         )
+    }
+
+    /// Whether this failure is PERMANENT for the model: it will recur on every call, so the model
+    /// should be *excluded* (a long bench window + periodic re-probe), not benched on the short
+    /// transient cooldown. True only for [`Capability`](Self::Capability).
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, Self::Capability(_))
     }
 
     /// How long to bench the model: the server-provided `retry_after` when present,
@@ -81,6 +95,7 @@ impl ProviderError {
             Self::Unavailable(_) => "unavailable",
             Self::Auth(_) => "auth failed",
             Self::Request(_) => "request error",
+            Self::Capability(_) => "unsupported (no tool calling / unaffordable)",
         }
     }
 }
@@ -192,6 +207,13 @@ impl DispatchProvider {
             codex_cli: CliProvider::codex().with_harness(harness),
             notice: std::sync::Once::new(),
         }
+    }
+
+    /// Cap output tokens on the genai (API-provider) path. `0` disables the cap. The CLI bridges
+    /// manage their own output, so this only affects the genai backend.
+    pub fn with_max_output_tokens(mut self, cap: u32) -> Self {
+        self.genai = self.genai.with_max_output_tokens(cap);
+        self
     }
 
     fn cli_notice(&self) {
