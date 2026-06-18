@@ -130,6 +130,11 @@ pub struct ToolCall {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Of `input_tokens`, how many were served from the provider's prompt cache (billed at a
+    /// fraction of the input rate). 0 when caching is unused/unsupported. Subset of `input_tokens`,
+    /// not additive. Used so cost reflects the cache-read discount the provider actually bills.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
     pub cost_usd: f64,
 }
 
@@ -848,6 +853,7 @@ mod tests {
         let u = Usage {
             input_tokens: 10,
             output_tokens: 5,
+            cached_input_tokens: 0,
             cost_usd: 0.01,
         };
         assert_eq!(u.total_tokens(), 15);

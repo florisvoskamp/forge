@@ -467,9 +467,19 @@ impl Provider for GenAiProvider {
                 }
                 ChatStreamEvent::End(end) => {
                     if let Some(u) = &end.captured_usage {
+                        // Cache-read tokens (subset of prompt_tokens) are billed at a fraction of
+                        // the input rate; capture them so the mesh prices them correctly instead of
+                        // charging the full rate (which diverges from the provider's actual bill).
+                        let cached = u
+                            .prompt_tokens_details
+                            .as_ref()
+                            .and_then(|d| d.cached_tokens)
+                            .unwrap_or(0)
+                            .max(0) as u64;
                         usage = Usage {
                             input_tokens: u.prompt_tokens.unwrap_or(0).max(0) as u64,
                             output_tokens: u.completion_tokens.unwrap_or(0).max(0) as u64,
+                            cached_input_tokens: cached,
                             cost_usd: 0.0, // priced by the mesh from token counts (FR-5)
                         };
                     }

@@ -293,6 +293,9 @@ pub struct App {
     /// lives in `input`, the backing content here. On submit, `resolve_paste_blocks()` substitutes
     /// text back inline and pulls images out as vision input.
     paste_blocks: Vec<PasteBlock>,
+    /// Images resolved from the last submitted prompt, stashed so the user-turn echo can show a
+    /// marker line per image (the placeholder was stripped from the text). Cleared by `submit_user`.
+    last_submit_images: Vec<forge_types::ImageAttachment>,
 }
 
 /// How many recent scrollback lines the remote snapshot keeps (a phone screen shows ~6–8).
@@ -1053,14 +1056,26 @@ impl App {
                 }
             }
         }
+        // Stash a copy so the user-turn echo (submit_user) can show a marker per image, since the
+        // placeholders were just stripped from the text.
+        self.last_submit_images = images.clone();
         (result, images)
     }
 
-    /// Echo a just-submitted user message into scrollback.
+    /// Echo a just-submitted user message into scrollback. Any images attached to this prompt
+    /// (stashed by `resolve_paste_blocks`) are shown as a marker line each, so the conversation
+    /// history reflects that an image was sent (terminals can't render the pixels inline here).
     pub fn submit_user(&mut self, line: &str) {
         self.flush.push(header_line("you", USER));
         for l in line.lines() {
             self.flush.push(body_line(l));
+        }
+        for img in std::mem::take(&mut self.last_submit_images) {
+            let kb = (img.data_base64.len() * 3 / 4).div_ceil(1024);
+            self.flush.push(body_line(&format!(
+                "🖼 image attached ({}, ~{kb} KB)",
+                img.media_type
+            )));
         }
         self.flush.push(TextLine::default());
     }
@@ -2721,6 +2736,32 @@ mod tests {
         let (again, imgs2) = app.resolve_paste_blocks("nothing".to_string());
         assert_eq!(again, "nothing");
         assert!(imgs2.is_empty());
+    }
+
+    #[test]
+    fn submitted_image_shows_a_marker_in_history() {
+        let mut app = App::default();
+        app.attach_image(
+            forge_types::ImageAttachment {
+                media_type: "image/png".to_string(),
+                data_base64: "Zm9vYmFy".to_string(),
+            },
+            "PNG 4x4",
+        );
+        let raw = std::mem::take(&mut app.input);
+        let (_text, images) = app.resolve_paste_blocks(raw);
+        assert_eq!(images.len(), 1);
+        app.submit_user("look at this");
+        let echoed = flush_text(&mut app);
+        assert!(echoed.contains("look at this"));
+        assert!(
+            echoed.contains("🖼 image attached"),
+            "history should mark the attached image, got: {echoed}"
+        );
+        // Marker is one-shot: a later plain turn doesn't repeat it.
+        app.submit_user("next");
+        let again = flush_text(&mut app);
+        assert!(!again.contains("🖼"));
     }
 
     #[test]

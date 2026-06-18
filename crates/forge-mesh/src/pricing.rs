@@ -3,11 +3,14 @@
 
 use std::collections::HashMap;
 
-/// USD price per 1,000 tokens for a model's input and output.
+/// USD price per 1,000 tokens for a model's input and output. `cache_read_per_1k` is the discounted
+/// rate for prompt tokens served from the provider's cache; `None` means we have no cache rate, so
+/// cached tokens fall back to the full input rate (no discount assumed).
 #[derive(Debug, Clone, Copy)]
 pub struct ModelRate {
     pub input_per_1k: f64,
     pub output_per_1k: f64,
+    pub cache_read_per_1k: Option<f64>,
 }
 
 impl From<forge_config::PriceOverride> for ModelRate {
@@ -15,6 +18,7 @@ impl From<forge_config::PriceOverride> for ModelRate {
         ModelRate {
             input_per_1k: o.input_per_1k,
             output_per_1k: o.output_per_1k,
+            cache_read_per_1k: None,
         }
     }
 }
@@ -51,6 +55,7 @@ impl Default for Pricing {
                     ModelRate {
                         input_per_1k,
                         output_per_1k,
+                        cache_read_per_1k: None,
                     },
                 )
             })
@@ -88,16 +93,17 @@ impl Pricing {
     /// defaults, so without the fetched layer their cost is $0 and the budget cap can't see it.
     pub fn from_config_with_fetched(
         config: &forge_config::Config,
-        fetched: impl IntoIterator<Item = (String, f64, f64)>,
+        fetched: impl IntoIterator<Item = (String, f64, f64, Option<f64>)>,
     ) -> Self {
         let fetched_rates = fetched
             .into_iter()
-            .map(|(id, input_per_1k, output_per_1k)| {
+            .map(|(id, input_per_1k, output_per_1k, cache_read_per_1k)| {
                 (
                     id,
                     ModelRate {
                         input_per_1k,
                         output_per_1k,
+                        cache_read_per_1k,
                     },
                 )
             })
@@ -113,7 +119,9 @@ impl Pricing {
             .with_overrides(config_overrides)
     }
 
-    /// Compute the USD cost of a call given token counts. Unknown models cost nothing.
+    /// Compute the USD cost of a call given token counts. Unknown models cost nothing. Charges all
+    /// input at the full rate — use [`cost_for_usage`](Self::cost_for_usage) when cache-read counts
+    /// are known so cached tokens get their discounted rate.
     pub fn cost_for(&self, model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
         match self.rates.get(model) {
             Some(rate) => {
@@ -122,6 +130,22 @@ impl Pricing {
             }
             None => 0.0,
         }
+    }
+
+    /// Compute the USD cost of a call from its [`Usage`], pricing cache-read tokens at the model's
+    /// discounted cache rate (the provider bills them well below the full input rate). Fresh input
+    /// = `input_tokens - cached_input_tokens`. With no cache rate or no cached tokens this equals
+    /// [`cost_for`](Self::cost_for). Unknown models cost nothing.
+    pub fn cost_for_usage(&self, model: &str, usage: &forge_types::Usage) -> f64 {
+        let Some(rate) = self.rates.get(model) else {
+            return 0.0;
+        };
+        let cached = usage.cached_input_tokens.min(usage.input_tokens);
+        let fresh = usage.input_tokens - cached;
+        let cache_rate = rate.cache_read_per_1k.unwrap_or(rate.input_per_1k);
+        (fresh as f64 / 1000.0) * rate.input_per_1k
+            + (cached as f64 / 1000.0) * cache_rate
+            + (usage.output_tokens as f64 / 1000.0) * rate.output_per_1k
     }
 
     /// A *relative* cost comparator for routing: the price of a nominal turn (1000 in / 500
@@ -210,6 +234,7 @@ mod tests {
             ModelRate {
                 input_per_1k: 0.00015,
                 output_per_1k: 0.0006,
+                cache_read_per_1k: None,
             },
         );
         let pricing = Pricing { rates };
@@ -289,15 +314,46 @@ mod tests {
         );
         let fetched = vec![
             // Same model the user overrode — config must win.
-            ("openrouter::vendor/a".to_string(), 1.0, 1.0),
+            ("openrouter::vendor/a".to_string(), 1.0, 1.0, None),
             // A model with no bundled default and no config — fetched gives it a real price.
-            ("openrouter::vendor/b".to_string(), 0.5, 2.0),
+            ("openrouter::vendor/b".to_string(), 0.5, 2.0, Some(0.05)),
         ];
         let pricing = Pricing::from_config_with_fetched(&config, fetched);
         // vendor/a: config (9.0/9.0) wins over fetched (1.0/1.0).
         assert!((pricing.cost_for("openrouter::vendor/a", 1000, 1000) - 18.0).abs() < 1e-9);
         // vendor/b: previously $0 (unpriced), now tracked from the fetched rate.
         assert!((pricing.cost_for("openrouter::vendor/b", 1000, 1000) - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_for_usage_prices_cached_tokens_at_the_discounted_rate() {
+        let fetched = vec![("openrouter::m".to_string(), 1.0, 2.0, Some(0.1))];
+        let pricing = Pricing::from_config_with_fetched(&forge_config::Config::default(), fetched);
+        // 1000 input of which 800 cached, 500 output.
+        // fresh 200 @ 1.0/1k = 0.2; cached 800 @ 0.1/1k = 0.08; output 500 @ 2.0/1k = 1.0 → 1.28.
+        let usage = forge_types::Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_input_tokens: 800,
+            cost_usd: 0.0,
+        };
+        assert!((pricing.cost_for_usage("openrouter::m", &usage) - 1.28).abs() < 1e-9);
+        // Without a cache rate, cached tokens fall back to the full input rate (= cost_for).
+        let fetched2 = vec![("openrouter::n".to_string(), 1.0, 2.0, None)];
+        let pricing2 =
+            Pricing::from_config_with_fetched(&forge_config::Config::default(), fetched2);
+        let u2 = forge_types::Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_input_tokens: 800,
+            cost_usd: 0.0,
+        };
+        assert!(
+            (pricing2.cost_for_usage("openrouter::n", &u2)
+                - pricing2.cost_for("openrouter::n", 1000, 500))
+            .abs()
+                < 1e-9
+        );
     }
 
     #[test]

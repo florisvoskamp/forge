@@ -40,6 +40,7 @@ impl Provider for MockProvider {
                 usage: Usage {
                     input_tokens: 42,
                     output_tokens: 18,
+                    cached_input_tokens: 0,
                     cost_usd: 0.0,
                 },
                 quotas: Vec::new(),
@@ -57,6 +58,7 @@ impl Provider for MockProvider {
                 usage: Usage {
                     input_tokens: 30,
                     output_tokens: 12,
+                    cached_input_tokens: 0,
                     cost_usd: 0.0,
                 },
                 quotas: Vec::new(),

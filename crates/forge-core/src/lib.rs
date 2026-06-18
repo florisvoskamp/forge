@@ -1672,12 +1672,9 @@ impl Session {
                 }
             };
 
-            // Compute the real cost from token counts and the model's price (FR-5, A-7).
-            resp.usage.cost_usd = self.pricing.cost_for(
-                &active_model,
-                resp.usage.input_tokens,
-                resp.usage.output_tokens,
-            );
+            // Compute the real cost from token counts and the model's price (FR-5, A-7), pricing
+            // cache-read tokens at the discounted rate so it tracks the provider's actual bill.
+            resp.usage.cost_usd = self.pricing.cost_for_usage(&active_model, &resp.usage);
             // The last call's input size is the live context fill (tui-token-counter.md).
             context_tokens = resp.usage.input_tokens;
 
@@ -4011,6 +4008,7 @@ mod tests {
             let usage = Usage {
                 input_tokens: 30,
                 output_tokens: 12,
+                cached_input_tokens: 0,
                 cost_usd: 0.0,
             };
             if is_subagent {
@@ -4203,6 +4201,7 @@ mod tests {
             let usage = Usage {
                 input_tokens: 5,
                 output_tokens: 2,
+                cached_input_tokens: 0,
                 cost_usd: 0.0,
             };
             if used_tool {

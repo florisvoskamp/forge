@@ -517,6 +517,7 @@ mod tests {
             let usage = Usage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cached_input_tokens: 0,
                 cost_usd: 0.0,
             };
             // Critic call: emit findings keyed by which lens (carried in the system prompt).

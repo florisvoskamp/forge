@@ -587,6 +587,8 @@ fn usage_from(v: &Value) -> Usage {
     Usage {
         input_tokens: n("input_tokens"),
         output_tokens: n("output_tokens"),
+        // Subscription bridge reports cache reads; carried for parity (cost stays $0 below).
+        cached_input_tokens: n("cache_read_input_tokens"),
         // Subscription-billed via the user's own CLI — $0 against Forge's USD budget (FR-5).
         cost_usd: 0.0,
     }
@@ -1510,6 +1512,7 @@ mod tests {
         assert!(items.contains(&Parsed::Usage(Usage {
             input_tokens: 16612,
             output_tokens: 4,
+            cached_input_tokens: 0,
             cost_usd: 0.0
         })));
         assert!(items.contains(&Parsed::Final("hello".into())));
@@ -1710,6 +1713,7 @@ mod tests {
             vec![Parsed::Usage(Usage {
                 input_tokens: 16927,
                 output_tokens: 23,
+                cached_input_tokens: 0,
                 cost_usd: 0.0
             })]
         );

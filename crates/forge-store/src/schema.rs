@@ -119,10 +119,11 @@ CREATE TABLE IF NOT EXISTS model_context (
 -- so without this their spend computes to $0 and the budget cap can't see it. A model absent here
 -- falls back to the bundled defaults, then to $0 (unpriced).
 CREATE TABLE IF NOT EXISTS model_pricing (
-    model         TEXT PRIMARY KEY,
-    input_per_1k  REAL NOT NULL,        -- USD per 1,000 input tokens
-    output_per_1k REAL NOT NULL,        -- USD per 1,000 output tokens
-    updated_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    model             TEXT PRIMARY KEY,
+    input_per_1k      REAL NOT NULL,    -- USD per 1,000 input tokens
+    output_per_1k     REAL NOT NULL,    -- USD per 1,000 output tokens
+    cache_read_per_1k REAL,             -- USD per 1,000 cached (prompt-cache read) tokens; NULL if unknown
+    updated_at        INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 
 -- Subscription quota windows (quota-aware routing, L3). One row per bridge provider per window;
