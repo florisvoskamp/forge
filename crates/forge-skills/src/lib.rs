@@ -211,14 +211,14 @@ impl Catalog {
         for dir in &sources.skills {
             cat.load_skills_dir(dir);
         }
-        // Inject built-in Forge skills last, at Builtin scope: insert_skill keeps any same-named
-        // User/Project skill (higher scope), so builtins only fill gaps — `orchestrate` is always
-        // present even with nothing imported.
-        for (name, raw) in BUILTIN_SKILLS {
-            if let Some(meta) = builtin_skill(name, raw) {
-                cat.insert_skill(meta);
-            }
-        }
+        // Inject built-in Forge commands last, at Builtin scope. Only a user/project *command*
+        // of the same name overrides a built-in (same-kind scope precedence: User/Project >
+        // Builtin). A same-named user *skill* does NOT suppress the built-in command — the
+        // command keeps priority on the bare `/orchestrate` invocation, and the skill stays
+        // reachable via `/skill orchestrate` (and visible in the listing). `/orchestrate` is
+        // intentionally a lightweight dynamic command, not a heavy built-in skill whose full
+        // methodology is injected every turn.
+        cat.insert_builtin_commands();
         cat
     }
 
@@ -342,6 +342,16 @@ impl Catalog {
         }
     }
 
+    fn insert_builtin_commands(&mut self) {
+        // Only a user/project command of the same name suppresses the built-in (same-kind scope
+        // precedence). A same-named skill must not — the built-in command keeps the bare
+        // `/orchestrate` invocation; the skill remains reachable via `/skill orchestrate`.
+        if self.commands.contains_key("orchestrate") {
+            return;
+        }
+        self.insert_command(builtin_orchestrate_command());
+    }
+
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -369,8 +379,12 @@ impl Catalog {
         self.skills.values().collect()
     }
 
-    /// All entries (commands then any skill not shadowed by a same-named command), sorted by
-    /// name — the source for `forge commands` and `/help`.
+    /// All entries — every command plus every skill, sorted by name — the source for
+    /// `forge commands` and `/help`. A command and a skill may share a name (e.g. the built-in
+    /// `orchestrate` command alongside a user `orchestrate` skill): both are listed so both stay
+    /// visible. The command wins the bare `/name` invocation (see [`Catalog::resolve`]); the
+    /// skill remains reachable via `/skill <name>`. The TUI palette dedups same-named rows, so
+    /// no duplicate appears there.
     pub fn entries(&self) -> Vec<Entry> {
         let mut out: Vec<Entry> = Vec::new();
         for cmd in self.commands.values() {
@@ -383,9 +397,6 @@ impl Catalog {
             });
         }
         for meta in self.skills.values() {
-            if self.commands.contains_key(&meta.name) {
-                continue; // command wins the bare /name; the skill is still reachable via /skill
-            }
             out.push(Entry {
                 name: meta.name.clone(),
                 description: forge_native(&meta.description),
@@ -703,28 +714,31 @@ fn parse_skill_meta(raw: &str, stem: &str, scope: Scope, dir: &Path) -> Result<S
     })
 }
 
-/// The Forge skills compiled into the binary (`Scope::Builtin`, lowest precedence). `orchestrate`
-/// ships as a first-class Forge feature so it is ALWAYS available via `use_skill`/`/orchestrate`,
-/// with zero import — a user/project skill of the same name still overrides it. See
-/// docs/features/command-skill-system.md.
-const BUILTIN_SKILLS: &[(&str, &str)] = &[(
-    "orchestrate",
-    include_str!("../builtin/orchestrate/SKILL.md"),
-)];
-
-/// Build a `Scope::Builtin` [`SkillMeta`] from an embedded `SKILL.md`, carrying its body inline.
-fn builtin_skill(name: &str, raw: &str) -> Option<SkillMeta> {
-    let (fm_text, body) = frontmatter::split(raw);
-    let fm = frontmatter::parse(fm_text.unwrap_or("")).ok()?;
-    Some(SkillMeta {
-        name: fm.scalar("name").unwrap_or_else(|| name.to_string()),
-        description: fm.scalar("description").unwrap_or_default(),
-        tier: fm.scalar("tier").and_then(|t| parse_tier(&t)),
-        resources: Vec::new(),
-        dir: PathBuf::from("<builtin>"),
+/// Build the built-in `/orchestrate` command. Keep this prompt compact: the command's job is to
+/// route dynamically from the live tool surface, not to inject a full orchestration methodology on
+/// every invocation. User/project commands or skills named `orchestrate` take precedence.
+fn builtin_orchestrate_command() -> Command {
+    Command {
+        name: "orchestrate".to_string(),
+        description: "Dynamically route a task through the best available Forge resources."
+            .to_string(),
+        args: Vec::new(),
+        tier: Some(TaskTier::Complex),
+        model: None,
+        body: concat!(
+            "Orchestrate this Forge task using the resources available in this turn.\n\n",
+            "Task: $ARGUMENTS\n\n",
+            "Decide whether the task needs a skill, subagent fan-out, MCP tool, web lookup, ",
+            "Lattice query, or direct implementation. Use the live tool descriptions as the ",
+            "authoritative resource list. If a Forge skill is the right fit, call `use_skill` ",
+            "with its exact name before applying it. Use `spawn_agents` for independent ",
+            "parallel investigation. Ask one clarifying question only when the task cannot ",
+            "be safely started without it; otherwise state a brief plan and execute."
+        )
+        .to_string(),
         scope: Scope::Builtin,
-        body: Some(body.trim().to_string()),
-    })
+        path: PathBuf::from("<builtin>/commands/orchestrate.md"),
+    }
 }
 
 fn first_line(body: &str, max: usize) -> String {
