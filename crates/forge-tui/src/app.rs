@@ -212,6 +212,8 @@ pub struct App {
     pub question_prompt: Option<String>,
     /// The current input-line buffer (shown in the input box).
     pub input: String,
+    /// Byte offset of the text cursor within `input`. Always on a char boundary.
+    pub input_cursor: usize,
     /// The current *partial* (un-flushed, newline-free) line of the streaming reply.
     pub streaming: String,
     /// Accumulated reasoning/thinking text, flushed as a dim block before the answer.
@@ -351,6 +353,12 @@ pub enum KeyKind {
     /// Arrow up/down — navigate the command palette / pickers (ignored by the input line).
     Up,
     Down,
+    Left,
+    Right,
+    Home,
+    End,
+    /// Ctrl+J — insert a newline into the input without submitting.
+    InsertNewline,
     /// TAB — complete the palette selection (ignored by the input line).
     Tab,
     /// SHIFT+TAB — cycle the operating temper (handled by the shell, not the input line).
@@ -367,26 +375,84 @@ pub enum InputOutcome {
     Quit,
 }
 
-/// Apply one keystroke to the input buffer (pure; no terminal I/O).
-pub fn handle_key(input: &mut String, key: KeyKind) -> InputOutcome {
+fn prev_char_boundary(s: &str, pos: usize) -> usize {
+    let mut p = pos;
+    loop {
+        if p == 0 {
+            return 0;
+        }
+        p -= 1;
+        if s.is_char_boundary(p) {
+            return p;
+        }
+    }
+}
+
+fn next_char_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() {
+        return s.len();
+    }
+    let mut p = pos + 1;
+    while p < s.len() && !s.is_char_boundary(p) {
+        p += 1;
+    }
+    p
+}
+
+/// Apply one keystroke to the input buffer (pure; no terminal I/O). `cursor` is the byte
+/// offset of the text cursor within `input`; updated in place, always kept on a char boundary.
+pub fn handle_key(input: &mut String, cursor: &mut usize, key: KeyKind) -> InputOutcome {
+    *cursor = (*cursor).min(input.len());
     match key {
         KeyKind::Char(c) => {
-            input.push(c);
+            input.insert(*cursor, c);
+            *cursor += c.len_utf8();
+            InputOutcome::Editing
+        }
+        KeyKind::InsertNewline => {
+            input.insert(*cursor, '\n');
+            *cursor += 1;
             InputOutcome::Editing
         }
         KeyKind::Backspace => {
-            input.pop();
+            if *cursor > 0 {
+                let prev = prev_char_boundary(input, *cursor);
+                input.remove(prev);
+                *cursor = prev;
+            }
+            InputOutcome::Editing
+        }
+        KeyKind::Left => {
+            if *cursor > 0 {
+                *cursor = prev_char_boundary(input, *cursor);
+            }
+            InputOutcome::Editing
+        }
+        KeyKind::Right => {
+            if *cursor < input.len() {
+                *cursor = next_char_boundary(input, *cursor);
+            }
+            InputOutcome::Editing
+        }
+        KeyKind::Home => {
+            let before = &input[..*cursor];
+            *cursor = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+            InputOutcome::Editing
+        }
+        KeyKind::End => {
+            let after = &input[*cursor..];
+            *cursor += after.find('\n').unwrap_or(after.len());
             InputOutcome::Editing
         }
         KeyKind::Enter => {
             if input.trim().is_empty() {
                 InputOutcome::Editing
             } else {
+                *cursor = 0;
                 InputOutcome::Submit(std::mem::take(input))
             }
         }
         KeyKind::Esc => InputOutcome::Quit,
-        // Navigation / temper keys are handled by the shell before reaching the input line.
         KeyKind::Up
         | KeyKind::Down
         | KeyKind::Tab
@@ -1570,19 +1636,41 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     // Build one ratatui Line per explicit input line so pasted newlines render as separate rows;
     // long lines are then soft-wrapped by `Wrap`. Slash-command highlighting applies to the first
     // line (where a leading `/command` lives); later lines render plain.
-    let lines: Vec<&str> = app.input.split('\n').collect();
-    let last = lines.len().saturating_sub(1);
-    let mut text_lines: Vec<TextLine> = Vec::with_capacity(lines.len().max(1));
-    for (i, line) in lines.iter().enumerate() {
+    let cursor = app.input_cursor.min(app.input.len());
+    let input_lines: Vec<&str> = app.input.split('\n').collect();
+    let mut byte_off = 0usize;
+    let mut text_lines: Vec<TextLine> = Vec::with_capacity(input_lines.len().max(1));
+    for (i, line) in input_lines.iter().enumerate() {
+        let line_end = byte_off + line.len();
+        let cursor_col = if cursor >= byte_off && cursor <= line_end {
+            Some(cursor - byte_off)
+        } else {
+            None
+        };
+        byte_off = line_end + 1; // skip the \n separator
+
         let mut spans = Vec::new();
         if i == 0 {
             spans.push(Span::styled("› ", Style::default().fg(ORANGE).bold()));
-            spans.extend(input_spans(line));
-        } else {
-            spans.push(Span::raw(line.to_string()));
         }
-        if i == last {
+        if let Some(col) = cursor_col {
+            let before = &line[..col];
+            let after = &line[col..];
+            if i == 0 {
+                spans.extend(input_spans(before));
+            } else {
+                spans.push(Span::raw(before.to_string()));
+            }
             spans.push(Span::styled("▌", Style::default().fg(ORANGE)));
+            if !after.is_empty() {
+                spans.push(Span::raw(after.to_string()));
+            }
+        } else {
+            if i == 0 {
+                spans.extend(input_spans(line));
+            } else {
+                spans.push(Span::raw(line.to_string()));
+            }
         }
         text_lines.push(TextLine::from(spans));
     }
@@ -2387,8 +2475,9 @@ mod tests {
     #[test]
     fn shift_tab_is_a_cycle_temper_key_not_an_edit() {
         let mut input = String::new();
+        let mut cur = 0usize;
         assert_eq!(
-            handle_key(&mut input, KeyKind::CycleTemper),
+            handle_key(&mut input, &mut cur, KeyKind::CycleTemper),
             InputOutcome::Editing
         );
         assert!(input.is_empty(), "temper key never edits the input line");
@@ -2697,8 +2786,10 @@ mod tests {
 
     #[test]
     fn input_bar_renders_when_present() {
+        let input = "fix the bug".to_string();
         let app = App {
-            input: "fix the bug".to_string(),
+            input_cursor: input.len(),
+            input,
             ..Default::default()
         };
         assert!(screen(&app).contains("› fix the bug"));
@@ -2724,47 +2815,94 @@ mod tests {
     #[test]
     fn typing_a_char_appends_and_keeps_editing() {
         let mut buf = String::new();
+        let mut cur = 0usize;
         assert_eq!(
-            handle_key(&mut buf, KeyKind::Char('h')),
+            handle_key(&mut buf, &mut cur, KeyKind::Char('h')),
             InputOutcome::Editing
         );
         assert_eq!(
-            handle_key(&mut buf, KeyKind::Char('i')),
+            handle_key(&mut buf, &mut cur, KeyKind::Char('i')),
             InputOutcome::Editing
         );
         assert_eq!(buf, "hi");
+        assert_eq!(cur, 2);
     }
 
     #[test]
     fn backspace_removes_last_char() {
         let mut buf = "abc".to_string();
+        let mut cur = 3usize;
         assert_eq!(
-            handle_key(&mut buf, KeyKind::Backspace),
+            handle_key(&mut buf, &mut cur, KeyKind::Backspace),
             InputOutcome::Editing
         );
         assert_eq!(buf, "ab");
+        assert_eq!(cur, 2);
     }
 
     #[test]
     fn enter_submits_and_clears_buffer() {
         let mut buf = "do it".to_string();
+        let mut cur = buf.len();
         assert_eq!(
-            handle_key(&mut buf, KeyKind::Enter),
+            handle_key(&mut buf, &mut cur, KeyKind::Enter),
             InputOutcome::Submit("do it".into())
         );
         assert_eq!(buf, "", "buffer cleared after submit");
+        assert_eq!(cur, 0);
     }
 
     #[test]
     fn enter_on_empty_buffer_keeps_editing() {
         let mut buf = "   ".to_string();
-        assert_eq!(handle_key(&mut buf, KeyKind::Enter), InputOutcome::Editing);
+        let mut cur = buf.len();
+        assert_eq!(
+            handle_key(&mut buf, &mut cur, KeyKind::Enter),
+            InputOutcome::Editing
+        );
     }
 
     #[test]
     fn esc_quits() {
         let mut buf = "whatever".to_string();
-        assert_eq!(handle_key(&mut buf, KeyKind::Esc), InputOutcome::Quit);
+        let mut cur = buf.len();
+        assert_eq!(
+            handle_key(&mut buf, &mut cur, KeyKind::Esc),
+            InputOutcome::Quit
+        );
+    }
+
+    #[test]
+    fn left_right_move_cursor() {
+        let mut buf = "abc".to_string();
+        let mut cur = 3usize;
+        handle_key(&mut buf, &mut cur, KeyKind::Left);
+        assert_eq!(cur, 2);
+        handle_key(&mut buf, &mut cur, KeyKind::Left);
+        assert_eq!(cur, 1);
+        handle_key(&mut buf, &mut cur, KeyKind::Right);
+        assert_eq!(cur, 2);
+    }
+
+    #[test]
+    fn insert_at_cursor_mid_string() {
+        let mut buf = "ac".to_string();
+        let mut cur = 1usize; // between 'a' and 'c'
+        handle_key(&mut buf, &mut cur, KeyKind::Char('b'));
+        assert_eq!(buf, "abc");
+        assert_eq!(cur, 2);
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline_without_submit() {
+        let mut buf = "hello".to_string();
+        let mut cur = buf.len();
+        assert_eq!(
+            handle_key(&mut buf, &mut cur, KeyKind::InsertNewline),
+            InputOutcome::Editing
+        );
+        assert_eq!(buf, "hello\n");
+        assert_eq!(cur, 6);
     }
 
     fn todo(title: &str, status: forge_types::TodoStatus) -> forge_types::TodoItem {

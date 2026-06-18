@@ -130,7 +130,7 @@ impl Presenter for TuiPresenter {
                         KeyCode::Enter => KeyKind::Enter,
                         _ => continue,
                     };
-                    match handle_key(&mut self.app.input, key) {
+                    match handle_key(&mut self.app.input, &mut self.app.input_cursor, key) {
                         InputOutcome::Submit(line) => {
                             if let Some(ans) = self.app.resolve_question(&line) {
                                 self.flush();
@@ -168,7 +168,7 @@ impl Presenter for TuiPresenter {
                         KeyCode::Esc => KeyKind::Esc,
                         _ => continue,
                     };
-                    match handle_key(&mut self.app.input, key) {
+                    match handle_key(&mut self.app.input, &mut self.app.input_cursor, key) {
                         InputOutcome::Editing => self.draw(),
                         InputOutcome::Submit(line) => {
                             // Echo the user's message into scrollback.

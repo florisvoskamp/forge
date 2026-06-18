@@ -193,6 +193,9 @@ impl Tui {
                     KeyCode::Char('o') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         KeyKind::ToggleSubagentDetail
                     }
+                    KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyKind::InsertNewline
+                    }
                     KeyCode::Char(c) => KeyKind::Char(c),
                     KeyCode::Backspace => KeyKind::Backspace,
                     KeyCode::Enter => KeyKind::Enter,
@@ -206,6 +209,10 @@ impl Tui {
                     }
                     KeyCode::Up => KeyKind::Up,
                     KeyCode::Down => KeyKind::Down,
+                    KeyCode::Left => KeyKind::Left,
+                    KeyCode::Right => KeyKind::Right,
+                    KeyCode::Home => KeyKind::Home,
+                    KeyCode::End => KeyKind::End,
                     KeyCode::Tab => KeyKind::Tab,
                     _ => return Ok(None),
                 };
