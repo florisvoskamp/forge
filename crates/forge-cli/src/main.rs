@@ -22,6 +22,7 @@ mod balance;
 mod benchmarks;
 mod bridge_stats;
 mod mcp_serve;
+mod remote;
 mod replay;
 
 /// Env var carrying the current subagent nesting depth across the process boundary (forge →
@@ -3219,6 +3220,10 @@ async fn run_chat_tui(
     let mut mesh_load_rx: Option<tokio::sync::oneshot::Receiver<Option<forge_tui::MeshOverlay>>> =
         None;
     let mut usage_load_rx: Option<tokio::sync::oneshot::Receiver<bridge_stats::BridgeStats>> = None;
+    // Remote control (`/remote`): when `Some`, a browser can drive the session. The handle owns
+    // the server task + the snapshot channel + the input queue; we broadcast a snapshot each
+    // dirty frame and drain inputs to inject them like local keystrokes.
+    let mut remote: Option<remote::RemoteControl> = None;
     // Only redraw when state actually changed: idle frames cost nothing and the whole
     // conversation isn't rebuilt 16×/sec for no reason.
     let mut dirty = true;
@@ -3367,6 +3372,9 @@ async fn run_chat_tui(
                             }
                             DispatchOutcome::PendingUsage(rx) => {
                                 usage_load_rx = Some(rx);
+                            }
+                            DispatchOutcome::ToggleRemote { lan } => {
+                                toggle_remote(&mut remote, &mut app, &mut tui, lan)?;
                             }
                         }
                     }
@@ -3762,6 +3770,9 @@ async fn run_chat_tui(
                                 DispatchOutcome::PendingUsage(rx) => {
                                     usage_load_rx = Some(rx);
                                 }
+                                DispatchOutcome::ToggleRemote { lan } => {
+                                    toggle_remote(&mut remote, &mut app, &mut tui, lan)?;
+                                }
                             }
                         } else {
                             let hooks = session.lock().await.hooks().to_vec();
@@ -3828,6 +3839,167 @@ async fn run_chat_tui(
                     pending_question = Some(reply);
                 }
             }
+        }
+
+        // Drain remote-control inputs (a browser sent a prompt / answer / interrupt) and inject
+        // them exactly like local keystrokes. We process the whole queue each iteration so a
+        // chatty phone can't fall behind. Each input marks `dirty` (the statusline/preview may
+        // change) and may spawn a turn / answer a prompt.
+        if let Some(rc) = remote.as_mut() {
+            while let Ok(input) = rc.input_rx.try_recv() {
+                dirty = true;
+                match input {
+                    remote::RemoteInput::Prompt { text } => {
+                        if busy {
+                            // A turn is running — don't queue a second; mirror the local guard.
+                            app.note("⚠ finish or Esc the current turn first (remote)");
+                        } else if let Some(rest) = text.strip_prefix("//") {
+                            let hooks = session.lock().await.hooks().to_vec();
+                            let escaped = format!("/{rest}");
+                            if let Ok(prompt) =
+                                forge_core::hooks::run_prompt_hooks(&hooks, &escaped).await
+                            {
+                                turn_gen += 1;
+                                turn_handle = Some(spawn_turn(
+                                    &prompt,
+                                    &session,
+                                    &done_tx,
+                                    turn_gen,
+                                    &mut app,
+                                    &mut busy,
+                                    &mut busy_since,
+                                ));
+                            }
+                        } else if text.starts_with('/') {
+                            match dispatch_command(
+                                &text,
+                                &session,
+                                &mut tui,
+                                &mut app,
+                                &catalog,
+                                &mut armed_project,
+                                trust_project,
+                                busy,
+                                &mut assay_lenses,
+                                &mut assay_scope,
+                            )
+                            .await?
+                            {
+                                DispatchOutcome::Quit => {
+                                    quit = true;
+                                    break;
+                                }
+                                DispatchOutcome::RunTurn {
+                                    prompt,
+                                    guidance,
+                                    tier,
+                                } => {
+                                    turn_gen += 1;
+                                    turn_handle = Some(spawn_turn_with(
+                                        prompt,
+                                        guidance,
+                                        tier,
+                                        &session,
+                                        &done_tx,
+                                        turn_gen,
+                                        &mut app,
+                                        &mut busy,
+                                        &mut busy_since,
+                                    ));
+                                }
+                                DispatchOutcome::RunCompact => {
+                                    turn_gen += 1;
+                                    turn_handle = Some(spawn_compact(
+                                        &session,
+                                        &done_tx,
+                                        turn_gen,
+                                        &mut app,
+                                        &mut busy,
+                                        &mut busy_since,
+                                    ));
+                                }
+                                DispatchOutcome::StartLoop { prompt } => {
+                                    turn_gen += 1;
+                                    loop_state = Some(LoopState {
+                                        gen: turn_gen,
+                                        iter: 1,
+                                    });
+                                    app.note("↻ loop started — Esc to stop");
+                                    turn_handle = Some(spawn_turn_with(
+                                        prompt,
+                                        vec![LOOP_GUIDANCE.to_string()],
+                                        None,
+                                        &session,
+                                        &done_tx,
+                                        turn_gen,
+                                        &mut app,
+                                        &mut busy,
+                                        &mut busy_since,
+                                    ));
+                                }
+                                _ => {} // handled in-loop (toggle, note, …)
+                            }
+                        } else {
+                            let hooks = session.lock().await.hooks().to_vec();
+                            if let Ok(prompt) =
+                                forge_core::hooks::run_prompt_hooks(&hooks, &text).await
+                            {
+                                turn_gen += 1;
+                                turn_handle = Some(spawn_turn(
+                                    &prompt,
+                                    &session,
+                                    &done_tx,
+                                    turn_gen,
+                                    &mut app,
+                                    &mut busy,
+                                    &mut busy_since,
+                                ));
+                            }
+                        }
+                    }
+                    remote::RemoteInput::Allow { yes } => {
+                        if let Some((tool, reply)) = pending.take() {
+                            let _ = reply.send(yes);
+                            app.prompt = None;
+                            if yes {
+                                app.note(&format!("✓ remote allowed {tool}"));
+                            } else {
+                                app.note(&format!("✗ remote denied {tool}"));
+                            }
+                        }
+                    }
+                    remote::RemoteInput::Answer { text } => {
+                        if app.awaiting_question() {
+                            if let Some(ans) = app.resolve_question(&text) {
+                                if let Some(tx) = pending_question.take() {
+                                    let _ = tx.send(ans);
+                                }
+                            } else {
+                                app.note("⚠ remote answer was invalid — re-asking");
+                            }
+                        }
+                    }
+                    remote::RemoteInput::Interrupt => {
+                        if busy {
+                            if let Some(h) = turn_handle.take() {
+                                h.abort();
+                            }
+                            turn_gen += 1;
+                            busy = false;
+                            loop_state = None;
+                            pending = None;
+                            pending_question = None;
+                            app.prompt = None;
+                            app.clear_question();
+                            app.apply(forge_tui::PresenterEvent::AssistantDone);
+                            app.note("⏹ remote interrupted — stopped responding");
+                        }
+                    }
+                }
+            }
+        }
+        if quit {
+            break;
         }
 
         // Clear busy only on the *current* turn's done-signal; a stale signal from an interrupted
@@ -4021,11 +4193,42 @@ async fn run_chat_tui(
             }
         }
 
-        // Push any finalized lines into native scrollback (above the pinned live region).
-        let flushed = app.drain_flush();
-        if !flushed.is_empty() {
-            tui.insert_lines(flushed);
-            dirty = true;
+        // Push any finalized lines into native scrollback (above the pinned live region). While
+        // remote control is on, also fold them into the transcript ring buffer so the phone's
+        // snapshot mirrors the conversation tail, then broadcast the snapshot.
+        if remote.is_some() {
+            let flushed = app.drain_flush_remote();
+            if !flushed.is_empty() {
+                tui.insert_lines(flushed);
+                dirty = true;
+            }
+            if dirty || busy {
+                let view = app.remote_snapshot();
+                let snap = remote::Snapshot {
+                    busy: view.busy,
+                    done: view.done,
+                    temper: view.temper,
+                    tier: view.tier,
+                    model: view.model,
+                    cost_usd: view.cost_usd,
+                    context_tokens: view.context_tokens,
+                    context_limit: view.context_limit,
+                    streaming: view.streaming,
+                    transcript: view.transcript,
+                    permission_prompt: view.permission_prompt,
+                    question: view.question,
+                    closed: false,
+                };
+                if let Some(rc) = remote.as_ref() {
+                    let _ = rc.snapshot_tx.send(snap);
+                }
+            }
+        } else {
+            let flushed = app.drain_flush();
+            if !flushed.is_empty() {
+                tui.insert_lines(flushed);
+                dirty = true;
+            }
         }
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
@@ -4158,6 +4361,46 @@ fn spawn_compact(
     })
 }
 
+/// Start or stop remote control in response to `/remote`. On: bind the server (LAN-reachable by
+/// default, loopback with `--local`), print the connect URL + a scan-to-connect QR code into
+/// scrollback, and light the statusline indicator. Off: drop the handle (stops the server +
+/// frees the port) and clear the indicator. Idempotent: `/remote` toggles, so running it again
+/// turns it off.
+fn toggle_remote(
+    remote: &mut Option<remote::RemoteControl>,
+    app: &mut forge_tui::App,
+    _tui: &mut forge_tui::Tui,
+    lan: bool,
+) -> Result<()> {
+    if let Some(rc) = remote.take() {
+        // Turning it off: the handle's Drop aborts the server task + sends a `closed` snapshot
+        // so any connected browser stops reconnecting.
+        app.remote_active = false;
+        app.note("◉ remote control off — browser disconnected");
+        drop(rc);
+        return Ok(());
+    }
+    match remote::start(lan) {
+        Ok(rc) => {
+            app.remote_active = true;
+            app.note(&format!(
+                "◉ remote control on — listening on {} ({})",
+                rc.url.addr,
+                if lan { "LAN" } else { "loopback" }
+            ));
+            app.note(&format!("  connect: {}", rc.url.url));
+            if let Some(qr) = remote::qr_lines(&rc.url.url) {
+                app.print_lines(qr);
+            }
+            *remote = Some(rc);
+        }
+        Err(e) => {
+            app.note(&format!("⚠ could not start remote control: {e}"));
+        }
+    }
+    Ok(())
+}
+
 /// What the render loop must do after [`dispatch_command`].
 enum DispatchOutcome {
     /// Command fully handled in-loop (palette, picker, note, …) — keep going.
@@ -4179,6 +4422,9 @@ enum DispatchOutcome {
     PendingMesh(tokio::sync::oneshot::Receiver<Option<forge_tui::MeshOverlay>>),
     /// `/usage` — overlay opened immediately; receiver delivers `BridgeStats` when ready.
     PendingUsage(tokio::sync::oneshot::Receiver<bridge_stats::BridgeStats>),
+    /// `/remote [--lan|--local]` — toggle remote control on (start the server) or off (stop it).
+    /// `lan` selects the bind address (LAN-reachable vs loopback-only).
+    ToggleRemote { lan: bool },
 }
 
 /// Build a fully-populated [`forge_tui::MeshOverlay`] from a routing explanation.
@@ -4282,6 +4528,7 @@ async fn dispatch_command(
             | CommandAction::PinModel(_)
             | CommandAction::Replay(_, _)
             | CommandAction::Usage
+            | CommandAction::Remote { .. }
     );
     if busy && mutates {
         app.note("⚠ finish or Esc the current turn first");
@@ -4652,6 +4899,10 @@ async fn dispatch_command(
             });
             return Ok(DispatchOutcome::PendingMesh(rx));
         }
+        // `/remote` toggles remote control. The render loop owns the `RemoteControl` handle (it
+        // needs the presenter channel + App state to broadcast snapshots + drain inputs), so the
+        // command just signals the desired bind mode; the loop starts/stops the server there.
+        CommandAction::Remote { lan } => return Ok(DispatchOutcome::ToggleRemote { lan }),
         // Not a builtin → try the file-based command/skill catalog.
         CommandAction::Unknown(_) => {
             return dispatch_catalog(line, catalog, session, app, armed, trust_project, busy).await
