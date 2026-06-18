@@ -520,11 +520,16 @@ fn command_wins_namespace_over_same_named_skill() {
         Resolved::Skill { .. } => {}
         other => panic!("skill reachable via /skill, got {other:?}"),
     }
-    // listing shows the command, not a duplicate skill entry
-    assert_eq!(
-        cat.entries().iter().filter(|e| e.name == "audit").count(),
-        1
-    );
+    // listing shows BOTH the command and the skill (both visible; command wins the bare name,
+    // the skill is still reachable via /skill)
+    let audit_entries: Vec<_> = cat
+        .entries()
+        .into_iter()
+        .filter(|e| e.name == "audit")
+        .collect();
+    assert_eq!(audit_entries.len(), 2, "command + skill both listed");
+    assert!(audit_entries.iter().any(|e| !e.is_skill), "command listed");
+    assert!(audit_entries.iter().any(|e| e.is_skill), "skill listed");
 }
 
 #[test]
@@ -555,16 +560,29 @@ fn skill_guidance_is_rebranded_forge_native() {
 }
 
 #[test]
-fn orchestrate_is_a_builtin_skill_with_no_import() {
-    // Empty user/project scopes: orchestrate must still be present (compiled-in builtin).
+fn orchestrate_is_a_builtin_command_with_no_import() {
+    // Empty user/project scopes: /orchestrate must still be present, but as a lightweight command
+    // rather than a built-in skill whose full methodology is injected on every invocation.
     let t = Tmp::new();
     let cat = t.load();
-    let g = cat
-        .skill_guidance("orchestrate")
-        .expect("builtin orchestrate must be available");
-    assert!(g.contains("Forge"));
-    assert!(!g.contains("Claude"), "builtin must be Forge-native: {g}");
-    assert!(cat.skill_listing().iter().any(|(n, _)| n == "orchestrate"));
+    assert!(cat.command("orchestrate").is_some());
+    assert!(cat.skill_guidance("orchestrate").is_none());
+    assert!(!cat.skill_listing().iter().any(|(n, _)| n == "orchestrate"));
+
+    match cat.resolve("/orchestrate improve the router") {
+        Resolved::Command {
+            prompt,
+            guidance,
+            cmd,
+            ..
+        } => {
+            assert_eq!(cmd.scope, Scope::Builtin);
+            assert!(guidance.is_empty(), "no heavy skill guidance injected");
+            assert!(prompt.contains("improve the router"));
+            assert!(prompt.contains("use_skill"));
+        }
+        other => panic!("expected builtin orchestrate command, got {other:?}"),
+    }
 }
 
 #[test]
@@ -606,7 +624,10 @@ fn nested_subdir_commands_get_deeply_namespaced_name() {
 }
 
 #[test]
-fn a_user_orchestrate_overrides_the_builtin() {
+fn a_user_orchestrate_skill_stays_usable_but_builtin_command_wins() {
+    // The builtin `orchestrate` command always keeps priority on the bare `/orchestrate`
+    // invocation, even when a user skill of the same name exists. The skill is NOT removed —
+    // it stays usable via `/skill orchestrate` and visible in the listing.
     let t = Tmp::new();
     t.skill(
         "user",
@@ -614,9 +635,64 @@ fn a_user_orchestrate_overrides_the_builtin() {
         "---\nname: orchestrate\ndescription: custom\n---\nMY CUSTOM ORCHESTRATE BODY.",
     );
     let cat = t.load();
-    let g = cat.skill_guidance("orchestrate").unwrap();
+    // The builtin command is present (priority) AND the user skill is present (usable).
+    let cmd = cat.command("orchestrate").expect("builtin command present");
+    assert_eq!(cmd.scope, Scope::Builtin);
+    let g = cat
+        .skill_guidance("orchestrate")
+        .expect("user skill present");
     assert!(
         g.contains("MY CUSTOM ORCHESTRATE BODY"),
-        "user copy should win: {g}"
+        "user skill body still loadable: {g}"
     );
+    // Bare /orchestrate → the builtin command (priority), not the user skill.
+    match cat.resolve("/orchestrate do it") {
+        Resolved::Command { cmd, prompt, .. } => {
+            assert_eq!(cmd.scope, Scope::Builtin);
+            // The builtin body is a template that consumes $ARGUMENTS, so the task is embedded.
+            assert!(
+                prompt.contains("do it"),
+                "task embedded in prompt: {prompt}"
+            );
+        }
+        other => panic!("expected builtin command to win, got {other:?}"),
+    }
+    // The user skill is still reachable explicitly via /skill.
+    match cat.resolve("/skill orchestrate do it") {
+        Resolved::Skill { meta, prompt } => {
+            assert_eq!(meta.scope, Scope::User);
+            assert_eq!(prompt, "do it");
+        }
+        other => panic!("expected user skill reachable via /skill, got {other:?}"),
+    }
+    // Both are visible in the inventory.
+    let orch_entries: Vec<_> = cat
+        .entries()
+        .into_iter()
+        .filter(|e| e.name == "orchestrate")
+        .collect();
+    assert_eq!(orch_entries.len(), 2, "command + skill both listed");
+}
+
+#[test]
+fn a_user_orchestrate_command_overrides_the_builtin() {
+    // A user *command* of the same name still overrides the builtin (same-kind scope
+    // precedence: User > Builtin) — this is the documented override path, not a skill.
+    let t = Tmp::new();
+    t.cmd(
+        "user",
+        "orchestrate",
+        "---\ndescription: my orchestration\n---\nRun MY orchestration: $ARGUMENTS",
+    );
+    let cat = t.load();
+    let cmd = cat.command("orchestrate").unwrap();
+    assert_eq!(cmd.scope, Scope::User, "user command wins the name");
+    match cat.resolve("/orchestrate ship it") {
+        Resolved::Command { cmd, prompt, .. } => {
+            assert_eq!(cmd.scope, Scope::User);
+            assert!(prompt.contains("Run MY orchestration"));
+            assert!(prompt.contains("ship it"));
+        }
+        other => panic!("expected user command, got {other:?}"),
+    }
 }
