@@ -510,7 +510,7 @@ forge assay run --scope diff --format markdown --fail-on high
     anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
-See `.github/workflows/forge-review.example.yml` for a full workflow.
+See `docs/ci/forge-review.yml` for a full example workflow to copy into your repo's `.github/workflows/`.
 
 ---
 
