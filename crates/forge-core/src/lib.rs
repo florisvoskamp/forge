@@ -13,7 +13,9 @@ use forge_provider::{CompletionOptions, Provider, StreamEvent, ToolSpec};
 use forge_store::Store;
 use forge_tools::ToolRegistry;
 use forge_tui::{Presenter, PresenterEvent};
-use forge_types::{EffortLevel, Message, PermissionDecision, PermissionMode, PermissionRule, Role, TaskTier};
+use forge_types::{
+    EffortLevel, Message, PermissionDecision, PermissionMode, PermissionRule, Role, TaskTier,
+};
 
 pub mod assay;
 pub mod hooks;
@@ -1189,9 +1191,10 @@ Rules:\n\
         let mut planner_msgs = self.transcript_for(&planner);
         planner_msgs.insert(0, Message::system(Self::ARCHITECT_PLANNER_SYSTEM));
 
-        let stream_idle =
-            std::time::Duration::from_secs(self.config.mesh.stream_idle_timeout_secs);
-        let completion_opts = CompletionOptions { effort: self.pinned_effort };
+        let stream_idle = std::time::Duration::from_secs(self.config.mesh.stream_idle_timeout_secs);
+        let completion_opts = CompletionOptions {
+            effort: self.pinned_effort,
+        };
 
         // Collect plan text while streaming it live to the presenter.
         let mut plan_text = String::new();
@@ -1212,7 +1215,8 @@ Rules:\n\
                 }
             };
             // Empty tool slice — the planner must not call tools.
-            let fut = provider.complete_with(&planner, &planner_msgs, &[], &completion_opts, &mut sink);
+            let fut =
+                provider.complete_with(&planner, &planner_msgs, &[], &completion_opts, &mut sink);
             stream_with_idle_timeout(fut, &activity, stream_idle).await
         };
 
@@ -1240,8 +1244,7 @@ Rules:\n\
         self.store.record_usage(&self.id, &msg_id, &resp.usage)?;
 
         // Push the plan into the live transcript so the editor model sees it.
-        self.transcript
-            .push(Message::assistant(&resp.content));
+        self.transcript.push(Message::assistant(&resp.content));
 
         Ok(Some(resp.content))
     }
@@ -1821,7 +1824,9 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                                     }
                                 }
                             };
-                        let completion_opts = CompletionOptions { effort: self.pinned_effort };
+                        let completion_opts = CompletionOptions {
+                            effort: self.pinned_effort,
+                        };
                         let fut = provider.complete_with(
                             &active_model,
                             &sent,
@@ -2070,9 +2075,8 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                             let result = {
                                 let provider = &self.provider;
                                 let presenter = &mut self.presenter;
-                                let activity = std::sync::Arc::new(
-                                    std::sync::atomic::AtomicU64::new(0),
-                                );
+                                let activity =
+                                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                                 let act = std::sync::Arc::clone(&activity);
                                 let mut sink = |ev: StreamEvent| {
                                     act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2083,8 +2087,9 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                                         StreamEvent::Reasoning(t) => {
                                             presenter.emit(PresenterEvent::Reasoning(t))
                                         }
-                                        StreamEvent::ToolStarted { name, args } => presenter
-                                            .emit(PresenterEvent::ToolStart { name, args }),
+                                        StreamEvent::ToolStarted { name, args } => {
+                                            presenter.emit(PresenterEvent::ToolStart { name, args })
+                                        }
                                         StreamEvent::ToolFinished { name, ok, summary } => {
                                             presenter.emit(PresenterEvent::ToolResult {
                                                 name,
@@ -2099,12 +2104,8 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                                                 task,
                                             })
                                         }
-                                        StreamEvent::SubagentProgress { id, snippet } => {
-                                            presenter.emit(PresenterEvent::SubagentProgress {
-                                                id,
-                                                snippet,
-                                            })
-                                        }
+                                        StreamEvent::SubagentProgress { id, snippet } => presenter
+                                            .emit(PresenterEvent::SubagentProgress { id, snippet }),
                                         StreamEvent::SubagentFinished {
                                             id,
                                             agent,
@@ -2123,8 +2124,9 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                                         }
                                     }
                                 };
-                                let completion_opts =
-                                    CompletionOptions { effort: self.pinned_effort };
+                                let completion_opts = CompletionOptions {
+                                    effort: self.pinned_effort,
+                                };
                                 let fut = provider.complete_with(
                                     &active_model,
                                     &sent,
@@ -2253,10 +2255,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
     /// Assay critic crew over it, and surface findings whose severity >= `gate_severity`. In
     /// `warn` mode the findings are emitted as warnings and the turn continues. In `block` mode
     /// they are emitted and `CoreError::TurnBlocked` is returned so the turn is aborted.
-    async fn auto_review_gate(
-        &mut self,
-        cfg: &forge_config::AssayConfig,
-    ) -> Result<(), CoreError> {
+    async fn auto_review_gate(&mut self, cfg: &forge_config::AssayConfig) -> Result<(), CoreError> {
         use similar::{ChangeTag, TextDiff};
 
         // Gather files touched this turn from the snapshot manifest.
@@ -2307,8 +2306,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         let pricing = std::sync::Arc::new(self.pricing.clone());
         let provider = std::sync::Arc::clone(&self.provider);
         let store = std::sync::Arc::clone(&self.store);
-        let cooldown =
-            std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
+        let cooldown = std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
 
         // Build tier model chains from the catalog (ranked + health-filtered) when available,
         // falling back to the configured model list — same pattern as the CLI's /assay path.
@@ -2585,11 +2583,10 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                         // self-corrects this turn. Best-effort: missing server → silent.
                         if self.config.lsp.enabled {
                             if let Some(lsp) = &self.lsp {
-                                let abs = std::path::absolute(path)
-                                    .unwrap_or_else(|_| path.clone());
-                                let timeout = std::time::Duration::from_millis(
-                                    self.config.lsp.timeout_ms,
-                                );
+                                let abs =
+                                    std::path::absolute(path).unwrap_or_else(|_| path.clone());
+                                let timeout =
+                                    std::time::Duration::from_millis(self.config.lsp.timeout_ms);
                                 let lsp = Arc::clone(lsp);
                                 let diags = lsp.diagnostics_for(&abs, timeout).await;
                                 if !diags.is_empty() {
@@ -2597,10 +2594,8 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                                         .iter()
                                         .map(|d| d.format_line(&path.display().to_string()))
                                         .collect();
-                                    self.pending_hints.push(format!(
-                                        "[lsp diagnostics]\n{}",
-                                        lines.join("\n")
-                                    ));
+                                    self.pending_hints
+                                        .push(format!("[lsp diagnostics]\n{}", lines.join("\n")));
                                 }
                             }
                         }
@@ -2805,8 +2800,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         let agents = Arc::new(forge_config::load_agents(std::path::Path::new(
             &self.config.mesh.subagents.agents_dir,
         )));
-        let repo_root = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let ctx = subagent::AgentCtx {
             provider: Arc::clone(&self.provider),
             router: Arc::clone(&self.router),
@@ -5621,7 +5615,7 @@ mod tests {
 
         let af = forge_config::AutofixConfig {
             auto_lint: true,
-            auto_test: false, // test disabled
+            auto_test: false,              // test disabled
             lint_cmd: "false".to_string(), // always exits 1
             test_cmd: String::new(),
             max_iterations: 3,
@@ -5635,7 +5629,11 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("Auto-fix:") && m.content.contains("lint:")),
             "failure message injected into transcript: {:?}",
-            session.transcript.iter().map(|m| &m.content).collect::<Vec<_>>()
+            session
+                .transcript
+                .iter()
+                .map(|m| &m.content)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -5846,10 +5844,7 @@ mod tests {
         let mut config = Config::default();
         config.mesh.editor_model = Some("groq::llama-3.1-8b-instant".to_string());
         let session = make_session(config);
-        assert_eq!(
-            session.resolve_editor_model(),
-            "groq::llama-3.1-8b-instant"
-        );
+        assert_eq!(session.resolve_editor_model(), "groq::llama-3.1-8b-instant");
     }
 
     #[test]

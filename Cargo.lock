@@ -1442,6 +1442,7 @@ dependencies = [
  "forge-config",
  "forge-core",
  "forge-index",
+ "forge-lsp",
  "forge-mcp",
  "forge-mesh",
  "forge-provider",
@@ -1492,6 +1493,7 @@ dependencies = [
  "async-trait",
  "forge-config",
  "forge-index",
+ "forge-lsp",
  "forge-mcp",
  "forge-mesh",
  "forge-provider",
@@ -1504,6 +1506,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shell-words",
+ "similar",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1535,6 +1538,19 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-tags",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "forge-lsp"
+version = "0.1.0"
+dependencies = [
+ "forge-config",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

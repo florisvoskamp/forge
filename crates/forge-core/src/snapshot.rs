@@ -110,11 +110,7 @@ pub(crate) struct TurnFile {
 /// Return the list of files touched during `seq` so the auto-review gate can build a diff without
 /// touching git. Returns an empty `Vec` when no snapshot exists (turn made no writes, or the
 /// checkpoint dir was cleared).
-pub(crate) fn changed_files_this_turn(
-    root: &Path,
-    session: &str,
-    seq: i64,
-) -> Vec<TurnFile> {
+pub(crate) fn changed_files_this_turn(root: &Path, session: &str, seq: i64) -> Vec<TurnFile> {
     let Some(manifest) = load_manifest(root, session, seq) else {
         return Vec::new();
     };

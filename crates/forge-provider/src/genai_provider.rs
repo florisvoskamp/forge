@@ -16,7 +16,9 @@ use genai::chat::{
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
 
-use crate::{CompletionOptions, EventSink, ModelResponse, Provider, ProviderError, StreamEvent, ToolSpec};
+use crate::{
+    CompletionOptions, EventSink, ModelResponse, Provider, ProviderError, StreamEvent, ToolSpec,
+};
 
 #[derive(Default)]
 pub struct GenAiProvider {
@@ -413,8 +415,14 @@ impl Provider for GenAiProvider {
         tools: &[ToolSpec],
         on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
-        self.complete_with(model, messages, tools, &CompletionOptions::default(), on_event)
-            .await
+        self.complete_with(
+            model,
+            messages,
+            tools,
+            &CompletionOptions::default(),
+            on_event,
+        )
+        .await
     }
 
     async fn complete_with(

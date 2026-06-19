@@ -27,3 +27,4 @@ graphify-out/
 
 # Stray nested forge runtime dirs (root /.forge already ignored above)
 **/.forge/
+.dual-graph/

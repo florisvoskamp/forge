@@ -565,7 +565,9 @@ pub async fn orchestrate(
             match worktree::WorktreeGuard::create(&ctx.repo_root, &child_id) {
                 Ok(g) => Some(g),
                 Err(e) => {
-                    tracing::warn!("worktree create failed for {child_id}: {e} — running without isolation");
+                    tracing::warn!(
+                        "worktree create failed for {child_id}: {e} — running without isolation"
+                    );
                     None
                 }
             }
@@ -612,9 +614,7 @@ pub async fn orchestrate(
                     }
                     Ok(report) => {
                         let conflicts = report.conflicted_files.join(", ");
-                        text.push_str(&format!(
-                            "\n[worktree merge conflicts in: {conflicts}]"
-                        ));
+                        text.push_str(&format!("\n[worktree merge conflicts in: {conflicts}]"));
                         ok = false;
                     }
                     Err(e) => {
@@ -990,7 +990,10 @@ mod tests {
         let root = std::path::Path::new("/work/tree");
         let args = json!({"path": "/absolute/path/file.rs"});
         let rewritten = rewrite_args_for_worktree(&args, root);
-        assert_eq!(rewritten["path"].as_str().unwrap(), "/absolute/path/file.rs");
+        assert_eq!(
+            rewritten["path"].as_str().unwrap(),
+            "/absolute/path/file.rs"
+        );
     }
 
     #[test]

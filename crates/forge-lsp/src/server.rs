@@ -24,7 +24,12 @@ impl LspServer {
             .spawn()?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = BufReader::new(child.stdout.take().expect("stdout piped"));
-        Ok(Self { _child: child, stdin, stdout, next_id: 1 })
+        Ok(Self {
+            _child: child,
+            stdin,
+            stdout,
+            next_id: 1,
+        })
     }
 
     fn new_id(&mut self) -> u64 {
@@ -92,15 +97,12 @@ impl LspServer {
                 Ok(Some(m)) => m,
                 _ => break,
             };
-            if msg.get("method").and_then(|v| v.as_str())
-                == Some("textDocument/publishDiagnostics")
+            if msg.get("method").and_then(|v| v.as_str()) == Some("textDocument/publishDiagnostics")
             {
                 if let Some(params) = msg.get("params") {
                     let msg_uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
                     if msg_uri == uri {
-                        if let Some(arr) =
-                            params.get("diagnostics").and_then(|v| v.as_array())
-                        {
+                        if let Some(arr) = params.get("diagnostics").and_then(|v| v.as_array()) {
                             diags = arr.iter().filter_map(parse_diagnostic).collect();
                         }
                         break;
@@ -130,5 +132,11 @@ fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
             c.as_u64().map(|n| n.to_string())
         }
     });
-    Some(Diagnostic { severity, message, line, character, code })
+    Some(Diagnostic {
+        severity,
+        message,
+        line,
+        character,
+        code,
+    })
 }

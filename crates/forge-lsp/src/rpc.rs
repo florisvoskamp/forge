@@ -6,8 +6,7 @@ pub async fn write_msg<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     msg: &Value,
 ) -> std::io::Result<()> {
-    let body = serde_json::to_vec(msg)
-        .map_err(std::io::Error::other)?;
+    let body = serde_json::to_vec(msg).map_err(std::io::Error::other)?;
     let header = format!("Content-Length: {}\r\n\r\n", body.len());
     writer.write_all(header.as_bytes()).await?;
     writer.write_all(&body).await?;

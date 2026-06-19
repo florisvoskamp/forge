@@ -39,7 +39,11 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn format_line(&self, path: &str) -> String {
-        let code_part = self.code.as_deref().map(|c| format!(" ({c})")).unwrap_or_default();
+        let code_part = self
+            .code
+            .as_deref()
+            .map(|c| format!(" ({c})"))
+            .unwrap_or_default();
         format!(
             "  {}:{}:{}: [{}]{} {}",
             path,

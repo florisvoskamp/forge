@@ -4994,23 +4994,26 @@ async fn dispatch_command(
         }
         // `/effort [level]` pins the reasoning-effort level for subsequent turns.
         // `/effort` (no arg) clears the pin and returns to the provider default.
-        CommandAction::SetEffort(level) => {
-            match level {
-                Some(ref s) => match forge_types::EffortLevel::parse(s) {
-                    Some(e) => {
-                        session.lock().await.set_effort(Some(e));
-                        app.note(&format!("◎ effort pinned: {} (clears with /effort)", e.as_str()));
-                    }
-                    None => {
-                        app.note(&format!("⚠ unknown effort level '{s}' — use low/medium/high/xhigh"));
-                    }
-                },
-                None => {
-                    session.lock().await.set_effort(None);
-                    app.note("◎ effort pin cleared — provider default restored");
+        CommandAction::SetEffort(level) => match level {
+            Some(ref s) => match forge_types::EffortLevel::parse(s) {
+                Some(e) => {
+                    session.lock().await.set_effort(Some(e));
+                    app.note(&format!(
+                        "◎ effort pinned: {} (clears with /effort)",
+                        e.as_str()
+                    ));
                 }
+                None => {
+                    app.note(&format!(
+                        "⚠ unknown effort level '{s}' — use low/medium/high/xhigh"
+                    ));
+                }
+            },
+            None => {
+                session.lock().await.set_effort(None);
+                app.note("◎ effort pin cleared — provider default restored");
             }
-        }
+        },
         // `/models` opens the interactive model browser: a provider list (with global counts in
         // the heading) that drills into each provider's models on Enter; Esc steps back.
         CommandAction::ListModels => open_models_root(session, app).await?,

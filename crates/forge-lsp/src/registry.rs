@@ -108,7 +108,13 @@ pub fn lang_from_ext(path: &Path) -> Option<&'static str> {
 pub fn repo_root(path: &Path) -> Option<PathBuf> {
     let mut dir = path.parent()?;
     loop {
-        for marker in &["Cargo.toml", "package.json", "pyproject.toml", "go.mod", ".git"] {
+        for marker in &[
+            "Cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "go.mod",
+            ".git",
+        ] {
             if dir.join(marker).exists() {
                 return Some(dir.to_path_buf());
             }

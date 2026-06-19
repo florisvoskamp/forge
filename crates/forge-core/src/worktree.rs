@@ -42,10 +42,7 @@ impl WorktreeGuard {
     /// Create a new worktree under `<repo_root>/.forge/worktrees/<child_id>` on branch
     /// `forge/subagent/<child_id>`, branched from HEAD.
     pub fn create(repo_root: &Path, child_id: &str) -> Result<WorktreeGuard, WorktreeError> {
-        let worktree_path = repo_root
-            .join(".forge")
-            .join("worktrees")
-            .join(child_id);
+        let worktree_path = repo_root.join(".forge").join("worktrees").join(child_id);
         let branch = format!("forge/subagent/{child_id}");
 
         run_git(
@@ -248,23 +245,13 @@ mod tests {
             "config email",
         )
         .unwrap();
-        run_git(
-            &dir,
-            &["config", "user.name", "Forge Test"],
-            "config name",
-        )
-        .unwrap();
+        run_git(&dir, &["config", "user.name", "Forge Test"], "config name").unwrap();
 
         // Initial commit (git worktree add requires at least one commit).
         let readme = dir.join("README");
         std::fs::write(&readme, "forge worktree test\n").unwrap();
         run_git(&dir, &["add", "README"], "add").unwrap();
-        run_git(
-            &dir,
-            &["commit", "-m", "init", "--no-gpg-sign"],
-            "commit",
-        )
-        .unwrap();
+        run_git(&dir, &["commit", "-m", "init", "--no-gpg-sign"], "commit").unwrap();
 
         dir
     }
@@ -291,15 +278,18 @@ mod tests {
             let guard = WorktreeGuard::create(&repo, child_id).unwrap();
             assert_eq!(guard.path(), expected_path);
             assert_eq!(guard.branch(), branch_name);
-            assert!(expected_path.exists(), "worktree dir must exist after create");
+            assert!(
+                expected_path.exists(),
+                "worktree dir must exist after create"
+            );
         }
         // After drop: directory and branch should be gone.
         assert!(
             !expected_path.exists(),
             "worktree dir removed after guard drop"
         );
-        let branch_list = run_git(&repo, &["branch", "--list", &branch_name], "branch list")
-            .unwrap_or_default();
+        let branch_list =
+            run_git(&repo, &["branch", "--list", &branch_name], "branch list").unwrap_or_default();
         assert!(
             String::from_utf8_lossy(&branch_list).trim().is_empty(),
             "tracking branch deleted after guard drop"
@@ -368,7 +358,10 @@ mod tests {
             main_file.exists(),
             "merged file must appear in main worktree"
         );
-        assert_eq!(std::fs::read_to_string(&main_file).unwrap(), "hello from child\n");
+        assert_eq!(
+            std::fs::read_to_string(&main_file).unwrap(),
+            "hello from child\n"
+        );
 
         // Cleanup.
         run_git(

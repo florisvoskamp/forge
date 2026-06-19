@@ -237,13 +237,8 @@ impl ServerHandler for ForgeMcp {
                     }
                 }
 
-                let decision = permission::decide(
-                    self.mode,
-                    side_effect,
-                    &name,
-                    &effective_args,
-                    &self.rules,
-                );
+                let decision =
+                    permission::decide(self.mode, side_effect, &name, &effective_args, &self.rules);
                 if decision == PermissionDecision::Deny {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
                         "denied by Forge permission policy: {name}"

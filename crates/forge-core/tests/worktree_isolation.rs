@@ -84,15 +84,17 @@ fn worktree_is_isolated_until_merge() {
 
     // Merge back: should be clean.
     let branch = guard.branch().to_string();
-    let report =
-        forge_core::worktree::merge_worktree_back(&repo, &branch).unwrap();
+    let report = forge_core::worktree::merge_worktree_back(&repo, &branch).unwrap();
     assert!(
         report.conflicted_files.is_empty(),
         "non-conflicting child write must merge cleanly"
     );
 
     // Now the file should be visible in the main tree.
-    assert!(main_file.exists(), "file must appear in main tree after merge");
+    assert!(
+        main_file.exists(),
+        "file must appear in main tree after merge"
+    );
     assert_eq!(
         std::fs::read_to_string(&main_file).unwrap(),
         "written by child\n"
