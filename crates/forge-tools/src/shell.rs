@@ -76,7 +76,7 @@ impl Tool for ShellTool {
 
 /// Execute `command` and format a model-facing result. Never returns `Err`: a failed spawn,
 /// a non-zero exit, and a timeout are all normal results the model can react to.
-async fn run_command(command: &str, cwd: &str, timeout_secs: u64) -> String {
+pub async fn run_command(command: &str, cwd: &str, timeout_secs: u64) -> String {
     let (shell, flag) = shell_invocation();
     let mut cmd = Command::new(shell);
     cmd.arg(flag)

@@ -17,7 +17,7 @@ pub use core_tools::{
     DeleteFileTool, EditFileTool, GlobTool, ListDirTool, ReadFileTool, SearchTool, WriteFileTool,
 };
 pub use lattice_tool::LatticeTool;
-pub use shell::ShellTool;
+pub use shell::{run_command as run_shell_command, ShellTool};
 pub use web::{BraveSearch, DuckDuckGo, SearchBackend, SearchResult, WebFetchTool, WebSearchTool};
 
 #[derive(Debug, thiserror::Error)]

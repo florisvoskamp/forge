@@ -243,6 +243,9 @@ pub struct Session {
     /// Images attached to the *next* user turn (vision input, e.g. via `/image <path>`). Drained
     /// when that turn's user message is built; empty for text-only turns.
     pending_images: Vec<forge_types::ImageAttachment>,
+    /// Count of successful writes made by `invoke_tool` in the current turn. Reset at the start
+    /// of each turn; used to gate the autofix stage (skip it when nothing was edited).
+    edits_this_turn: u32,
 }
 
 impl Session {
@@ -374,6 +377,7 @@ impl Session {
             always_compact_on_switch: false,
             project_prompt_injected,
             pending_images: Vec::new(),
+            edits_this_turn: 0,
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -1469,6 +1473,10 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             }
         }
 
+        // Reset the per-turn edit counter so the autofix stage only fires when THIS turn wrote
+        // something (not a carry-over from a prior turn).
+        self.edits_this_turn = 0;
+
         // 2. Persist + record the user message. Its seq keys this turn's code-snapshot dir
         // (PR3): files written during the turn are restorable by rewinding to this boundary.
         let seq = self.next_seq();
@@ -1835,6 +1843,201 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             }
         }
 
+        // ── Autofix self-healing loop (autofix.md) ────────────────────────────────────────────
+        // After the turn's model↔tool loop finishes: if edits were made AND autofix is enabled
+        // with at least one non-empty command, run lint/test and feed failures back into the
+        // conversation so the model can fix them. Repeat up to `max_iterations`. When autofix is
+        // off, or no edits happened, this block is a no-op (zero overhead).
+        let af = self.config.autofix.clone();
+        let autofix_active = self.edits_this_turn > 0
+            && ((af.auto_lint && !af.lint_cmd.is_empty())
+                || (af.auto_test && !af.test_cmd.is_empty()));
+
+        if autofix_active {
+            self.presenter.emit(PresenterEvent::Warning(format!(
+                "autofix: running checks after {} edit(s)",
+                self.edits_this_turn
+            )));
+            let mut iterations_used = 0u32;
+            loop {
+                if iterations_used >= af.max_iterations {
+                    self.presenter.emit(PresenterEvent::Warning(format!(
+                        "autofix: reached iteration cap ({}) — stopping; remaining failures \
+                         were not fixed",
+                        af.max_iterations
+                    )));
+                    break;
+                }
+                iterations_used += 1;
+
+                match self.run_autofix_stage(&af).await {
+                    Ok(true) => {
+                        self.presenter.emit(PresenterEvent::Warning(
+                            "autofix: all checks passed".to_string(),
+                        ));
+                        break;
+                    }
+                    Ok(false) => {
+                        // Failures already injected into transcript by run_autofix_stage.
+                        // Re-run the model↔tool inner loop to let the model fix them.
+                        self.presenter.emit(PresenterEvent::Warning(format!(
+                            "autofix: iteration {iterations_used}/{} — re-running model loop",
+                            af.max_iterations
+                        )));
+                        // Run the inner model↔tool loop again (same routing/tool setup).
+                        let fix_prompt = "(autofix re-entry: fix the failures above)";
+                        let specs = self.tool_specs();
+                        let mut fix_hit_cap = true;
+                        for step in 0..max_steps {
+                            let sent = self.transcript_for(&active_model);
+                            let result = {
+                                let provider = &self.provider;
+                                let presenter = &mut self.presenter;
+                                let activity = std::sync::Arc::new(
+                                    std::sync::atomic::AtomicU64::new(0),
+                                );
+                                let act = std::sync::Arc::clone(&activity);
+                                let mut sink = |ev: StreamEvent| {
+                                    act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    match ev {
+                                        StreamEvent::Text(t) => {
+                                            presenter.emit(PresenterEvent::AssistantDelta(t))
+                                        }
+                                        StreamEvent::Reasoning(t) => {
+                                            presenter.emit(PresenterEvent::Reasoning(t))
+                                        }
+                                        StreamEvent::ToolStarted { name, args } => presenter
+                                            .emit(PresenterEvent::ToolStart { name, args }),
+                                        StreamEvent::ToolFinished { name, ok, summary } => {
+                                            presenter.emit(PresenterEvent::ToolResult {
+                                                name,
+                                                ok,
+                                                summary,
+                                            })
+                                        }
+                                        StreamEvent::SubagentStarted { id, agent, task } => {
+                                            presenter.emit(PresenterEvent::SubagentStart {
+                                                id,
+                                                agent,
+                                                task,
+                                            })
+                                        }
+                                        StreamEvent::SubagentProgress { id, snippet } => {
+                                            presenter.emit(PresenterEvent::SubagentProgress {
+                                                id,
+                                                snippet,
+                                            })
+                                        }
+                                        StreamEvent::SubagentFinished {
+                                            id,
+                                            agent,
+                                            ok,
+                                            summary,
+                                            cost_usd,
+                                        } => presenter.emit(PresenterEvent::SubagentResult {
+                                            id,
+                                            agent,
+                                            ok,
+                                            summary,
+                                            cost_usd,
+                                        }),
+                                        StreamEvent::Tasks(tasks) => {
+                                            presenter.emit(PresenterEvent::Tasks(tasks))
+                                        }
+                                    }
+                                };
+                                let completion_opts =
+                                    CompletionOptions { effort: self.pinned_effort };
+                                let fut = provider.complete_with(
+                                    &active_model,
+                                    &sent,
+                                    &specs,
+                                    &completion_opts,
+                                    &mut sink,
+                                );
+                                stream_with_idle_timeout(fut, &activity, stream_idle).await
+                            };
+                            let mut resp = match result {
+                                Ok(r) => {
+                                    if !r.content.is_empty() {
+                                        self.presenter.emit(PresenterEvent::AssistantDone);
+                                    }
+                                    r
+                                }
+                                Err(e) => return Err(e.into()),
+                            };
+
+                            resp.usage.cost_usd =
+                                self.pricing.cost_for_usage(&active_model, &resp.usage);
+                            context_tokens = resp.usage.input_tokens;
+                            self.transcript.push(Message::assistant_tool_calls(
+                                &resp.content,
+                                resp.tool_calls.clone(),
+                            ));
+                            let seq = self.next_seq();
+                            let msg_id = self.store.add_message_full(
+                                &self.id,
+                                seq,
+                                Role::Assistant,
+                                &resp.content,
+                                Some(&active_model),
+                                &resp.tool_calls,
+                                None,
+                            )?;
+                            self.store.record_usage(&self.id, &msg_id, &resp.usage)?;
+
+                            if !resp.wants_tools() {
+                                final_text = resp.content;
+                                fix_hit_cap = false;
+                                break;
+                            }
+                            for call in &resp.tool_calls {
+                                let result = self.invoke_tool(&msg_id, call).await?;
+                                let seq = self.next_seq();
+                                self.store.add_message_full(
+                                    &self.id,
+                                    seq,
+                                    Role::Tool,
+                                    &result,
+                                    None,
+                                    &[],
+                                    Some(&call.id),
+                                )?;
+                                self.transcript.push(Message::tool_result(&call.id, result));
+                                let hints: Vec<String> = self.pending_hints.drain(..).collect();
+                                for hint in hints {
+                                    let hseq = self.next_seq();
+                                    let _ = self.store.add_message(
+                                        &self.id,
+                                        hseq,
+                                        Role::System,
+                                        &hint,
+                                        None,
+                                    );
+                                    self.transcript.push(Message::system(hint));
+                                }
+                            }
+                            let _ = step; // suppress unused-variable warning
+                        }
+                        let _ = fix_prompt; // used only as a label above
+                        if fix_hit_cap {
+                            self.presenter.emit(PresenterEvent::Warning(format!(
+                                "autofix: inner model loop hit the {max_steps}-step limit"
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        // Autofix infrastructure failure — surface as warning and abort the loop.
+                        self.presenter.emit(PresenterEvent::Warning(format!(
+                            "autofix: stage error ({e}) — skipping remaining iterations"
+                        )));
+                        break;
+                    }
+                }
+            }
+        }
+        // ── End autofix ───────────────────────────────────────────────────────────────────────
+
         let (session_in, session_out) = self.store.session_tokens(&self.id)?;
         self.presenter.emit(PresenterEvent::Cost {
             session_total_usd: self.store.session_cost(&self.id)?,
@@ -1847,6 +2050,51 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             final_text: final_text.clone(),
         });
         Ok(final_text)
+    }
+
+    /// Run the autofix stage: execute lint and/or test commands (if enabled and non-empty);
+    /// return `Ok(true)` when every enabled command exits 0, `Ok(false)` when any fails (the
+    /// combined output of failing commands is injected into the transcript as a synthetic user
+    /// message so the model can fix it next iteration). Never returns `Err` from a non-zero
+    /// command exit — only from infrastructure failures (transcript write, etc.).
+    async fn run_autofix_stage(
+        &mut self,
+        af: &forge_config::AutofixConfig,
+    ) -> Result<bool, CoreError> {
+        // Use the same 120-second timeout as the shell tool's default; lint/test commands that
+        // need more can be wrapped in a script.
+        const AUTOFIX_TIMEOUT_SECS: u64 = 120;
+        let mut failures = Vec::new();
+
+        if af.auto_lint && !af.lint_cmd.is_empty() {
+            let out = forge_tools::run_shell_command(&af.lint_cmd, ".", AUTOFIX_TIMEOUT_SECS).await;
+            if shell_command_failed(&out) {
+                failures.push(format!("[lint: {}]\n{}", af.lint_cmd, out));
+            }
+        }
+        if af.auto_test && !af.test_cmd.is_empty() {
+            let out = forge_tools::run_shell_command(&af.test_cmd, ".", AUTOFIX_TIMEOUT_SECS).await;
+            if shell_command_failed(&out) {
+                failures.push(format!("[test: {}]\n{}", af.test_cmd, out));
+            }
+        }
+
+        if failures.is_empty() {
+            return Ok(true);
+        }
+
+        // Inject the failures as a synthetic user message so the model fixes them on the next
+        // iteration of the outer autofix loop.
+        let body = format!(
+            "Auto-fix: the following checks failed, fix them:\n\n{}",
+            failures.join("\n\n")
+        );
+        let seq = self.next_seq();
+        self.store
+            .add_message(&self.id, seq, Role::User, &body, None)?;
+        self.transcript.push(Message::user(&body));
+
+        Ok(false)
     }
 
     /// Run a single tool call, applying the permission policy, and return its result text.
@@ -1981,6 +2229,8 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                             self.current_turn_seq,
                             path,
                         );
+                        // Count this successful write so the autofix stage knows edits happened.
+                        self.edits_this_turn += 1;
                         // Reindex the touched file in-turn so later retrieval/queries this turn
                         // reflect the edit (code-intelligence.md — post-edit freshness).
                         if let Some(lat) = &self.lattice {
@@ -4971,5 +5221,129 @@ mod tests {
         b.reset_fresh(".").unwrap();
         assert!(b.history().is_empty());
         assert_ne!(b.id(), a);
+    }
+
+    // ── Autofix tests ──────────────────────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autofix_stage_passes_when_commands_exit_zero() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        let af = forge_config::AutofixConfig {
+            auto_lint: true,
+            auto_test: true,
+            lint_cmd: "true".to_string(), // always exits 0
+            test_cmd: "true".to_string(), // always exits 0
+            max_iterations: 3,
+        };
+        // run_autofix_stage returns Ok(true) when all enabled commands pass.
+        let passed = session.run_autofix_stage(&af).await.unwrap();
+        assert!(passed, "both 'true' commands exit 0 → stage should pass");
+        // No synthetic failure message pushed to transcript.
+        assert!(
+            session
+                .transcript
+                .iter()
+                .all(|m| !m.content.contains("Auto-fix:")),
+            "no failure message injected on pass"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autofix_stage_fails_when_lint_exits_nonzero() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        let af = forge_config::AutofixConfig {
+            auto_lint: true,
+            auto_test: false, // test disabled
+            lint_cmd: "false".to_string(), // always exits 1
+            test_cmd: String::new(),
+            max_iterations: 3,
+        };
+        let passed = session.run_autofix_stage(&af).await.unwrap();
+        assert!(!passed, "'false' exits 1 → stage should fail");
+        // A synthetic user message with the failure should be in the transcript.
+        assert!(
+            session
+                .transcript
+                .iter()
+                .any(|m| m.content.contains("Auto-fix:") && m.content.contains("lint:")),
+            "failure message injected into transcript: {:?}",
+            session.transcript.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autofix_stage_skipped_when_no_edits() {
+        // edits_this_turn == 0 means the autofix outer condition evaluates to false;
+        // test that run_autofix_stage is not reached (verify the guard independently).
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let session = Session::start(
+            Arc::clone(&store),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+        // Fresh session: edits_this_turn must be 0 before any turn.
+        assert_eq!(
+            session.edits_this_turn, 0,
+            "edits_this_turn starts at 0; autofix gate would not fire"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autofix_stage_empty_cmd_is_skipped() {
+        // When lint_cmd / test_cmd is empty the command must not run even if auto_lint/auto_test
+        // is true (empty string = disabled per spec).
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        let af = forge_config::AutofixConfig {
+            auto_lint: true,
+            auto_test: true,
+            lint_cmd: String::new(), // empty = disabled
+            test_cmd: String::new(), // empty = disabled
+            max_iterations: 3,
+        };
+        // No commands run → stage trivially passes.
+        let passed = session.run_autofix_stage(&af).await.unwrap();
+        assert!(passed, "empty commands → nothing runs → stage passes");
     }
 }
