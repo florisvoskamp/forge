@@ -261,6 +261,41 @@ enum Command {
         #[arg(long, value_enum)]
         mode: Option<Mode>,
     },
+    /// Manage Forge skills.
+    Skill {
+        #[command(subcommand)]
+        sub: SkillCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCmd {
+    /// Distil a past session's transcript into a reusable Forge skill.
+    ///
+    /// Reads the persisted transcript of SESSION_ID, calls a cheap model to synthesise a
+    /// SKILL.md (a generalised, reusable methodology), and writes it where Forge discovers skills.
+    /// The new skill is immediately invokable in future sessions.
+    ///
+    /// Examples:
+    ///   forge skill from-session abc123
+    ///   forge skill from-session abc123 --name refactor-workflow --scope project
+    FromSession {
+        /// Session id (or unambiguous prefix) — see `forge sessions`.
+        session_id: String,
+        /// Override the skill slug (kebab-case, e.g. `refactor-workflow`).
+        /// Derived from the session's first user prompt when absent.
+        #[arg(long)]
+        name: Option<String>,
+        /// Where to write the skill: `user` (default) or `project` (`.forge/skills/`).
+        #[arg(long, default_value = "user")]
+        scope: SkillScope,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum SkillScope {
+    User,
+    Project,
 }
 
 #[derive(Subcommand)]
@@ -646,6 +681,7 @@ async fn main() -> Result<()> {
         Command::Import { source } => import_cmd(source),
         Command::Git { cmd } => git_cmd(cmd),
         Command::Nl { query, mode } => nl_cmd(query.join(" "), mode).await,
+        Command::Skill { sub } => skill_cmd(sub).await,
     }
 }
 
@@ -1793,6 +1829,173 @@ fn commands_cmd() -> Result<()> {
         eprintln!("warning: {w}");
     }
     Ok(())
+}
+
+/// `forge skill from-session <id> [--name <slug>] [--scope user|project]`
+///
+/// Loads the persisted transcript of `session_id`, calls a cheap model to synthesise a
+/// generalised SKILL.md methodology, and writes it to the appropriate skills directory.
+async fn skill_cmd(sub: SkillCmd) -> Result<()> {
+    match sub {
+        SkillCmd::FromSession {
+            session_id,
+            name,
+            scope,
+        } => skill_from_session(&session_id, name.as_deref(), scope).await,
+    }
+}
+
+async fn skill_from_session(
+    session_prefix: &str,
+    name_override: Option<&str>,
+    scope: SkillScope,
+) -> Result<()> {
+    // --- Inject provider keys (same as assay / mesh) ---
+    forge_config::inject_provider_keys();
+
+    // --- Resolve session id ---
+    let store = open_store()?;
+    let session_id = resolve_session(&store, session_prefix)?;
+
+    // --- Load transcript ---
+    let messages = store
+        .load_messages(&session_id)
+        .context("loading session transcript")?;
+    if messages.is_empty() {
+        anyhow::bail!(
+            "session {} has no messages — nothing to distil",
+            &session_id[..session_id.len().min(8)]
+        );
+    }
+
+    // --- Convert StoredMessage → TranscriptEntry ---
+    let entries: Vec<forge_skills::TranscriptEntry> = messages
+        .iter()
+        .map(|m| forge_skills::TranscriptEntry {
+            role: m.role.as_str().to_string(),
+            content: m.content.clone(),
+            tool_actions: m
+                .tool_calls
+                .iter()
+                .map(|tc| format!("{} {}", tc.name, compact_tool_args(&tc.args.to_string())))
+                .collect(),
+        })
+        .collect();
+
+    // --- Derive slug (from first user prompt or --name override) ---
+    let slug: String = match name_override {
+        Some(n) => {
+            let s = forge_skills::derive_slug(n);
+            if s.is_empty() {
+                anyhow::bail!("--name produced an empty slug; use alphanumeric characters");
+            }
+            s
+        }
+        None => {
+            let first_user = entries
+                .iter()
+                .find(|e| e.role == "user" && !e.content.trim().is_empty())
+                .map(|e| e.content.as_str())
+                .unwrap_or("custom-skill");
+            forge_skills::derive_slug(first_user)
+        }
+    };
+
+    // --- Resolve target skills directory ---
+    let skills_dir = match scope {
+        SkillScope::User => {
+            let dir = forge_config::config_dir()
+                .ok_or_else(|| anyhow::anyhow!("cannot resolve user config directory"))?;
+            dir.join("skills")
+        }
+        SkillScope::Project => std::path::PathBuf::from("./.forge/skills"),
+    };
+
+    // --- Check for existing skill before making the model call ---
+    if skills_dir.join(&slug).exists() {
+        anyhow::bail!(
+            "skill '{}' already exists at {} — use --name to choose a different name",
+            slug,
+            skills_dir.join(&slug).display()
+        );
+    }
+
+    // --- Discover models ---
+    let config = forge_config::load().unwrap_or_default();
+    let pricing = std::sync::Arc::new(forge_mesh::pricing::Pricing::from_config(&config));
+    let store = std::sync::Arc::new(open_store()?);
+    let cat = discover_catalog(&config).await;
+    if cat.is_empty() {
+        anyhow::bail!(
+            "no models available — set a provider key (`forge auth <provider>`) or run ollama"
+        );
+    }
+    let benched = store.current_benched().unwrap_or_default();
+    let mut trivial_models: Vec<String> = cat
+        .ranked_for(forge_types::TaskTier::Trivial, &pricing, 5)
+        .into_iter()
+        .filter(|m| !benched.is_benched(m))
+        .collect();
+    if trivial_models.is_empty() {
+        if let Some(m) = config.model_for(forge_types::TaskTier::Trivial) {
+            trivial_models.push(m.to_string());
+        }
+    }
+    if trivial_models.is_empty() {
+        anyhow::bail!("every model is rate-limited/benched — try `forge models --probe`");
+    }
+    let model = trivial_models.remove(0);
+
+    // --- Build the distillation prompt and call the model ---
+    let prompt_text = forge_skills::build_distillation_prompt(&entries);
+    let messages_for_model = [
+        forge_types::Message::system(
+            "You are a Forge skill author. Follow the instructions exactly.",
+        ),
+        forge_types::Message::user(prompt_text),
+    ];
+
+    eprintln!(
+        "forge skill: distilling session {} via {} ...",
+        &session_id[..session_id.len().min(8)],
+        model
+    );
+
+    let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
+    let provider = DispatchProvider::new(harness);
+    let mut sink = |_: forge_provider::StreamEvent| { /* discard; no TUI in headless mode */ };
+    let response = provider
+        .complete(&model, &messages_for_model, &[], &mut sink)
+        .await
+        .map_err(|e| anyhow::anyhow!("model call failed: {e}"))?;
+
+    // Record cost against the store (best-effort, like compact / diagnose)
+    let _ = store.record_side_call_usage(&session_id, "skill/from-session", &response.usage);
+
+    // --- Parse model output and assemble SKILL.md ---
+    let (body, description) = forge_skills::parse_model_output(&response.content);
+    if body.trim().is_empty() {
+        anyhow::bail!("model returned an empty skill body — try again or use a different model");
+    }
+    let skill_md = forge_skills::assemble_skill_md(&slug, &description, &body);
+
+    // --- Write to disk ---
+    let written = forge_skills::write_skill(&skills_dir, &slug, &skill_md)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("skill '{}' written to {}", slug, written.display());
+    println!("invoke with: /skill {slug}");
+    Ok(())
+}
+
+/// Compact a tool-call arguments JSON to at most 80 chars for the transcript summary.
+fn compact_tool_args(args: &str) -> String {
+    let s = args.trim();
+    if s.chars().count() > 80 {
+        s.chars().take(80).collect::<String>() + "…"
+    } else {
+        s.to_string()
+    }
 }
 
 /// Resolve health-aware tier models from the discovery catalog, then spawn the Assay task (like
