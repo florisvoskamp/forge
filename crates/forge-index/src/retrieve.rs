@@ -111,9 +111,8 @@ fn backticked(prompt: &str) -> HashSet<String> {
 
 /// Query terms extracted from a prompt, plus whether they came from the high-confidence
 /// symbol-shaped path. `strong=false` means we fell back to plain prose words (no symbol-shaped
-/// token in the prompt) — a low-confidence signal where injecting a fat source *body* is risky
-/// (a prose word like "insert" can exact-match an unrelated helper), so the caller injects only
-/// signature lines in that case.
+/// token in the prompt) — a low-confidence signal where any injection is net-negative (a prose word
+/// like "insert" exact-matches an unrelated helper), so [`retrieve`] injects nothing in that case.
 struct Query {
     terms: Vec<String>,
     strong: bool,
@@ -221,9 +220,13 @@ pub fn retrieve(
         terms: idents,
         strong,
     } = extract_query(prompt);
-    // Bodies are high-cost and re-sent every agent step — only inject them when the query is
-    // confident (symbol-shaped). On a prose fallback, signatures only.
-    let bodies = if strong { bodies } else { None };
+    // Low-confidence prose query (no symbol-shaped token): inject nothing. Benchmarks show that
+    // injecting fuzzy/marginal hits for a prose question is net-negative — it can point the model
+    // at an unrelated symbol and *add* exploration vs no injection. Staying silent bounds the
+    // downside: Lattice helps when the prompt names what it wants, and never hurts when it can't.
+    if !strong {
+        return Ok(InjectedContext::default());
+    }
     // Prompt-adaptive ceiling: don't spend the full budget padding context for a prompt that names
     // one symbol. Each named symbol "earns" up to ~one body's worth of budget, clamped to the
     // configured ceiling. A prompt with no identifiers still gets a small floor.
@@ -277,12 +280,6 @@ pub fn retrieve(
                     }
                 }
             }
-        }
-        // On a low-confidence prose query, a fuzzy signature match is worse than nothing: it points
-        // the model at an unrelated symbol and *adds* exploration. Inject only exact-name hits then
-        // (possibly nothing — degrading to the no-injection baseline rather than misleading).
-        if !strong && !exact {
-            continue;
         }
         // Signature lines are cheap individually but a long tail of fuzzy matches is pure tax,
         // re-sent on every agent step. Cap them so injection stays lean.

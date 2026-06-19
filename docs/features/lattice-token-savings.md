@@ -5,10 +5,10 @@
 > Make Lattice context injection actually *save* tokens by injecting the **source bodies** of the
 > top-ranked symbols, not just their signatures — so the model reads the relevant code from
 > context instead of spending whole-file `read_file` calls, **and** by querying only high-signal
-> symbol-shaped identifiers so the injection is relevant rather than a wall of noise. Measured
-> **~50% median per-task reduction** in agent-loop tokens vs the previous (signature-only) default,
-> **~37% vs no Lattice**, on a repo-question benchmark — and the model answers in 1–2 steps instead
-> of 3–4.
+> symbol-shaped identifiers (staying silent when the prompt names no symbol) so the injection is
+> relevant rather than a wall of noise. Measured **~37% reduction** in agent-loop tokens vs no
+> Lattice (and a similar margin vs the previous signature-only default at reps=8), on a
+> repo-question benchmark — with the model answering in ~2 steps instead of ~4.5.
 
 ---
 
@@ -56,12 +56,12 @@ Fixes (`retrieve.rs`):
   *only* those. All-caps acronyms ("SQL", "INSERT") and Titlecase prose ("Answer", "Store") are
   excluded; a backtick-quoted token (`` `Usage` ``) is always treated as a symbol. Only when the
   prompt contains no symbol-shaped token at all do we fall back to plain prose words.
-- **Bodies only on a confident (symbol-shaped) query.** A prose fallback injects signatures only —
-  a fat body for a fuzzy prose match (e.g. "insert" exact-matching an unrelated helper) is the
-  worst case, costing hundreds of tokens of noise per step.
-- **Bodies only for exact-name hits**, and **signature lines for fuzzy hits dropped on the prose
-  path** (so a low-confidence query injects a few exact matches or nothing — degrading to the
-  no-injection baseline rather than misleading the model).
+- **Nothing injected on a low-confidence (prose) query.** When the prompt names no symbol-shaped
+  token, `retrieve` returns empty rather than guessing — a fuzzy prose match (e.g. "insert"
+  exact-matching an unrelated helper) only points the model at the wrong place and *adds*
+  exploration. Measured net-negative, so we stay silent and let the turn behave as if Lattice were
+  off.
+- **Bodies only for exact-name hits** on the confident path.
 - **Signature cap** (`MAX_SIG_SNIPPETS = 8`) bounds the long tail of fuzzy matches.
 
 This took the example prompt's injection from ~720 tokens / 30 snippets to ~160 / 3 (the two
@@ -115,28 +115,34 @@ The mean was measuring luck, not the change.
 
 The report now uses, per task, the **median total across reps**, and aggregates conditions by the
 **mean and median of the per-task percentage reductions** (each task weighted equally — so one
-giant-token task can't swing the headline). The median-of-tasks is the figure to trust; the mean is
-shown alongside and is positive whenever a single task blows up.
+giant-token task can't swing the headline). Both are reported; when they disagree, the run is
+under-sampled.
 
-### Results (median of per-task reductions, 3 runs at reps=3–4)
+**Use reps ≥ 8.** The five tasks are bimodal — symbol-named prompts (large, reliable win) and prose
+prompts (no win) — so at low reps the equal-weight *median* lands on the boundary task and flips
+sign run-to-run (one reps=3 run measured the Improved-vs-Current median at +0.1%, another at −83%).
+At reps=8 mean and median converge and agree.
 
-| metric | typical |
-|--------|---------|
-| Improved vs Current (old signature-only default) | **−48% to −54%** |
-| Improved vs Off (no Lattice) | **−37% to −38%** |
-| steps, Off → Improved | 3–4 → 1–2 |
+### Results (reps=8)
 
-The big wins are on **symbol-named questions** (T1 `Usage`, T2 `inject_budget`/`BudgetStatus`, T5
-`PermissionMode`): the relevant body is injected, the model answers in one step. The strongest
-single case was T2, the prompt that previously *regressed*: the noisy injection that sent the model
-exploring is gone, and Improved now lands ~2.5k tokens vs Current's 5–150k (run-dependent).
+| metric | mean | median |
+|--------|------|--------|
+| Improved vs Off (no Lattice)              | −38% | −37% |
+| Improved vs Current (old signature-only)  | −37% | −47% |
+| steps, Off → Improved                     | 4.5 → 2.0 | |
 
-**Honest caveat — prose questions.** T4 names no symbol ("the retrieval code extracts candidate
-identifiers… minimum length… stopword"). On the prose-fallback path Lattice can only inject a few
-exact-name guesses or nothing, so it is **neutral-to-slightly-negative vs no injection** there — the
-model reads the file regardless. Lattice helps when the prompt names what it wants; it does not hurt
-much when it can't. Run-to-run, absolute numbers still swing widely (T2-Current ranged 5.7k–151k
-across runs); the **median per-task reduction is stable** and clears the ≥30% target with margin.
+The win is entirely on **symbol-named questions** (T1 `Usage`, T2 `inject_budget`/`BudgetStatus`, T5
+`PermissionMode`): the relevant body is injected and the model answers without a file read. T2 is
+the strongest case and the one that previously *regressed* — Improved now lands ~2.5k tokens vs
+Current's 5k–150k (the old noisy injection that sent the model exploring is gone).
+
+**Prose questions inject nothing (by design).** A prompt that names no symbol (T3, T4) hits the
+low-confidence fallback, where benchmarks showed any injection is net-negative — a fuzzy hit points
+the model at an unrelated symbol and *adds* exploration. So `retrieve` stays **silent** on prose
+queries: Improved equals Off there (the T3/T4 spread across conditions is pure model RNG, not an
+injection effect). Lattice helps when the prompt names what it wants, and does not hurt when it
+can't. The headline figure is **vs Off** — that is what turning Lattice on does for a user — and it
+is a stable ~37% reduction; the ≥30% target is met with margin.
 
 A diagnostic, `cargo run -p xtasks -- probe-retrieve`, prints exactly which symbols (body vs
 signature, token cost) each task's prompt would inject — used to root-cause regressions without
