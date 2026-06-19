@@ -1573,6 +1573,24 @@ impl Store {
         Ok(rows)
     }
 
+    /// All nodes ordered by pagerank descending, capped at `limit` — the repo-map selection query.
+    /// Returns the top-N most important symbols across all files in the index; the caller applies
+    /// a token-budget cutoff. Use `usize::MAX` to retrieve every node (for small repos).
+    pub fn lattice_nodes_ranked(&self, limit: usize) -> Result<Vec<LatticeNodeRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.file_id, n.kind, n.name, n.qualname, n.signature,
+                    n.span_start, n.span_end, n.line_start, n.pagerank
+             FROM lattice_node n
+             ORDER BY n.pagerank DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit as i64], lattice_node_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// All (node_id, node_name) pairs — needed to resolve reference names to node ids for PageRank.
     pub fn lattice_node_ids_and_names(&self) -> Result<Vec<(String, String)>> {
         let conn = self.lock()?;

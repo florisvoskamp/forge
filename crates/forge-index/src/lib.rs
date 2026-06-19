@@ -15,11 +15,13 @@ use sha2::{Digest, Sha256};
 
 mod embed;
 mod extract;
+mod map;
 mod retrieve;
 mod watch;
 
 pub use embed::{parse_ollama_embeddings, Embedder, OllamaEmbedder};
 pub use extract::{extract, lang_for_path, supported_languages, Def, Parsed, Ref};
+pub use map::build_map;
 pub use retrieve::{BodyOpts, InjectedContext, RetrievedSnippet};
 pub use watch::{spawn_watcher, LatticeWatcher};
 
@@ -609,6 +611,24 @@ impl Lattice {
             edges,
             refs,
         })
+    }
+
+    /// All nodes ranked by pagerank descending, capped at `limit`. Used by [`Lattice::map`] to
+    /// select the most important symbols for the repo-map without needing to re-sort client-side.
+    /// Pass `usize::MAX` to retrieve everything (the map applies its own token-budget cutoff).
+    pub(crate) fn store_nodes_ranked(&self, limit: usize) -> Result<Vec<NodeHit>, LatticeError> {
+        let rows = self.store.lattice_nodes_ranked(limit)?;
+        self.rows_to_hits(rows)
+    }
+
+    /// Build a compact, token-budgeted repo-map: the most important definitions across the repo,
+    /// grouped by file, ordered by source line within each file. Selection is by pagerank
+    /// descending so high-centrality symbols (called by many others) appear first. The output is
+    /// deterministic and safe to cache — same index + budget → same string.
+    ///
+    /// Returns a plain-text block ready to print or inject. Empty index → a hint to run update.
+    pub fn map(&self, token_budget: usize) -> Result<String, LatticeError> {
+        map::build_map(self, token_budget)
     }
 
     fn rows_to_hits(&self, rows: Vec<LatticeNodeRow>) -> Result<Vec<NodeHit>, LatticeError> {
