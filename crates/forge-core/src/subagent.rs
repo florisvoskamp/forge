@@ -558,22 +558,20 @@ pub async fn orchestrate(
         // Decide whether this child gets an isolated worktree. We create the WorktreeGuard here
         // (on the orchestrator task, before spawning) so any creation error is visible immediately
         // and doesn't kill an already-running child task.
-        let maybe_guard = if isolation_enabled
-            && repo_is_git
-            && is_write_capable(&resolved, &full_registry)
-        {
-            match worktree::WorktreeGuard::create(&ctx.repo_root, &child_id) {
-                Ok(g) => Some(g),
-                Err(e) => {
-                    tracing::warn!(
+        let maybe_guard =
+            if isolation_enabled && repo_is_git && is_write_capable(&resolved, &full_registry) {
+                match worktree::WorktreeGuard::create(&ctx.repo_root, &child_id) {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        tracing::warn!(
                         "worktree create failed for {child_id}: {e} — running without isolation"
                     );
-                    None
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // Build the child context, injecting the worktree root when applicable.
         let child_ctx = AgentCtx {
