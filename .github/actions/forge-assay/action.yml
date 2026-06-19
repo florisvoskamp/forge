@@ -1,0 +1,112 @@
+name: "Forge Assay"
+description: "Run Forge's Assay critic crew on a PR and post findings as a sticky comment (and optionally upload SARIF)."
+author: "Forge"
+branding:
+  icon: "shield"
+  color: "purple"
+
+inputs:
+  version:
+    description: "Forge release tag to use (e.g. v0.2.0). Must be a release whose binary has `forge assay run`."
+    required: true
+  scope:
+    description: "Assay scope: diff | repo (default diff)."
+    required: false
+    default: "diff"
+  fail-on:
+    description: "Fail the job when a finding's severity is >= this (low|medium|high|critical). Empty = never fail."
+    required: false
+    default: "high"
+  lenses:
+    description: "Comma-separated subset of lenses (default: full crew)."
+    required: false
+    default: ""
+  anthropic-api-key:
+    description: "ANTHROPIC_API_KEY for the crew (pass from secrets)."
+    required: false
+    default: ""
+  openrouter-api-key:
+    description: "OPENROUTER_API_KEY for the crew (pass from secrets)."
+    required: false
+    default: ""
+  comment:
+    description: "Post/update a sticky PR comment with the markdown report (true/false)."
+    required: false
+    default: "true"
+  sarif:
+    description: "Also upload SARIF to GitHub code-scanning (true/false)."
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Forge
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "$(uname -m)" != "x86_64" ]; then
+          echo "::error::forge-assay only ships an x86_64 Linux binary; runner is $(uname -m)"; exit 1
+        fi
+        asset="forge-x86_64-unknown-linux-gnu.tar.gz"
+        url="https://github.com/florisvoskamp/forge/releases/download/${{ inputs.version }}/${asset}"
+        curl -fsSL "$url" -o /tmp/forge.tar.gz
+        tar xzf /tmp/forge.tar.gz -C /tmp
+        sudo install -m0755 /tmp/forge-x86_64-unknown-linux-gnu/forge /usr/local/bin/forge
+        forge --version
+
+    - name: Run Assay
+      id: assay
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
+      run: |
+        set -uo pipefail
+        args=(assay run --scope "${{ inputs.scope }}" --format markdown)
+        [ -n "${{ inputs.fail-on }}" ] && args+=(--fail-on "${{ inputs.fail-on }}")
+        [ -n "${{ inputs.lenses }}" ] && args+=(--lenses "${{ inputs.lenses }}")
+        set +e
+        forge "${args[@]}" > /tmp/assay.md
+        echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+        set -e
+        if [ "${{ inputs.sarif }}" = "true" ]; then
+          forge assay run --scope "${{ inputs.scope }}" --format sarif > /tmp/assay.sarif || true
+        fi
+        # Expose the markdown to the comment step.
+        { echo "report<<FORGE_EOF"; cat /tmp/assay.md; echo "FORGE_EOF"; } >> "$GITHUB_OUTPUT"
+
+    - name: Upload SARIF
+      if: inputs.sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: /tmp/assay.sarif
+      continue-on-error: true
+
+    - name: Sticky PR comment
+      if: inputs.comment == 'true' && github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const body = `<!-- forge-assay -->\n## 🛡️ Forge Assay\n\n` + process.env.REPORT;
+          const {owner, repo} = context.repo;
+          const issue_number = context.payload.pull_request.number;
+          const comments = await github.paginate(github.rest.issues.listComments, {owner, repo, issue_number});
+          const mine = comments.find(c => c.body && c.body.includes('<!-- forge-assay -->'));
+          if (mine) {
+            await github.rest.issues.updateComment({owner, repo, comment_id: mine.id, body});
+          } else {
+            await github.rest.issues.createComment({owner, repo, issue_number, body});
+          }
+      env:
+        REPORT: ${{ steps.assay.outputs.report }}
+
+    - name: Enforce fail-on
+      if: inputs.fail-on != ''
+      shell: bash
+      run: |
+        code="${{ steps.assay.outputs.exit_code }}"
+        if [ "$code" = "2" ]; then
+          echo "::error::Forge Assay found findings at or above '${{ inputs.fail-on }}'"; exit 1
+        fi
+        [ "$code" = "0" ] || { echo "::error::forge assay run failed (exit $code)"; exit "$code"; }

@@ -53,7 +53,25 @@ $ forge lattice query "UserRepository"
 
 ## Install
 
-### Prebuilt binaries (recommended)
+### One-line install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/florisvoskamp/forge/main/install.sh | sh
+```
+
+Detects your OS/arch, downloads the matching release binary (verifying its
+SHA-256), and installs `forge` to `~/.local/bin`. Override with `FORGE_VERSION`
+(a tag) or `FORGE_INSTALL_DIR`. Linux x86-64 and macOS (Apple Silicon + Intel)
+are supported; on other arches it falls back to building from source.
+
+### Homebrew
+
+```bash
+brew tap florisvoskamp/forge https://github.com/florisvoskamp/forge
+brew install forge
+```
+
+### Prebuilt binaries
 
 Grab the latest release for your OS from the [**Releases**](https://github.com/florisvoskamp/forge/releases) page:
 
@@ -466,6 +484,33 @@ monthly_cap_usd = 50.0
 ```
 
 At 80% Forge warns; at the cap it stops (override with `FORGE_BUDGET_OVERRIDE=1`). Under budget pressure the mesh downshifts to cheaper models and reduces Lattice context. **Context auto-compaction:** when the token gauge reaches 80% of the model's window at turn-end, Forge runs `/compact` automatically.
+
+---
+
+## Continuous Integration
+
+Run the Assay critic crew headlessly in any pipeline:
+
+```bash
+forge assay run --scope diff --format markdown --fail-on high
+```
+
+- `--format human|markdown|json|sarif` — `sarif` uploads to GitHub code-scanning; `markdown` is PR-comment shaped.
+- `--fail-on low|medium|high|critical` — exit code `2` when a finding meets the threshold (CI fails); omit to never fail.
+- `--scope diff|repo` (+ `--branch`/`--since`/`--path`). Reads `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` from the environment (no keyring needed in CI).
+
+**GitHub Action** — post findings as a sticky PR comment:
+
+```yaml
+- uses: florisvoskamp/forge/.github/actions/forge-assay@main
+  with:
+    version: v0.1.0          # a release whose binary has `forge assay run`
+    scope: diff
+    fail-on: high
+    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+See `docs/ci/forge-review.yml` for a full example workflow to copy into your repo's `.github/workflows/`.
 
 ---
 

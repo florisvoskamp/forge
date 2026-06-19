@@ -18,6 +18,7 @@ use forge_tui::{HeadlessPresenter, Presenter, TuiPresenter};
 use forge_types::PermissionMode;
 use forge_types::TaskTier;
 
+mod assay_output;
 mod balance;
 mod benchmarks;
 mod bridge_stats;
@@ -43,6 +44,34 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum AssayFormat {
+    Human,
+    Markdown,
+    Json,
+    Sarif,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq, PartialOrd, Ord)]
+enum FailOnSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl FailOnSeverity {
+    fn matches(self, sev: forge_types::Severity) -> bool {
+        let sev_ord = match sev {
+            forge_types::Severity::Low => FailOnSeverity::Low,
+            forge_types::Severity::Medium => FailOnSeverity::Medium,
+            forge_types::Severity::High => FailOnSeverity::High,
+            forge_types::Severity::Critical => FailOnSeverity::Critical,
+        };
+        sev_ord >= self
+    }
+}
+
 #[derive(Subcommand)]
 enum AssayCmd {
     /// List past assay runs (newest first).
@@ -53,6 +82,37 @@ enum AssayCmd {
         a: String,
         /// Second run id (or prefix).
         b: String,
+    },
+    /// Run the Assay critic crew headlessly (CI-friendly). Exits 0 on success, 2 when
+    /// findings meet the --fail-on threshold, 1 on hard error.
+    Run {
+        /// What to analyse: `diff` (uncommitted changes), `repo` (whole repo),
+        /// `branch`, `since`, or `path` (see --branch / --since / --path).
+        #[arg(long, default_value = "diff")]
+        scope: String,
+        /// For `--scope branch`: the base ref to diff against (e.g. `main`).
+        #[arg(long)]
+        branch: Option<String>,
+        /// For `--scope since`: a git ref (commit / tag) to diff from.
+        #[arg(long)]
+        since: Option<String>,
+        /// For `--scope path`: the file or directory to analyse.
+        #[arg(long)]
+        path: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "human")]
+        format: AssayFormat,
+        /// Exit 2 if any finding's severity is >= this threshold.
+        #[arg(long)]
+        fail_on: Option<FailOnSeverity>,
+        /// Comma-separated subset of lenses to run (default: full crew).
+        /// Valid names: dead-weight, correctness, unsafe, test-coverage,
+        ///              design, architecture, documentation, over-engineering
+        #[arg(long)]
+        lenses: Option<String>,
+        /// Override the model for all critics (bypasses mesh tier selection).
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
@@ -566,7 +626,7 @@ async fn main() -> Result<()> {
         } => chat(mock, mode, resume, plain, model).await,
         Command::Sessions => sessions(),
         Command::Replay { ids, json } => replay_cmd(&ids, json),
-        Command::Assay { sub } => assay_cmd(sub),
+        Command::Assay { sub } => assay_cmd(sub).await,
         Command::Commands => commands_cmd(),
         Command::Models { probe, clear } => models(probe, clear).await,
         Command::Mesh { prompt, json } => mesh_explain(prompt.join(" "), json).await,
@@ -1422,10 +1482,24 @@ fn replay_cmd(ids: &[String], json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `forge assay list` / `forge assay compare <a> <b>` — inspect persisted assay runs.
-fn assay_cmd(sub: AssayCmd) -> Result<()> {
+/// `forge assay list` / `forge assay compare <a> <b>` / `forge assay run` — assay commands.
+async fn assay_cmd(sub: AssayCmd) -> Result<()> {
+    if let AssayCmd::Run {
+        scope,
+        branch,
+        since,
+        path,
+        format,
+        fail_on,
+        lenses,
+        model,
+    } = sub
+    {
+        return assay_run_cmd(scope, branch, since, path, format, fail_on, lenses, model).await;
+    }
     let store = open_store()?;
     match sub {
+        AssayCmd::Run { .. } => return Ok(()), // already handled above
         AssayCmd::List => {
             let runs = store.list_assay_runs().context("loading assay runs")?;
             if runs.is_empty() {
@@ -1495,6 +1569,162 @@ fn assay_cmd(sub: AssayCmd) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Headless `forge assay run` — CI path. Prepares inputs exactly like the TUI's `spawn_assay`
+/// (same model-tier discovery, same `bundle_scoped_source`), calls `run_assay`, renders output,
+/// and exits 2 when `--fail-on` is set and a finding meets the threshold. Exit 1 on hard error
+/// (propagated as `anyhow::Error`); exit 0 otherwise.
+#[allow(clippy::too_many_arguments)]
+async fn assay_run_cmd(
+    scope_str: String,
+    branch: Option<String>,
+    since: Option<String>,
+    path_override: Option<String>,
+    format: AssayFormat,
+    fail_on: Option<FailOnSeverity>,
+    lenses_str: Option<String>,
+    model_override: Option<String>,
+) -> Result<()> {
+    // Inject provider keys from env (ANTHROPIC_API_KEY / OPENROUTER_API_KEY etc.) so CI works
+    // without a keyring — same call as `forge models` and `forge mesh` make.
+    forge_config::inject_provider_keys();
+    forge_config::inject_search_keys();
+
+    // --- Resolve AssayScope from CLI flags ---
+    let scope = match scope_str.trim().to_lowercase().as_str() {
+        "repo" => forge_types::AssayScope::Repo,
+        "diff" => forge_types::AssayScope::Diff,
+        "branch" => {
+            let base =
+                branch.ok_or_else(|| anyhow::anyhow!("--scope branch requires --branch <ref>"))?;
+            forge_types::AssayScope::Branch(base)
+        }
+        "since" => {
+            let r = since.ok_or_else(|| anyhow::anyhow!("--scope since requires --since <ref>"))?;
+            forge_types::AssayScope::Since(r)
+        }
+        "path" => {
+            let p = path_override
+                .ok_or_else(|| anyhow::anyhow!("--scope path requires --path <path>"))?;
+            forge_types::AssayScope::Path(p)
+        }
+        other => anyhow::bail!("unknown scope '{other}' — valid: diff, repo, branch, since, path"),
+    };
+
+    // --- Bundle source for the scope ---
+    let source = match bundle_scoped_source(&scope, 200_000) {
+        Ok(s) => s,
+        Err(e) => anyhow::bail!("assay: {e}"),
+    };
+    if source.trim().is_empty() {
+        anyhow::bail!("assay: no analysable source files for the requested scope");
+    }
+
+    // --- Parse lenses ---
+    let lenses: Vec<forge_types::FindingCategory> = match lenses_str {
+        None => forge_types::FindingCategory::crew().to_vec(),
+        Some(s) => {
+            let mut out = Vec::new();
+            for part in s.split(',') {
+                let name = part.trim();
+                match forge_types::FindingCategory::parse(name) {
+                    Some(cat) => out.push(cat),
+                    None => anyhow::bail!(
+                        "unknown lens '{name}' — valid: dead-weight, correctness, unsafe, \
+                         test-coverage, design, architecture, documentation, over-engineering"
+                    ),
+                }
+            }
+            if out.is_empty() {
+                anyhow::bail!("--lenses was empty; provide at least one lens name");
+            }
+            out
+        }
+    };
+
+    // --- Discover models (same path as TUI's spawn_assay) ---
+    let config = forge_config::load().unwrap_or_default();
+    let pricing = std::sync::Arc::new(forge_mesh::pricing::Pricing::from_config(&config));
+    let store = std::sync::Arc::new(open_store()?);
+    let cat = discover_catalog(&config).await;
+    if cat.is_empty() {
+        anyhow::bail!(
+            "assay: no models available — set a provider key (`forge auth <provider>`) or run ollama"
+        );
+    }
+    let benched = store.current_benched().unwrap_or_default();
+    let chain = |tier| -> Vec<String> {
+        if let Some(ref m) = model_override {
+            return vec![m.clone()];
+        }
+        let mut models: Vec<String> = cat
+            .ranked_for(tier, &pricing, 8)
+            .into_iter()
+            .filter(|m| !benched.is_benched(m))
+            .collect();
+        if models.is_empty() {
+            if let Some(m) = config.model_for(tier) {
+                models.push(m.to_string());
+            }
+        }
+        models
+    };
+    let (trivial, complex) = (
+        chain(forge_types::TaskTier::Trivial),
+        chain(forge_types::TaskTier::Complex),
+    );
+    if trivial.is_empty() && complex.is_empty() {
+        anyhow::bail!("assay: every model is rate-limited/benched — try `forge models --probe`");
+    }
+    let models = forge_core::assay::TierModels { trivial, complex };
+
+    // --- Build provider (same as build_provider_and_router, no mock in CI) ---
+    let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
+    let provider: std::sync::Arc<dyn forge_provider::Provider> = std::sync::Arc::new(
+        forge_provider::DispatchProvider::new(harness)
+            .with_max_output_tokens(config.mesh.effective_max_output_tokens()),
+    );
+
+    let cooldown = std::time::Duration::from_secs(config.mesh.failover_cooldown_secs);
+
+    // --- Run the crew ---
+    let src: std::sync::Arc<str> = std::sync::Arc::from(source.as_str());
+    let report = forge_core::assay::run_assay(
+        scope,
+        src,
+        lenses,
+        models,
+        provider,
+        pricing,
+        store,
+        cooldown,
+        &mut |_| {}, // progress events suppressed in headless mode
+    )
+    .await;
+
+    // --- Render output ---
+    match format {
+        AssayFormat::Human => assay_output::print_human(&report),
+        AssayFormat::Markdown => print!("{}", assay_output::print_markdown(&report)),
+        AssayFormat::Json => println!("{}", assay_output::print_json(&report)),
+        AssayFormat::Sarif => println!("{}", assay_output::print_sarif(&report)),
+    }
+
+    // --- Exit-code gate ---
+    if let Some(threshold) = fail_on {
+        let triggered = report
+            .findings
+            .iter()
+            .any(|f| threshold.matches(f.severity));
+        if triggered {
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            std::process::exit(2);
+        }
+    }
+
     Ok(())
 }
 

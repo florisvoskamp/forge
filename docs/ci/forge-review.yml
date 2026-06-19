@@ -1,0 +1,31 @@
+# Example: run Forge's Assay critic crew on every pull request and post the
+# findings as a sticky comment. Copy this into your own repo's .github/workflows/.
+#
+# Requires a repo/org secret with a model key (ANTHROPIC_API_KEY or OPENROUTER_API_KEY).
+name: forge-review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write # only needed if sarif: true
+
+jobs:
+  assay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so --scope diff/branch can resolve the base
+
+      - uses: florisvoskamp/forge/.github/actions/forge-assay@main
+        with:
+          version: v0.1.0 # pin to a release whose binary has `forge assay run`
+          scope: diff
+          fail-on: high
+          comment: "true"
+          sarif: "false"
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
