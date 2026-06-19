@@ -170,7 +170,8 @@ CREATE TABLE IF NOT EXISTS lattice_node (
     signature   TEXT,
     span_start  INTEGER NOT NULL,
     span_end    INTEGER NOT NULL,
-    line_start  INTEGER NOT NULL
+    line_start  INTEGER NOT NULL,
+    pagerank    REAL NOT NULL DEFAULT 0.0
 );
 CREATE INDEX IF NOT EXISTS idx_lnode_name ON lattice_node(name);
 CREATE INDEX IF NOT EXISTS idx_lnode_file ON lattice_node(file_id);

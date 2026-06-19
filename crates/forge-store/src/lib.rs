@@ -160,6 +160,7 @@ impl Store {
             "ALTER TABLE message ADD COLUMN tool_call_id TEXT",
             "ALTER TABLE message ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE session ADD COLUMN parent_session_id TEXT",
+            "ALTER TABLE lattice_node ADD COLUMN pagerank REAL NOT NULL DEFAULT 0.0",
         ] {
             let _ = conn.execute(stmt, []);
         }
@@ -1270,6 +1271,7 @@ pub struct LatticeNodeRow {
     pub span_start: i64,
     pub span_end: i64,
     pub line_start: i64,
+    pub pagerank: f64,
 }
 
 /// A persisted relationship edge.
@@ -1292,8 +1294,8 @@ pub struct LatticeRefRow {
     pub line: i64,
 }
 
-/// Read a [`LatticeNodeRow`] from the first 9 columns of a row (id, file_id, kind, name, qualname,
-/// signature, span_start, span_end, line_start).
+/// Read a [`LatticeNodeRow`] from the first 10 columns of a row (id, file_id, kind, name, qualname,
+/// signature, span_start, span_end, line_start, pagerank).
 fn lattice_node_from_row(r: &rusqlite::Row) -> rusqlite::Result<LatticeNodeRow> {
     Ok(LatticeNodeRow {
         id: r.get(0)?,
@@ -1305,6 +1307,7 @@ fn lattice_node_from_row(r: &rusqlite::Row) -> rusqlite::Result<LatticeNodeRow> 
         span_start: r.get(6)?,
         span_end: r.get(7)?,
         line_start: r.get(8)?,
+        pagerank: r.get(9).unwrap_or(0.0),
     })
 }
 
@@ -1356,8 +1359,8 @@ impl Store {
         for n in nodes {
             tx.execute(
                 "INSERT INTO lattice_node
-                   (id, file_id, kind, name, qualname, signature, span_start, span_end, line_start)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                   (id, file_id, kind, name, qualname, signature, span_start, span_end, line_start, pagerank)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0.0)",
                 rusqlite::params![
                     n.id,
                     n.file_id,
@@ -1395,7 +1398,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.file_id, n.kind, n.name, n.qualname, n.signature,
-                    n.span_start, n.span_end, n.line_start
+                    n.span_start, n.span_end, n.line_start, n.pagerank
              FROM lattice_ref r
              JOIN lattice_node n ON n.id = r.src_id
              WHERE r.name = ?1 AND n.name <> ?1
@@ -1436,7 +1439,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT n.id, n.file_id, n.kind, n.name, n.qualname, n.signature,
-                    n.span_start, n.span_end, n.line_start,
+                    n.span_start, n.span_end, n.line_start, n.pagerank,
                     CASE
                         WHEN lower(n.name) = lower(?1) THEN 0
                         WHEN lower(n.name) LIKE lower(?1) || '%' THEN 1
@@ -1459,6 +1462,7 @@ impl Store {
                     span_start: r.get(6)?,
                     span_end: r.get(7)?,
                     line_start: r.get(8)?,
+                    pagerank: r.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1469,7 +1473,7 @@ impl Store {
     pub fn lattice_node_by_id(&self, id: &str) -> Result<Option<LatticeNodeRow>> {
         let conn = self.lock()?;
         match conn.query_row(
-            "SELECT id, file_id, kind, name, qualname, signature, span_start, span_end, line_start
+            "SELECT id, file_id, kind, name, qualname, signature, span_start, span_end, line_start, pagerank
              FROM lattice_node WHERE id = ?1",
             [id],
             lattice_node_from_row,
@@ -1521,7 +1525,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT n.id, n.file_id, n.kind, n.name, n.qualname, n.signature,
-                    n.span_start, n.span_end, n.line_start
+                    n.span_start, n.span_end, n.line_start, n.pagerank
              FROM lattice_node n
              LEFT JOIN lattice_embedding e ON e.node_id = n.id
              WHERE e.node_id IS NULL
@@ -1555,6 +1559,64 @@ impl Store {
         Ok(self
             .lock()?
             .query_row("SELECT COUNT(*) FROM lattice_embedding", [], |r| r.get(0))?)
+    }
+
+    /// All (src_id, dst_name) pairs from lattice_ref — the directed reference graph for PageRank.
+    /// `src_id` is the referencing node's id; `dst_name` is the referenced identifier (resolved to
+    /// node ids by name-join at call time). Returns (src_node_id, referenced_name) pairs.
+    pub fn lattice_ref_edges(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT src_id, name FROM lattice_ref")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// All nodes ordered by pagerank descending, capped at `limit` — the repo-map selection query.
+    /// Returns the top-N most important symbols across all files in the index; the caller applies
+    /// a token-budget cutoff. Use `usize::MAX` to retrieve every node (for small repos).
+    pub fn lattice_nodes_ranked(&self, limit: usize) -> Result<Vec<LatticeNodeRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.file_id, n.kind, n.name, n.qualname, n.signature,
+                    n.span_start, n.span_end, n.line_start, n.pagerank
+             FROM lattice_node n
+             ORDER BY n.pagerank DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit as i64], lattice_node_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// All (node_id, node_name) pairs — needed to resolve reference names to node ids for PageRank.
+    pub fn lattice_node_ids_and_names(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT id, name FROM lattice_node")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Batch-update pagerank scores: for each `(node_id, score)` pair, set `pagerank = score`.
+    /// Runs inside one transaction for performance.
+    pub fn set_lattice_pageranks(&self, scores: &[(String, f64)]) -> Result<()> {
+        if scores.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE lattice_node SET pagerank = ?2 WHERE id = ?1")?;
+            for (id, score) in scores {
+                stmt.execute(rusqlite::params![id, score])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -2150,6 +2212,7 @@ mod tests {
             span_start: 0,
             span_end: 1,
             line_start: 1,
+            pagerank: 0.0,
         };
         store
             .replace_lattice_file(&file, &[node], &[], &[])

@@ -10,6 +10,68 @@
 use std::collections::HashMap;
 use tree_sitter_tags::{TagsConfiguration, TagsContext};
 
+// Hand-crafted tags queries for grammars that ship a tags.scm but do not export it as a const,
+// or that have no tags.scm at all. Validated against the grammar's node-types.json.
+
+// The bundled tree-sitter-c-sharp TAGS_QUERY contains a bare `@module` capture which is not a
+// valid tags capture name (tree-sitter-tags only accepts `@definition.*` / `@reference.*` /
+// `@name` / `@doc`). Use a fixed version that replaces `@module` with `@definition.module`.
+const CSHARP_TAGS_QUERY: &str = r#"
+(class_declaration name: (identifier) @name) @definition.class
+(class_declaration (base_list (_) @name)) @reference.class
+(interface_declaration name: (identifier) @name) @definition.interface
+(interface_declaration (base_list (_) @name)) @reference.interface
+(method_declaration name: (identifier) @name) @definition.method
+(object_creation_expression type: (identifier) @name) @reference.class
+(type_parameter_constraints_clause (identifier) @name) @reference.class
+(type_parameter_constraint (type type: (identifier) @name)) @reference.class
+(variable_declaration type: (identifier) @name) @reference.class
+(invocation_expression function: (member_access_expression name: (identifier) @name)) @reference.send
+(namespace_declaration name: (identifier) @name) @definition.module
+"#;
+
+const BASH_TAGS_QUERY: &str = r#"
+(function_definition
+  name: (word) @name) @definition.function
+"#;
+
+const HASKELL_TAGS_QUERY: &str = r#"
+(function
+  name: (variable) @name) @definition.function
+(signature
+  name: (variable) @name) @definition.type
+"#;
+
+const SCALA_TAGS_QUERY: &str = r#"
+(package_clause
+  name: (package_identifier) @name) @definition.module
+(trait_definition
+  name: (identifier) @name) @definition.interface
+(enum_definition
+  name: (identifier) @name) @definition.enum
+(class_definition
+  name: (identifier) @name) @definition.class
+(object_definition
+  name: (identifier) @name) @definition.object
+(function_definition
+  name: (identifier) @name) @definition.function
+(val_definition
+  pattern: (identifier) @name) @definition.variable
+(type_definition
+  name: (type_identifier) @name) @definition.type
+(call_expression
+  (identifier) @name) @reference.call
+"#;
+
+const KOTLIN_TAGS_QUERY: &str = r#"
+(function_declaration
+  name: (identifier) @name) @definition.function
+(class_declaration
+  name: (identifier) @name) @definition.class
+(object_declaration
+  name: (identifier) @name) @definition.object
+"#;
+
 /// A symbol definition pulled from a tags query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Def {
@@ -149,6 +211,63 @@ fn build_registry() -> Registry {
                     tree_sitter_ruby::TAGS_QUERY,
                 ),
                 &["rb"],
+            ),
+            (
+                "csharp",
+                lang(tree_sitter_c_sharp::LANGUAGE.into(), CSHARP_TAGS_QUERY),
+                &["cs"],
+            ),
+            (
+                "php",
+                lang(
+                    tree_sitter_php::LANGUAGE_PHP.into(),
+                    tree_sitter_php::TAGS_QUERY,
+                ),
+                &["php"],
+            ),
+            (
+                "elixir",
+                lang(
+                    tree_sitter_elixir::LANGUAGE.into(),
+                    tree_sitter_elixir::TAGS_QUERY,
+                ),
+                &["ex", "exs"],
+            ),
+            (
+                "lua",
+                lang(
+                    tree_sitter_lua::LANGUAGE.into(),
+                    tree_sitter_lua::TAGS_QUERY,
+                ),
+                &["lua"],
+            ),
+            (
+                "ocaml",
+                lang(
+                    tree_sitter_ocaml::LANGUAGE_OCAML.into(),
+                    tree_sitter_ocaml::TAGS_QUERY,
+                ),
+                &["ml", "mli"],
+            ),
+            (
+                "bash",
+                lang(tree_sitter_bash::LANGUAGE.into(), BASH_TAGS_QUERY),
+                &["sh", "bash"],
+            ),
+            (
+                "haskell",
+                lang(tree_sitter_haskell::LANGUAGE.into(), HASKELL_TAGS_QUERY),
+                &["hs"],
+            ),
+            (
+                "scala",
+                lang(tree_sitter_scala::LANGUAGE.into(), SCALA_TAGS_QUERY),
+                &["scala"],
+            ),
+            (
+                "kotlin",
+                lang(tree_sitter_kotlin_ng::LANGUAGE.into(), KOTLIN_TAGS_QUERY),
+                &["kt", "kts"],
             ),
         ];
         let mut entries = Vec::new();
@@ -390,5 +509,107 @@ pub fn helper() -> String { String::new() }
         assert!(extract("x.rs", "").defs.is_empty());
         assert_eq!(lang_for_path("a.go"), Some("go"));
         assert_eq!(lang_for_path("a.unknownext"), None);
+        assert_eq!(lang_for_path("a.cs"), Some("csharp"));
+        assert_eq!(lang_for_path("a.php"), Some("php"));
+        assert_eq!(lang_for_path("a.ex"), Some("elixir"));
+        assert_eq!(lang_for_path("a.lua"), Some("lua"));
+        assert_eq!(lang_for_path("a.ml"), Some("ocaml"));
+        assert_eq!(lang_for_path("a.sh"), Some("bash"));
+        assert_eq!(lang_for_path("a.hs"), Some("haskell"));
+        assert_eq!(lang_for_path("a.scala"), Some("scala"));
+        assert_eq!(lang_for_path("a.kt"), Some("kotlin"));
+    }
+
+    #[test]
+    fn csharp_definitions() {
+        let src = "public class Greeter { public void Hello() {} }";
+        let p = extract("app.cs", src);
+        assert!(p.defs.iter().any(|d| d.name == "Greeter"), "class captured");
+    }
+
+    #[test]
+    fn php_definitions() {
+        let src = "<?php\nfunction greet($name) { return $name; }\nclass Foo {}\n";
+        let p = extract("app.php", src);
+        assert!(
+            p.defs.iter().any(|d| d.name == "greet" || d.name == "Foo"),
+            "php def captured"
+        );
+    }
+
+    #[test]
+    fn elixir_definitions() {
+        let src = "defmodule MyApp do\n  def hello(name) do\n    name\n  end\nend\n";
+        let p = extract("app.ex", src);
+        assert!(
+            p.defs
+                .iter()
+                .any(|d| d.name == "hello" || d.name == "MyApp"),
+            "elixir def captured"
+        );
+    }
+
+    #[test]
+    fn lua_definitions() {
+        let src = "function greet(name)\n  return name\nend\n";
+        let p = extract("app.lua", src);
+        assert!(
+            p.defs.iter().any(|d| d.name == "greet"),
+            "lua function captured"
+        );
+    }
+
+    #[test]
+    fn ocaml_definitions() {
+        let src = "let greet name = print_endline name\n";
+        let p = extract("app.ml", src);
+        assert!(
+            p.defs.iter().any(|d| d.name == "greet"),
+            "ocaml let binding captured"
+        );
+    }
+
+    #[test]
+    fn bash_definitions() {
+        let src = "greet() {\n  echo hello\n}\n";
+        let p = extract("script.sh", src);
+        assert!(
+            p.defs.iter().any(|d| d.name == "greet"),
+            "bash function captured"
+        );
+    }
+
+    #[test]
+    fn haskell_definitions() {
+        let src = "greet :: String -> String\ngreet name = name\n";
+        let p = extract("app.hs", src);
+        assert!(
+            p.defs.iter().any(|d| d.name == "greet"),
+            "haskell function captured"
+        );
+    }
+
+    #[test]
+    fn scala_definitions() {
+        let src = "class Greeter {\n  def hello(): Unit = println(\"hi\")\n}\n";
+        let p = extract("app.scala", src);
+        assert!(
+            p.defs
+                .iter()
+                .any(|d| d.name == "Greeter" || d.name == "hello"),
+            "scala def captured"
+        );
+    }
+
+    #[test]
+    fn kotlin_definitions() {
+        let src = "class Greeter {\n  fun hello(): Unit {}\n}\n";
+        let p = extract("app.kt", src);
+        assert!(
+            p.defs
+                .iter()
+                .any(|d| d.name == "Greeter" || d.name == "hello"),
+            "kotlin def captured"
+        );
     }
 }

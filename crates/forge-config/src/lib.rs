@@ -171,6 +171,11 @@ pub struct LatticeConfig {
     /// a signature line instead (injecting a huge body would cost more than the read it saves).
     #[serde(default = "default_body_max_tokens")]
     pub body_max_tokens: usize,
+    /// Future hook for `forge lattice map`: when true, group the map output by importance tier
+    /// (high / medium / low pagerank bands) rather than by file path. Not yet wired into the
+    /// agent turn loop — present so it can be set in config ahead of the feature landing.
+    #[serde(default)]
+    pub map_orientation: bool,
 }
 
 /// Embedding-backed semantic retrieval settings. On by default with `backend = "auto"`, which
@@ -229,6 +234,7 @@ impl Default for LatticeConfig {
             embeddings: EmbeddingsConfig::default(),
             inject_bodies: default_inject_bodies(),
             body_max_tokens: default_body_max_tokens(),
+            map_orientation: false,
         }
     }
 }
