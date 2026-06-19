@@ -44,6 +44,8 @@ fn init_repo() -> PathBuf {
     run_git(&dir, &["init"]).unwrap();
     run_git(&dir, &["config", "user.email", "test@forge.local"]).unwrap();
     run_git(&dir, &["config", "user.name", "Forge Test"]).unwrap();
+    // Byte-exact line endings so `git apply` doesn't add CRLF on Windows.
+    run_git(&dir, &["config", "core.autocrlf", "false"]).unwrap();
     // Initial commit.
     std::fs::write(dir.join("README"), "root\n").unwrap();
     run_git(&dir, &["add", "README"]).unwrap();
