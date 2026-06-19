@@ -31,6 +31,10 @@ sandbox_writable = ["/home/me/.cargo"]   # extra writable dirs beyond cwd + temp
   possible follow-up). Pair with the permission broker + denylist for command-level control.
 - Applies to the in-process `shell` tool on the primary session path. Default off so existing
   behaviour is byte-for-byte unchanged.
+- **PTY interaction:** the `shell` tool's `pty: true` path (pseudo-terminal) is spawned by
+  `portable-pty`, which exposes no `pre_exec` hook, so Landlock can't confine it. To prevent a
+  trivial escape (always passing `pty: true`), `pty: true` is **refused** while the sandbox is
+  enabled — the model must re-run without PTY.
 
 Verified on Linux 6.x/7.x (`CONFIG_SECURITY_LANDLOCK=y`): a write inside cwd succeeds, a write to
 `/etc/...` is denied with `Permission denied`.

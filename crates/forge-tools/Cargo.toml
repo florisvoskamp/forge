@@ -19,6 +19,8 @@ globset.workspace = true
 regex.workspace = true
 tracing.workspace = true
 
+portable-pty = "0.9"
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

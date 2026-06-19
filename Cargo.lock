@@ -1634,6 +1634,7 @@ dependencies = [
  "globset",
  "landlock",
  "libc",
+ "portable-pty",
  "regex",
  "reqwest",
  "serde_json",
