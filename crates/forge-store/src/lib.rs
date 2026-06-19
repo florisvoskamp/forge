@@ -387,6 +387,20 @@ impl Store {
         Ok((i.max(0) as u64, o.max(0) as u64))
     }
 
+    /// Number of provider calls (model steps) recorded in a session — one `usage` row per call.
+    /// The Lattice benchmark uses this as the "steps" metric: fewer tool-exploration round-trips
+    /// means fewer steps and fewer tokens.
+    pub fn session_step_count(&self, session_id: &str) -> Result<u64> {
+        let conn = self.lock()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM usage u JOIN message m ON m.id = u.message_id
+             WHERE m.session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
+    }
+
     /// Models the Mesh routed to within a session (chosen_model per routing_decision), oldest
     /// first. Used to verify subagents route independently of the parent.
     pub fn session_models(&self, session_id: &str) -> Result<Vec<String>> {

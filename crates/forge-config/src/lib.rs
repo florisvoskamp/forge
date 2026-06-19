@@ -152,6 +152,16 @@ pub struct LatticeConfig {
     /// and blended into retrieval, and it's a no-op (zero cost, structural-only) when none is.
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    /// Inject the *source body* of the top-ranked retrieved symbols (not just their signature),
+    /// so the model can read a function directly from context instead of spending a `read_file`
+    /// (which dumps the whole file into the transcript). The single biggest token-saving lever —
+    /// see docs/features/lattice-token-savings.md. Off → signature-only (legacy behaviour).
+    #[serde(default = "default_inject_bodies")]
+    pub inject_bodies: bool,
+    /// Per-symbol token ceiling for an injected body. Symbols whose body exceeds this are kept as
+    /// a signature line instead (injecting a huge body would cost more than the read it saves).
+    #[serde(default = "default_body_max_tokens")]
+    pub body_max_tokens: usize,
 }
 
 /// Embedding-backed semantic retrieval settings. On by default with `backend = "auto"`, which
@@ -208,8 +218,18 @@ impl Default for LatticeConfig {
             inject_token_budget: default_inject_budget(),
             watch: default_lattice_watch(),
             embeddings: EmbeddingsConfig::default(),
+            inject_bodies: default_inject_bodies(),
+            body_max_tokens: default_body_max_tokens(),
         }
     }
+}
+
+fn default_inject_bodies() -> bool {
+    true
+}
+
+fn default_body_max_tokens() -> usize {
+    800
 }
 
 fn default_lattice_watch() -> bool {
@@ -225,7 +245,11 @@ fn default_lattice_inject() -> bool {
 }
 
 fn default_inject_budget() -> usize {
-    1500
+    // Sized so the top few symbol *bodies* fit (body injection is the token-saving lever): a body
+    // costs up to `body_max_tokens` (~800) and we inject up to 3, so ~3000 covers bodies + a tail
+    // of signature lines. Prompt-adaptive scaling in retrieval avoids over-injecting on simple
+    // prompts. See docs/features/lattice-token-savings.md.
+    3000
 }
 
 /// Settings for the `shell` tool.

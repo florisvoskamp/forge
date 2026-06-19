@@ -6296,6 +6296,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "xtasks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "forge-config",
+ "forge-core",
+ "forge-index",
+ "forge-mesh",
+ "forge-provider",
+ "forge-store",
+ "forge-tools",
+ "forge-tui",
+ "forge-types",
+ "tokio",
+]
+
+[[package]]
 name = "yaml-rust"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

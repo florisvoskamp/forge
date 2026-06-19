@@ -20,7 +20,7 @@ mod watch;
 
 pub use embed::{parse_ollama_embeddings, Embedder, OllamaEmbedder};
 pub use extract::{extract, lang_for_path, supported_languages, Def, Parsed, Ref};
-pub use retrieve::{InjectedContext, RetrievedSnippet};
+pub use retrieve::{BodyOpts, InjectedContext, RetrievedSnippet};
 pub use watch::{spawn_watcher, LatticeWatcher};
 
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +55,10 @@ pub struct NodeHit {
     pub signature: Option<String>,
     pub rel_path: String,
     pub line: i64,
+    /// Byte offsets of the symbol's source span in its file (from tree-sitter). Used to slice the
+    /// body for body-injection retrieval without re-parsing. `(0, 0)` when unknown.
+    pub span_start: i64,
+    pub span_end: i64,
 }
 
 /// Reverse-dependency closure for `impact`: the symbol(s) named, everything that references them
@@ -295,9 +299,10 @@ impl Lattice {
         &self,
         prompt: &str,
         token_budget: usize,
+        bodies: Option<retrieve::BodyOpts>,
         embedder: &dyn Embedder,
     ) -> Result<InjectedContext, LatticeError> {
-        let ctx = retrieve::retrieve(self, prompt, token_budget)?;
+        let ctx = retrieve::retrieve(self, prompt, token_budget, bodies)?;
         if self.store.lattice_embedding_count()? == 0 {
             return Ok(ctx);
         }
@@ -468,13 +473,21 @@ impl Lattice {
         })
     }
 
+    /// Canonicalized repo root this index covers (used to resolve a node's file for body slicing).
+    pub fn repo_root(&self) -> &str {
+        &self.repo_root
+    }
+
     /// Retrieve a budgeted set of relevant code for `prompt` — the auto-injection payload.
+    /// `bodies` enables source-body injection for the top hits (the big token-saving lever); pass
+    /// `None` for signature-only (legacy) retrieval.
     pub fn retrieve(
         &self,
         prompt: &str,
         token_budget: usize,
+        bodies: Option<retrieve::BodyOpts>,
     ) -> Result<InjectedContext, LatticeError> {
-        retrieve::retrieve(self, prompt, token_budget)
+        retrieve::retrieve(self, prompt, token_budget, bodies)
     }
 
     pub fn status(&self) -> Result<IndexStatus, LatticeError> {
@@ -502,6 +515,8 @@ impl Lattice {
                 signature: r.signature,
                 rel_path,
                 line: r.line_start,
+                span_start: r.span_start,
+                span_end: r.span_end,
             });
         }
         Ok(hits)
@@ -719,9 +734,9 @@ mod tests {
         lat.update().unwrap();
 
         // No embeddings yet → identical to structural retrieve.
-        let structural = lat.retrieve("parse_tokens", 500).unwrap();
+        let structural = lat.retrieve("parse_tokens", 500, None).unwrap();
         let hybrid = lat
-            .retrieve_hybrid("parse_tokens", 500, &FakeEmbedder)
+            .retrieve_hybrid("parse_tokens", 500, None, &FakeEmbedder)
             .await
             .unwrap();
         assert_eq!(
@@ -732,7 +747,7 @@ mod tests {
         // After embedding, hybrid still returns the structural hit (and never fewer).
         lat.embed_pending(&FakeEmbedder, 50).await.unwrap();
         let hybrid2 = lat
-            .retrieve_hybrid("parse_tokens", 500, &FakeEmbedder)
+            .retrieve_hybrid("parse_tokens", 500, None, &FakeEmbedder)
             .await
             .unwrap();
         assert!(hybrid2.snippets.len() >= structural.snippets.len());

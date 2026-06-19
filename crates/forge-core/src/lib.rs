@@ -1480,15 +1480,25 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             if let Some(lat) = self.lattice.as_ref().filter(|_| self.config.lattice.inject) {
                 let budget = inject_budget(self.config.lattice.inject_token_budget, status);
                 let emb = &self.config.lattice.embeddings;
+                // Body injection (the big token-saving lever): inject the top hits' full source so
+                // the model reads them from context instead of spending a whole-file `read_file`.
+                let bodies = self
+                    .config
+                    .lattice
+                    .inject_bodies
+                    .then_some(forge_index::BodyOpts {
+                        max_tokens: self.config.lattice.body_max_tokens,
+                        max_hits: 3,
+                    });
                 // Hybrid: blend embedding neighbours of the prompt with structural hits. The
                 // backend is chosen by config (auto-picks the cheapest available); any backend
                 // error degrades to structural inside `retrieve_hybrid`. No backend → structural.
                 match forge_provider::select_embedder(emb) {
                     Some((embedder, _)) => lat
-                        .retrieve_hybrid(prompt, budget, embedder.as_ref())
+                        .retrieve_hybrid(prompt, budget, bodies, embedder.as_ref())
                         .await
                         .ok(),
-                    None => lat.retrieve(prompt, budget).ok(),
+                    None => lat.retrieve(prompt, budget, bodies).ok(),
                 }
             } else {
                 None
