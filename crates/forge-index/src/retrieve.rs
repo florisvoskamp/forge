@@ -79,7 +79,10 @@ const STOPWORDS: &[&str] = &[
 /// sentence-start words leak in and drag a wall of unrelated symbols into the injection. Genuine
 /// single-word types ("Usage") are recovered via backtick quoting instead (see [`backticked`]).
 fn looks_like_symbol(t: &str) -> bool {
-    let internal_upper = t.chars().enumerate().any(|(i, c)| i > 0 && c.is_ascii_uppercase());
+    let internal_upper = t
+        .chars()
+        .enumerate()
+        .any(|(i, c)| i > 0 && c.is_ascii_uppercase());
     let has_lower = t.chars().any(|c| c.is_ascii_lowercase());
     // `_` → snake_case. internal-upper + lower → camelCase/PascalCase-multiword. The lowercase
     // requirement excludes all-caps acronyms ("SQL", "INSERT", "JSON") which are prose, not symbols
@@ -353,7 +356,10 @@ mod tests {
         assert!(!q.strong);
         assert!(q.terms.contains(&"depth".to_string()));
         assert!(q.terms.contains(&"start".to_string()));
-        assert!(!q.terms.iter().any(|i| i == "and" || i == "the" || i == "field"));
+        assert!(!q
+            .terms
+            .iter()
+            .any(|i| i == "and" || i == "the" || i == "field"));
     }
 
     #[test]

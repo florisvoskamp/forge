@@ -24,12 +24,20 @@ pub fn run() -> anyhow::Result<()> {
     });
     for t in TASKS {
         let ctx = lattice.retrieve(t.prompt, 3000, bodies)?;
-        println!("\n=== {} ===  est_tokens={} snippets={}", t.id, ctx.est_tokens, ctx.snippets.len());
+        println!(
+            "\n=== {} ===  est_tokens={} snippets={}",
+            t.id,
+            ctx.est_tokens,
+            ctx.snippets.len()
+        );
         for s in &ctx.snippets {
             let kind = if s.is_body { "BODY" } else { "sig " };
             let cost = (s.text.len() / 4).max(1);
             let head = s.text.lines().next().unwrap_or("");
-            println!("  [{kind}] ~{cost:>4} tok  {}:{}  {}", s.rel_path, s.line, head);
+            println!(
+                "  [{kind}] ~{cost:>4} tok  {}:{}  {}",
+                s.rel_path, s.line, head
+            );
         }
     }
     Ok(())

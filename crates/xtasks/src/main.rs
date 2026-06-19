@@ -12,6 +12,8 @@ async fn main() -> anyhow::Result<()> {
     match cmd.as_str() {
         "bench-lattice" => bench_lattice::run().await,
         "probe-retrieve" => probe_retrieve::run(),
-        other => anyhow::bail!("unknown subcommand: {other:?} (try: bench-lattice, probe-retrieve)"),
+        other => {
+            anyhow::bail!("unknown subcommand: {other:?} (try: bench-lattice, probe-retrieve)")
+        }
     }
 }

@@ -275,6 +275,10 @@ fn print_report(rows: &[Row], conds: &[Condition]) {
     println!("\n## Reduction (equal-weight per-task)\n");
     report_delta("Current vs Off    ", Condition::Off, Condition::Current);
     report_delta("Improved vs Off   ", Condition::Off, Condition::Improved);
-    report_delta("Improved vs Current", Condition::Current, Condition::Improved);
+    report_delta(
+        "Improved vs Current",
+        Condition::Current,
+        Condition::Improved,
+    );
     println!("\n(target: Improved vs Current ≤ -30%)");
 }
