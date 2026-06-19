@@ -261,6 +261,9 @@ pub struct App {
     /// For the `/models` browser only: `Some(provider)` when drilled into a provider's models,
     /// `None` at the top-level provider list. Lets Esc step back a level instead of closing.
     pub models_drilled: Option<String>,
+    /// When true the models picker was opened via bare `/model` (pin-mode): selecting a leaf model
+    /// row pins it instead of just browsing. Reset to false when the picker closes.
+    pub models_pin_mode: bool,
     /// The live task list (`update_tasks`). Kept so the sticky tasks panel stays visible during
     /// the turn (the inline scrollback copy scrolls away); cleared when the model empties the list.
     tasks: Vec<forge_types::TodoItem>,

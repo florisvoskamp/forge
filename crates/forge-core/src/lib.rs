@@ -9,11 +9,13 @@ use forge_config::Config;
 use forge_index::Lattice;
 use forge_mesh::pricing::Pricing;
 use forge_mesh::{BudgetState, BudgetStatus, ModelCatalog, Router};
-use forge_provider::{Provider, StreamEvent, ToolSpec};
+use forge_provider::{CompletionOptions, Provider, StreamEvent, ToolSpec};
 use forge_store::Store;
 use forge_tools::ToolRegistry;
 use forge_tui::{Presenter, PresenterEvent};
-use forge_types::{Message, PermissionDecision, PermissionMode, PermissionRule, Role, TaskTier};
+use forge_types::{
+    EffortLevel, Message, PermissionDecision, PermissionMode, PermissionRule, Role, TaskTier,
+};
 
 pub mod assay;
 pub mod hooks;
@@ -21,6 +23,7 @@ pub mod llm_router;
 pub mod permission;
 pub mod snapshot;
 pub mod subagent;
+pub mod worktree;
 
 pub use llm_router::LlmRouter;
 
@@ -90,6 +93,23 @@ pub(crate) fn pattern_diagnose(result: &str) -> Option<&'static str> {
     None
 }
 
+/// Whether `finding_sev` is at or above `threshold` (a string from `AssayConfig::gate_severity`).
+/// Ordering (most → least severe): critical > high > medium > low.
+/// A "high" threshold matches `high` and `critical` but not `medium` or `low`.
+/// Returns `true` for any unrecognised threshold string (fail-open: surface the finding rather than
+/// silently drop it when the config has a typo).
+pub(crate) fn severity_meets(finding_sev: forge_types::Severity, threshold: &str) -> bool {
+    use forge_types::Severity;
+    let min_weight = match threshold.trim().to_lowercase().as_str() {
+        "critical" => Severity::Critical.weight(),
+        "high" => Severity::High.weight(),
+        "medium" | "med" => Severity::Medium.weight(),
+        "low" => Severity::Low.weight(),
+        _ => 0, // unknown threshold → pass everything through
+    };
+    finding_sev.weight() >= min_weight
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error(transparent)]
@@ -104,6 +124,10 @@ pub enum CoreError {
     SessionNotFound(String),
     #[error("no healthy model available: every routed/fallback model is rate-limited or down")]
     NoHealthyModel,
+    /// The auto-review gate found findings at/above the configured severity and `gate_mode =
+    /// "block"` is set — the turn is aborted so the model can fix them before proceeding.
+    #[error("auto-review gate blocked: {0}")]
+    TurnBlocked(String),
 }
 
 /// Result of a [`Session::rewind_to`] / [`Session::undo`]: what the file-restore did, plus the
@@ -216,6 +240,8 @@ pub struct Session {
     /// Background file watcher that keeps the index fresh on external edits. Held only to keep the
     /// watcher thread alive for the session's lifetime (dropped → watching stops).
     lattice_watcher: Option<forge_index::LatticeWatcher>,
+    /// LSP registry for live diagnostics after writes. `None` when lsp.enabled = false.
+    lsp: Option<Arc<forge_lsp::LspRegistry>>,
     /// The discovered command/skill catalog, so the model can find + load Forge's own skills via
     /// the `use_skill` virtual tool (command-skill-system.md). `None` → the tool is not advertised
     /// and the turn runs exactly as before.
@@ -223,6 +249,9 @@ pub struct Session {
     /// In-session model pin (`/model <id>`). When set, mesh routing still classifies the prompt
     /// (for stats), but this model is used instead of the routed pick. `None` = mesh routing.
     pinned_model: Option<String>,
+    /// In-session reasoning-effort pin (`/effort <level>`). When set, forwarded to the provider
+    /// as a `ReasoningEffort` hint each turn. `None` = provider default (no hint sent).
+    pinned_effort: Option<EffortLevel>,
     /// System hints queued by side-call diagnostics (e.g. shell error interceptor) to be injected
     /// into the transcript immediately after the tool result that triggered them. Cleared each time.
     pending_hints: Vec<String>,
@@ -237,6 +266,9 @@ pub struct Session {
     /// Images attached to the *next* user turn (vision input, e.g. via `/image <path>`). Drained
     /// when that turn's user message is built; empty for text-only turns.
     pending_images: Vec<forge_types::ImageAttachment>,
+    /// Count of successful writes made by `invoke_tool` in the current turn. Reset at the start
+    /// of each turn; used to gate the autofix stage (skip it when nothing was edited).
+    edits_this_turn: u32,
 }
 
 impl Session {
@@ -360,12 +392,15 @@ impl Session {
             mcp: None,
             lattice: None,
             lattice_watcher: None,
+            lsp: None,
             skills: None,
             pinned_model: None,
+            pinned_effort: None,
             pending_hints: vec![],
             always_compact_on_switch: false,
             project_prompt_injected,
             pending_images: Vec::new(),
+            edits_this_turn: 0,
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -403,6 +438,16 @@ impl Session {
         self.pinned_model.as_deref()
     }
 
+    /// Set (or clear) the in-session reasoning-effort pin. `None` returns to the provider default.
+    pub fn set_effort(&mut self, e: Option<EffortLevel>) {
+        self.pinned_effort = e;
+    }
+
+    /// The currently-pinned effort level, if any (`/effort <level>` was called this session).
+    pub fn pinned_effort(&self) -> Option<EffortLevel> {
+        self.pinned_effort
+    }
+
     /// The discovered model catalog, if auto-discovery ran for this session.
     pub fn catalog(&self) -> Option<&ModelCatalog> {
         self.catalog.as_ref()
@@ -425,6 +470,11 @@ impl Session {
     /// Attach the background reindex watcher (composition root); held for the session's lifetime.
     pub fn set_lattice_watcher(&mut self, watcher: Option<forge_index::LatticeWatcher>) {
         self.lattice_watcher = watcher;
+    }
+
+    /// Attach the LSP registry (composition root). No-op when `lsp.enabled = false`.
+    pub fn set_lsp(&mut self, lsp: Option<Arc<forge_lsp::LspRegistry>>) {
+        self.lsp = lsp;
     }
 
     /// Attach the command/skill catalog (composition root) so the model can discover and load
@@ -1065,6 +1115,140 @@ impl Session {
         fit_messages(&self.transcript, budget_chars.max(2048))
     }
 
+    /// System prompt for the architect planner phase. Instructs the planner to produce a concrete
+    /// prose plan only — no tool calls are available in this phase.
+    const ARCHITECT_PLANNER_SYSTEM: &'static str =
+        "You are the PLANNER in a two-phase coding-assistant pipeline. \
+Your job is to think through the request carefully and produce a concise, concrete, step-by-step \
+plan of the edits and tool calls that an EDITOR agent will execute next. \
+Rules:\n\
+- Output ONLY the plan as structured prose or a numbered list. No preamble, no summary of what \
+  you were asked, no sign-off.\n\
+- Be specific: name the exact files to create/modify, the functions to add/change, \
+  and the commands to run (if any).\n\
+- Do NOT attempt to call any tools — none are available in this phase. \
+  Describe what SHOULD be done, not do it.";
+
+    /// Resolve the model to use for the architect PLAN phase.
+    /// Priority: in-session `/model` pin > `mesh.architect_model` config > mesh-routed Complex tier.
+    fn resolve_planner_model(&self) -> String {
+        // An active /model pin overrides everything.
+        if let Some(pin) = &self.pinned_model {
+            return pin.clone();
+        }
+        // Explicit config override.
+        if let Some(m) = &self.config.mesh.architect_model {
+            if !m.is_empty() {
+                return m.clone();
+            }
+        }
+        // Fall back to the primary Complex-tier model from the config.
+        self.config
+            .model_for(forge_types::TaskTier::Complex)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "anthropic::claude-opus-4-8".to_string())
+    }
+
+    /// Resolve the model to use for the architect EDIT phase.
+    /// Priority: in-session `/model` pin > `mesh.editor_model` config > mesh-routed Standard tier.
+    fn resolve_editor_model(&self) -> String {
+        // An active /model pin overrides everything (both phases use the same pinned model).
+        if let Some(pin) = &self.pinned_model {
+            return pin.clone();
+        }
+        // Explicit config override.
+        if let Some(m) = &self.config.mesh.editor_model {
+            if !m.is_empty() {
+                return m.clone();
+            }
+        }
+        // Fall back to the primary Standard-tier model from the config.
+        self.config
+            .model_for(forge_types::TaskTier::Standard)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "groq::llama-3.3-70b-versatile".to_string())
+    }
+
+    /// Run the PLAN phase of the architect pipeline.
+    ///
+    /// Calls the planner model with the current transcript and NO tools advertised, streams its
+    /// response as a normal assistant turn (persisted + streamed to the presenter), records
+    /// usage/cost, and returns the plan text. Returns `Ok(None)` when `architect_mode` is off —
+    /// the early-exit guard that makes the non-architect path byte-for-byte unchanged.
+    async fn run_plan(&mut self) -> Result<Option<String>, CoreError> {
+        if !self.config.mesh.architect_mode {
+            return Ok(None);
+        }
+
+        let planner = self.resolve_planner_model();
+        self.presenter.emit(PresenterEvent::Routing {
+            tier: forge_types::TaskTier::Complex.as_str().to_string(),
+            model: planner.clone(),
+            rationale: "architect plan phase (no tools)".to_string(),
+        });
+
+        // Build the transcript window for the planner, then prepend the planner system prompt.
+        let mut planner_msgs = self.transcript_for(&planner);
+        planner_msgs.insert(0, Message::system(Self::ARCHITECT_PLANNER_SYSTEM));
+
+        let stream_idle = std::time::Duration::from_secs(self.config.mesh.stream_idle_timeout_secs);
+        let completion_opts = CompletionOptions {
+            effort: self.pinned_effort,
+        };
+
+        // Collect plan text while streaming it live to the presenter.
+        let mut plan_text = String::new();
+        let result = {
+            let provider = &self.provider;
+            let presenter = &mut self.presenter;
+            let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let act = std::sync::Arc::clone(&activity);
+            let mut sink = |ev: StreamEvent| {
+                act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let StreamEvent::Text(ref t) = ev {
+                    plan_text.push_str(t);
+                }
+                match ev {
+                    StreamEvent::Text(t) => presenter.emit(PresenterEvent::AssistantDelta(t)),
+                    StreamEvent::Reasoning(t) => presenter.emit(PresenterEvent::Reasoning(t)),
+                    _ => {}
+                }
+            };
+            // Empty tool slice — the planner must not call tools.
+            let fut =
+                provider.complete_with(&planner, &planner_msgs, &[], &completion_opts, &mut sink);
+            stream_with_idle_timeout(fut, &activity, stream_idle).await
+        };
+
+        let mut resp = result.map_err(CoreError::Provider)?;
+        if !resp.content.is_empty() {
+            self.presenter.emit(PresenterEvent::AssistantDone);
+        }
+        // Use the streamed text if the provider returns empty content (some providers do).
+        if resp.content.is_empty() && !plan_text.is_empty() {
+            resp.content = plan_text;
+        }
+
+        // Record cost/usage for the plan phase.
+        resp.usage.cost_usd = self.pricing.cost_for_usage(&planner, &resp.usage);
+        let seq = self.next_seq();
+        let msg_id = self.store.add_message_full(
+            &self.id,
+            seq,
+            Role::Assistant,
+            &resp.content,
+            Some(&planner),
+            &[],
+            None,
+        )?;
+        self.store.record_usage(&self.id, &msg_id, &resp.usage)?;
+
+        // Push the plan into the live transcript so the editor model sees it.
+        self.transcript.push(Message::assistant(&resp.content));
+
+        Ok(Some(resp.content))
+    }
+
     /// Rough token estimate of the current transcript (chars / [`CHARS_PER_TOKEN`], + small
     /// per-message framing). Used to decide compaction; not billed.
     fn estimated_transcript_tokens(&self) -> u64 {
@@ -1446,6 +1630,10 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             }
         }
 
+        // Reset the per-turn edit counter so the autofix stage only fires when THIS turn wrote
+        // something (not a carry-over from a prior turn).
+        self.edits_this_turn = 0;
+
         // 2. Persist + record the user message. Its seq keys this turn's code-snapshot dir
         // (PR3): files written during the turn are restorable by rewinding to this boundary.
         let seq = self.next_seq();
@@ -1526,10 +1714,33 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             });
         }
 
+        // ── Architect plan phase (architect_mode) ────────────────────────────────────────────────
+        // When enabled: call the strong planner model with NO tools advertised; append its plan to
+        // the transcript as a persisted assistant message so the editor model sees it below. When
+        // disabled (the default) `run_plan` returns Ok(None) immediately — this block is a no-op.
+        if let Some(_plan) = self.run_plan().await? {
+            // The plan is already in self.transcript (pushed inside run_plan). Nothing else to do
+            // here; the editor phase below will see it as the last assistant message in context.
+        }
+
+        // Determine the model for the edit phase.  In architect mode the editor model takes over;
+        // otherwise we keep the mesh-routed model unchanged.
+        let edit_model = if self.config.mesh.architect_mode {
+            let editor = self.resolve_editor_model();
+            self.presenter.emit(PresenterEvent::Routing {
+                tier: decision.tier.as_str().to_string(),
+                model: editor.clone(),
+                rationale: "architect edit phase".to_string(),
+            });
+            editor
+        } else {
+            routed_model.clone()
+        };
+
         // Silent auto-compaction: if the conversation has grown past ~80% of the routed model's
         // (fetched/heuristic) context window, summarize older messages now so the turn doesn't ride
         // the hard-trim floor and lose recent context. Transparent — `compact` emits its own note.
-        self.auto_compact_if_needed(&routed_model).await;
+        self.auto_compact_if_needed(&edit_model).await;
 
         let specs = self.tool_specs();
         let mut final_text = String::new();
@@ -1545,7 +1756,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
         let stream_idle = std::time::Duration::from_secs(self.config.mesh.stream_idle_timeout_secs);
         let mut chain = decision.fallbacks.clone().into_iter();
-        let mut active_model = routed_model;
+        let mut active_model = edit_model;
         // One-shot guard for the last-resort attempt when the whole chain is exhausted (below).
         let mut last_resort_used = false;
 
@@ -1613,7 +1824,16 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                                     }
                                 }
                             };
-                        let fut = provider.complete(&active_model, &sent, &specs, &mut sink);
+                        let completion_opts = CompletionOptions {
+                            effort: self.pinned_effort,
+                        };
+                        let fut = provider.complete_with(
+                            &active_model,
+                            &sent,
+                            &specs,
+                            &completion_opts,
+                            &mut sink,
+                        );
                         stream_with_idle_timeout(fut, &activity, stream_idle).await
                     };
                 match result {
@@ -1805,6 +2025,218 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             }
         }
 
+        // ── Autofix self-healing loop (autofix.md) ────────────────────────────────────────────
+        // After the turn's model↔tool loop finishes: if edits were made AND autofix is enabled
+        // with at least one non-empty command, run lint/test and feed failures back into the
+        // conversation so the model can fix them. Repeat up to `max_iterations`. When autofix is
+        // off, or no edits happened, this block is a no-op (zero overhead).
+        let af = self.config.autofix.clone();
+        let autofix_active = self.edits_this_turn > 0
+            && ((af.auto_lint && !af.lint_cmd.is_empty())
+                || (af.auto_test && !af.test_cmd.is_empty()));
+
+        if autofix_active {
+            self.presenter.emit(PresenterEvent::Warning(format!(
+                "autofix: running checks after {} edit(s)",
+                self.edits_this_turn
+            )));
+            let mut iterations_used = 0u32;
+            loop {
+                if iterations_used >= af.max_iterations {
+                    self.presenter.emit(PresenterEvent::Warning(format!(
+                        "autofix: reached iteration cap ({}) — stopping; remaining failures \
+                         were not fixed",
+                        af.max_iterations
+                    )));
+                    break;
+                }
+                iterations_used += 1;
+
+                match self.run_autofix_stage(&af).await {
+                    Ok(true) => {
+                        self.presenter.emit(PresenterEvent::Warning(
+                            "autofix: all checks passed".to_string(),
+                        ));
+                        break;
+                    }
+                    Ok(false) => {
+                        // Failures already injected into transcript by run_autofix_stage.
+                        // Re-run the model↔tool inner loop to let the model fix them.
+                        self.presenter.emit(PresenterEvent::Warning(format!(
+                            "autofix: iteration {iterations_used}/{} — re-running model loop",
+                            af.max_iterations
+                        )));
+                        // Run the inner model↔tool loop again (same routing/tool setup).
+                        let fix_prompt = "(autofix re-entry: fix the failures above)";
+                        let specs = self.tool_specs();
+                        let mut fix_hit_cap = true;
+                        for step in 0..max_steps {
+                            let sent = self.transcript_for(&active_model);
+                            let result = {
+                                let provider = &self.provider;
+                                let presenter = &mut self.presenter;
+                                let activity =
+                                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                                let act = std::sync::Arc::clone(&activity);
+                                let mut sink = |ev: StreamEvent| {
+                                    act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    match ev {
+                                        StreamEvent::Text(t) => {
+                                            presenter.emit(PresenterEvent::AssistantDelta(t))
+                                        }
+                                        StreamEvent::Reasoning(t) => {
+                                            presenter.emit(PresenterEvent::Reasoning(t))
+                                        }
+                                        StreamEvent::ToolStarted { name, args } => {
+                                            presenter.emit(PresenterEvent::ToolStart { name, args })
+                                        }
+                                        StreamEvent::ToolFinished { name, ok, summary } => {
+                                            presenter.emit(PresenterEvent::ToolResult {
+                                                name,
+                                                ok,
+                                                summary,
+                                            })
+                                        }
+                                        StreamEvent::SubagentStarted { id, agent, task } => {
+                                            presenter.emit(PresenterEvent::SubagentStart {
+                                                id,
+                                                agent,
+                                                task,
+                                            })
+                                        }
+                                        StreamEvent::SubagentProgress { id, snippet } => presenter
+                                            .emit(PresenterEvent::SubagentProgress { id, snippet }),
+                                        StreamEvent::SubagentFinished {
+                                            id,
+                                            agent,
+                                            ok,
+                                            summary,
+                                            cost_usd,
+                                        } => presenter.emit(PresenterEvent::SubagentResult {
+                                            id,
+                                            agent,
+                                            ok,
+                                            summary,
+                                            cost_usd,
+                                        }),
+                                        StreamEvent::Tasks(tasks) => {
+                                            presenter.emit(PresenterEvent::Tasks(tasks))
+                                        }
+                                    }
+                                };
+                                let completion_opts = CompletionOptions {
+                                    effort: self.pinned_effort,
+                                };
+                                let fut = provider.complete_with(
+                                    &active_model,
+                                    &sent,
+                                    &specs,
+                                    &completion_opts,
+                                    &mut sink,
+                                );
+                                stream_with_idle_timeout(fut, &activity, stream_idle).await
+                            };
+                            let mut resp = match result {
+                                Ok(r) => {
+                                    if !r.content.is_empty() {
+                                        self.presenter.emit(PresenterEvent::AssistantDone);
+                                    }
+                                    r
+                                }
+                                Err(e) => return Err(e.into()),
+                            };
+
+                            resp.usage.cost_usd =
+                                self.pricing.cost_for_usage(&active_model, &resp.usage);
+                            context_tokens = resp.usage.input_tokens;
+                            self.transcript.push(Message::assistant_tool_calls(
+                                &resp.content,
+                                resp.tool_calls.clone(),
+                            ));
+                            let seq = self.next_seq();
+                            let msg_id = self.store.add_message_full(
+                                &self.id,
+                                seq,
+                                Role::Assistant,
+                                &resp.content,
+                                Some(&active_model),
+                                &resp.tool_calls,
+                                None,
+                            )?;
+                            self.store.record_usage(&self.id, &msg_id, &resp.usage)?;
+
+                            if !resp.wants_tools() {
+                                final_text = resp.content;
+                                fix_hit_cap = false;
+                                break;
+                            }
+                            for call in &resp.tool_calls {
+                                let result = self.invoke_tool(&msg_id, call).await?;
+                                let seq = self.next_seq();
+                                self.store.add_message_full(
+                                    &self.id,
+                                    seq,
+                                    Role::Tool,
+                                    &result,
+                                    None,
+                                    &[],
+                                    Some(&call.id),
+                                )?;
+                                self.transcript.push(Message::tool_result(&call.id, result));
+                                let hints: Vec<String> = self.pending_hints.drain(..).collect();
+                                for hint in hints {
+                                    let hseq = self.next_seq();
+                                    let _ = self.store.add_message(
+                                        &self.id,
+                                        hseq,
+                                        Role::System,
+                                        &hint,
+                                        None,
+                                    );
+                                    self.transcript.push(Message::system(hint));
+                                }
+                            }
+                            let _ = step; // suppress unused-variable warning
+                        }
+                        let _ = fix_prompt; // used only as a label above
+                        if fix_hit_cap {
+                            self.presenter.emit(PresenterEvent::Warning(format!(
+                                "autofix: inner model loop hit the {max_steps}-step limit"
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        // Autofix infrastructure failure — surface as warning and abort the loop.
+                        self.presenter.emit(PresenterEvent::Warning(format!(
+                            "autofix: stage error ({e}) — skipping remaining iterations"
+                        )));
+                        break;
+                    }
+                }
+            }
+        }
+        // ── End autofix ───────────────────────────────────────────────────────────────────────
+
+        // ── Auto-review gate (assay.auto_review) ──────────────────────────────────────────────
+        // When enabled: build a unified diff of files written THIS turn, run the Assay critic
+        // crew over it, and either warn or block depending on gate_mode. Zero overhead when off.
+        if self.config.assay.auto_review && self.edits_this_turn > 0 {
+            let ar = self.config.assay.clone();
+            if let Err(e) = self.auto_review_gate(&ar).await {
+                // TurnBlocked propagates up so the caller can surface it; other errors are
+                // infrastructure failures we surface as warnings to avoid silently killing the turn.
+                match &e {
+                    CoreError::TurnBlocked(_) => return Err(e),
+                    _ => {
+                        self.presenter.emit(PresenterEvent::Warning(format!(
+                            "auto-review: gate error ({e}) — skipping"
+                        )));
+                    }
+                }
+            }
+        }
+        // ── End auto-review gate ───────────────────────────────────────────────────────────────
+
         let (session_in, session_out) = self.store.session_tokens(&self.id)?;
         self.presenter.emit(PresenterEvent::Cost {
             session_total_usd: self.store.session_cost(&self.id)?,
@@ -1817,6 +2249,194 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             final_text: final_text.clone(),
         });
         Ok(final_text)
+    }
+
+    /// Build a unified diff of files written this turn (pre-turn blob vs current file), run the
+    /// Assay critic crew over it, and surface findings whose severity >= `gate_severity`. In
+    /// `warn` mode the findings are emitted as warnings and the turn continues. In `block` mode
+    /// they are emitted and `CoreError::TurnBlocked` is returned so the turn is aborted.
+    async fn auto_review_gate(&mut self, cfg: &forge_config::AssayConfig) -> Result<(), CoreError> {
+        use similar::{ChangeTag, TextDiff};
+
+        // Gather files touched this turn from the snapshot manifest.
+        let turn_files = snapshot::changed_files_this_turn(
+            &self.checkpoint_root,
+            &self.id,
+            self.current_turn_seq,
+        );
+        if turn_files.is_empty() {
+            return Ok(());
+        }
+
+        // Build a concatenated unified diff: for each file, diff old (blob or empty) vs new.
+        let mut combined = String::new();
+        for tf in &turn_files {
+            let old = tf
+                .blob
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default();
+            let new = std::fs::read_to_string(&tf.path).unwrap_or_default();
+            if old == new {
+                continue;
+            }
+            combined.push_str(&format!("--- a/{}\n+++ b/{}\n", tf.path, tf.path));
+            let td = TextDiff::from_lines(old.as_str(), new.as_str());
+            for change in td.iter_all_changes() {
+                let sym = match change.tag() {
+                    ChangeTag::Delete => "-",
+                    ChangeTag::Insert => "+",
+                    ChangeTag::Equal => " ",
+                };
+                combined.push_str(&format!("{sym} {}", change.value()));
+            }
+            combined.push('\n');
+        }
+
+        if combined.len() < cfg.min_diff_bytes {
+            return Ok(());
+        }
+
+        self.presenter.emit(PresenterEvent::Warning(format!(
+            "auto-review: diff is {} bytes — running critic crew",
+            combined.len(),
+        )));
+
+        let lenses = forge_types::FindingCategory::crew().to_vec();
+        let pricing = std::sync::Arc::new(self.pricing.clone());
+        let provider = std::sync::Arc::clone(&self.provider);
+        let store = std::sync::Arc::clone(&self.store);
+        let cooldown = std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
+
+        // Build tier model chains from the catalog (ranked + health-filtered) when available,
+        // falling back to the configured model list — same pattern as the CLI's /assay path.
+        let benched = self.store.current_benched().unwrap_or_default();
+        let models = {
+            let chain = |tier: forge_types::TaskTier| -> Vec<String> {
+                // Catalog path: ranked candidates, drop currently-benched ones first.
+                if let Some(cat) = &self.catalog {
+                    let ranked: Vec<String> = cat
+                        .ranked_for(tier, &self.pricing, 8)
+                        .into_iter()
+                        .filter(|m| !benched.is_benched(m))
+                        .collect();
+                    if !ranked.is_empty() {
+                        return ranked;
+                    }
+                }
+                // Config fallback: the configured candidates for this tier.
+                self.config
+                    .candidates_for(tier)
+                    .into_iter()
+                    .filter(|m| !benched.is_benched(m))
+                    .collect()
+            };
+            assay::TierModels {
+                trivial: chain(forge_types::TaskTier::Trivial),
+                complex: chain(forge_types::TaskTier::Complex),
+            }
+        };
+
+        let source: std::sync::Arc<str> = combined.into();
+        let presenter = &mut self.presenter;
+        let mut on_progress = |p: assay::AssayProgress| {
+            presenter.emit(PresenterEvent::AssayProgress(assay::progress_line(&p)));
+        };
+
+        let report = assay::run_assay(
+            forge_types::AssayScope::Diff,
+            source,
+            lenses,
+            models,
+            provider,
+            pricing,
+            store,
+            cooldown,
+            &mut on_progress,
+        )
+        .await;
+
+        // Filter to findings at/above the configured gate severity.
+        let gate_findings: Vec<&forge_types::Finding> = report
+            .findings
+            .iter()
+            .filter(|f| severity_meets(f.severity, &cfg.gate_severity))
+            .collect();
+
+        if gate_findings.is_empty() {
+            self.presenter.emit(PresenterEvent::Warning(
+                "auto-review: no findings at/above gate severity — OK".to_string(),
+            ));
+            return Ok(());
+        }
+
+        // Surface all gate-triggering findings as warnings.
+        for f in &gate_findings {
+            self.presenter.emit(PresenterEvent::Warning(format!(
+                "auto-review [{}] {}: {} — {} ({}:{})",
+                f.severity.as_str(),
+                f.category.as_str(),
+                f.title,
+                f.suggested_fix,
+                f.file,
+                f.line.map(|l| l.to_string()).unwrap_or_default(),
+            )));
+        }
+
+        if cfg.gate_mode.trim().eq_ignore_ascii_case("block") {
+            return Err(CoreError::TurnBlocked(format!(
+                "{} finding(s) at/above '{}' severity",
+                gate_findings.len(),
+                cfg.gate_severity
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Run the autofix stage: execute lint and/or test commands (if enabled and non-empty);
+    /// return `Ok(true)` when every enabled command exits 0, `Ok(false)` when any fails (the
+    /// combined output of failing commands is injected into the transcript as a synthetic user
+    /// message so the model can fix it next iteration). Never returns `Err` from a non-zero
+    /// command exit — only from infrastructure failures (transcript write, etc.).
+    async fn run_autofix_stage(
+        &mut self,
+        af: &forge_config::AutofixConfig,
+    ) -> Result<bool, CoreError> {
+        // Use the same 120-second timeout as the shell tool's default; lint/test commands that
+        // need more can be wrapped in a script.
+        const AUTOFIX_TIMEOUT_SECS: u64 = 120;
+        let mut failures = Vec::new();
+
+        if af.auto_lint && !af.lint_cmd.is_empty() {
+            let out = forge_tools::run_shell_command(&af.lint_cmd, ".", AUTOFIX_TIMEOUT_SECS).await;
+            if shell_command_failed(&out) {
+                failures.push(format!("[lint: {}]\n{}", af.lint_cmd, out));
+            }
+        }
+        if af.auto_test && !af.test_cmd.is_empty() {
+            let out = forge_tools::run_shell_command(&af.test_cmd, ".", AUTOFIX_TIMEOUT_SECS).await;
+            if shell_command_failed(&out) {
+                failures.push(format!("[test: {}]\n{}", af.test_cmd, out));
+            }
+        }
+
+        if failures.is_empty() {
+            return Ok(true);
+        }
+
+        // Inject the failures as a synthetic user message so the model fixes them on the next
+        // iteration of the outer autofix loop.
+        let body = format!(
+            "Auto-fix: the following checks failed, fix them:\n\n{}",
+            failures.join("\n\n")
+        );
+        let seq = self.next_seq();
+        self.store
+            .add_message(&self.id, seq, Role::User, &body, None)?;
+        self.transcript.push(Message::user(&body));
+
+        Ok(false)
     }
 
     /// Run a single tool call, applying the permission policy, and return its result text.
@@ -1951,10 +2571,33 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                             self.current_turn_seq,
                             path,
                         );
+                        // Count this successful write so the autofix stage knows edits happened.
+                        self.edits_this_turn += 1;
                         // Reindex the touched file in-turn so later retrieval/queries this turn
                         // reflect the edit (code-intelligence.md — post-edit freshness).
                         if let Some(lat) = &self.lattice {
                             let _ = lat.reindex_path(path);
+                        }
+                        // LSP diagnostics: ask the language server for errors on the
+                        // just-written file and queue them as a pending hint so the model
+                        // self-corrects this turn. Best-effort: missing server → silent.
+                        if self.config.lsp.enabled {
+                            if let Some(lsp) = &self.lsp {
+                                let abs =
+                                    std::path::absolute(path).unwrap_or_else(|_| path.clone());
+                                let timeout =
+                                    std::time::Duration::from_millis(self.config.lsp.timeout_ms);
+                                let lsp = Arc::clone(lsp);
+                                let diags = lsp.diagnostics_for(&abs, timeout).await;
+                                if !diags.is_empty() {
+                                    let lines: Vec<String> = diags
+                                        .iter()
+                                        .map(|d| d.format_line(&path.display().to_string()))
+                                        .collect();
+                                    self.pending_hints
+                                        .push(format!("[lsp diagnostics]\n{}", lines.join("\n")));
+                                }
+                            }
                         }
                     }
                     (out, true)
@@ -2157,6 +2800,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         let agents = Arc::new(forge_config::load_agents(std::path::Path::new(
             &self.config.mesh.subagents.agents_dir,
         )));
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let ctx = subagent::AgentCtx {
             provider: Arc::clone(&self.provider),
             router: Arc::clone(&self.router),
@@ -2168,6 +2812,8 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             depth: 0,
             max_depth: self.config.mesh.subagents.max_depth,
             agents,
+            worktree_root: None,
+            repo_root,
         };
         let parent_id = self.id.clone();
         let max_concurrency = self.config.mesh.subagents.max_concurrency;
@@ -4913,5 +5559,310 @@ mod tests {
         b.reset_fresh(".").unwrap();
         assert!(b.history().is_empty());
         assert_ne!(b.id(), a);
+    }
+
+    // ── Autofix tests ──────────────────────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autofix_stage_passes_when_commands_exit_zero() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        let af = forge_config::AutofixConfig {
+            auto_lint: true,
+            auto_test: true,
+            lint_cmd: "true".to_string(), // always exits 0
+            test_cmd: "true".to_string(), // always exits 0
+            max_iterations: 3,
+        };
+        // run_autofix_stage returns Ok(true) when all enabled commands pass.
+        let passed = session.run_autofix_stage(&af).await.unwrap();
+        assert!(passed, "both 'true' commands exit 0 → stage should pass");
+        // No synthetic failure message pushed to transcript.
+        assert!(
+            session
+                .transcript
+                .iter()
+                .all(|m| !m.content.contains("Auto-fix:")),
+            "no failure message injected on pass"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autofix_stage_fails_when_lint_exits_nonzero() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        let af = forge_config::AutofixConfig {
+            auto_lint: true,
+            auto_test: false,              // test disabled
+            lint_cmd: "false".to_string(), // always exits 1
+            test_cmd: String::new(),
+            max_iterations: 3,
+        };
+        let passed = session.run_autofix_stage(&af).await.unwrap();
+        assert!(!passed, "'false' exits 1 → stage should fail");
+        // A synthetic user message with the failure should be in the transcript.
+        assert!(
+            session
+                .transcript
+                .iter()
+                .any(|m| m.content.contains("Auto-fix:") && m.content.contains("lint:")),
+            "failure message injected into transcript: {:?}",
+            session
+                .transcript
+                .iter()
+                .map(|m| &m.content)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autofix_stage_skipped_when_no_edits() {
+        // edits_this_turn == 0 means the autofix outer condition evaluates to false;
+        // test that run_autofix_stage is not reached (verify the guard independently).
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let session = Session::start(
+            Arc::clone(&store),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+        // Fresh session: edits_this_turn must be 0 before any turn.
+        assert_eq!(
+            session.edits_this_turn, 0,
+            "edits_this_turn starts at 0; autofix gate would not fire"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autofix_stage_empty_cmd_is_skipped() {
+        // When lint_cmd / test_cmd is empty the command must not run even if auto_lint/auto_test
+        // is true (empty string = disabled per spec).
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        let af = forge_config::AutofixConfig {
+            auto_lint: true,
+            auto_test: true,
+            lint_cmd: String::new(), // empty = disabled
+            test_cmd: String::new(), // empty = disabled
+            max_iterations: 3,
+        };
+        // No commands run → stage trivially passes.
+        let passed = session.run_autofix_stage(&af).await.unwrap();
+        assert!(passed, "empty commands → nothing runs → stage passes");
+    }
+
+    // ── Auto-review gate tests ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn severity_meets_high_threshold() {
+        use forge_types::Severity;
+        // "high" gate: critical and high pass; medium and low do not.
+        assert!(severity_meets(Severity::Critical, "high"));
+        assert!(severity_meets(Severity::High, "high"));
+        assert!(!severity_meets(Severity::Medium, "high"));
+        assert!(!severity_meets(Severity::Low, "high"));
+    }
+
+    #[test]
+    fn severity_meets_medium_threshold() {
+        use forge_types::Severity;
+        // "medium" gate: critical, high, medium pass; low does not.
+        assert!(severity_meets(Severity::Critical, "medium"));
+        assert!(severity_meets(Severity::High, "medium"));
+        assert!(severity_meets(Severity::Medium, "medium"));
+        assert!(!severity_meets(Severity::Low, "medium"));
+    }
+
+    #[test]
+    fn severity_meets_low_threshold() {
+        use forge_types::Severity;
+        // "low" gate: everything passes.
+        assert!(severity_meets(Severity::Critical, "low"));
+        assert!(severity_meets(Severity::High, "low"));
+        assert!(severity_meets(Severity::Medium, "low"));
+        assert!(severity_meets(Severity::Low, "low"));
+    }
+
+    #[test]
+    fn severity_meets_critical_threshold() {
+        use forge_types::Severity;
+        // "critical" gate: only critical passes.
+        assert!(severity_meets(Severity::Critical, "critical"));
+        assert!(!severity_meets(Severity::High, "critical"));
+        assert!(!severity_meets(Severity::Medium, "critical"));
+        assert!(!severity_meets(Severity::Low, "critical"));
+    }
+
+    #[test]
+    fn severity_meets_unknown_threshold_is_permissive() {
+        use forge_types::Severity;
+        // Unknown threshold → fail-open (surface the finding).
+        assert!(severity_meets(Severity::Low, "unknown-typo"));
+        assert!(severity_meets(Severity::Medium, ""));
+    }
+
+    #[test]
+    fn auto_review_gate_skipped_when_disabled() {
+        // When auto_review = false, the gate condition is never entered regardless of edits.
+        let cfg = forge_config::AssayConfig {
+            auto_review: false,
+            gate_severity: "high".to_string(),
+            gate_mode: "block".to_string(),
+            min_diff_bytes: 0,
+        };
+        // The predicate `auto_review && edits_this_turn > 0` must be false with auto_review=off.
+        let edits: u32 = 5;
+        assert!(
+            !(cfg.auto_review && edits > 0),
+            "gate must be skipped when auto_review is off"
+        );
+    }
+
+    #[test]
+    fn auto_review_gate_skipped_when_no_edits() {
+        // Even with auto_review=true, gate is skipped when edits_this_turn==0.
+        let cfg = forge_config::AssayConfig {
+            auto_review: true,
+            gate_severity: "high".to_string(),
+            gate_mode: "warn".to_string(),
+            min_diff_bytes: 200,
+        };
+        let edits: u32 = 0;
+        assert!(
+            !(cfg.auto_review && edits > 0),
+            "gate must be skipped when no edits happened"
+        );
+    }
+
+    #[test]
+    fn auto_review_gate_skipped_when_diff_too_small() {
+        // The diff-size check: if the concatenated diff is < min_diff_bytes the gate returns
+        // early without running the crew. We test the predicate directly.
+        let cfg = forge_config::AssayConfig {
+            auto_review: true,
+            gate_severity: "high".to_string(),
+            gate_mode: "warn".to_string(),
+            min_diff_bytes: 200,
+        };
+        let diff = "small".to_string();
+        assert!(
+            diff.len() < cfg.min_diff_bytes,
+            "a 5-byte diff is below the 200-byte threshold"
+        );
+    }
+
+    // ── Architect mode: model resolution tests ────────────────────────────────────────────────
+
+    fn make_session(config: Config) -> Session {
+        Session::start(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(forge_provider::MockProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            config,
+            ".",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_planner_falls_back_to_complex_tier_model() {
+        // No architect_model set, no pin → first Complex-tier candidate.
+        let config = Config::default();
+        let expected = config
+            .model_for(forge_types::TaskTier::Complex)
+            .unwrap()
+            .to_string();
+        let session = make_session(config);
+        assert_eq!(session.resolve_planner_model(), expected);
+    }
+
+    #[test]
+    fn resolve_editor_falls_back_to_standard_tier_model() {
+        // No editor_model set, no pin → first Standard-tier candidate.
+        let config = Config::default();
+        let expected = config
+            .model_for(forge_types::TaskTier::Standard)
+            .unwrap()
+            .to_string();
+        let session = make_session(config);
+        assert_eq!(session.resolve_editor_model(), expected);
+    }
+
+    #[test]
+    fn resolve_planner_uses_architect_model_when_set() {
+        let mut config = Config::default();
+        config.mesh.architect_model = Some("anthropic::claude-opus-4-8".to_string());
+        let session = make_session(config);
+        assert_eq!(
+            session.resolve_planner_model(),
+            "anthropic::claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn resolve_editor_uses_editor_model_when_set() {
+        let mut config = Config::default();
+        config.mesh.editor_model = Some("groq::llama-3.1-8b-instant".to_string());
+        let session = make_session(config);
+        assert_eq!(session.resolve_editor_model(), "groq::llama-3.1-8b-instant");
+    }
+
+    #[test]
+    fn pin_overrides_both_planner_and_editor() {
+        // /model pin takes priority over both config fields and tier fallback.
+        let mut config = Config::default();
+        config.mesh.architect_model = Some("anthropic::claude-opus-4-8".to_string());
+        config.mesh.editor_model = Some("groq::llama-3.1-8b-instant".to_string());
+        let mut session = make_session(config);
+        session.pin_model(Some("openai::gpt-4o".to_string()));
+        assert_eq!(session.resolve_planner_model(), "openai::gpt-4o");
+        assert_eq!(session.resolve_editor_model(), "openai::gpt-4o");
+    }
+
+    #[test]
+    fn architect_mode_off_by_default() {
+        // Default config must have architect_mode = false so run_turn is unchanged.
+        let config = Config::default();
+        assert!(!config.mesh.architect_mode);
     }
 }

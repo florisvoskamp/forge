@@ -76,6 +76,15 @@ pub struct Config {
     /// Git integration settings (co-authoring, hook installation).
     #[serde(default)]
     pub git: GitConfig,
+    /// LSP-backed live diagnostics fed back into the turn after edits (lsp.md). Off = inert.
+    #[serde(default)]
+    pub lsp: LspConfig,
+    /// Auto-lint / auto-test self-healing loop after edits (autofix.md). Off = inert.
+    #[serde(default)]
+    pub autofix: AutofixConfig,
+    /// Assay-gated auto-review of write turns before they finish (assay-gate.md). Off = inert.
+    #[serde(default)]
+    pub assay: AssayConfig,
 }
 
 /// When a hook fires.
@@ -282,6 +291,120 @@ pub struct GitConfig {
     /// Claude/Codex co-author lines and adds `Co-Authored-By: Forge <noreply@forge.dev>`.
     #[serde(default)]
     pub coauthor: bool,
+}
+
+/// LSP-backed live diagnostics. After an edit, Forge asks a language server for diagnostics on the
+/// touched file and feeds any errors back into the turn so the model self-corrects. Off = inert;
+/// when no server binary is on PATH the path degrades silently to no diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long to wait for a server's `publishDiagnostics` before giving up.
+    #[serde(default = "default_lsp_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Per-language server command, keyed by language id (`rust`, `typescript`, `python`, …).
+    /// Empty = use the built-in defaults for languages whose server binary is found on PATH.
+    #[serde(default)]
+    pub servers: std::collections::HashMap<String, LspServerEntry>,
+}
+
+/// One language server invocation: a binary plus extra args (e.g. `["--stdio"]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspServerEntry {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_ms: default_lsp_timeout_ms(),
+            servers: std::collections::HashMap::new(),
+        }
+    }
+}
+
+fn default_lsp_timeout_ms() -> u64 {
+    3000
+}
+
+/// Auto-lint / auto-test self-healing. After a turn makes edits, run the configured lint and/or
+/// test command; on a non-zero exit, feed the output back into the turn so the model fixes it,
+/// looping up to `max_iterations` times. Off = inert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutofixConfig {
+    #[serde(default)]
+    pub auto_lint: bool,
+    #[serde(default)]
+    pub auto_test: bool,
+    /// Lint command line (e.g. `cargo clippy --all-targets` / `npm run lint`). Empty disables lint.
+    #[serde(default)]
+    pub lint_cmd: String,
+    /// Test command line (e.g. `cargo test` / `pytest -x`). Empty disables test.
+    #[serde(default)]
+    pub test_cmd: String,
+    /// Max fix attempts per turn before giving up and surfacing the remaining failures.
+    #[serde(default = "default_autofix_iterations")]
+    pub max_iterations: u32,
+}
+
+impl Default for AutofixConfig {
+    fn default() -> Self {
+        Self {
+            auto_lint: false,
+            auto_test: false,
+            lint_cmd: String::new(),
+            test_cmd: String::new(),
+            max_iterations: default_autofix_iterations(),
+        }
+    }
+}
+
+fn default_autofix_iterations() -> u32 {
+    3
+}
+
+/// Assay-gated auto-review: before a write turn finishes, run the Assay critic crew on the turn's
+/// diff and warn (or block) on findings at/above `gate_severity`. Off = inert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssayConfig {
+    #[serde(default)]
+    pub auto_review: bool,
+    /// Minimum severity that triggers the gate: `low` | `medium` | `high`.
+    #[serde(default = "default_assay_gate_severity")]
+    pub gate_severity: String,
+    /// `warn` surfaces findings but lets the turn finish; `block` fails the turn.
+    #[serde(default = "default_assay_gate_mode")]
+    pub gate_mode: String,
+    /// Skip review when the turn's diff is smaller than this (bytes) — trivial edits aren't worth it.
+    #[serde(default = "default_assay_min_diff_bytes")]
+    pub min_diff_bytes: usize,
+}
+
+impl Default for AssayConfig {
+    fn default() -> Self {
+        Self {
+            auto_review: false,
+            gate_severity: default_assay_gate_severity(),
+            gate_mode: default_assay_gate_mode(),
+            min_diff_bytes: default_assay_min_diff_bytes(),
+        }
+    }
+}
+
+fn default_assay_gate_severity() -> String {
+    "high".to_string()
+}
+
+fn default_assay_gate_mode() -> String {
+    "warn".to_string()
+}
+
+fn default_assay_min_diff_bytes() -> usize {
+    200
 }
 
 /// Settings for the slash-command + skill system.
@@ -585,6 +708,20 @@ pub struct MeshConfig {
     /// Frugal caps output tokens at 2048; Strict caps at 1024 and routes to free/sub only.
     #[serde(default)]
     pub credit_mode: CreditMode,
+    /// Architect mode (dual-model pipeline): when true, each turn runs a plan phase on a strong
+    /// model then an apply phase on a cheaper one. Off = single-model turns (default).
+    #[serde(default)]
+    pub architect_mode: bool,
+    /// Planner model id for architect mode. Empty → mesh-route at the Complex tier.
+    #[serde(default)]
+    pub architect_model: Option<String>,
+    /// Editor (apply) model id for architect mode. Empty → mesh-route at the Standard tier.
+    #[serde(default)]
+    pub editor_model: Option<String>,
+    /// Default reasoning effort sent to API providers (`low`|`medium`|`high`|`xhigh`). Absent →
+    /// no effort param (provider default). Overridable per session with `/effort`.
+    #[serde(default)]
+    pub default_effort: Option<String>,
 }
 
 impl MeshConfig {
@@ -678,6 +815,11 @@ pub struct SubagentsConfig {
     /// Directory holding named agent-type files (`<name>.md`), relative to the cwd.
     #[serde(default = "default_agents_dir")]
     pub agents_dir: String,
+    /// Give each write-capable child its own git worktree so concurrent edits can't corrupt the
+    /// shared working tree; changes are merged back after the child finishes. Read-only children
+    /// always skip this. Off by default (requires the repo to be a git work tree).
+    #[serde(default)]
+    pub worktree_isolation: bool,
 }
 
 fn default_subagents_enabled() -> bool {
@@ -704,6 +846,7 @@ impl Default for SubagentsConfig {
             max_concurrency: default_max_concurrency(),
             max_depth: default_max_depth(),
             agents_dir: default_agents_dir(),
+            worktree_isolation: false,
         }
     }
 }
@@ -827,6 +970,10 @@ impl Default for Config {
                 disabled: Vec::new(),
                 max_output_tokens: default_max_output_tokens(),
                 credit_mode: CreditMode::Normal,
+                architect_mode: false,
+                architect_model: None,
+                editor_model: None,
+                default_effort: None,
             },
             permissions: PermissionsConfig::default(),
             mcp: McpConfig::default(),
@@ -835,6 +982,9 @@ impl Default for Config {
             shell: ShellConfig::default(),
             hooks: Vec::new(),
             git: GitConfig::default(),
+            lsp: LspConfig::default(),
+            autofix: AutofixConfig::default(),
+            assay: AssayConfig::default(),
         }
     }
 }

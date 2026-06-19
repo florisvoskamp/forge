@@ -6,17 +6,19 @@
 //! prior tool results are replayed as genai tool responses so multi-step loops round-trip.
 
 use async_trait::async_trait;
-use forge_types::{Message, Role, ToolCall, Usage};
+use forge_types::{EffortLevel, Message, Role, ToolCall, Usage};
 use futures::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
     Binary, CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatStreamEvent,
-    ContentPart, MessageContent, Tool, ToolCall as GenAiToolCall, ToolResponse,
+    ContentPart, MessageContent, ReasoningEffort, Tool, ToolCall as GenAiToolCall, ToolResponse,
 };
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
 
-use crate::{EventSink, ModelResponse, Provider, ProviderError, StreamEvent, ToolSpec};
+use crate::{
+    CompletionOptions, EventSink, ModelResponse, Provider, ProviderError, StreamEvent, ToolSpec,
+};
 
 #[derive(Default)]
 pub struct GenAiProvider {
@@ -413,6 +415,24 @@ impl Provider for GenAiProvider {
         tools: &[ToolSpec],
         on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
+        self.complete_with(
+            model,
+            messages,
+            tools,
+            &CompletionOptions::default(),
+            on_event,
+        )
+        .await
+    }
+
+    async fn complete_with(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        opts: &CompletionOptions,
+        on_event: &mut EventSink<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
         let model_name = to_genai_model(model);
 
         let mut genai_messages = to_genai_messages(messages);
@@ -431,6 +451,16 @@ impl Provider for GenAiProvider {
         // full max-token default (mesh.max_output_tokens).
         if let Some(cap) = self.max_output_tokens {
             options = options.with_max_tokens(cap);
+        }
+        // Apply the caller's reasoning-effort hint when set (e.g. from `/effort high`).
+        if let Some(effort) = opts.effort {
+            let re = match effort {
+                EffortLevel::Low => ReasoningEffort::Low,
+                EffortLevel::Medium => ReasoningEffort::Medium,
+                EffortLevel::High => ReasoningEffort::High,
+                EffortLevel::XHigh => ReasoningEffort::XHigh,
+            };
+            options = options.with_reasoning_effort(re);
         }
 
         // Stall guards: a hung connection or a stream that goes silent must not freeze the

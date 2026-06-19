@@ -2891,6 +2891,7 @@ async fn build_session_with(
     let config_has_mcp = mcp_config.active_servers().next().is_some();
     let lattice_enabled = config.lattice.enabled;
     let config_lattice_watch = config.lattice.watch;
+    let config_default_effort = config.mesh.default_effort.clone();
 
     let store = Arc::new(open_store()?);
     let store_for_lattice = Arc::clone(&store);
@@ -2967,6 +2968,7 @@ async fn build_session_with(
         });
     }
 
+    let lsp_config = config.lsp.clone();
     let mut session = match resume {
         Some(prefix) => {
             let full = resolve_session(&store, &prefix)?;
@@ -2980,6 +2982,12 @@ async fn build_session_with(
         }
     };
     session.set_catalog(catalog);
+    // Seed the effort pin from config if set (`mesh.default_effort`).
+    if let Some(ref s) = config_default_effort {
+        if let Some(e) = forge_types::EffortLevel::parse(s) {
+            session.set_effort(Some(e));
+        }
+    }
     // Share the index with the session so turns auto-inject relevant code and agent edits reindex
     // in-turn (code-intelligence.md). Empty index → nothing injected (additive guarantee).
     // Also start the background watcher so external editor edits reindex automatically.
@@ -3010,6 +3018,11 @@ async fn build_session_with(
         let manager = std::sync::Arc::new(forge_mcp::McpManager::connect_all(&mcp_config).await);
         session.set_mcp(Some(manager));
         session.announce_mcp();
+    }
+    if lsp_config.enabled {
+        session.set_lsp(Some(std::sync::Arc::new(
+            forge_lsp::LspRegistry::from_config(&lsp_config),
+        )));
     }
     Ok(session)
 }
@@ -3660,6 +3673,7 @@ async fn run_chat_tui(
                             open_models_root(&session, &mut app).await?;
                         } else {
                             app.models_drilled = None;
+                            app.models_pin_mode = false;
                             app.picker.close();
                         }
                     }
@@ -3670,10 +3684,24 @@ async fn run_chat_tui(
                         let kind = app.picker.kind;
                         // The models browser drills (provider → models) on Enter instead of
                         // resolving; model rows are terminal. Keep the picker open either way.
+                        // Exception: in pin-mode (bare `/model`) a leaf model row closes the picker
+                        // and pins the selected model.
                         if kind == Some(forge_tui::PickerKind::Models) {
                             if let Some(row) = chosen {
                                 if app.models_drilled.is_none() && !row.id.contains("::") {
+                                    // Provider-level row → drill in.
                                     open_models_provider(&session, &mut app, &row.id).await?;
+                                } else if row.id.contains("::") && app.models_pin_mode {
+                                    // Leaf model row in pin-mode → pin it and close.
+                                    let model_id =
+                                        forge_provider::normalize_model_id(&row.id).into_owned();
+                                    session.lock().await.pin_model(Some(model_id.clone()));
+                                    app.models_pin_mode = false;
+                                    app.models_drilled = None;
+                                    app.picker.close();
+                                    app.note(&format!(
+                                        "⊕ model pinned: {model_id} (clears with /model)"
+                                    ));
                                 }
                             }
                             continue;
@@ -4848,6 +4876,7 @@ async fn dispatch_command(
             | CommandAction::Resume(_)
             | CommandAction::ClearScreen
             | CommandAction::PinModel(_)
+            | CommandAction::SetEffort(_)
             | CommandAction::Replay(_, _)
             | CommandAction::Usage
             | CommandAction::Remote { .. }
@@ -4950,17 +4979,41 @@ async fn dispatch_command(
         // its filter. Resolving + swapping the session happens on Enter (picker_accept).
         CommandAction::Resume(prefix) => open_sessions_picker(app, &prefix)?,
         CommandAction::ListSessions => open_sessions_picker(app, "")?,
-        // `/model <id>` pins a specific model for the rest of this session (or clears the pin).
+        // `/model <id>` pins a specific model for the rest of this session.
+        // `/model` with no arg opens the interactive model browser — selecting a model pins it.
         // Works while a turn is running (pin takes effect on the NEXT turn).
-        CommandAction::PinModel(model_id) => {
-            let model_id = model_id.map(|id| forge_provider::normalize_model_id(&id).into_owned());
+        CommandAction::PinModel(Some(model_id)) => {
+            let model_id = forge_provider::normalize_model_id(&model_id).into_owned();
             let mut s = session.lock().await;
-            s.pin_model(model_id.clone());
-            match model_id {
-                Some(id) => app.note(&format!("⊕ model pinned: {id} (clears with /model)")),
-                None => app.note("⊖ model pin cleared — mesh routing restored"),
-            }
+            s.pin_model(Some(model_id.clone()));
+            app.note(&format!("⊕ model pinned: {model_id} (clears with /model)"));
         }
+        CommandAction::PinModel(None) => {
+            // Bare `/model` opens the interactive picker so the user can browse + select.
+            open_models_pin_picker(session, app).await?;
+        }
+        // `/effort [level]` pins the reasoning-effort level for subsequent turns.
+        // `/effort` (no arg) clears the pin and returns to the provider default.
+        CommandAction::SetEffort(level) => match level {
+            Some(ref s) => match forge_types::EffortLevel::parse(s) {
+                Some(e) => {
+                    session.lock().await.set_effort(Some(e));
+                    app.note(&format!(
+                        "◎ effort pinned: {} (clears with /effort)",
+                        e.as_str()
+                    ));
+                }
+                None => {
+                    app.note(&format!(
+                        "⚠ unknown effort level '{s}' — use low/medium/high/xhigh"
+                    ));
+                }
+            },
+            None => {
+                session.lock().await.set_effort(None);
+                app.note("◎ effort pin cleared — provider default restored");
+            }
+        },
         // `/models` opens the interactive model browser: a provider list (with global counts in
         // the heading) that drills into each provider's models on Enter; Esc steps back.
         CommandAction::ListModels => open_models_root(session, app).await?,
@@ -5626,6 +5679,18 @@ async fn open_models_root(
         None => app.note("model discovery is off (mock/offline) — nothing to browse"),
     }
     Ok(())
+}
+
+/// Open the model picker for `/model` (bare): shows the same provider browser as `/models`,
+/// but selecting a leaf model row pins it (closes the picker + shows a confirmation note).
+/// We reuse the same `PickerKind::Models` infrastructure; the render-loop Enter handler
+/// distinguishes "pin mode" from "browse mode" via `app.models_pin_mode`.
+async fn open_models_pin_picker(
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    app: &mut forge_tui::App,
+) -> Result<()> {
+    app.models_pin_mode = true;
+    open_models_root(session, app).await
 }
 
 /// Drill the `/models` browser into one provider's models.

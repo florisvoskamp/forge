@@ -17,6 +17,7 @@
 //! default read-only investigator and are mesh-routed.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use forge_config::{AgentDef, Config};
@@ -26,10 +27,11 @@ use forge_provider::{Provider, StreamEvent, ToolSpec};
 use forge_store::Store;
 use forge_tools::ToolRegistry;
 use forge_types::{
-    Message, PermissionDecision, PermissionMode, PermissionRule, Role, TaskTier, Usage,
+    Message, PermissionDecision, PermissionMode, PermissionRule, Role, SideEffect, TaskTier, Usage,
 };
+use serde_json::Value;
 
-use crate::{permission, CoreError};
+use crate::{permission, worktree, CoreError};
 
 /// The virtual tool name the parent model calls to delegate subtasks.
 pub const SPAWN_AGENTS_TOOL: &str = "spawn_agents";
@@ -173,6 +175,70 @@ pub struct AgentCtx {
     pub max_depth: usize,
     /// Loaded agent types, shared so a recursing child can resolve named agents too.
     pub agents: Arc<HashMap<String, AgentDef>>,
+    /// When worktree isolation is active for this child, the root of its isolated worktree.
+    /// `None` for the top-level context and for read-only children.
+    pub worktree_root: Option<PathBuf>,
+    /// The git repo root for this session (used to create/merge worktrees).
+    pub repo_root: PathBuf,
+}
+
+/// Returns `true` when any of the agent's resolved tools is write- or shell-capable, meaning
+/// concurrent execution could corrupt the shared working tree.
+pub fn is_write_capable(agent: &ResolvedAgent, registry: &ToolRegistry) -> bool {
+    let tool_names: Vec<&str> = if agent.tools.is_empty() {
+        SUBAGENT_TOOLS.to_vec()
+    } else {
+        agent.tools.iter().map(String::as_str).collect()
+    };
+    tool_names.iter().any(|name| {
+        registry
+            .get(name)
+            .map(|t| matches!(t.side_effect(), SideEffect::Write | SideEffect::Shell))
+            .unwrap_or(false)
+    })
+}
+
+/// Rewrite tool call arguments so that relative or absent paths/cwd are rooted inside the
+/// isolated `worktree_root`. Absolute paths that already point outside the root are left alone.
+/// - For `path` args: if the value is relative, make it absolute under `worktree_root`.
+/// - For `cwd` args on shell calls: if absent or relative, set it to `worktree_root`.
+pub fn rewrite_args_for_worktree(args: &Value, worktree_root: &Path) -> Value {
+    let Some(map) = args.as_object() else {
+        return args.clone();
+    };
+    let mut out = map.clone();
+
+    // Rewrite "path" field.
+    if let Some(Value::String(p)) = out.get("path") {
+        let pb = Path::new(p);
+        if pb.is_relative() {
+            let abs = worktree_root.join(pb);
+            out.insert(
+                "path".into(),
+                Value::String(abs.to_string_lossy().into_owned()),
+            );
+        }
+    }
+
+    // Rewrite "cwd" field (shell tool); inject worktree_root when absent.
+    match out.get("cwd") {
+        None => {
+            out.insert(
+                "cwd".into(),
+                Value::String(worktree_root.to_string_lossy().into_owned()),
+            );
+        }
+        Some(Value::String(cwd)) if Path::new(cwd).is_relative() => {
+            let abs = worktree_root.join(cwd);
+            out.insert(
+                "cwd".into(),
+                Value::String(abs.to_string_lossy().into_owned()),
+            );
+        }
+        _ => {}
+    }
+
+    Value::Object(out)
 }
 
 /// The result of running one child agent.
@@ -372,6 +438,9 @@ fn run_nested_spawn(
         };
         let deeper = AgentCtx {
             depth: ctx.depth + 1,
+            // Nested spawns start without a pre-allocated worktree; orchestrate will create
+            // one per child if worktree_isolation is enabled.
+            worktree_root: None,
             ..ctx.clone()
         };
         let concurrency = ctx.config.mesh.subagents.max_concurrency;
@@ -441,13 +510,36 @@ pub async fn orchestrate(
     max_concurrency: usize,
     on_event: &mut (dyn FnMut(Lifecycle) + Send),
 ) -> Result<(String, bool), CoreError> {
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::{mpsc, Mutex, Semaphore};
 
     let mode_label = format!("{:?}", ctx.mode);
     let n = requests.len();
     let sem = Arc::new(Semaphore::new(max_concurrency.max(1)));
     let (tx, mut rx) = mpsc::unbounded_channel::<ChildMsg>();
     let mut ids: Vec<String> = Vec::with_capacity(n);
+
+    // Serialize merge-back across concurrently-finishing children so `git apply` doesn't race on
+    // the index. One merge at a time is fine: the patch itself is generated from the branch diff,
+    // not the index, so ordering is deterministic.
+    let merge_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+    let isolation_enabled = ctx.config.mesh.subagents.worktree_isolation;
+    // Emit a one-time warning when isolation is requested but the cwd is not a git repo.
+    let repo_is_git = if isolation_enabled {
+        let ok = worktree::is_git_repo(&ctx.repo_root);
+        if !ok {
+            tracing::warn!(
+                "worktree_isolation is enabled but {:?} is not a git repo — \
+                 running without worktree isolation",
+                ctx.repo_root
+            );
+        }
+        ok
+    } else {
+        false
+    };
+
+    let full_registry = ToolRegistry::with_core_tools();
 
     // Create each child session + announce Start up front (so a UI shows the whole batch as
     // running immediately), then spawn the work bounded by a concurrency permit.
@@ -463,9 +555,34 @@ pub async fn orchestrate(
         });
         ids.push(child_id.clone());
 
-        let ctx = ctx.clone();
+        // Decide whether this child gets an isolated worktree. We create the WorktreeGuard here
+        // (on the orchestrator task, before spawning) so any creation error is visible immediately
+        // and doesn't kill an already-running child task.
+        let maybe_guard =
+            if isolation_enabled && repo_is_git && is_write_capable(&resolved, &full_registry) {
+                match worktree::WorktreeGuard::create(&ctx.repo_root, &child_id) {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        tracing::warn!(
+                        "worktree create failed for {child_id}: {e} — running without isolation"
+                    );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+        // Build the child context, injecting the worktree root when applicable.
+        let child_ctx = AgentCtx {
+            worktree_root: maybe_guard.as_ref().map(|g| g.path().to_path_buf()),
+            ..ctx.clone()
+        };
+
         let tx = tx.clone();
         let sem = Arc::clone(&sem);
+        let merge_lock = Arc::clone(&merge_lock);
+        let repo_root = ctx.repo_root.clone();
         tokio::spawn(async move {
             let _permit = sem.acquire_owned().await;
             // Forward streamed text/reasoning as live progress for this child's UI row.
@@ -476,12 +593,39 @@ pub async fn orchestrate(
                 };
                 let _ = tx.send(ChildMsg::Progress { index: i, snippet });
             };
-            let outcome = run_subagent(&ctx, &child_id, &resolved, budget, &mut on_delta).await;
-            let (text, ok) = match outcome {
+            let outcome =
+                run_subagent(&child_ctx, &child_id, &resolved, budget, &mut on_delta).await;
+            let (mut text, mut ok) = match outcome {
                 Ok(out) => (out.final_text, out.ok),
                 Err(e) => (format!("error: subagent failed: {e}"), false),
             };
-            let cost = ctx.store.session_cost(&child_id).unwrap_or(0.0);
+
+            // Merge the child's worktree changes back into the main tree (serialized).
+            if let Some(guard) = maybe_guard {
+                let branch = guard.branch().to_string();
+                // Hold the merge lock for the duration of the git apply so concurrent finishers
+                // don't race on the index. Drop guard AFTER merge so the branch still exists.
+                let _lock = merge_lock.lock().await;
+                match worktree::merge_worktree_back(&repo_root, &branch) {
+                    Ok(report) if report.conflicted_files.is_empty() => {
+                        // Clean merge — nothing to add.
+                    }
+                    Ok(report) => {
+                        let conflicts = report.conflicted_files.join(", ");
+                        text.push_str(&format!("\n[worktree merge conflicts in: {conflicts}]"));
+                        ok = false;
+                    }
+                    Err(e) => {
+                        tracing::warn!("merge_worktree_back failed for {child_id}: {e}");
+                        text.push_str(&format!("\n[worktree merge failed: {e}]"));
+                        ok = false;
+                    }
+                }
+                // Drop the guard now (removes worktree dir + branch).
+                drop(guard);
+            }
+
+            let cost = child_ctx.store.session_cost(&child_id).unwrap_or(0.0);
             let _ = tx.send(ChildMsg::Done(ChildDone {
                 index: i,
                 id: child_id,
@@ -557,7 +701,18 @@ async fn execute_tool(
             PermissionDecision::Deny | PermissionDecision::Ask => false,
         };
     let (result, status) = if allowed {
-        match tool.run(&call.args).await {
+        // When this child has an isolated worktree, rewrite path/cwd args for write/shell tools
+        // so the child's operations stay inside its worktree rather than touching the shared tree.
+        let effective_args = if let Some(root) = &ctx.worktree_root {
+            if matches!(side_effect, SideEffect::Write | SideEffect::Shell) {
+                rewrite_args_for_worktree(&call.args, root)
+            } else {
+                call.args.clone()
+            }
+        } else {
+            call.args.clone()
+        };
+        match tool.run(&effective_args).await {
             Ok(out) => (out, "ok"),
             Err(e) => (format!("error: {e}"), "error"),
         }
@@ -732,6 +887,8 @@ mod tests {
             depth: 1,
             max_depth: 2,
             agents: Arc::new(HashMap::new()),
+            worktree_root: None,
+            repo_root: std::path::PathBuf::from("."),
         }
     }
 
@@ -766,5 +923,99 @@ mod tests {
             store.current_benched().unwrap().is_benched("bad::model"),
             "the rate-limited model was benched"
         );
+    }
+
+    #[test]
+    fn is_write_capable_detects_write_tools() {
+        let registry = ToolRegistry::with_core_tools();
+
+        // An agent with write_file in its toolset is write-capable.
+        let write_agent = ResolvedAgent {
+            name: "writer".into(),
+            task: "t".into(),
+            system_prompt: "s".into(),
+            tools: vec!["write_file".into()],
+            tier: None,
+        };
+        assert!(is_write_capable(&write_agent, &registry));
+
+        // An agent with only read_file is not.
+        let read_agent = ResolvedAgent {
+            name: "reader".into(),
+            task: "t".into(),
+            system_prompt: "s".into(),
+            tools: vec!["read_file".into()],
+            tier: None,
+        };
+        assert!(!is_write_capable(&read_agent, &registry));
+
+        // An agent with shell is write-capable.
+        let shell_agent = ResolvedAgent {
+            name: "sheller".into(),
+            task: "t".into(),
+            system_prompt: "s".into(),
+            tools: vec!["shell".into()],
+            tier: None,
+        };
+        assert!(is_write_capable(&shell_agent, &registry));
+
+        // An agent with empty tools falls back to SUBAGENT_TOOLS (read-only), so not write-capable.
+        let default_agent = ResolvedAgent {
+            name: "general".into(),
+            task: "t".into(),
+            system_prompt: "s".into(),
+            tools: Vec::new(),
+            tier: None,
+        };
+        assert!(!is_write_capable(&default_agent, &registry));
+    }
+
+    #[test]
+    fn rewrite_args_for_worktree_rewrites_relative_path() {
+        let root = std::path::Path::new("/work/tree");
+        let args = json!({"path": "src/main.rs", "content": "fn main() {}"});
+        let rewritten = rewrite_args_for_worktree(&args, root);
+        // Compute the expected path the same way the impl joins it, so the assertion holds on both
+        // unix ("/work/tree/src/main.rs") and Windows (backslash separators).
+        let expected = root.join("src/main.rs").to_string_lossy().into_owned();
+        assert_eq!(rewritten["path"].as_str().unwrap(), expected);
+        // content field is untouched
+        assert_eq!(rewritten["content"].as_str().unwrap(), "fn main() {}");
+    }
+
+    #[test]
+    fn rewrite_args_for_worktree_leaves_absolute_path_alone() {
+        let root = std::path::Path::new("/work/tree");
+        let args = json!({"path": "/absolute/path/file.rs"});
+        let rewritten = rewrite_args_for_worktree(&args, root);
+        assert_eq!(
+            rewritten["path"].as_str().unwrap(),
+            "/absolute/path/file.rs"
+        );
+    }
+
+    #[test]
+    fn rewrite_args_for_worktree_injects_cwd_when_absent() {
+        let root = std::path::Path::new("/work/tree");
+        let args = json!({"cmd": "cargo test"});
+        let rewritten = rewrite_args_for_worktree(&args, root);
+        assert_eq!(rewritten["cwd"].as_str().unwrap(), "/work/tree");
+    }
+
+    #[test]
+    fn rewrite_args_for_worktree_rewrites_relative_cwd() {
+        let root = std::path::Path::new("/work/tree");
+        let args = json!({"cmd": "ls", "cwd": "subdir"});
+        let rewritten = rewrite_args_for_worktree(&args, root);
+        let expected = root.join("subdir").to_string_lossy().into_owned();
+        assert_eq!(rewritten["cwd"].as_str().unwrap(), expected);
+    }
+
+    #[test]
+    fn rewrite_args_for_worktree_leaves_absolute_cwd_alone() {
+        let root = std::path::Path::new("/work/tree");
+        let args = json!({"cmd": "ls", "cwd": "/other/dir"});
+        let rewritten = rewrite_args_for_worktree(&args, root);
+        assert_eq!(rewritten["cwd"].as_str().unwrap(), "/other/dir");
     }
 }

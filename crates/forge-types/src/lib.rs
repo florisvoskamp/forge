@@ -307,6 +307,40 @@ impl FindingCategory {
     }
 }
 
+/// Reasoning / thinking intensity hint forwarded to the model (e.g. OpenAI `reasoning_effort`,
+/// Anthropic extended-thinking budget). Maps to [`genai::chat::ReasoningEffort`] on the genai
+/// path; ignored by CLI-bridge providers that manage their own thinking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+impl EffortLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EffortLevel::Low => "low",
+            EffortLevel::Medium => "medium",
+            EffortLevel::High => "high",
+            EffortLevel::XHigh => "xhigh",
+        }
+    }
+
+    /// Parse case-insensitively from "low", "medium", "high", "xhigh".
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "low" => Some(EffortLevel::Low),
+            "medium" | "med" => Some(EffortLevel::Medium),
+            "high" => Some(EffortLevel::High),
+            "xhigh" | "x-high" | "extra-high" => Some(EffortLevel::XHigh),
+            _ => None,
+        }
+    }
+}
+
 /// Rough fix effort for a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

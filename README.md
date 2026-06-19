@@ -32,16 +32,19 @@ $ forge lattice query "UserRepository"
 | **Providers** | Anthropic, OpenAI, Ollama, Claude Code CLI, Codex CLI, Groq, Gemini, DeepSeek, OpenRouter, xAI, Cerebras, and more |
 | **Planning mode** | `/plan` investigates read-only and proposes a plan; `/execute` approves it and carries it out |
 | **Code Intelligence** | Lattice: tree-sitter symbol graph (9 languages), semantic embeddings, hybrid retrieval, blast-radius, call-chain, git provenance |
+| **LSP feedback** | Live diagnostics from a language server fed back after edits so the model self-corrects (`[lsp]`, opt-in; rust/ts/js/python/go) |
+| **Autofix loop** | Run lint/test after edits and self-heal on failure, up to N iterations (`[autofix]`, opt-in) |
+| **Architect mode** | Dual-model turns — strong planner drafts a plan, cheaper editor applies it (`[mesh] architect_mode`, opt-in) |
 | **Context** | `@file` mentions inject file contents; project memory auto-loaded from `.forge/AGENTS.md` (scaffold with `/init`); Lattice auto-injection |
 | **Vision** | Attach images by `/image <path>` or paste them straight into the input bar as inline blocks |
-| **Assay** | Parallel critic crew, adversarial verification, ranked findings, git scopes (diff/branch/since), lens selection, auto-diff vs prior run |
+| **Assay** | Parallel critic crew, adversarial verification, ranked findings, git scopes (diff/branch/since), lens selection, auto-diff vs prior run; opt-in auto-review gate over a turn's diff (`[assay] auto_review`, warn/block) |
 | **MCP** | Client for external MCP servers (stdio + HTTP/SSE), OAuth 2.0 + PKCE, deferred loading, allowlist gating |
-| **TUI** | ratatui live progress, cost meter, context-window token gauge, fuzzy command palette, session/checkpoint pickers, `/usage` + `/mesh` overlays, focus-aware blinking cursor |
+| **TUI** | ratatui live progress, cost meter, context-window token gauge, fuzzy command palette, session/checkpoint pickers, `/usage` + `/mesh` overlays, `/model` picker, `/effort` reasoning knob, focus-aware blinking cursor |
 | **Skills & Commands** | Markdown prompt templates + skill methodology injection; Claude Code format compatible |
-| **Subagents** | Parallel fan-out (`spawn_agents`), mesh-routed children, live TUI tree, depth-limited |
+| **Subagents** | Parallel fan-out (`spawn_agents`), mesh-routed children, live TUI tree, depth-limited, opt-in git-worktree isolation for write-capable children |
 | **Session Management** | Checkpoints, `/undo` with file restore, session replay + JSON export, transcript diff, assay run history |
 | **Remote control** | Drive a session from a phone/desktop browser (`/remote`) — LAN, loopback, or public tunnel |
-| **Hooks** | Pre/post tool-use shell hooks — block (pre) or observe (post) any tool call; fires on both direct and CLI-bridge paths |
+| **Hooks** | Pre/post tool-use shell hooks — block (pre) or observe (post) any tool call; fires on both direct and CLI-bridge paths, including MCP tool calls |
 | **Cost** | Prompt caching, per-model pricing fetched from OpenRouter (cache-read aware), persistent cross-restart usage store |
 | **Git** | Optional model-aware co-author attribution on commits + PR bodies |
 | **Safety** | Permission broker, per-tool rules, diff preview before write, shadow file snapshots, unoverridable denylist |

@@ -98,6 +98,33 @@ fn load_manifest(root: &Path, session: &str, seq: i64) -> Option<Manifest> {
     serde_json::from_str(&raw).ok()
 }
 
+/// One file touched by this turn, as needed by the auto-review gate.
+pub(crate) struct TurnFile {
+    /// Absolute path of the file as it stands now (post-edit).
+    pub path: String,
+    /// Absolute path of the pre-turn blob (the snapshot), if the file was modified rather than
+    /// created. `None` for new files (no prior content to diff against — treat old as empty).
+    pub blob: Option<std::path::PathBuf>,
+}
+
+/// Return the list of files touched during `seq` so the auto-review gate can build a diff without
+/// touching git. Returns an empty `Vec` when no snapshot exists (turn made no writes, or the
+/// checkpoint dir was cleared).
+pub(crate) fn changed_files_this_turn(root: &Path, session: &str, seq: i64) -> Vec<TurnFile> {
+    let Some(manifest) = load_manifest(root, session, seq) else {
+        return Vec::new();
+    };
+    let dir = turn_dir(root, session, seq);
+    manifest
+        .files
+        .into_iter()
+        .map(|e| TurnFile {
+            path: e.path,
+            blob: e.blob.map(|b| dir.join(b)),
+        })
+        .collect()
+}
+
 fn save_manifest(root: &Path, session: &str, seq: i64, m: &Manifest) -> std::io::Result<()> {
     let dir = turn_dir(root, session, seq);
     std::fs::create_dir_all(&dir)?;

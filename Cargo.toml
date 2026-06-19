@@ -17,6 +17,7 @@ forge-types = { path = "crates/forge-types", version = "0.1.0" }
 forge-config = { path = "crates/forge-config", version = "0.1.0" }
 forge-core = { path = "crates/forge-core", version = "0.1.0" }
 forge-index = { path = "crates/forge-index", version = "0.1.0" }
+forge-lsp = { path = "crates/forge-lsp", version = "0.1.0" }
 forge-mcp = { path = "crates/forge-mcp", version = "0.1.0" }
 forge-mesh = { path = "crates/forge-mesh", version = "0.1.0" }
 forge-provider = { path = "crates/forge-provider", version = "0.1.0" }

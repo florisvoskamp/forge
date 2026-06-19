@@ -208,19 +208,69 @@ impl ServerHandler for ForgeMcp {
         }
 
         // External MCP meta-tools — gate (External/ReadOnly) then route to the manager. Server
-        // tools are invoked via `mcp_call`, so this covers the whole external surface.
+        // tools are invoked via `mcp_call`, so this covers the whole external surface. Hooks fire
+        // here too (PreToolUse block + arg-rewrite, PostToolUse observe) so the hook-based
+        // permission/logging story applies to MCP traffic, not just built-in tools.
         if let Some(m) = &self.mcp {
             if m.knows_tool(&name) {
                 let side_effect = m.side_effect_of(&name);
+                let mut effective_args = args.clone();
+
+                // PreToolUse: block, or rewrite the args before the gate + dispatch.
+                if !self.config.hooks.is_empty() {
+                    let payload =
+                        serde_json::json!({ "tool": name, "args": effective_args }).to_string();
+                    let outcome = hooks::run_hooks(
+                        &self.config.hooks,
+                        forge_config::HookEvent::PreToolUse,
+                        &name,
+                        &payload,
+                    )
+                    .await;
+                    if let Some(reason) = outcome.blocked {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "blocked by hook: {reason}"
+                        ))]));
+                    }
+                    if let Some(rewritten) = outcome.rewritten_args {
+                        effective_args = rewritten;
+                    }
+                }
+
                 let decision =
-                    permission::decide(self.mode, side_effect, &name, &args, &self.rules);
+                    permission::decide(self.mode, side_effect, &name, &effective_args, &self.rules);
                 if decision == PermissionDecision::Deny {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
                         "denied by Forge permission policy: {name}"
                     ))]));
                 }
-                let out = m.call(&name, &args).await;
-                let content = vec![Content::text(out.text)];
+                let out = m.call(&name, &effective_args).await;
+
+                // PostToolUse: observe; notes are prefixed onto the bridge model's result text.
+                let mut note_prefix = String::new();
+                if !self.config.hooks.is_empty() {
+                    let payload = serde_json::json!({
+                        "tool": name, "args": effective_args, "result": out.text, "ok": out.ok
+                    })
+                    .to_string();
+                    let outcome = hooks::run_hooks(
+                        &self.config.hooks,
+                        forge_config::HookEvent::PostToolUse,
+                        &name,
+                        &payload,
+                    )
+                    .await;
+                    for note in outcome.notes {
+                        note_prefix.push_str(&format!("[hook note] {note}\n"));
+                    }
+                }
+
+                let text = if note_prefix.is_empty() {
+                    out.text
+                } else {
+                    format!("{note_prefix}{}", out.text)
+                };
+                let content = vec![Content::text(text)];
                 return Ok(if out.ok {
                     CallToolResult::success(content)
                 } else {
@@ -424,6 +474,8 @@ pub async fn run() -> Result<()> {
             depth,
             max_depth: config.mesh.subagents.max_depth,
             agents,
+            worktree_root: None,
+            repo_root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         };
         Some(SubagentSupport {
             ctx,

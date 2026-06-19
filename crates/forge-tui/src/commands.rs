@@ -131,6 +131,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/loop <task>",
     },
     Command {
+        name: "effort",
+        desc: "pin the reasoning-effort level for this session (low/medium/high/xhigh), or clear",
+        usage: "/effort [low|medium|high|xhigh]",
+    },
+    Command {
         name: "clear",
         desc: "clear the screen (keep the session)",
         usage: "/clear",
@@ -216,6 +221,10 @@ pub enum CommandAction {
     Image(String),
     /// Scan the repository and write `.forge/AGENTS.md` project memory (`/init`).
     Init,
+    /// Pin (or clear) the reasoning-effort level for this session (`/effort <level>` / `/effort`).
+    /// The level string is the raw user-supplied value (e.g. "high"); the binary parses + applies
+    /// it. `None` clears the pin and returns to the provider default.
+    SetEffort(Option<String>),
     /// Enter planning mode (`/plan <task>`): read-only investigation that proposes a plan.
     Plan(String),
     /// Approve the proposed plan and execute it (`/execute`): switches to Auto-edit and builds it.
@@ -492,6 +501,7 @@ pub fn parse_command(line: &str) -> CommandAction {
                 .filter(|s| !s.is_empty());
             CommandAction::Replay(id_a, id_b)
         }
+        "effort" => CommandAction::SetEffort((!arg.is_empty()).then_some(arg)),
         "clear" | "cls" => CommandAction::ClearScreen,
         "usage" => CommandAction::Usage,
         "mesh" => CommandAction::Mesh((!arg.is_empty()).then_some(arg)),
@@ -824,6 +834,28 @@ mod tests {
         assert_eq!(parse_command("/execute"), CommandAction::Execute);
         assert_eq!(parse_command("/approve"), CommandAction::Execute);
         assert_eq!(parse_command("/go"), CommandAction::Execute);
+    }
+
+    #[test]
+    fn parses_effort_command() {
+        assert_eq!(
+            parse_command("/effort high"),
+            CommandAction::SetEffort(Some("high".into()))
+        );
+        assert_eq!(
+            parse_command("/effort xhigh"),
+            CommandAction::SetEffort(Some("xhigh".into()))
+        );
+        assert_eq!(
+            parse_command("/effort low"),
+            CommandAction::SetEffort(Some("low".into()))
+        );
+        assert_eq!(
+            parse_command("/effort medium"),
+            CommandAction::SetEffort(Some("medium".into()))
+        );
+        // bare /effort clears the pin
+        assert_eq!(parse_command("/effort"), CommandAction::SetEffort(None));
     }
 
     #[test]

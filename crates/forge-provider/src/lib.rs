@@ -5,7 +5,7 @@
 //! walking skeleton.
 
 use async_trait::async_trait;
-use forge_types::{Message, QuotaHint, ToolCall, Usage};
+use forge_types::{EffortLevel, Message, QuotaHint, ToolCall, Usage};
 
 mod cli_provider;
 mod embedder;
@@ -171,6 +171,14 @@ pub enum StreamEvent {
 /// A sink for [`StreamEvent`]s as they arrive (text, reasoning, tool activity).
 pub type EventSink<'a> = dyn FnMut(StreamEvent) + Send + 'a;
 
+/// Per-completion options that extend the base [`Provider::complete`] signature without breaking
+/// existing call sites. Passed via [`Provider::complete_with`]; the base `complete` ignores it.
+#[derive(Debug, Clone, Default)]
+pub struct CompletionOptions {
+    /// Reasoning / thinking intensity hint forwarded to the model. `None` = provider default.
+    pub effort: Option<EffortLevel>,
+}
+
 /// A model backend. Implement this trait (and nothing in the core) to add a provider.
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -184,6 +192,21 @@ pub trait Provider: Send + Sync {
         tools: &[ToolSpec],
         on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError>;
+
+    /// Like [`complete`] but accepts extra per-call options (e.g. effort / thinking intensity).
+    /// The default implementation ignores `opts` and delegates to [`complete`], so existing
+    /// backends need not change. Override in providers that support the options.
+    async fn complete_with(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        opts: &CompletionOptions,
+        on_event: &mut EventSink<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        let _ = opts;
+        self.complete(model, messages, tools, on_event).await
+    }
 }
 
 /// Routes each turn to a backend by the model id's `provider::` prefix: `claude-cli::…` /
@@ -257,6 +280,33 @@ impl Provider for DispatchProvider {
                 .await
         } else {
             self.genai.complete(model, messages, tools, on_event).await
+        }
+    }
+
+    async fn complete_with(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        opts: &CompletionOptions,
+        on_event: &mut EventSink<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        let model = normalize_model_id(model);
+        let model = model.as_ref();
+        if model.starts_with("claude-cli::") {
+            self.cli_notice();
+            self.claude_cli
+                .complete(model, messages, tools, on_event)
+                .await
+        } else if model.starts_with("codex-cli::") {
+            self.cli_notice();
+            self.codex_cli
+                .complete(model, messages, tools, on_event)
+                .await
+        } else {
+            self.genai
+                .complete_with(model, messages, tools, opts, on_event)
+                .await
         }
     }
 }

@@ -16,6 +16,7 @@ forge-types.workspace = true
 forge-config.workspace = true
 forge-core.workspace = true
 forge-index.workspace = true
+forge-lsp.workspace = true
 forge-mcp.workspace = true
 forge-mesh.workspace = true
 forge-provider.workspace = true
