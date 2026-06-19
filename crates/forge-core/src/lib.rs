@@ -1113,6 +1113,139 @@ impl Session {
         fit_messages(&self.transcript, budget_chars.max(2048))
     }
 
+    /// System prompt for the architect planner phase. Instructs the planner to produce a concrete
+    /// prose plan only — no tool calls are available in this phase.
+    const ARCHITECT_PLANNER_SYSTEM: &'static str =
+        "You are the PLANNER in a two-phase coding-assistant pipeline. \
+Your job is to think through the request carefully and produce a concise, concrete, step-by-step \
+plan of the edits and tool calls that an EDITOR agent will execute next. \
+Rules:\n\
+- Output ONLY the plan as structured prose or a numbered list. No preamble, no summary of what \
+  you were asked, no sign-off.\n\
+- Be specific: name the exact files to create/modify, the functions to add/change, \
+  and the commands to run (if any).\n\
+- Do NOT attempt to call any tools — none are available in this phase. \
+  Describe what SHOULD be done, not do it.";
+
+    /// Resolve the model to use for the architect PLAN phase.
+    /// Priority: in-session `/model` pin > `mesh.architect_model` config > mesh-routed Complex tier.
+    fn resolve_planner_model(&self) -> String {
+        // An active /model pin overrides everything.
+        if let Some(pin) = &self.pinned_model {
+            return pin.clone();
+        }
+        // Explicit config override.
+        if let Some(m) = &self.config.mesh.architect_model {
+            if !m.is_empty() {
+                return m.clone();
+            }
+        }
+        // Fall back to the primary Complex-tier model from the config.
+        self.config
+            .model_for(forge_types::TaskTier::Complex)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "anthropic::claude-opus-4-8".to_string())
+    }
+
+    /// Resolve the model to use for the architect EDIT phase.
+    /// Priority: in-session `/model` pin > `mesh.editor_model` config > mesh-routed Standard tier.
+    fn resolve_editor_model(&self) -> String {
+        // An active /model pin overrides everything (both phases use the same pinned model).
+        if let Some(pin) = &self.pinned_model {
+            return pin.clone();
+        }
+        // Explicit config override.
+        if let Some(m) = &self.config.mesh.editor_model {
+            if !m.is_empty() {
+                return m.clone();
+            }
+        }
+        // Fall back to the primary Standard-tier model from the config.
+        self.config
+            .model_for(forge_types::TaskTier::Standard)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "groq::llama-3.3-70b-versatile".to_string())
+    }
+
+    /// Run the PLAN phase of the architect pipeline.
+    ///
+    /// Calls the planner model with the current transcript and NO tools advertised, streams its
+    /// response as a normal assistant turn (persisted + streamed to the presenter), records
+    /// usage/cost, and returns the plan text. Returns `Ok(None)` when `architect_mode` is off —
+    /// the early-exit guard that makes the non-architect path byte-for-byte unchanged.
+    async fn run_plan(&mut self) -> Result<Option<String>, CoreError> {
+        if !self.config.mesh.architect_mode {
+            return Ok(None);
+        }
+
+        let planner = self.resolve_planner_model();
+        self.presenter.emit(PresenterEvent::Routing {
+            tier: forge_types::TaskTier::Complex.as_str().to_string(),
+            model: planner.clone(),
+            rationale: "architect plan phase (no tools)".to_string(),
+        });
+
+        // Build the transcript window for the planner, then prepend the planner system prompt.
+        let mut planner_msgs = self.transcript_for(&planner);
+        planner_msgs.insert(0, Message::system(Self::ARCHITECT_PLANNER_SYSTEM));
+
+        let stream_idle =
+            std::time::Duration::from_secs(self.config.mesh.stream_idle_timeout_secs);
+        let completion_opts = CompletionOptions { effort: self.pinned_effort };
+
+        // Collect plan text while streaming it live to the presenter.
+        let mut plan_text = String::new();
+        let result = {
+            let provider = &self.provider;
+            let presenter = &mut self.presenter;
+            let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let act = std::sync::Arc::clone(&activity);
+            let mut sink = |ev: StreamEvent| {
+                act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let StreamEvent::Text(ref t) = ev {
+                    plan_text.push_str(t);
+                }
+                match ev {
+                    StreamEvent::Text(t) => presenter.emit(PresenterEvent::AssistantDelta(t)),
+                    StreamEvent::Reasoning(t) => presenter.emit(PresenterEvent::Reasoning(t)),
+                    _ => {}
+                }
+            };
+            // Empty tool slice — the planner must not call tools.
+            let fut = provider.complete_with(&planner, &planner_msgs, &[], &completion_opts, &mut sink);
+            stream_with_idle_timeout(fut, &activity, stream_idle).await
+        };
+
+        let mut resp = result.map_err(CoreError::Provider)?;
+        if !resp.content.is_empty() {
+            self.presenter.emit(PresenterEvent::AssistantDone);
+        }
+        // Use the streamed text if the provider returns empty content (some providers do).
+        if resp.content.is_empty() && !plan_text.is_empty() {
+            resp.content = plan_text;
+        }
+
+        // Record cost/usage for the plan phase.
+        resp.usage.cost_usd = self.pricing.cost_for_usage(&planner, &resp.usage);
+        let seq = self.next_seq();
+        let msg_id = self.store.add_message_full(
+            &self.id,
+            seq,
+            Role::Assistant,
+            &resp.content,
+            Some(&planner),
+            &[],
+            None,
+        )?;
+        self.store.record_usage(&self.id, &msg_id, &resp.usage)?;
+
+        // Push the plan into the live transcript so the editor model sees it.
+        self.transcript
+            .push(Message::assistant(&resp.content));
+
+        Ok(Some(resp.content))
+    }
+
     /// Rough token estimate of the current transcript (chars / [`CHARS_PER_TOKEN`], + small
     /// per-message framing). Used to decide compaction; not billed.
     fn estimated_transcript_tokens(&self) -> u64 {
@@ -1578,10 +1711,33 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             });
         }
 
+        // ── Architect plan phase (architect_mode) ────────────────────────────────────────────────
+        // When enabled: call the strong planner model with NO tools advertised; append its plan to
+        // the transcript as a persisted assistant message so the editor model sees it below. When
+        // disabled (the default) `run_plan` returns Ok(None) immediately — this block is a no-op.
+        if let Some(_plan) = self.run_plan().await? {
+            // The plan is already in self.transcript (pushed inside run_plan). Nothing else to do
+            // here; the editor phase below will see it as the last assistant message in context.
+        }
+
+        // Determine the model for the edit phase.  In architect mode the editor model takes over;
+        // otherwise we keep the mesh-routed model unchanged.
+        let edit_model = if self.config.mesh.architect_mode {
+            let editor = self.resolve_editor_model();
+            self.presenter.emit(PresenterEvent::Routing {
+                tier: decision.tier.as_str().to_string(),
+                model: editor.clone(),
+                rationale: "architect edit phase".to_string(),
+            });
+            editor
+        } else {
+            routed_model.clone()
+        };
+
         // Silent auto-compaction: if the conversation has grown past ~80% of the routed model's
         // (fetched/heuristic) context window, summarize older messages now so the turn doesn't ride
         // the hard-trim floor and lose recent context. Transparent — `compact` emits its own note.
-        self.auto_compact_if_needed(&routed_model).await;
+        self.auto_compact_if_needed(&edit_model).await;
 
         let specs = self.tool_specs();
         let mut final_text = String::new();
@@ -1597,7 +1753,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
         let stream_idle = std::time::Duration::from_secs(self.config.mesh.stream_idle_timeout_secs);
         let mut chain = decision.fallbacks.clone().into_iter();
-        let mut active_model = routed_model;
+        let mut active_model = edit_model;
         // One-shot guard for the last-resort attempt when the whole chain is exhausted (below).
         let mut last_resort_used = false;
 
@@ -5633,5 +5789,85 @@ mod tests {
             diff.len() < cfg.min_diff_bytes,
             "a 5-byte diff is below the 200-byte threshold"
         );
+    }
+
+    // ── Architect mode: model resolution tests ────────────────────────────────────────────────
+
+    fn make_session(config: Config) -> Session {
+        Session::start(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(forge_provider::MockProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            config,
+            ".",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_planner_falls_back_to_complex_tier_model() {
+        // No architect_model set, no pin → first Complex-tier candidate.
+        let config = Config::default();
+        let expected = config
+            .model_for(forge_types::TaskTier::Complex)
+            .unwrap()
+            .to_string();
+        let session = make_session(config);
+        assert_eq!(session.resolve_planner_model(), expected);
+    }
+
+    #[test]
+    fn resolve_editor_falls_back_to_standard_tier_model() {
+        // No editor_model set, no pin → first Standard-tier candidate.
+        let config = Config::default();
+        let expected = config
+            .model_for(forge_types::TaskTier::Standard)
+            .unwrap()
+            .to_string();
+        let session = make_session(config);
+        assert_eq!(session.resolve_editor_model(), expected);
+    }
+
+    #[test]
+    fn resolve_planner_uses_architect_model_when_set() {
+        let mut config = Config::default();
+        config.mesh.architect_model = Some("anthropic::claude-opus-4-8".to_string());
+        let session = make_session(config);
+        assert_eq!(
+            session.resolve_planner_model(),
+            "anthropic::claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn resolve_editor_uses_editor_model_when_set() {
+        let mut config = Config::default();
+        config.mesh.editor_model = Some("groq::llama-3.1-8b-instant".to_string());
+        let session = make_session(config);
+        assert_eq!(
+            session.resolve_editor_model(),
+            "groq::llama-3.1-8b-instant"
+        );
+    }
+
+    #[test]
+    fn pin_overrides_both_planner_and_editor() {
+        // /model pin takes priority over both config fields and tier fallback.
+        let mut config = Config::default();
+        config.mesh.architect_model = Some("anthropic::claude-opus-4-8".to_string());
+        config.mesh.editor_model = Some("groq::llama-3.1-8b-instant".to_string());
+        let mut session = make_session(config);
+        session.pin_model(Some("openai::gpt-4o".to_string()));
+        assert_eq!(session.resolve_planner_model(), "openai::gpt-4o");
+        assert_eq!(session.resolve_editor_model(), "openai::gpt-4o");
+    }
+
+    #[test]
+    fn architect_mode_off_by_default() {
+        // Default config must have architect_mode = false so run_turn is unchanged.
+        let config = Config::default();
+        assert!(!config.mesh.architect_mode);
     }
 }
