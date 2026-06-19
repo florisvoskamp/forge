@@ -11,14 +11,22 @@ use serde_json::Value;
 
 mod core_tools;
 mod lattice_tool;
+mod sandbox;
 mod shell;
 mod web;
 pub use core_tools::{
     DeleteFileTool, EditFileTool, GlobTool, ListDirTool, ReadFileTool, SearchTool, WriteFileTool,
 };
 pub use lattice_tool::LatticeTool;
-pub use shell::{run_command as run_shell_command, ShellTool};
+pub use sandbox::{ApplyResult, SandboxPolicy};
+pub use shell::ShellTool;
 pub use web::{BraveSearch, DuckDuckGo, SearchBackend, SearchResult, WebFetchTool, WebSearchTool};
+
+/// Run a shell command without a sandbox (for use by the autofix loop and other internal
+/// callers that don't need filesystem confinement). Never returns `Err`.
+pub async fn run_shell_command(command: &str, cwd: &str, timeout_secs: u64) -> String {
+    shell::run_command(command, cwd, timeout_secs, &SandboxPolicy::default()).await
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -65,7 +73,7 @@ impl ToolRegistry {
         r.register(Box::new(WriteFileTool));
         r.register(Box::new(EditFileTool));
         r.register(Box::new(DeleteFileTool));
-        r.register(Box::new(ShellTool));
+        r.register(Box::new(ShellTool::default()));
         r.register(Box::new(ListDirTool));
         r.register(Box::new(SearchTool));
         r.register(Box::new(GlobTool));

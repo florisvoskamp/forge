@@ -14,6 +14,7 @@
 //! TUI (`ToolOutputDelta`/`ToolEnd`), background jobs (`shell_poll`/`shell_kill`),
 //! session-remembered allows, and the rich command-context permission prompt.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
+use crate::sandbox::{self, SandboxPolicy};
 use crate::{str_arg, Tool, ToolError};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -35,7 +37,10 @@ const MODEL_BUDGET: usize = 64 * 1024;
 #[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
-pub struct ShellTool;
+#[derive(Default)]
+pub struct ShellTool {
+    pub policy: SandboxPolicy,
+}
 
 #[async_trait]
 impl Tool for ShellTool {
@@ -70,13 +75,23 @@ impl Tool for ShellTool {
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
-        Ok(run_command(command, cwd, timeout_secs).await)
+        Ok(run_command(command, cwd, timeout_secs, &self.policy).await)
     }
 }
 
 /// Execute `command` and format a model-facing result. Never returns `Err`: a failed spawn,
 /// a non-zero exit, and a timeout are all normal results the model can react to.
-pub async fn run_command(command: &str, cwd: &str, timeout_secs: u64) -> String {
+///
+/// When `policy.enabled` is true and the platform supports Landlock, the child process runs
+/// under a kernel-enforced sandbox that confines filesystem writes to the workspace + temp dir.
+/// If Landlock is unavailable a one-time `tracing::warn!` is emitted (in the parent, once per
+/// process) and the command runs unconfined.
+pub async fn run_command(
+    command: &str,
+    cwd: &str,
+    timeout_secs: u64,
+    policy: &SandboxPolicy,
+) -> String {
     let (shell, flag) = shell_invocation();
     let mut cmd = Command::new(shell);
     cmd.arg(flag)
@@ -87,6 +102,9 @@ pub async fn run_command(command: &str, cwd: &str, timeout_secs: u64) -> String 
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     put_in_own_process_group(&mut cmd);
+
+    // Sandbox wiring: probe in the parent, install pre_exec only when supported.
+    maybe_install_sandbox(&mut cmd, policy, cwd);
 
     let start = Instant::now();
     let mut child = match cmd.spawn() {
@@ -186,6 +204,58 @@ async fn read_capped<R: AsyncRead + Unpin>(mut r: R) -> (Vec<u8>, bool) {
         }
     }
     (buf, capped)
+}
+
+/// Probe Landlock support once per process and emit the "unconfined" warning at most once.
+/// Returns `true` if a sandbox pre_exec should be installed.
+fn sandbox_supported_once(policy: &SandboxPolicy) -> bool {
+    if !policy.enabled {
+        return false;
+    }
+    // Fast path: check support and warn once.
+    use std::sync::OnceLock;
+    static CHECKED: OnceLock<bool> = OnceLock::new();
+    let supported = *CHECKED.get_or_init(|| {
+        let s = sandbox::is_supported();
+        if !s {
+            tracing::warn!("Landlock unavailable; shell runs unconfined (sandbox = true has no effect on this kernel)");
+        }
+        s
+    });
+    supported
+}
+
+/// Attach a `pre_exec` hook to `cmd` that applies the Landlock sandbox in the child process.
+/// On non-Unix platforms and when the sandbox is disabled or unsupported this is a no-op.
+fn maybe_install_sandbox(cmd: &mut Command, policy: &SandboxPolicy, cwd: &str) {
+    if !sandbox_supported_once(policy) {
+        return;
+    }
+
+    // Build the writable set in the parent (before fork) — PathBuf is Send + Clone.
+    let cwd_path = PathBuf::from(cwd);
+    let extra: Vec<PathBuf> = policy.writable.iter().map(PathBuf::from).collect();
+    let writable = sandbox::effective_writable(&cwd_path, &extra);
+
+    // Install the pre_exec closure. It runs after fork, before exec — in the child only.
+    // Landlock syscalls are async-signal-safe.
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            // tokio::process::Command exposes pre_exec via std::os::unix::process::CommandExt
+            // which is blanket-implemented — no explicit use needed.
+            cmd.pre_exec(move || {
+                // Errors are swallowed: a sandbox failure must never prevent the command
+                // from running (best-effort confinement).
+                let _ = crate::sandbox::linux::apply_landlock(&writable);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (cmd, writable);
+    }
 }
 
 /// The OS shell + its "run this command string" flag: `sh -c` on Unix, `cmd /C` on Windows
@@ -342,30 +412,34 @@ mod tests {
     mod exec {
         use super::*;
 
+        fn no_sandbox() -> SandboxPolicy {
+            SandboxPolicy::default()
+        }
+
         #[tokio::test]
         async fn runs_and_captures_stdout_and_exit() {
-            let out = run_command("echo hello", ".", 30).await;
+            let out = run_command("echo hello", ".", 30, &no_sandbox()).await;
             assert!(out.contains("hello"), "stdout captured: {out}");
             assert!(out.contains("exit 0"), "exit code reported: {out}");
         }
 
         #[tokio::test]
         async fn non_zero_exit_is_reported_with_output() {
-            let out = run_command("echo oops >&2; exit 3", ".", 30).await;
+            let out = run_command("echo oops >&2; exit 3", ".", 30, &no_sandbox()).await;
             assert!(out.contains("exit 3"), "non-zero exit: {out}");
             assert!(out.contains("oops"), "stderr captured: {out}");
         }
 
         #[tokio::test]
         async fn command_not_found_is_a_normal_result() {
-            let out = run_command("definitelynotacommand_xyz", ".", 30).await;
+            let out = run_command("definitelynotacommand_xyz", ".", 30, &no_sandbox()).await;
             assert!(out.contains("exit 127"), "not-found exit 127: {out}");
         }
 
         #[tokio::test]
         async fn timeout_kills_and_reports() {
             let start = Instant::now();
-            let out = run_command("sleep 30", ".", 1).await;
+            let out = run_command("sleep 30", ".", 1, &no_sandbox()).await;
             assert!(out.contains("timed out"), "timeout reported: {out}");
             assert!(
                 start.elapsed() < Duration::from_secs(10),
@@ -376,14 +450,26 @@ mod tests {
         #[tokio::test]
         async fn stdin_is_closed_no_hang() {
             // `cat` with no args reads stdin; with /dev/null it gets EOF and exits promptly.
-            let out = run_command("cat", ".", 5).await;
+            let out = run_command("cat", ".", 5, &no_sandbox()).await;
             assert!(out.contains("exit 0"), "cat got EOF and exited: {out}");
         }
 
         #[tokio::test]
         async fn bad_cwd_is_a_spawn_failure_not_a_panic() {
-            let out = run_command("echo hi", "/no/such/dir/xyz", 5).await;
+            let out = run_command("echo hi", "/no/such/dir/xyz", 5, &no_sandbox()).await;
             assert!(out.contains("failed to start"), "spawn failure: {out}");
+        }
+
+        /// Cross-platform: a disabled sandbox must not change command behaviour.
+        #[tokio::test]
+        async fn disabled_sandbox_runs_normally() {
+            let policy = SandboxPolicy {
+                enabled: false,
+                writable: vec![],
+            };
+            let out = run_command("echo sandbox_off", ".", 10, &policy).await;
+            assert!(out.contains("sandbox_off"), "output: {out}");
+            assert!(out.contains("exit 0"), "exit: {out}");
         }
     }
 
@@ -392,16 +478,20 @@ mod tests {
     mod exec_windows {
         use super::*;
 
+        fn no_sandbox() -> SandboxPolicy {
+            SandboxPolicy::default()
+        }
+
         #[tokio::test]
         async fn runs_and_captures_stdout_and_exit() {
-            let out = run_command("echo hello", ".", 30).await;
+            let out = run_command("echo hello", ".", 30, &no_sandbox()).await;
             assert!(out.contains("hello"), "stdout captured: {out}");
             assert!(out.contains("exit 0"), "exit code reported: {out}");
         }
 
         #[tokio::test]
         async fn non_zero_exit_is_reported() {
-            let out = run_command("exit 3", ".", 30).await;
+            let out = run_command("exit 3", ".", 30, &no_sandbox()).await;
             assert!(out.contains("exit 3"), "non-zero exit: {out}");
         }
 
@@ -409,7 +499,7 @@ mod tests {
         async fn timeout_kills_and_reports() {
             // `ping -n 20` sleeps ~19s between echoes; a 1s timeout must kill it fast.
             let start = Instant::now();
-            let out = run_command("ping -n 20 127.0.0.1", ".", 1).await;
+            let out = run_command("ping -n 20 127.0.0.1", ".", 1, &no_sandbox()).await;
             assert!(out.contains("timed out"), "timeout reported: {out}");
             assert!(
                 start.elapsed() < Duration::from_secs(10),
@@ -419,7 +509,7 @@ mod tests {
 
         #[tokio::test]
         async fn bad_cwd_is_a_spawn_failure_not_a_panic() {
-            let out = run_command("echo hi", "Z:\\no\\such\\dir\\xyz", 5).await;
+            let out = run_command("echo hi", "Z:\\no\\such\\dir\\xyz", 5, &no_sandbox()).await;
             assert!(out.contains("failed to start"), "spawn failure: {out}");
         }
     }

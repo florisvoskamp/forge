@@ -276,12 +276,30 @@ pub struct ShellConfig {
     /// budget is exhausted.
     #[serde(default = "default_explain_errors")]
     pub explain_errors: bool,
+    /// Opt-in OS-level sandbox using Linux Landlock (Linux 5.13+). When true, shell commands
+    /// run under a kernel-enforced ruleset that confines filesystem **writes** to the workspace
+    /// (cwd) and the system temp directory; reads stay broad so tools continue to work. A clean
+    /// no-op on macOS/Windows and on Linux kernels without Landlock support — never hard-fails
+    /// a command. Default: false (opt-in).
+    ///
+    /// TOML key: `shell.sandbox`
+    #[serde(default)]
+    pub sandbox: bool,
+    /// Extra writable paths beyond the workspace (cwd) and the system temp directory. Each
+    /// entry is an absolute path (relative entries are resolved against cwd at the time the
+    /// shell command runs). Ignored when `sandbox = false`.
+    ///
+    /// TOML key: `shell.sandbox_writable`
+    #[serde(default)]
+    pub sandbox_writable: Vec<String>,
 }
 
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
             explain_errors: default_explain_errors(),
+            sandbox: false,
+            sandbox_writable: Vec::new(),
         }
     }
 }

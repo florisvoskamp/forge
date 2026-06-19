@@ -3196,6 +3196,22 @@ async fn build_session_with(
         Arc::new(forge_index::Lattice::new(store_for_lattice, &root))
     });
     let mut tools = ToolRegistry::with_core_tools();
+    // Opt-in OS sandbox: replace the default shell tool with one that confines filesystem writes
+    // to the workspace via Landlock (Linux; no-op elsewhere / on unsupported kernels).
+    if config.shell.sandbox {
+        let writable = config
+            .shell
+            .sandbox_writable
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        tools.register(Box::new(forge_tools::ShellTool {
+            policy: forge_tools::SandboxPolicy {
+                enabled: true,
+                writable,
+            },
+        }));
+    }
     if let Some(lat) = &lattice {
         tools.register(Box::new(forge_tools::LatticeTool::new(Arc::clone(lat))));
         // Auto-index (and auto-embed when enabled) in the background so the graph is fresh without

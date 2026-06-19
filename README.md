@@ -47,7 +47,7 @@ $ forge lattice query "UserRepository"
 | **Hooks** | Pre/post tool-use shell hooks — block (pre) or observe (post) any tool call; fires on both direct and CLI-bridge paths, including MCP tool calls |
 | **Cost** | Prompt caching, per-model pricing fetched from OpenRouter (cache-read aware), persistent cross-restart usage store |
 | **Git** | Optional model-aware co-author attribution on commits + PR bodies |
-| **Safety** | Permission broker, per-tool rules, diff preview before write, shadow file snapshots, unoverridable denylist |
+| **Safety** | Permission broker, per-tool rules, diff preview before write, shadow file snapshots, unoverridable denylist; opt-in OS shell sandbox (Linux Landlock, `[shell] sandbox`) |
 
 ---
 
