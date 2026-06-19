@@ -63,15 +63,67 @@ impl InjectedContext {
     }
 }
 
+/// Max signature lines injected per turn. Beyond a handful, extra fuzzy matches are noise that the
+/// model re-reads on every step without benefit. Bodies (exact hits) are not counted here.
+const MAX_SIG_SNIPPETS: usize = 8;
+
 const STOPWORDS: &[&str] = &[
     "the", "and", "for", "this", "that", "with", "from", "into", "add", "use", "new", "get", "set",
     "all", "any", "but", "not", "you", "are", "can", "how", "why", "what", "where", "when", "fix",
     "make", "thread", "through", "field", "function", "method", "file", "code", "test", "tests",
+    "answer", "stop", "concisely", "please", "every", "given",
 ];
 
-/// Identifier-ish tokens worth looking up: length ≥ 3, not a stopword. CamelCase / snake_case
-/// tokens are kept whole (a real symbol name); split words also count so plain prose still hits.
-fn identifiers(prompt: &str) -> Vec<String> {
+/// A token that *looks like a code symbol* — snake_case (`inject_budget`) or multi-word mixed-case
+/// (`BudgetStatus`, `PermissionMode`). Requires an underscore or an **internal** capital: a single
+/// leading capital is just Titlecase prose ("Answer", "Usage", "Store") and must not qualify, or
+/// sentence-start words leak in and drag a wall of unrelated symbols into the injection. Genuine
+/// single-word types ("Usage") are recovered via backtick quoting instead (see [`backticked`]).
+fn looks_like_symbol(t: &str) -> bool {
+    let internal_upper = t.chars().enumerate().any(|(i, c)| i > 0 && c.is_ascii_uppercase());
+    let has_lower = t.chars().any(|c| c.is_ascii_lowercase());
+    // `_` → snake_case. internal-upper + lower → camelCase/PascalCase-multiword. The lowercase
+    // requirement excludes all-caps acronyms ("SQL", "INSERT", "JSON") which are prose, not symbols
+    // — and which otherwise exact-match unrelated helpers ("insert") and inject a fat wrong body.
+    t.contains('_') || (internal_upper && has_lower)
+}
+
+/// Identifiers the prompt wrapped in backticks (`` `Usage` ``) — an explicit "this is code" signal,
+/// so they count as symbol-shaped even when Titlecase. Returns the lengthy-enough tokens inside any
+/// backtick span.
+fn backticked(prompt: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let mut inside = false;
+    for part in prompt.split('`') {
+        if inside {
+            for tok in part.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                if tok.len() >= 3 {
+                    set.insert(tok.to_string());
+                }
+            }
+        }
+        inside = !inside;
+    }
+    set
+}
+
+/// Query terms extracted from a prompt, plus whether they came from the high-confidence
+/// symbol-shaped path. `strong=false` means we fell back to plain prose words (no symbol-shaped
+/// token in the prompt) — a low-confidence signal where injecting a fat source *body* is risky
+/// (a prose word like "insert" can exact-match an unrelated helper), so the caller injects only
+/// signature lines in that case.
+struct Query {
+    terms: Vec<String>,
+    strong: bool,
+}
+
+/// Identifier-ish tokens worth looking up: length ≥ 3, not a stopword. **Symbol-shaped** tokens
+/// (snake_case / CamelCase) are strongly preferred — if the prompt names any, we query *only* those
+/// and ignore the surrounding prose, because a fuzzy prose match (e.g. "forge", "value") returns a
+/// wall of irrelevant symbols that costs tokens on every agent step without answering anything.
+/// Only when the prompt contains no symbol-shaped token do we fall back to plain words so generic
+/// prose questions still hit something.
+fn extract_query(prompt: &str) -> Query {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut cur = String::new();
@@ -93,8 +145,20 @@ fn identifiers(prompt: &str) -> Vec<String> {
         }
     }
     flush(&mut cur, &mut out, &mut seen);
-    out.truncate(12);
-    out
+
+    let quoted = backticked(prompt);
+    let strong: Vec<String> = out
+        .iter()
+        .filter(|t| looks_like_symbol(t) || quoted.contains(*t))
+        .cloned()
+        .collect();
+    let is_strong = !strong.is_empty();
+    let mut terms = if is_strong { strong } else { out };
+    terms.truncate(12);
+    Query {
+        terms,
+        strong: is_strong,
+    }
 }
 
 fn render_line(n: &NodeHit) -> String {
@@ -151,7 +215,13 @@ pub fn retrieve(
     token_budget: usize,
     bodies: Option<BodyOpts>,
 ) -> Result<InjectedContext, LatticeError> {
-    let idents = identifiers(prompt);
+    let Query {
+        terms: idents,
+        strong,
+    } = extract_query(prompt);
+    // Bodies are high-cost and re-sent every agent step — only inject them when the query is
+    // confident (symbol-shaped). On a prose fallback, signatures only.
+    let bodies = if strong { bodies } else { None };
     // Prompt-adaptive ceiling: don't spend the full budget padding context for a prompt that names
     // one symbol. Each named symbol "earns" up to ~one body's worth of budget, clamped to the
     // configured ceiling. A prompt with no identifiers still gets a small floor.
@@ -178,11 +248,13 @@ pub fn retrieve(
     let mut snippets = Vec::new();
     let mut nodes = Vec::new();
     let mut bodies_left = bodies.map(|b| b.max_hits).unwrap_or(0);
+    let mut sigs_left = MAX_SIG_SNIPPETS;
     for n in candidates {
-        // Try a body for the top hits: a precise function body injected here saves the model a
-        // whole-file `read_file` later. Falls back to the signature line if the body is missing,
-        // too large, or wouldn't fit the budget.
-        if bodies_left > 0 {
+        // A body is only worth its (per-step) cost for a *confident* hit — a symbol whose name
+        // exactly matches a queried identifier. Injecting a fuzzy match's body (e.g. `ForgeMcp` for
+        // the word "forge") spends hundreds of tokens on noise the model must then ignore.
+        let exact = idents.iter().any(|id| n.name.eq_ignore_ascii_case(id));
+        if bodies_left > 0 && exact {
             if let Some(opts) = bodies {
                 if let Some(body) =
                     read_body(lat.repo_root(), &n.rel_path, n.span_start, n.span_end)
@@ -204,12 +276,24 @@ pub fn retrieve(
                 }
             }
         }
+        // On a low-confidence prose query, a fuzzy signature match is worse than nothing: it points
+        // the model at an unrelated symbol and *adds* exploration. Inject only exact-name hits then
+        // (possibly nothing — degrading to the no-injection baseline rather than misleading).
+        if !strong && !exact {
+            continue;
+        }
+        // Signature lines are cheap individually but a long tail of fuzzy matches is pure tax,
+        // re-sent on every agent step. Cap them so injection stays lean.
+        if sigs_left == 0 {
+            continue;
+        }
         let text = render_line(&n);
         let cost = est_tokens(&text);
         if est + cost > token_budget {
             break;
         }
         est += cost;
+        sigs_left -= 1;
         snippets.push(RetrievedSnippet {
             rel_path: n.rel_path.clone(),
             line: n.line,
@@ -265,11 +349,39 @@ mod tests {
 
     #[test]
     fn identifiers_keep_symbols_drop_stopwords() {
-        let ids = identifiers("add a depth field to Session and thread it through start");
-        assert!(ids.contains(&"Session".to_string()));
-        assert!(ids.contains(&"depth".to_string()));
-        assert!(ids.contains(&"start".to_string()));
-        assert!(!ids.iter().any(|i| i == "and" || i == "the" || i == "field"));
+        // No symbol-shaped token here → prose fallback, so plain words survive.
+        let q = extract_query("add a depth field to session and thread it through start");
+        assert!(!q.strong);
+        assert!(q.terms.contains(&"depth".to_string()));
+        assert!(q.terms.contains(&"start".to_string()));
+        assert!(!q.terms.iter().any(|i| i == "and" || i == "the" || i == "field"));
+    }
+
+    #[test]
+    fn symbol_shaped_tokens_win_over_prose() {
+        // A snake_case / CamelCase token makes the query "strong" and suppresses prose noise.
+        let q = extract_query("what does inject_budget return for the BudgetStatus value");
+        assert!(q.strong);
+        assert!(q.terms.contains(&"inject_budget".to_string()));
+        assert!(q.terms.contains(&"BudgetStatus".to_string()));
+        assert!(!q.terms.iter().any(|t| t == "does" || t == "return"));
+    }
+
+    #[test]
+    fn all_caps_acronyms_are_not_symbols() {
+        // "SQL"/"INSERT" are prose acronyms, not symbol names — must not trigger the strong path.
+        assert!(!looks_like_symbol("SQL"));
+        assert!(!looks_like_symbol("INSERT"));
+        assert!(!looks_like_symbol("Store")); // leading-cap Titlecase is prose
+        assert!(looks_like_symbol("BudgetStatus"));
+        assert!(looks_like_symbol("inject_budget"));
+    }
+
+    #[test]
+    fn backticked_titlecase_counts_as_symbol() {
+        let q = extract_query("list fields of the `Usage` struct");
+        assert!(q.strong);
+        assert!(q.terms.contains(&"Usage".to_string()));
     }
 
     #[test]

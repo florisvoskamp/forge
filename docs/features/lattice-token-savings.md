@@ -4,8 +4,11 @@
 >
 > Make Lattice context injection actually *save* tokens by injecting the **source bodies** of the
 > top-ranked symbols, not just their signatures — so the model reads the relevant code from
-> context instead of spending whole-file `read_file` calls. Measured **~60% reduction** in total
-> agent-loop tokens vs the previous (signature-only) default on a repo-question benchmark.
+> context instead of spending whole-file `read_file` calls, **and** by querying only high-signal
+> symbol-shaped identifiers so the injection is relevant rather than a wall of noise. Measured
+> **~50% median per-task reduction** in agent-loop tokens vs the previous (signature-only) default,
+> **~37% vs no Lattice**, on a repo-question benchmark — and the model answers in 1–2 steps instead
+> of 3–4.
 
 ---
 
@@ -35,7 +38,34 @@ fn inject_budget(base: usize, status: BudgetStatus) -> usize { … }
 
 instead of a bare signature line. The remaining hits stay signature lines. A precise ~40-line body
 (~300 tokens) replaces a whole-file read (2–6k tokens), and because the answer is already in
-context the model typically completes in **one step** instead of a multi-step read/grep loop.
+context the model typically completes in **1–2 steps** instead of a multi-step read/grep loop.
+
+### 2.1 Retrieval relevance (the fix that made the bodies pay off)
+
+The first cut of body injection regressed on some prompts: it *added* tokens. Root cause was
+retrieval noise, not the bodies themselves. The prompt was tokenized into all words ≥3 chars, so
+prose ("value", "return", "variant", "forge", "core") became query terms that each matched a
+handful of unrelated symbols — especially **test functions**. A single prompt injected ~30 snippets
+(~720 tokens) of mostly-junk signatures, plus a fat body for a fuzzy match (e.g. `ForgeMcp` for the
+word "forge"). All of it was re-sent on **every agent step**, and the wall of noise made the model
+distrust the one relevant body and explore anyway.
+
+Fixes (`retrieve.rs`):
+- **Symbol-shaped query terms only.** Prefer tokens that look like code identifiers — snake_case
+  (`inject_budget`) or multi-word CamelCase (`BudgetStatus`) — and, when the prompt names any, query
+  *only* those. All-caps acronyms ("SQL", "INSERT") and Titlecase prose ("Answer", "Store") are
+  excluded; a backtick-quoted token (`` `Usage` ``) is always treated as a symbol. Only when the
+  prompt contains no symbol-shaped token at all do we fall back to plain prose words.
+- **Bodies only on a confident (symbol-shaped) query.** A prose fallback injects signatures only —
+  a fat body for a fuzzy prose match (e.g. "insert" exact-matching an unrelated helper) is the
+  worst case, costing hundreds of tokens of noise per step.
+- **Bodies only for exact-name hits**, and **signature lines for fuzzy hits dropped on the prose
+  path** (so a low-confidence query injects a few exact matches or nothing — degrading to the
+  no-injection baseline rather than misleading the model).
+- **Signature cap** (`MAX_SIG_SNIPPETS = 8`) bounds the long tail of fuzzy matches.
+
+This took the example prompt's injection from ~720 tokens / 30 snippets to ~160 / 3 (the two
+relevant bodies + one signature).
 
 Supporting changes:
 - `NodeHit` now carries `span_start`/`span_end` (already in `LatticeNodeRow`; previously dropped in
@@ -70,28 +100,47 @@ five repo-specific questions whose answers live in this codebase, under three co
 | Improved  | signature + body (the new default) |
 
 Each run is isolated (fresh in-memory session store, pinned model, no failover, no budget cutoff,
-embeddings off, watcher off, shared pre-built index). The metric is **total input+output tokens
-summed across every provider call** of the turn, read from the `usage` table via
+embeddings off, watcher off, shared pre-built index). The per-task metric is **total input+output
+tokens summed across every provider call** of the turn, read from the `usage` table via
 `Store::session_tokens` / `Store::session_step_count`. A real model is required — the mock returns
 fixed token counts and would defeat the measurement.
 
-### Results (reps=3)
+### Aggregation: median, equal-weight per task
 
-| | Off | Current | Improved |
-|--|-----|---------|----------|
-| mean total tokens / task | 9345 | 8536 | **3412** |
-| mean steps | ~3.6 | ~2.3 | **~1.4** |
+A live single-turn run is **noisy** — the model occasionally spirals into a 4–6-step exploration, a
+5–30× token outlier. An earlier version of this benchmark reported the *arithmetic mean of summed
+tokens*, which is dominated by whichever condition happened to hit that outlier on one task. That
+produced a "−60%" headline that did not reproduce: a later run on the same code measured only −20%.
+The mean was measuring luck, not the change.
 
-- **Improved vs Current (old default): −60.0%**
-- **Improved vs Off (no Lattice): −63.5%**
+The report now uses, per task, the **median total across reps**, and aggregates conditions by the
+**mean and median of the per-task percentage reductions** (each task weighted equally — so one
+giant-token task can't swing the headline). The median-of-tasks is the figure to trust; the mean is
+shown alongside and is positive whenever a single task blows up.
 
-Improved is also far **lower-variance**: because the answer is injected, the model answers in one
-step deterministically, where Off/Current sometimes spiral into 4–6-step explorations (a single
-59k-token outlier in Off). The one task where injection slightly *adds* tokens is a tiny struct the
-model could already answer cheaply — dominated by the large wins elsewhere.
+### Results (median of per-task reductions, 3 runs at reps=3–4)
 
-> The benchmark is single-turn and uses a live model, so absolute numbers are noisy run-to-run; the
-> ≥30% target is met with wide margin and is robust to the outliers.
+| metric | typical |
+|--------|---------|
+| Improved vs Current (old signature-only default) | **−48% to −54%** |
+| Improved vs Off (no Lattice) | **−37% to −38%** |
+| steps, Off → Improved | 3–4 → 1–2 |
+
+The big wins are on **symbol-named questions** (T1 `Usage`, T2 `inject_budget`/`BudgetStatus`, T5
+`PermissionMode`): the relevant body is injected, the model answers in one step. The strongest
+single case was T2, the prompt that previously *regressed*: the noisy injection that sent the model
+exploring is gone, and Improved now lands ~2.5k tokens vs Current's 5–150k (run-dependent).
+
+**Honest caveat — prose questions.** T4 names no symbol ("the retrieval code extracts candidate
+identifiers… minimum length… stopword"). On the prose-fallback path Lattice can only inject a few
+exact-name guesses or nothing, so it is **neutral-to-slightly-negative vs no injection** there — the
+model reads the file regardless. Lattice helps when the prompt names what it wants; it does not hurt
+much when it can't. Run-to-run, absolute numbers still swing widely (T2-Current ranged 5.7k–151k
+across runs); the **median per-task reduction is stable** and clears the ≥30% target with margin.
+
+A diagnostic, `cargo run -p xtasks -- probe-retrieve`, prints exactly which symbols (body vs
+signature, token cost) each task's prompt would inject — used to root-cause regressions without
+spending model calls.
 
 ## 4. Future levers (not needed to hit the target, documented for later)
 
