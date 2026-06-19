@@ -30,7 +30,7 @@ pub struct RetrievedSnippet {
 }
 
 /// The result of [`Lattice::retrieve`] — what gets injected as a system message.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct InjectedContext {
     pub nodes: Vec<NodeHit>,
     pub snippets: Vec<RetrievedSnippet>,
@@ -234,20 +234,34 @@ pub fn retrieve(
     let token_budget = token_budget.min((idents.len().max(1) * per_ident).max(per_ident));
 
     let mut seen: HashSet<(String, i64, String)> = HashSet::new();
-    let mut candidates: Vec<NodeHit> = Vec::new();
+    let mut exact_candidates: Vec<NodeHit> = Vec::new();
+    let mut fuzzy_candidates: Vec<NodeHit> = Vec::new();
     for ident in &idents {
         for hit in lat.query(ident, 5)? {
-            // Prefer exact name matches as the strongest signal.
             let exact = hit.name.eq_ignore_ascii_case(ident);
             if seen.insert((hit.rel_path.clone(), hit.line, hit.name.clone())) {
                 if exact {
-                    candidates.insert(0, hit);
+                    exact_candidates.push(hit);
                 } else {
-                    candidates.push(hit);
+                    fuzzy_candidates.push(hit);
                 }
             }
         }
     }
+    // Within each group (exact vs fuzzy), break ties by pagerank descending so higher-centrality
+    // symbols are preferred. The exact/fuzzy split preserves the existing primary ordering.
+    exact_candidates.sort_by(|a, b| {
+        b.pagerank
+            .partial_cmp(&a.pagerank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    fuzzy_candidates.sort_by(|a, b| {
+        b.pagerank
+            .partial_cmp(&a.pagerank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut candidates = exact_candidates;
+    candidates.extend(fuzzy_candidates);
 
     let mut est = 0usize;
     let mut snippets = Vec::new();
@@ -397,6 +411,7 @@ mod tests {
             line: 10,
             span_start: 0,
             span_end: 0,
+            pagerank: 0.0,
         };
         let b = body_block(&n, "fn foo() {}\n");
         assert!(b.starts_with("src/a.rs:10 — function foo"));

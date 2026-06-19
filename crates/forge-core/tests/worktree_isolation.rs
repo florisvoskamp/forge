@@ -33,13 +33,11 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn init_repo() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "forge-wt-integ-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos()
-    ));
+    // Unique per (process, call) so parallel tests never collide on the same temp dir — a
+    // subsec_nanos-only name races under macOS's parallel test runner and `git init` then fails.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("forge-wt-integ-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     run_git(&dir, &["init"]).unwrap();
     run_git(&dir, &["config", "user.email", "test@forge.local"]).unwrap();

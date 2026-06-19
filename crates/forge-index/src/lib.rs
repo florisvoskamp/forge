@@ -15,11 +15,13 @@ use sha2::{Digest, Sha256};
 
 mod embed;
 mod extract;
+mod map;
 mod retrieve;
 mod watch;
 
 pub use embed::{parse_ollama_embeddings, Embedder, OllamaEmbedder};
 pub use extract::{extract, lang_for_path, supported_languages, Def, Parsed, Ref};
+pub use map::build_map;
 pub use retrieve::{BodyOpts, InjectedContext, RetrievedSnippet};
 pub use watch::{spawn_watcher, LatticeWatcher};
 
@@ -47,7 +49,7 @@ pub struct UpdateStats {
 }
 
 /// A symbol returned from a query.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeHit {
     pub name: String,
     pub kind: String,
@@ -59,11 +61,14 @@ pub struct NodeHit {
     /// body for body-injection retrieval without re-parsing. `(0, 0)` when unknown.
     pub span_start: i64,
     pub span_end: i64,
+    /// PageRank importance score: higher = referenced by more symbols. Used as a secondary
+    /// sort key (tie-break) within each retrieval group. `0.0` until `recompute_pagerank` runs.
+    pub pagerank: f64,
 }
 
 /// Reverse-dependency closure for `impact`: the symbol(s) named, everything that references them
 /// (transitively), and the files involved.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BlastRadius {
     pub roots: Vec<NodeHit>,
     pub dependents: Vec<NodeHit>,
@@ -85,7 +90,7 @@ pub struct Provenance {
 
 /// A scoped subgraph for one symbol — what the interactive `/lattice` view renders: the matching
 /// definitions, their reverse-dependents (blast radius), and git provenance for the exact match.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LatticeView {
     pub query: String,
     pub roots: Vec<NodeHit>,
@@ -138,7 +143,113 @@ impl Lattice {
                 }
             }
         }
+        if stats.files_indexed > 0 {
+            // Recompute PageRank whenever the graph changed. Best-effort: a failure here is
+            // non-fatal — retrieval simply uses the previous (or zero) scores.
+            let _ = self.recompute_pagerank();
+        }
         Ok(stats)
+    }
+
+    /// Compute PageRank over the lattice reference graph and persist scores for every node.
+    ///
+    /// Algorithm: iterative power method, damping factor 0.85, up to 20 iterations or until
+    /// the L1 norm of the update is < 1e-6 (convergence). The graph is built from `lattice_ref`
+    /// (name-keyed edges) by joining to `lattice_node` to resolve names to node ids; nodes with
+    /// no outgoing edges (dangling nodes) distribute their rank uniformly. Scores are normalized
+    /// to sum to 1.0 before persisting so they're comparable across index sizes.
+    pub fn recompute_pagerank(&self) -> Result<(), LatticeError> {
+        use std::collections::HashMap;
+
+        // Load all nodes and build an id→index map.
+        let node_pairs = self.store.lattice_node_ids_and_names()?;
+        if node_pairs.is_empty() {
+            return Ok(());
+        }
+        let n = node_pairs.len();
+        let id_to_idx: HashMap<&str, usize> = node_pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.as_str(), i))
+            .collect();
+        // name → list of node indices (multiple nodes can share a name across files).
+        let mut name_to_idxs: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, (_, name)) in node_pairs.iter().enumerate() {
+            name_to_idxs.entry(name.as_str()).or_default().push(i);
+        }
+
+        // Build adjacency: out_edges[src_idx] = list of dst_idx (resolved from lattice_ref).
+        let ref_edges = self.store.lattice_ref_edges()?;
+        let mut out_edges: Vec<Vec<usize>> = vec![vec![]; n];
+        for (src_id, dst_name) in &ref_edges {
+            let Some(&src_idx) = id_to_idx.get(src_id.as_str()) else {
+                continue;
+            };
+            if let Some(targets) = name_to_idxs.get(dst_name.as_str()) {
+                for &dst_idx in targets {
+                    if dst_idx != src_idx {
+                        out_edges[src_idx].push(dst_idx);
+                    }
+                }
+            }
+        }
+
+        const DAMPING: f64 = 0.85;
+        const MAX_ITER: usize = 20;
+        const CONVERGENCE: f64 = 1e-6;
+
+        let uniform = 1.0 / n as f64;
+        let mut rank = vec![uniform; n];
+        let mut next = vec![0.0f64; n];
+
+        for _ in 0..MAX_ITER {
+            // Dangling rank: nodes with no out-edges contribute uniformly.
+            let dangling: f64 = rank
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| out_edges[*i].is_empty())
+                .map(|(_, r)| r)
+                .sum::<f64>();
+
+            for v in next.iter_mut() {
+                *v = (1.0 - DAMPING) * uniform + DAMPING * dangling * uniform;
+            }
+            for (src, targets) in out_edges.iter().enumerate() {
+                if targets.is_empty() {
+                    continue;
+                }
+                let share = DAMPING * rank[src] / targets.len() as f64;
+                for &dst in targets {
+                    next[dst] += share;
+                }
+            }
+
+            // Check convergence (L1 norm of delta).
+            let delta: f64 = rank.iter().zip(&next).map(|(a, b)| (a - b).abs()).sum();
+            rank.copy_from_slice(&next);
+            for v in next.iter_mut() {
+                *v = 0.0;
+            }
+            if delta < CONVERGENCE {
+                break;
+            }
+        }
+
+        // Normalize so scores sum to 1.0 (keeps values comparable across index sizes).
+        let total: f64 = rank.iter().sum();
+        if total > 0.0 {
+            for r in rank.iter_mut() {
+                *r /= total;
+            }
+        }
+
+        let scores: Vec<(String, f64)> = node_pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.clone(), rank[i]))
+            .collect();
+        self.store.set_lattice_pageranks(&scores)?;
+        Ok(())
     }
 
     /// (Re)index a single file (e.g. after the agent edits it). No-op for unsupported files.
@@ -192,6 +303,7 @@ impl Lattice {
                 span_start: d.span_start as i64,
                 span_end: d.span_end as i64,
                 line_start: d.line_start as i64,
+                pagerank: 0.0,
             });
         }
 
@@ -501,6 +613,24 @@ impl Lattice {
         })
     }
 
+    /// All nodes ranked by pagerank descending, capped at `limit`. Used by [`Lattice::map`] to
+    /// select the most important symbols for the repo-map without needing to re-sort client-side.
+    /// Pass `usize::MAX` to retrieve everything (the map applies its own token-budget cutoff).
+    pub(crate) fn store_nodes_ranked(&self, limit: usize) -> Result<Vec<NodeHit>, LatticeError> {
+        let rows = self.store.lattice_nodes_ranked(limit)?;
+        self.rows_to_hits(rows)
+    }
+
+    /// Build a compact, token-budgeted repo-map: the most important definitions across the repo,
+    /// grouped by file, ordered by source line within each file. Selection is by pagerank
+    /// descending so high-centrality symbols (called by many others) appear first. The output is
+    /// deterministic and safe to cache — same index + budget → same string.
+    ///
+    /// Returns a plain-text block ready to print or inject. Empty index → a hint to run update.
+    pub fn map(&self, token_budget: usize) -> Result<String, LatticeError> {
+        map::build_map(self, token_budget)
+    }
+
     fn rows_to_hits(&self, rows: Vec<LatticeNodeRow>) -> Result<Vec<NodeHit>, LatticeError> {
         let mut hits = Vec::with_capacity(rows.len());
         for r in rows {
@@ -517,6 +647,7 @@ impl Lattice {
                 line: r.line_start,
                 span_start: r.span_start,
                 span_end: r.span_end,
+                pagerank: r.pagerank,
             });
         }
         Ok(hits)
@@ -909,5 +1040,82 @@ mod tests {
         let s = lat.status().unwrap();
         assert_eq!(s.files, 1);
         assert_eq!(s.nodes, 2);
+    }
+
+    /// PageRank assigns a higher score to a symbol referenced by many others than to an
+    /// unreferenced leaf. We build a small graph: `hub` is called by `a`, `b`, and `c`
+    /// (three separate symbols). `leaf` is never referenced. After `recompute_pagerank`,
+    /// hub's score must exceed leaf's.
+    #[test]
+    fn pagerank_hub_scores_higher_than_leaf() {
+        let t = Tmp::new();
+        // hub is called by three callers; leaf is never referenced.
+        t.write(
+            "src/lib.rs",
+            r#"
+pub fn hub() {}
+pub fn leaf() {}
+pub fn caller_a() { hub(); }
+pub fn caller_b() { hub(); }
+pub fn caller_c() { hub(); }
+"#,
+        );
+        let lat = lattice(&t.root);
+        lat.update().unwrap(); // recompute_pagerank is called inside update when files_indexed > 0
+
+        let hub_hits = lat.query("hub", 1).unwrap();
+        let leaf_hits = lat.query("leaf", 1).unwrap();
+        assert_eq!(hub_hits.len(), 1, "hub should be indexed");
+        assert_eq!(leaf_hits.len(), 1, "leaf should be indexed");
+        assert!(
+            hub_hits[0].pagerank > leaf_hits[0].pagerank,
+            "hub (referenced 3×) must outrank leaf (0 references): hub={} leaf={}",
+            hub_hits[0].pagerank,
+            leaf_hits[0].pagerank
+        );
+    }
+
+    /// Among two equal-name-match candidates, the one with higher pagerank is ordered first
+    /// in retrieve output. We index two files each defining `parse_target` (snake_case →
+    /// symbol-shaped so the retrieve strong-path fires), give one a higher pagerank via direct
+    /// store write, then verify retrieve orders it first.
+    #[test]
+    fn retrieve_orders_higher_pagerank_first_among_equal_name_matches() {
+        use crate::retrieve;
+        let t = Tmp::new();
+        // Two separate files each define a symbol-shaped function name.
+        t.write("src/a.rs", "pub fn parse_target() {}");
+        t.write("src/b.rs", "pub fn parse_target() {}");
+        let store = std::sync::Arc::new(forge_store::Store::open_in_memory().unwrap());
+        let lat = Lattice::new(std::sync::Arc::clone(&store), &t.root);
+        lat.update().unwrap();
+
+        // Find the two `parse_target` nodes and assign distinct pagerank scores directly.
+        let nodes = store.lattice_nodes_by_name("parse_target", 10).unwrap();
+        assert_eq!(
+            nodes.len(),
+            2,
+            "both parse_target definitions must be indexed"
+        );
+        let high_id = nodes[0].id.clone();
+        let low_id = nodes[1].id.clone();
+        store
+            .set_lattice_pageranks(&[(high_id.clone(), 0.9), (low_id.clone(), 0.1)])
+            .unwrap();
+
+        // `parse_target` is snake_case → symbol-shaped → strong path fires → snippets injected.
+        let ctx = retrieve::retrieve(&lat, "parse_target", 2000, None).unwrap();
+        assert_eq!(ctx.snippets.len(), 2, "both definitions must be retrieved");
+
+        // Identify which file the high-pagerank node lives in. It must be first.
+        let high_node = store.lattice_node_by_id(&high_id).unwrap().unwrap();
+        let high_path = store
+            .lattice_file_path(&high_node.file_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ctx.snippets[0].rel_path, high_path,
+            "higher-pagerank parse_target must be ordered first"
+        );
     }
 }

@@ -526,7 +526,56 @@ through new `Store` methods (§4) or a `Store::with_conn(|c| …)` accessor expo
 (`ToolRegistry::with_core_tools` gains a sibling `with_lattice(Arc<Lattice>)`), mirroring how the
 subagent `task` tool is wired at the core boundary.
 
-### 5.8 Edge cases
+### 5.8 Repo-map (`forge lattice map`)
+
+`forge lattice map [--budget N]` prints a compact, token-budgeted overview of the repo's most
+important definitions grouped by file — the "aider-style repo-map" that lets a model (or a
+human) orient quickly in an unfamiliar codebase without reading every source file.
+
+**How it works:**
+
+1. All indexed nodes are fetched ordered by `pagerank DESC` — higher centrality first. PageRank
+   is already computed and stored by `Lattice::update`, so this is a single `SELECT … ORDER BY
+   pagerank DESC LIMIT ?` (no re-computation in the map path).
+2. Nodes are greedily packed into a token budget (default 2 000, overridable with `--budget N`).
+   Token cost is estimated at ~4 chars/token, identical to the estimate in `retrieve.rs`. A file
+   header line (e.g. `crates/forge-core/src/lib.rs:`) is charged once per file the first time a
+   symbol from that file is selected.
+3. Selected nodes are grouped by file path (`BTreeMap<String, …>`), so file headers appear in
+   lexicographic order — deterministic and readable. Within each file, symbols are sorted by
+   source line (ascending) so the output reads like the file itself.
+4. Rendering: one `<rel_path>:` header per file, then each symbol indented by two spaces:
+   `  <kind> <signature-or-qualname-or-name>`.
+
+**Output example** (truncated):
+
+```
+crates/forge-core/src/lib.rs:
+  function run_turn_with
+  struct Session
+crates/forge-index/src/lib.rs:
+  struct Lattice
+  function build_map
+crates/forge-store/src/lib.rs:
+  function lattice_nodes_ranked
+```
+
+**Implementation surface:**
+
+| Item | Location |
+|------|----------|
+| `build_map(lat, budget)` free fn | `crates/forge-index/src/map.rs` |
+| `Lattice::map(budget)` wrapper | `crates/forge-index/src/lib.rs` |
+| `Store::lattice_nodes_ranked(limit)` | `crates/forge-store/src/lib.rs` |
+| `LatticeOp::Map { budget }` clap variant | `crates/forge-cli/src/main.rs` |
+| `LatticeConfig::map_orientation` (future hook) | `crates/forge-config/src/lib.rs` |
+
+**`map_orientation` config field:** `[lattice] map_orientation = true` is wired in config but
+intentionally **not yet active** in the map output or the agent turn loop. When activated in a
+future PR, it will group the map by importance tier (high / medium / low pagerank bands) rather
+than by file path — useful for very large repos where file grouping scatters related symbols.
+
+### 5.9 Edge cases
 
 | Edge case | Behaviour |
 |-----------|-----------|

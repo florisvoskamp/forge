@@ -277,6 +277,14 @@ enum LatticeOp {
     Embed,
     /// Show index counts (files, symbols, edges, refs).
     Status,
+    /// Print a compact, importance-ranked overview of the repo's key definitions, grouped by file
+    /// (aider-style repo-map). Selection is by PageRank so high-centrality symbols appear first;
+    /// within each file symbols are shown in source order. Output is token-budgeted.
+    Map {
+        /// Token budget for the map (default: 2000). Larger = more symbols shown.
+        #[arg(long, short = 'b')]
+        budget: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1104,6 +1112,12 @@ async fn lattice_cmd(op: LatticeOp) -> Result<()> {
                 s.refs,
                 forge_index::supported_languages().len()
             );
+        }
+        LatticeOp::Map { budget } => {
+            let lat = forge_index::Lattice::new(store, &cwd);
+            let budget = budget.unwrap_or(2000);
+            let map = lat.map(budget).map_err(|e| anyhow::anyhow!("{e}"))?;
+            print!("{map}");
         }
     }
     Ok(())
