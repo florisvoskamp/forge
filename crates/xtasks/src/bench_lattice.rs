@@ -29,35 +29,7 @@ const DEFAULT_MODEL: &str = "openrouter::google/gemini-2.5-flash";
 const DEFAULT_REPS: usize = 3;
 const MAX_STEPS: usize = 6;
 
-struct BenchTask {
-    id: &'static str,
-    prompt: &'static str,
-}
-
-/// Narrow, repo-specific questions whose answers live in one or two source files — exactly the
-/// case where injecting the relevant symbol should save the model a file read.
-const TASKS: &[BenchTask] = &[
-    BenchTask {
-        id: "T1-usage-fields",
-        prompt: "List every field of the `Usage` struct in the forge-types crate. Answer concisely, then stop.",
-    },
-    BenchTask {
-        id: "T2-inject-budget",
-        prompt: "In forge-core, what value does the `inject_budget` function return when the BudgetStatus is the most constrained variant, given a base of 1500? Answer with the number and stop.",
-    },
-    BenchTask {
-        id: "T3-record-usage",
-        prompt: "Which method on the Store type in forge-store records per-message token usage, and which SQL table does it INSERT into? Answer in one line and stop.",
-    },
-    BenchTask {
-        id: "T4-retrieve-identifiers",
-        prompt: "In forge-index, the retrieval code extracts candidate identifiers from a prompt. What minimum length must a token be to qualify, and name one stopword it drops? Answer in one line and stop.",
-    },
-    BenchTask {
-        id: "T5-permission-modes",
-        prompt: "Name the variants of the PermissionMode enum in forge-types. Answer with just the variant names and stop.",
-    },
-];
+use crate::tasks::TASKS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Condition {

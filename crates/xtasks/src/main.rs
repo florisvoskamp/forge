@@ -4,6 +4,7 @@
 
 mod bench_lattice;
 mod probe_retrieve;
+mod tasks;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

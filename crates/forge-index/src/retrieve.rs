@@ -71,7 +71,6 @@ const STOPWORDS: &[&str] = &[
     "the", "and", "for", "this", "that", "with", "from", "into", "add", "use", "new", "get", "set",
     "all", "any", "but", "not", "you", "are", "can", "how", "why", "what", "where", "when", "fix",
     "make", "thread", "through", "field", "function", "method", "file", "code", "test", "tests",
-    "answer", "stop", "concisely", "please", "every", "given",
 ];
 
 /// A token that *looks like a code symbol* — snake_case (`inject_budget`) or multi-word mixed-case
