@@ -138,9 +138,14 @@ pub struct RewindOutcome {
     pub rewound_prompt: Option<String>,
 }
 
-/// Rough chars-per-token used to convert a model's token context window into a character budget
-/// for transcript trimming. ~4 is the standard English approximation; we only need a safe bound.
-const CHARS_PER_TOKEN: usize = 4;
+/// Chars-per-token used to convert a model's token window into a character budget for trimming and
+/// to estimate transcript size for auto-compaction. Deliberately CONSERVATIVE (3, not the ~4
+/// English average): a coding agent's transcript is dense with code/JSON/tool output that tokenizes
+/// closer to ~3 chars/token, so assuming 4 lets the real token count exceed the window — the input
+/// then overflows, the provider rejects it, and (because overflow surfaces as a transient error)
+/// the mesh benches a healthy model and churns the whole failover chain. Under-estimating the ratio
+/// keeps the trimmed input safely inside the window and makes auto-compaction trigger on time.
+const CHARS_PER_TOKEN: usize = 3;
 
 /// Trim a transcript to fit within `budget_chars` (an already-derived character budget for the
 /// model's context window minus the reserved reply). System messages are ALWAYS kept (the standing
@@ -1424,7 +1429,27 @@ Rules:\n\
     async fn auto_compact_if_needed(&mut self, model: &str) {
         if !self.transcript_fits(model) {
             let _ = self.compact(true).await;
+            // Refresh the gauge NOW so it reflects the reduced context immediately, instead of
+            // showing the old (over-window) size until the turn's first model call returns.
+            self.emit_context_gauge(model);
         }
+    }
+
+    /// Emit a [`Cost`](PresenterEvent::Cost) event reflecting the CURRENT transcript size as the
+    /// live context fill, so the statusline gauge + compaction band update right away (e.g. right
+    /// after auto-compaction) rather than waiting for the next model call's real input-token count
+    /// at turn end. Uses the conservative transcript estimate as a stand-in until the real count
+    /// arrives.
+    fn emit_context_gauge(&mut self, model: &str) {
+        let (session_in, session_out) = self.store.session_tokens(&self.id).unwrap_or((0, 0));
+        let session_total_usd = self.store.session_cost(&self.id).unwrap_or(0.0);
+        self.presenter.emit(PresenterEvent::Cost {
+            session_total_usd,
+            session_in,
+            session_out,
+            context_tokens: self.estimated_transcript_tokens(),
+            context_limit: forge_mesh::pricing::context_limit(model),
+        });
     }
 
     /// Bench (or, for a permanent incapability, exclude) `model` after a retryable error and
@@ -1691,6 +1716,9 @@ Rules:\n\
         let fallbacks: Vec<String> = decision.map(|d| d.fallbacks.clone()).unwrap_or_default();
         let mut chain = fallbacks.into_iter();
         let mut last_resort_used = false;
+        // Bounds the overflow self-heal (compact + retry the SAME model) so a transcript that can't
+        // be shrunk enough eventually falls through to normal failover instead of looping.
+        let mut compact_retries = 0usize;
 
         let mut final_text = String::new();
         let mut context_tokens: u64 = 0;
@@ -1775,6 +1803,19 @@ Rules:\n\
                         break r;
                     }
                     Err(e) if failover_enabled && e.is_retryable() => {
+                        // Context-overflow self-heal: the input exceeded THIS model's window, so the
+                        // fix is to shrink the conversation and retry the SAME (healthy) model —
+                        // NOT to bench it and burn the whole failover chain (the "every model
+                        // unavailable" churn that left the turn stuck). Bounded by `compact_retries`.
+                        if compact_retries < 2 && e.is_context_overflow() {
+                            compact_retries += 1;
+                            self.presenter.emit(PresenterEvent::Warning(format!(
+                                "{active_model}: input exceeded the context window — compacting and retrying"
+                            )));
+                            let _ = self.compact(true).await;
+                            self.emit_context_gauge(&active_model);
+                            continue;
+                        }
                         let reason = e.reason();
                         // A PERMANENT incapability (no tool support / unaffordable) excludes the
                         // model for a long window so it isn't re-tried every turn (the "every model
@@ -5183,6 +5224,67 @@ mod tests {
             message: "429".into(),
             retry_after: Some(std::time::Duration::from_secs(42)),
         }
+    }
+
+    /// Fails the first `fail_first` calls with a context-overflow error, then answers. Used to
+    /// prove an overflow self-heals (compact + retry the SAME model) instead of benching it.
+    struct OverflowThenOkProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_first: usize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for OverflowThenOkProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.fail_first {
+                return Err(forge_provider::ProviderError::Unavailable(
+                    "maximum context length is 128000 tokens".into(),
+                ));
+            }
+            on_event(StreamEvent::Text("recovered".into()));
+            Ok(forge_provider::ModelResponse {
+                content: "recovered".into(),
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn context_overflow_compacts_and_retries_the_same_model_without_benching() {
+        // The first call overflows the window; the fix is to shrink the transcript and retry the
+        // SAME (healthy) model — NOT to bench it and churn the failover chain (the stuck-turn bug).
+        let provider = Arc::new(OverflowThenOkProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_first: 1,
+        });
+        let router = Arc::new(FixedRouter {
+            model: "good::model".into(),
+            fallbacks: vec!["other::model".into()],
+        });
+        let (store, mut session) = fixed_session(provider, router);
+        // Enough history that the compaction triggered by the overflow actually folds messages.
+        for i in 0..12 {
+            session
+                .transcript
+                .push(Message::user(format!("message {i}")));
+        }
+        let answer = session.run_turn("summarize the work").await.unwrap();
+        assert_eq!(answer, "recovered", "the turn self-healed and completed");
+        // The healthy model must NOT have been benched — overflow is an input problem, not a
+        // model-health problem.
+        let benched = store.current_benched_report().unwrap();
+        assert!(
+            benched.is_empty(),
+            "overflow must not bench the model: {benched:?}"
+        );
     }
 
     fn fixed_session(

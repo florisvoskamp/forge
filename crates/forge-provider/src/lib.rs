@@ -88,6 +88,35 @@ impl ProviderError {
         }
     }
 
+    /// Heuristic: whether this failure is a context-length OVERFLOW (the prompt exceeded the
+    /// model's window) rather than a genuine outage. Providers surface overflow inconsistently —
+    /// often as a 4xx/5xx the generic classifier files under [`Unavailable`](Self::Unavailable) or
+    /// [`Request`](Self::Request) — so we sniff the message. The correct response is to SHRINK the
+    /// input (compact/trim) and retry the SAME model, not to bench a healthy model and fail over.
+    pub fn is_context_overflow(&self) -> bool {
+        let msg = match self {
+            Self::Unavailable(m) | Self::Request(m) => m,
+            Self::RateLimited { message, .. } => message,
+            _ => return false,
+        };
+        let m = msg.to_lowercase();
+        [
+            "context length",
+            "context window",
+            "context_length",
+            "maximum context",
+            "maximum number of tokens",
+            "too many tokens",
+            "reduce the length",
+            "prompt is too long",
+            "input is too large",
+            "exceeds the maximum",
+            "string too long",
+        ]
+        .iter()
+        .any(|k| m.contains(k))
+    }
+
     /// A short reason string for the health record / UI ("rate-limited (429)", …).
     pub fn reason(&self) -> &'static str {
         match self {
@@ -97,6 +126,32 @@ impl ProviderError {
             Self::Request(_) => "request error",
             Self::Capability(_) => "unsupported (no tool calling / unaffordable)",
         }
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn is_context_overflow_sniffs_the_message_but_not_plain_outages() {
+        // Providers surface overflow as Unavailable/Request/RateLimited with a telltale message.
+        assert!(ProviderError::Unavailable(
+            "This model's maximum context length is 128000 tokens".into()
+        )
+        .is_context_overflow());
+        assert!(
+            ProviderError::Request("input is too large for the context window".into())
+                .is_context_overflow()
+        );
+        // A genuine outage / rate-limit is NOT an overflow — it must fail over, not compact.
+        assert!(!ProviderError::Unavailable("502 bad gateway".into()).is_context_overflow());
+        assert!(!ProviderError::RateLimited {
+            message: "429 slow down".into(),
+            retry_after: None
+        }
+        .is_context_overflow());
+        assert!(!ProviderError::Auth("401".into()).is_context_overflow());
     }
 }
 
