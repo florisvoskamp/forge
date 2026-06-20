@@ -41,6 +41,8 @@ qrcode = { workspace = true }
 base64 = "0.22"
 arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rcgen = "0.14"
 
 [dev-dependencies]
 portable-pty = "0.9"
