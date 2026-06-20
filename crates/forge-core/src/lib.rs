@@ -2112,29 +2112,43 @@ Rules:\n\
                 break;
             }
 
-            // Execute each requested tool through the permission broker.
-            for call in &resp.tool_calls {
-                let result = self.invoke_tool(&msg_id, call).await?;
-                let seq = self.next_seq();
-                self.store.add_message_full(
-                    &self.id,
-                    seq,
-                    Role::Tool,
-                    &result,
-                    None,
-                    &[],
-                    Some(&call.id),
-                )?;
-                self.transcript.push(Message::tool_result(&call.id, result));
-                // Drain any system hints queued by side-call diagnostics (e.g. shell error
-                // interceptor) so the model sees them after the failing tool result.
-                let hints: Vec<String> = self.pending_hints.drain(..).collect();
-                for hint in hints {
-                    let hseq = self.next_seq();
-                    let _ = self
-                        .store
-                        .add_message(&self.id, hseq, Role::System, &hint, None);
-                    self.transcript.push(Message::system(hint));
+            // Fast path: when the model batched several independent side-effect-free calls (and no
+            // hooks are configured), run them CONCURRENTLY instead of one-at-a-time — a direct
+            // latency win on multi-file reads/searches. Mixed or hook-bearing batches take the
+            // serial path below unchanged.
+            let concurrent_batch = resp.tool_calls.len() >= 2
+                && self.config.hooks.is_empty()
+                && resp
+                    .tool_calls
+                    .iter()
+                    .all(|c| self.is_concurrent_readonly(&c.name));
+            if concurrent_batch {
+                self.run_readonly_batch(&msg_id, &resp.tool_calls).await?;
+            } else {
+                // Execute each requested tool through the permission broker, serially.
+                for call in &resp.tool_calls {
+                    let result = self.invoke_tool(&msg_id, call).await?;
+                    let seq = self.next_seq();
+                    self.store.add_message_full(
+                        &self.id,
+                        seq,
+                        Role::Tool,
+                        &result,
+                        None,
+                        &[],
+                        Some(&call.id),
+                    )?;
+                    self.transcript.push(Message::tool_result(&call.id, result));
+                    // Drain any system hints queued by side-call diagnostics (e.g. shell error
+                    // interceptor) so the model sees them after the failing tool result.
+                    let hints: Vec<String> = self.pending_hints.drain(..).collect();
+                    for hint in hints {
+                        let hseq = self.next_seq();
+                        let _ = self
+                            .store
+                            .add_message(&self.id, hseq, Role::System, &hint, None);
+                        self.transcript.push(Message::system(hint));
+                    }
                 }
             }
         }
@@ -2736,6 +2750,120 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
     }
 
     /// Run a single tool call, applying the permission policy, and return its result text.
+    /// Whether `name` is a side-effect-free registry tool that's safe to run concurrently in a
+    /// batch: not a core-owned virtual tool (those mutate session state / prompt the user), not an
+    /// external MCP tool, present in the registry, and ReadOnly.
+    fn is_concurrent_readonly(&self, name: &str) -> bool {
+        if name == subagent::SPAWN_AGENTS_TOOL
+            || name == ASK_USER_TOOL
+            || name == UPDATE_TASKS_TOOL
+            || name == USE_SKILL_TOOL
+        {
+            return false;
+        }
+        if self.mcp.as_ref().is_some_and(|m| m.knows_tool(name)) {
+            return false;
+        }
+        self.tools
+            .get(name)
+            .map(|t| t.side_effect() == forge_types::SideEffect::ReadOnly)
+            .unwrap_or(false)
+    }
+
+    /// Execute a batch of side-effect-free tool calls CONCURRENTLY, then append their results in the
+    /// original order. When the model requests several independent reads/searches in one step,
+    /// running them together (instead of serially) is a direct latency win — and safe because
+    /// ReadOnly tools have no side effects, never prompt (permission resolves to Allow/Deny without
+    /// asking), don't snapshot, and queue no hints. Only used when all calls qualify and no hooks
+    /// are configured (PreToolUse/PostToolUse run on every call and must stay serial); otherwise the
+    /// caller falls back to the serial [`invoke_tool`] path.
+    async fn run_readonly_batch(
+        &mut self,
+        msg_id: &str,
+        calls: &[forge_types::ToolCall],
+    ) -> Result<(), CoreError> {
+        struct Pending {
+            id: String,
+            name: String,
+            args: serde_json::Value,
+            args_json: String,
+            allowed: bool,
+        }
+        // Phase 1 (serial): announce each call + resolve permission (pure; no prompt for ReadOnly).
+        let mut pend = Vec::with_capacity(calls.len());
+        for call in calls {
+            let args_json = serde_json::to_string(&call.args)?;
+            self.presenter.emit(PresenterEvent::ToolStart {
+                name: call.name.clone(),
+                args: args_json.clone(),
+            });
+            let allowed = matches!(
+                permission::decide(
+                    self.mode,
+                    forge_types::SideEffect::ReadOnly,
+                    &call.name,
+                    &call.args,
+                    &self.rules,
+                ),
+                PermissionDecision::Allow
+            );
+            pend.push(Pending {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                args: call.args.clone(),
+                args_json,
+                allowed,
+            });
+        }
+        // Phase 2 (concurrent): run every allowed tool's `run()` together. Borrows `self.tools`
+        // immutably for the duration of the join; no `&mut self` is touched until it completes.
+        let results: Vec<(String, bool)> = {
+            let tools = &self.tools;
+            let futs = pend.iter().map(|p| async move {
+                if !p.allowed {
+                    return ("permission denied by policy".to_string(), false);
+                }
+                match tools.get(&p.name) {
+                    Some(tool) => match tool.run(&p.args).await {
+                        Ok(out) => (out, true),
+                        Err(e) => (format!("error: {e}"), false),
+                    },
+                    None => (format!("error: unknown tool '{}'", p.name), false),
+                }
+            });
+            futures::future::join_all(futs).await
+        };
+        // Phase 3 (serial): surface + persist + append each result in the ORIGINAL order, so every
+        // tool_call_id is answered in sequence.
+        for (p, (result, ok)) in pend.iter().zip(results) {
+            self.presenter.emit(PresenterEvent::ToolResult {
+                name: p.name.clone(),
+                ok,
+                summary: summarize(&result),
+            });
+            self.store.record_tool_call(
+                msg_id,
+                &p.name,
+                &p.args_json,
+                &result,
+                if p.allowed { "allowed" } else { "denied" },
+                if ok { "ok" } else { "error" },
+            )?;
+            let seq = self.next_seq();
+            self.store.add_message_full(
+                &self.id,
+                seq,
+                Role::Tool,
+                &result,
+                None,
+                &[],
+                Some(&p.id),
+            )?;
+            self.transcript.push(Message::tool_result(&p.id, result));
+        }
+        Ok(())
+    }
+
     async fn invoke_tool(
         &mut self,
         msg_id: &str,
@@ -3702,6 +3830,56 @@ mod tests {
         );
         assert!(msgs[1].content.contains("<env>"), "env block present");
         assert!(msgs[1].content.contains("platform:"));
+    }
+
+    #[tokio::test]
+    async fn readonly_batch_runs_concurrently_and_preserves_order() {
+        let provider = Arc::new(FlakyProvider {
+            bad: std::collections::HashSet::new(),
+            err: rate_limited,
+        });
+        let router = Arc::new(FixedRouter {
+            model: "m".into(),
+            fallbacks: vec![],
+        });
+        let (_store, mut session) = fixed_session(provider, router);
+
+        let dir = std::env::temp_dir().join(format!("forge-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut calls = Vec::new();
+        for i in 0..3 {
+            let p = dir.join(format!("f{i}.txt"));
+            std::fs::write(&p, format!("content-{i}")).unwrap();
+            calls.push(forge_types::ToolCall {
+                id: format!("c{i}"),
+                name: "read_file".into(),
+                args: serde_json::json!({ "path": p.to_str().unwrap() }),
+            });
+        }
+        // All three reads qualify for the concurrent fast path.
+        assert!(calls
+            .iter()
+            .all(|c| session.is_concurrent_readonly(&c.name)));
+
+        let msg_id = session
+            .store
+            .add_message_full(session.id(), 0, Role::Assistant, "", None, &[], None)
+            .unwrap();
+        session.run_readonly_batch(&msg_id, &calls).await.unwrap();
+
+        // Every call is answered, in the ORIGINAL order, paired by tool_call_id.
+        let tools: Vec<&Message> = session
+            .transcript
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0].tool_call_id.as_deref(), Some("c0"));
+        assert!(tools[0].content.contains("content-0"));
+        assert_eq!(tools[1].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(tools[2].tool_call_id.as_deref(), Some("c2"));
+        assert!(tools[2].content.contains("content-2"));
     }
 
     /// A presenter that records every event so tests can assert on what was shown.
