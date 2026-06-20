@@ -5280,7 +5280,7 @@ fn spawn_compact(
     tokio::spawn(async move {
         let _done = DoneGuard(dt, gen);
         let mut sess = s.lock().await;
-        if let Err(e) = sess.compact().await {
+        if let Err(e) = sess.compact(false).await {
             sess.notify_error(&format!("compact failed: {e}"));
         }
     })

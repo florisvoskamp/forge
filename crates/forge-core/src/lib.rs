@@ -1413,7 +1413,7 @@ Rules:\n\
                 return Ok(false); // No / cancelled → skip this model
             }
         }
-        self.compact().await?;
+        self.compact(true).await?;
         Ok(true)
     }
 
@@ -1423,7 +1423,7 @@ Rules:\n\
     /// compact. Distinct from the failover consent path ([`admit_failover_model`]).
     async fn auto_compact_if_needed(&mut self, model: &str) {
         if !self.transcript_fits(model) {
-            let _ = self.compact().await;
+            let _ = self.compact(true).await;
         }
     }
 
@@ -1461,11 +1461,14 @@ Rules:\n\
         next
     }
 
-    pub async fn compact(&mut self) -> Result<(usize, usize), CoreError> {
+    pub async fn compact(&mut self, auto: bool) -> Result<(usize, usize), CoreError> {
         let before = self.transcript.len();
         if before <= COMPACT_KEEP_RECENT + COMPACT_MIN_OLDER {
             return Ok((before, before)); // not worth a model call yet
         }
+        // Drive the TUI's animated progress band (cleared by CompactionFinished below).
+        self.presenter
+            .emit(PresenterEvent::CompactionStarted { auto });
         let split = before - COMPACT_KEEP_RECENT;
         let older = &self.transcript[..split];
         let rendered = older
@@ -1541,6 +1544,8 @@ Rules:\n\
             .compact_session_store(&self.id, summary.trim(), COMPACT_KEEP_RECENT);
 
         let after = self.transcript.len();
+        self.presenter
+            .emit(PresenterEvent::CompactionFinished { before, after });
         self.presenter.emit(PresenterEvent::Warning(format!(
             "compacted {before} messages → {after} (summary via {model})"
         )));
@@ -4359,7 +4364,7 @@ mod tests {
                 .transcript
                 .push(Message::user(format!("message {i}")));
         }
-        let (before, after) = session.compact().await.unwrap();
+        let (before, after) = session.compact(false).await.unwrap();
         assert_eq!(before, 12);
         assert_eq!(
             after,
@@ -4391,7 +4396,7 @@ mod tests {
                 .transcript
                 .push(Message::user(format!("message {i}")));
         }
-        let (before, after) = session.compact().await.unwrap();
+        let (before, after) = session.compact(false).await.unwrap();
         assert_eq!(before, 12);
         assert_eq!(after, COMPACT_KEEP_RECENT + 1);
         // The fallback produced the summary, and the rate-limited primary was benched.
@@ -4415,7 +4420,7 @@ mod tests {
         )
         .unwrap();
         session.transcript.push(Message::user("just one"));
-        let (before, after) = session.compact().await.unwrap();
+        let (before, after) = session.compact(false).await.unwrap();
         assert_eq!((before, after), (1, 1), "nothing to compact");
     }
 

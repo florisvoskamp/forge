@@ -208,6 +208,16 @@ pub enum PresenterEvent {
         window: String,
         fraction: f64,
     },
+    /// Compaction (summarizing older messages) started — drives the animated progress band in the
+    /// TUI. `auto` distinguishes a silent auto-compact from an explicit `/compact`.
+    CompactionStarted {
+        auto: bool,
+    },
+    /// Compaction finished, with the message counts before/after — clears the progress band.
+    CompactionFinished {
+        before: usize,
+        after: usize,
+    },
 }
 
 /// A rendering + interaction surface. Implementors decide how to display events and how
@@ -384,6 +394,12 @@ impl Presenter for HeadlessPresenter {
             PresenterEvent::Done { .. } => {}
             // Real-time quota updates are for the TUI overlay; headless ignores them.
             PresenterEvent::QuotaUpdate { .. } => {}
+            PresenterEvent::CompactionStarted { auto } => {
+                println!("  ⟳ compacting{}…", if auto { " (auto)" } else { "" });
+            }
+            PresenterEvent::CompactionFinished { before, after } => {
+                println!("  ⟳ compacted {before} → {after} messages");
+            }
         }
     }
 

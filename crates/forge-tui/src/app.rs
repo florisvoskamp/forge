@@ -207,6 +207,18 @@ struct PasteBlock {
     kind: PasteKind,
 }
 
+/// Live state for the compaction progress band. Progress is indeterminate (a single summarizer
+/// call with no measurable fraction), so it's eased toward ~95% over an expected duration and
+/// snapped to 100% when [`CompactionFinished`](crate::PresenterEvent::CompactionFinished) clears
+/// it — the standard "honest indeterminate" progress UX.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionState {
+    /// `App::tick` value when compaction started; elapsed ≈ (tick - start_tick) frames.
+    pub start_tick: usize,
+    /// Whether this was a silent auto-compact (vs an explicit `/compact`).
+    pub auto: bool,
+}
+
 /// All state the TUI needs to render the pinned live region, plus the scrollback outbox.
 #[derive(Debug, Clone, Default)]
 pub struct App {
@@ -218,6 +230,8 @@ pub struct App {
     pub session_out: u64,
     pub context_tokens: u64,
     pub context_limit: Option<u32>,
+    /// Set while compaction is running, driving the animated progress band. `None` otherwise.
+    pub compaction: Option<CompactionState>,
     pub done: bool,
     /// The active operating temper label (e.g. "Guarded"), shown in the statusline.
     pub temper: String,
@@ -794,6 +808,16 @@ impl App {
                     ("codex-cli", "weekly") => self.usage_overlay.codex_weekly_pct = pct,
                     _ => {}
                 }
+            }
+            PresenterEvent::CompactionStarted { auto } => {
+                self.compaction = Some(CompactionState {
+                    start_tick: self.tick,
+                    auto,
+                });
+            }
+            PresenterEvent::CompactionFinished { .. } => {
+                // The band clears; the core also emits a "compacted N → M" warning into scrollback.
+                self.compaction = None;
             }
         }
     }
@@ -1466,7 +1490,10 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     // change, so the inline viewport's total height is untouched (never resized at runtime).
     let input_h = input_box_height(&app.input, frame.area().width);
     let status_h = statusline_height(app);
-    let fixed = PERMISSION_H + input_h + status_h;
+    // A one-row band between the input and the statusline: shows the animated compaction bar while
+    // compacting, otherwise an "approaching auto-compact" hint when the context fills up.
+    let band_h = compact_band_height(app);
+    let fixed = PERMISSION_H + input_h + band_h + status_h;
     let avail = frame.area().height.saturating_sub(fixed);
     let panel_avail = avail.saturating_sub(MIN_STREAM);
 
@@ -1488,6 +1515,7 @@ pub fn render_live(frame: &mut Frame, app: &App) {
         Constraint::Length(task_h),
         Constraint::Length(PERMISSION_H),
         Constraint::Length(input_h),
+        Constraint::Length(band_h),
         Constraint::Length(status_h),
     ])
     .split(frame.area());
@@ -1520,7 +1548,10 @@ pub fn render_live(frame: &mut Frame, app: &App) {
         render_permission(frame, areas[4], app);
     }
     render_input(frame, areas[5], app);
-    render_statusline(frame, areas[6], app);
+    if band_h > 0 {
+        render_compact_band(frame, areas[6], app);
+    }
+    render_statusline(frame, areas[7], app);
     // Usage overlay renders last so it appears on top of everything.
     render_usage_overlay(frame, app);
     render_mesh_overlay(frame, app);
@@ -2610,6 +2641,100 @@ fn format_tok(n: u64) -> String {
     }
 }
 
+/// Context fill at/above which the "approaching auto-compact" hint appears below the input.
+const COMPACT_HINT_FRACTION: f64 = 0.65;
+/// The context fill at which the core auto-compacts (~80% of the usable window). Shown as the
+/// target in the hint and used to color it red once reached.
+const AUTO_COMPACT_FRACTION: f64 = 0.80;
+/// Time constant (seconds) for easing the indeterminate compaction bar toward its ceiling.
+const COMPACT_EASE_TAU_SECS: f64 = 2.5;
+
+/// Current context fill as a fraction (0..=1), using the same fallback window as the gauge.
+/// `None` when there's no token/limit signal yet (so no band is shown on a fresh session).
+fn context_fraction(app: &App) -> Option<f64> {
+    if app.context_tokens == 0 && app.context_limit.is_none() {
+        return None;
+    }
+    let limit = match app.context_limit {
+        Some(l) if l > 0 => l as u64,
+        _ => CONTEXT_FALLBACK_LIMIT,
+    };
+    Some((app.context_tokens as f64 / limit as f64).clamp(0.0, 1.0))
+}
+
+/// One row while compaction runs (animated bar) or while the context is approaching the
+/// auto-compact threshold (hint); zero otherwise.
+pub fn compact_band_height(app: &App) -> u16 {
+    if app.compaction.is_some() {
+        return 1;
+    }
+    match context_fraction(app) {
+        Some(f) if f >= COMPACT_HINT_FRACTION => 1,
+        _ => 0,
+    }
+}
+
+/// Render the compaction band: an animated, eased progress bar with elapsed time while compacting,
+/// else a colored "approaching auto-compact" hint with the tokens remaining until the trigger.
+fn render_compact_band(frame: &mut Frame, area: Rect, app: &App) {
+    let bg = Style::default().bg(STATUSBG);
+    let spans: Vec<Span> = if let Some(c) = &app.compaction {
+        let elapsed = app.tick.saturating_sub(c.start_tick) as f64 * 0.06;
+        // Indeterminate work (one summarizer call): ease toward a ceiling instead of faking a real
+        // fraction; CompactionFinished clears the band (the "snap to done").
+        let frac = 1.0 - (-elapsed / COMPACT_EASE_TAU_SECS).exp();
+        let pct = (frac * 95.0).round() as u64;
+        const CELLS: usize = 16;
+        let filled = ((frac * 0.95) * CELLS as f64).round() as usize;
+        let filled = filled.min(CELLS);
+        let spin = SPINNER[app.tick % SPINNER.len()];
+        let bar: String = "█".repeat(filled) + &"░".repeat(CELLS - filled);
+        let label = if c.auto {
+            "auto-compacting"
+        } else {
+            "compacting"
+        };
+        vec![
+            Span::styled(
+                format!(" {spin} {label} "),
+                Style::default().fg(ORANGE).bold().bg(STATUSBG),
+            ),
+            Span::styled(bar, Style::default().fg(ORANGE).bg(STATUSBG)),
+            Span::styled(
+                format!(" {pct}%  {elapsed:.1}s"),
+                Style::default().fg(DIM).bg(STATUSBG),
+            ),
+        ]
+    } else {
+        let frac = context_fraction(app).unwrap_or(0.0);
+        let pct = (frac * 100.0).round() as u64;
+        let limit = match app.context_limit {
+            Some(l) if l > 0 => l as u64,
+            _ => CONTEXT_FALLBACK_LIMIT,
+        };
+        let trigger = (AUTO_COMPACT_FRACTION * limit as f64) as u64;
+        let left = trigger.saturating_sub(app.context_tokens);
+        let color = if frac >= AUTO_COMPACT_FRACTION {
+            ERRRED
+        } else if frac >= 0.72 {
+            WARNYEL
+        } else {
+            DIM
+        };
+        let msg = if frac >= AUTO_COMPACT_FRACTION {
+            format!(" ⚠ context {pct}% — auto-compact imminent")
+        } else {
+            format!(
+                " ⚠ context {pct}% — auto-compact at {:.0}% (~{} left)",
+                AUTO_COMPACT_FRACTION * 100.0,
+                human(left)
+            )
+        };
+        vec![Span::styled(msg, Style::default().fg(color).bg(STATUSBG))]
+    };
+    frame.render_widget(Paragraph::new(TextLine::from(spans)).style(bg), area);
+}
+
 /// Returns 1 when idle (no session data), 2 once context / token data is available.
 /// Used by [`render_live`] to allocate the right number of rows for the status area.
 pub fn statusline_height(app: &App) -> u16 {
@@ -2758,6 +2883,49 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    #[test]
+    fn compact_band_hidden_until_context_fills_then_shows_hint() {
+        assert_eq!(
+            compact_band_height(&App::default()),
+            0,
+            "no signal → no band"
+        );
+        let low = App {
+            context_tokens: 10_000,
+            context_limit: Some(100_000), // 10%
+            ..Default::default()
+        };
+        assert_eq!(compact_band_height(&low), 0, "plenty of room → no band");
+        let near = App {
+            context_tokens: 70_000, // 70% ≥ 65% hint threshold
+            context_limit: Some(100_000),
+            ..Default::default()
+        };
+        assert_eq!(compact_band_height(&near), 1, "approaching → hint shows");
+        let out = screen_wh(&near, 80, LIVE_H);
+        assert!(
+            out.contains("auto-compact"),
+            "hint names the trigger: {out:?}"
+        );
+    }
+
+    #[test]
+    fn compact_band_shows_animated_bar_while_compacting() {
+        let app = App {
+            compaction: Some(CompactionState {
+                start_tick: 0,
+                auto: true,
+            }),
+            tick: 40, // ~2.4s elapsed → eased bar well underway
+            ..Default::default()
+        };
+        assert_eq!(compact_band_height(&app), 1);
+        let out = screen_wh(&app, 80, LIVE_H);
+        assert!(out.contains("auto-compacting"), "shows the label: {out:?}");
+        assert!(out.contains('%'), "shows a percentage: {out:?}");
+        assert!(out.contains('█'), "shows a filled bar: {out:?}");
     }
 
     #[test]
