@@ -179,9 +179,18 @@ fn mark_cache_breakpoints(msgs: &mut [ChatMessage]) {
     if msgs.is_empty() {
         return;
     }
-    let sys = msgs.iter().position(|m| m.role == ChatRole::System);
+    // Anchor on the END of the leading system run, not just the first system message: Forge emits
+    // several stacked system messages (base prompt + env + AGENTS.md + skill guidance), and a
+    // breakpoint caches everything UP TO it — so marking the last leading system message caches the
+    // whole standing prefix instead of re-billing all but the first every turn. Plus a breakpoint on
+    // the final message so the rest of the conversation prefix is cached for the next turn's reuse.
+    let last_leading_system = msgs
+        .iter()
+        .take_while(|m| m.role == ChatRole::System)
+        .count()
+        .checked_sub(1);
     let last = msgs.len() - 1;
-    for idx in [sys, Some(last)].into_iter().flatten() {
+    for idx in [last_leading_system, Some(last)].into_iter().flatten() {
         msgs[idx].options = Some(CacheControl::Ephemeral.into());
     }
 }
@@ -461,6 +470,10 @@ impl Provider for GenAiProvider {
                 EffortLevel::XHigh => ReasoningEffort::XHigh,
             };
             options = options.with_reasoning_effort(re);
+        } else if let Some(temp) = opts.temperature {
+            // Low temperature for deterministic edits/patches — but ONLY when reasoning isn't
+            // engaged: thinking models reject (or ignore) a custom temperature, so effort wins.
+            options = options.with_temperature(temp as f64);
         }
 
         // Stall guards: a hung connection or a stream that goes silent must not freeze the
@@ -568,6 +581,27 @@ mod tests {
             genai[genai.len() - 1].options.is_some(),
             "last message should be a breakpoint"
         );
+    }
+
+    #[test]
+    fn cache_breakpoint_anchors_on_the_last_leading_system_message() {
+        // Forge stacks several system messages (base prompt + env + AGENTS.md). The breakpoint must
+        // sit on the LAST of them so the whole standing prefix is cached, not just the first.
+        let msgs = [
+            Message::system("base prompt"),
+            Message::system("<env>"),
+            Message::system("AGENTS.md"),
+            Message::user("do it"),
+        ];
+        let mut genai = to_genai_messages(&msgs);
+        mark_cache_breakpoints(&mut genai);
+        assert!(genai[0].options.is_none(), "not just the first system");
+        assert!(genai[1].options.is_none());
+        assert!(
+            genai[2].options.is_some(),
+            "last leading system carries the breakpoint"
+        );
+        assert!(genai[3].options.is_some(), "final message too");
     }
 
     #[test]

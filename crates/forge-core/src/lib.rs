@@ -42,6 +42,11 @@ Line 1: the most likely cause in one terse sentence (no preamble, no restating t
 Line 2 (optional): if a single shell command fixes it, write exactly: FIX: <the command>. \
 Omit line 2 if no single command fixes it.";
 
+/// Default sampling temperature for coding turns: low, so edits/patches are deterministic rather
+/// than creatively varied. Only takes effect when reasoning/effort isn't engaged (thinking models
+/// reject a custom temperature) — see `genai_provider`.
+const CODING_TEMPERATURE: f32 = 0.1;
+
 /// The base coding-agent system prompt, prepended (fresh, never persisted) to every main-loop
 /// request so a model performs in Forge the way it does in a purpose-built harness. Kept tight: it
 /// establishes role + tool discipline + editing conventions without burning context. Project-level
@@ -1438,6 +1443,7 @@ Rules:\n\
         let stream_idle = std::time::Duration::from_secs(self.config.mesh.stream_idle_timeout_secs);
         let completion_opts = CompletionOptions {
             effort: self.pinned_effort,
+            temperature: Some(CODING_TEMPERATURE),
         };
 
         let mut chain = fallbacks.into_iter();
@@ -1941,6 +1947,7 @@ Rules:\n\
                             };
                         let completion_opts = CompletionOptions {
                             effort: self.pinned_effort,
+                            temperature: Some(CODING_TEMPERATURE),
                         };
                         let fut = provider.complete_with(
                             &active_model,
@@ -2763,7 +2770,15 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         let mut effective_args = call.args.clone();
 
         let Some(tool) = self.tools.get(&call.name) else {
-            let result = format!("error: unknown tool '{}'", call.name);
+            // Name the valid tools so the model can recover instead of guessing again.
+            let mut available: Vec<String> =
+                self.tool_specs().into_iter().map(|s| s.name).collect();
+            available.sort();
+            let result = format!(
+                "error: unknown tool '{}'. Available tools: {}",
+                call.name,
+                available.join(", ")
+            );
             self.presenter.emit(PresenterEvent::ToolResult {
                 name: call.name.clone(),
                 ok: false,

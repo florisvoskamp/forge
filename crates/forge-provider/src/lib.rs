@@ -232,6 +232,9 @@ pub type EventSink<'a> = dyn FnMut(StreamEvent) + Send + 'a;
 pub struct CompletionOptions {
     /// Reasoning / thinking intensity hint forwarded to the model. `None` = provider default.
     pub effort: Option<EffortLevel>,
+    /// Sampling temperature. `None` = provider default; coding turns set a low value so edits and
+    /// patches are deterministic rather than creatively varied.
+    pub temperature: Option<f32>,
 }
 
 /// A model backend. Implement this trait (and nothing in the core) to add a provider.
