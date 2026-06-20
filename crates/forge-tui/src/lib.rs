@@ -43,8 +43,8 @@ mod transcript;
 mod tui;
 pub use app::{
     banner_lines, handle_key, lattice_view_lines, render_mesh_overlay, render_usage_overlay, App,
-    InputOutcome, KeyKind, MeshCandRow, MeshOverlay, MeshQuotaRow, RemoteSnapshot, SubagentView,
-    UsageOverlay,
+    InputOutcome, KeyKind, MeshCandRow, MeshOverlay, MeshQuotaRow, RemoteSnapshot, ReplayItem,
+    SubagentView, UsageOverlay,
 };
 pub use commands::{
     at_token_at, filter_commands, parse_command, slash_token_at, AtPathPicker, AtToken, Command,

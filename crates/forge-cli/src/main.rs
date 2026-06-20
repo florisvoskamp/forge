@@ -1518,11 +1518,12 @@ fn sessions() -> Result<()> {
     }
     for s in list {
         let id: String = s.id.chars().take(8).collect();
-        let preview = s.preview.unwrap_or_default();
-        let preview: String = preview.chars().take(50).collect();
         println!(
-            "{id}  ${:>8.4}  {:>3} msgs  {}",
-            s.total_cost_usd, s.message_count, preview
+            "{id}  {:>7}  {:>3} msgs  ${:>8.4}  {}",
+            fmt_age(s.last_activity),
+            s.message_count,
+            s.total_cost_usd,
+            session_title(s.preview.as_deref()),
         );
     }
     Ok(())
@@ -3928,11 +3929,11 @@ async fn run_chat_tui(
     // the resumed history ends and new input begins.
     {
         let s = session.lock().await;
-        let history = s.history();
-        if !history.is_empty() {
+        let items = s.replay_items();
+        if !items.is_empty() {
             let sid8: String = s.session_id().chars().take(8).collect();
-            let n = history.len();
-            app.replay_history(&history);
+            let n = s.history().len();
+            app.replay_history(&items);
             app.push_resume_separator(&format!("— resumed session {sid8} ({n} messages) —"));
         }
     }
@@ -6091,6 +6092,23 @@ fn project_trust_ok(
 }
 
 /// Populate + open the session picker from the store (newest first). `query` pre-fills the filter.
+/// A clean, single-line title for a session row, derived from its first user prompt: newlines and
+/// runs of whitespace collapse to single spaces, leading `/command` noise is kept, and the result
+/// is trimmed to a readable length. Falls back to a placeholder when the session has no prompt.
+fn session_title(preview: Option<&str>) -> String {
+    let raw = preview.unwrap_or("").trim();
+    if raw.is_empty() {
+        return "(no prompt yet)".to_string();
+    }
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let max = 64;
+    if collapsed.chars().count() > max {
+        format!("{}…", collapsed.chars().take(max - 1).collect::<String>())
+    } else {
+        collapsed
+    }
+}
+
 fn open_sessions_picker(app: &mut forge_tui::App, query: &str) -> Result<()> {
     let store = open_store()?;
     let list = store.list_sessions().context("listing sessions")?;
@@ -6103,15 +6121,18 @@ fn open_sessions_picker(app: &mut forge_tui::App, query: &str) -> Result<()> {
         .take(50)
         .map(|s| {
             let id8: String = s.id.chars().take(8).collect();
-            let preview: String = s.preview.unwrap_or_default().chars().take(60).collect();
+            // Title = a clean one-line snippet of the first user prompt (newlines/extra spaces
+            // collapsed), so each row reads as a recognizable conversation rather than a hash.
+            let title = session_title(s.preview.as_deref());
             forge_tui::PickerRow {
-                title: format!(
-                    "{id8}  ${:>7.4}  {:>3} msgs  {}",
-                    s.total_cost_usd,
+                title,
+                // Subtitle = the metadata: short id · last-used age · message count · cost.
+                subtitle: format!(
+                    "{id8} · {} · {} msgs · ${:.4}",
+                    fmt_age(s.last_activity),
                     s.message_count,
-                    fmt_age(s.created_at)
+                    s.total_cost_usd,
                 ),
-                subtitle: preview,
                 id: s.id,
             }
         })
@@ -6319,29 +6340,29 @@ async fn picker_accept(
 ) -> Result<()> {
     match kind {
         forge_tui::PickerKind::Sessions => {
-            let history = {
+            let items = {
                 let mut s = session.lock().await;
                 s.reset_resumed(&row.id)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                s.history()
+                s.replay_items()
             };
             tui.clear_screen();
             app.note(&format!(
                 "● resumed {}",
                 row.id.chars().take(8).collect::<String>()
             ));
-            app.replay_history(&history);
+            app.replay_history(&items);
         }
         forge_tui::PickerKind::Checkpoints => {
             let seq: i64 = row.id.parse().unwrap_or(0);
-            let (history, outcome) = {
+            let (items, outcome) = {
                 let mut s = session.lock().await;
                 let outcome = s.rewind_to(seq).map_err(|e| anyhow::anyhow!("{e}"))?;
-                (s.history(), outcome)
+                (s.replay_items(), outcome)
             };
             tui.clear_screen();
             app.note("● rewound to that point");
-            app.replay_history(&history);
+            app.replay_history(&items);
             note_restore(app, &outcome.restore);
             // Put the rewound-to message back in the input box so it can be edited/resubmitted.
             if let Some(prompt) = outcome.rewound_prompt {
@@ -6624,6 +6645,20 @@ mod tests {
                 .unwrap();
         }
         store
+    }
+
+    #[test]
+    fn session_title_collapses_whitespace_truncates_and_falls_back() {
+        assert_eq!(session_title(None), "(no prompt yet)");
+        assert_eq!(session_title(Some("   ")), "(no prompt yet)");
+        assert_eq!(
+            session_title(Some("fix the\n\n  resume   bug")),
+            "fix the resume bug"
+        );
+        let long = "x".repeat(100);
+        let title = session_title(Some(&long));
+        assert_eq!(title.chars().count(), 64);
+        assert!(title.ends_with('…'));
     }
 
     #[test]

@@ -615,6 +615,60 @@ impl Session {
             .collect()
     }
 
+    /// The full rehydrated transcript as renderable [`ReplayItem`](forge_tui::ReplayItem)s for the
+    /// TUI to redraw on resume — user prompts, assistant text, AND the tool calls/results between
+    /// them, so a resumed agentic session reappears faithfully instead of as a sparse user-only
+    /// echo (the old [`history`](Self::history) dropped every tool-only assistant turn). Tool
+    /// results are matched back to their call's name via the `tool_call_id`.
+    pub fn replay_items(&self) -> Vec<forge_tui::ReplayItem> {
+        use forge_tui::ReplayItem;
+        let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut out = Vec::new();
+        for m in &self.transcript {
+            match m.role {
+                Role::User => {
+                    if !m.content.trim().is_empty() {
+                        out.push(ReplayItem::User(m.content.clone()));
+                    }
+                }
+                Role::Assistant => {
+                    if !m.content.trim().is_empty() {
+                        out.push(ReplayItem::Assistant(m.content.clone()));
+                    }
+                    for tc in &m.tool_calls {
+                        names.insert(tc.id.clone(), tc.name.clone());
+                        let args = serde_json::to_string(&tc.args).unwrap_or_default();
+                        out.push(ReplayItem::Tool {
+                            name: tc.name.clone(),
+                            args,
+                        });
+                    }
+                }
+                Role::Tool => {
+                    let name = m
+                        .tool_call_id
+                        .as_ref()
+                        .and_then(|id| names.get(id).cloned())
+                        .unwrap_or_else(|| "tool".to_string());
+                    let summary = m.content.lines().next().unwrap_or("").to_string();
+                    // The success flag isn't persisted; an error result conventionally starts with
+                    // "error". Good enough to color the replayed line.
+                    let ok = !summary.trim_start().to_lowercase().starts_with("error");
+                    out.push(ReplayItem::ToolResult { name, ok, summary });
+                }
+                Role::System => {
+                    // Only the compaction marker represents real prior conversation; other System
+                    // messages (per-turn guidance/project prompt) are machinery — skip them.
+                    if m.content.starts_with("[Earlier conversation summarized") {
+                        let first = m.content.lines().next().unwrap_or("").to_string();
+                        out.push(ReplayItem::Note(first.trim_matches(['[', ']']).to_string()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Reconfigure this session in place as a **fresh** one (new id, empty transcript), keeping
     /// the same backends + live presenter so events keep flowing to the running TUI. Powers
     /// `/new` — no process restart, no Session move (it lives behind the loop's `Mutex`).
@@ -5142,6 +5196,47 @@ mod tests {
         )
         .unwrap();
         (store, session)
+    }
+
+    #[test]
+    fn replay_items_reconstructs_text_and_tool_activity() {
+        use forge_tui::ReplayItem;
+        let (_store, mut session) = fixed_session(
+            Arc::new(FlakyProvider {
+                bad: std::collections::HashSet::new(),
+                err: rate_limited,
+            }),
+            Arc::new(FixedRouter {
+                model: "m".into(),
+                fallbacks: vec![],
+            }),
+        );
+        // A compaction marker, a user turn, a tool-only assistant turn + its result, a final answer.
+        session.transcript = vec![
+            Message::system("[Earlier conversation summarized to save context]\ndid X then Y"),
+            Message::user("do the thing"),
+            Message::assistant_tool_calls(
+                "",
+                vec![forge_types::ToolCall {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    args: serde_json::json!({"path": "a.rs"}),
+                }],
+            ),
+            Message::tool_result("c1", "fn main() {}"),
+            Message::assistant("done"),
+        ];
+        let items = session.replay_items();
+        // The old history() dropped the summary, the tool-only turn, and the result; replay_items
+        // keeps all of them so the resumed conversation is faithful.
+        assert!(matches!(&items[0], ReplayItem::Note(s) if s.contains("summarized")));
+        assert!(matches!(&items[1], ReplayItem::User(s) if s == "do the thing"));
+        assert!(matches!(&items[2], ReplayItem::Tool { name, .. } if name == "read_file"));
+        assert!(
+            matches!(&items[3], ReplayItem::ToolResult { name, ok, .. } if name == "read_file" && *ok)
+        );
+        assert!(matches!(&items[4], ReplayItem::Assistant(s) if s == "done"));
+        assert_eq!(items.len(), 5);
     }
 
     #[tokio::test]
