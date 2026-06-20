@@ -148,6 +148,8 @@ pub fn available_bridge_models() -> Vec<String> {
     out
 }
 
+/// IDLE window (seconds) for a bridged CLI: kill only after this long with NO output. Not a total
+/// cap — a turn streaming events stays alive indefinitely, so long hard tasks aren't truncated.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 #[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(2);
@@ -989,13 +991,37 @@ impl Provider for CliProvider {
         let mut tool_names: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
-        let read = tokio::time::timeout(self.timeout, async {
+        // IDLE timeout, not a hard cap: the window resets on every event, so a long but PRODUCTIVE
+        // bridge turn (claude/codex streaming reasoning + tool calls for many minutes on a hard
+        // task) is never killed mid-work. The old hard `timeout(self.timeout, …)` truncated exactly
+        // those turns — killing an agent that was actively making progress — which is how Forge lost
+        // instances a competitor's own CLI (with no such cap) solved. Only genuine silence for the
+        // whole window counts as a stall.
+        enum BridgeEvent {
+            Line(std::io::Result<Option<String>>),
+            Sub(StreamEvent),
+        }
+        let idle = self.timeout;
+        let mut stalled = false;
+        let read = async {
             let mut lines = BufReader::new(stdout).lines();
             loop {
-                tokio::select! {
-                    // Bias toward the CLI's own output; subagent events are supplementary.
-                    biased;
-                    line = lines.next_line() => {
+                let tick = tokio::time::timeout(idle, async {
+                    tokio::select! {
+                        // Bias toward the CLI's own output; subagent events are supplementary.
+                        biased;
+                        line = lines.next_line() => BridgeEvent::Line(line),
+                        Some(ev) = sub_rx.recv() => BridgeEvent::Sub(ev),
+                    }
+                })
+                .await;
+                match tick {
+                    Err(_) => {
+                        stalled = true;
+                        break;
+                    }
+                    Ok(BridgeEvent::Sub(ev)) => on_event(ev),
+                    Ok(BridgeEvent::Line(line)) => {
                         let Some(line) = line? else { break };
                         for item in parse_line(self.kind, &line) {
                             match item {
@@ -1033,7 +1059,6 @@ impl Provider for CliProvider {
                             }
                         }
                     }
-                    Some(ev) = sub_rx.recv() => on_event(ev),
                 }
             }
             // Drain any subagent events that landed just before the CLI's stdout closed.
@@ -1041,7 +1066,7 @@ impl Provider for CliProvider {
                 on_event(ev);
             }
             Ok::<(), std::io::Error>(())
-        })
+        }
         .await;
 
         if let Some(t) = tailer {
@@ -1051,23 +1076,22 @@ impl Provider for CliProvider {
             let _ = std::fs::remove_file(p);
         }
 
-        match read {
-            Err(_elapsed) => {
-                terminate(&mut child, pgid).await;
-                return Err(ProviderError::Request(format!(
-                    "`{}` timed out after {}s (killed)",
-                    self.binary,
-                    self.timeout.as_secs()
-                )));
-            }
-            Ok(Err(e)) => {
-                terminate(&mut child, pgid).await;
-                return Err(ProviderError::Request(format!(
-                    "reading `{}` output failed: {e}",
-                    self.binary
-                )));
-            }
-            Ok(Ok(())) => {}
+        if stalled {
+            terminate(&mut child, pgid).await;
+            // A stalled bridge is retryable (fail over), like a stalled genai stream — distinct from
+            // a turn that's simply taking a while but still streaming.
+            return Err(ProviderError::Unavailable(format!(
+                "`{}` produced no output for {}s — killed (stalled)",
+                self.binary,
+                idle.as_secs()
+            )));
+        }
+        if let Err(e) = read {
+            terminate(&mut child, pgid).await;
+            return Err(ProviderError::Request(format!(
+                "reading `{}` output failed: {e}",
+                self.binary
+            )));
         }
 
         let status = child.wait().await.ok();
