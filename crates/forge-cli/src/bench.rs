@@ -129,11 +129,24 @@ fn prepare_repo(inst: &SweInstance, root: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The model's patch: the working-tree diff after Forge's edits. New (untracked) files are staged
-/// with `-N` first so they appear in the diff, matching how SWE-bench predictions are built.
+/// The model's patch: the diff of TRACKED files after the agent's edits. We deliberately do NOT
+/// `git add -A` first — that swept in untracked junk an agent run leaves in the repo (`__pycache__`
+/// from running python, Forge's own `.forge/forge.db` store, etc.), which bloated and invalidated
+/// the patch. SWE-bench gold patches edit existing source/test files, so a tracked-file diff is
+/// what the evaluator expects; brand-new untracked files (rare) are intentionally excluded as the
+/// safe default. As a belt-and-braces guard, junk paths are excluded via pathspec too.
 fn extract_patch(dir: &Path) -> Result<String> {
-    let _ = run_git(dir, &["add", "-A", "-N"]);
-    run_git(dir, &["diff"])
+    run_git(
+        dir,
+        &[
+            "diff",
+            "--",
+            ".",
+            ":(exclude).forge/**",
+            ":(exclude)**/__pycache__/**",
+            ":(exclude)**/*.pyc",
+        ],
+    )
 }
 
 /// Generate predictions for (up to `limit`) instances from `dataset`, writing `predictions.jsonl`
