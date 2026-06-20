@@ -61,6 +61,37 @@ python -m swebench.harness.run_evaluation \
 It writes a report with the **resolved rate** (the headline SWE-bench number) and per-instance
 results. Requires Docker.
 
+## Comparing against Claude Code / Codex
+
+To answer "does a model do as well in Forge as in its native CLI", run the **same** instances
+through each agent and score all three. `--agent` swaps the harness; everything else (repo state,
+task, evaluator) is identical.
+
+```bash
+# Forge's harness (mesh-routed, or pin --model provider::model)
+forge bench swe --dataset swe-lite.jsonl --agent forge       --out preds-forge.jsonl  --limit 20
+
+# Claude Code's own harness (claude -p --dangerously-skip-permissions)
+forge bench swe --dataset swe-lite.jsonl --agent claude-code --out preds-claude.jsonl --limit 20 --model opus
+
+# Codex's own harness (codex exec --full-auto)
+forge bench swe --dataset swe-lite.jsonl --agent codex       --out preds-codex.jsonl  --limit 20 --model gpt-5-codex
+```
+
+Each external agent runs **fully autonomous** in the freshly-reset clone (it must edit files + run
+commands unattended), so `claude` / `codex` must be installed, on `PATH`, and authenticated. Then
+score each predictions file with the evaluator (step 3) and compare the resolved rates:
+
+```bash
+for a in forge claude codex; do
+  python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench_Lite \
+    --predictions_path preds-$a.jsonl --run_id $a
+done
+```
+
+Use the **same model family** across agents (e.g. Forge pinned to `anthropic::claude-…` vs
+`--agent claude-code --model …`) to isolate the harness from the model.
+
 ## A/B-ing harness changes
 
 Because the prediction step exercises Forge's real harness (system prompt, tools, agent loop,

@@ -10,11 +10,36 @@
 //! `model_patch`. Sequential by design (each instance sets the process CWD).
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::Mode;
+
+/// Which agent harness solves each instance. The point of the comparison: run the SAME instances
+/// through Forge vs another CLI agent (each with ITS OWN harness, on the same task + repo state),
+/// score both with the official evaluator, and compare resolved rates. The external agents run
+/// fully autonomous (they must edit + run commands unattended) in the freshly-reset clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Agent {
+    /// Forge's own harness (in-process).
+    Forge,
+    /// Anthropic's Claude Code CLI (`claude -p --dangerously-skip-permissions`).
+    ClaudeCode,
+    /// OpenAI's Codex CLI (`codex exec --full-auto`).
+    Codex,
+}
+
+impl Agent {
+    fn label(self) -> &'static str {
+        match self {
+            Agent::Forge => "forge",
+            Agent::ClaudeCode => "claude-code",
+            Agent::Codex => "codex",
+        }
+    }
+}
 
 /// One SWE-bench task. Datasets carry more fields (test patches, FAIL_TO_PASS, …) used only by the
 /// evaluator; the prediction step needs just these four.
@@ -114,12 +139,15 @@ fn extract_patch(dir: &Path) -> Result<String> {
 /// Generate predictions for (up to `limit`) instances from `dataset`, writing `predictions.jsonl`
 /// to `out`. Repos are prepared under `workdir` (clones are reused across runs). A failed instance
 /// records an empty patch (counts as unresolved) rather than aborting the whole sweep.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_swe(
     dataset: PathBuf,
     out: PathBuf,
     limit: Option<usize>,
     model: Option<String>,
     workdir: PathBuf,
+    agent: Agent,
+    timeout_secs: u64,
 ) -> Result<()> {
     let mut instances = load_instances(&dataset)?;
     if let Some(n) = limit {
@@ -129,7 +157,8 @@ pub async fn run_swe(
         anyhow::bail!("no instances in {}", dataset.display());
     }
     eprintln!(
-        "SWE-bench: {} instance(s); repos under {}",
+        "SWE-bench [{}]: {} instance(s); repos under {}",
+        agent.label(),
         instances.len(),
         workdir.display()
     );
@@ -139,7 +168,8 @@ pub async fn run_swe(
     let total = instances.len();
     for (i, inst) in instances.iter().enumerate() {
         eprintln!("[{}/{}] {} ({})", i + 1, total, inst.instance_id, inst.repo);
-        let patch = match prepare_and_run(inst, &workdir, model.clone()).await {
+        let patch = match prepare_and_run(inst, &workdir, model.clone(), agent, timeout_secs).await
+        {
             Ok(p) => {
                 let lines = p.lines().count();
                 eprintln!("  ✓ patch: {} lines", lines);
@@ -154,7 +184,7 @@ pub async fn run_swe(
         let _ = std::env::set_current_dir(&orig_cwd);
         preds.push(Prediction {
             instance_id: inst.instance_id.clone(),
-            model_name_or_path: "forge".to_string(),
+            model_name_or_path: agent.label().to_string(),
             model_patch: patch,
         });
     }
@@ -178,19 +208,101 @@ async fn prepare_and_run(
     inst: &SweInstance,
     workdir: &Path,
     model: Option<String>,
+    agent: Agent,
+    timeout_secs: u64,
 ) -> Result<String> {
     let dir = prepare_repo(inst, workdir)?;
     std::env::set_current_dir(&dir).context("entering instance repo")?;
-    // Bypass mode: a benchmark turn runs unattended, so no permission prompts. The agent edits the
-    // freshly-reset working tree; we read the diff back out afterwards.
-    let mut session = crate::build_session(false, Some(Mode::Bypass), false, None, model)
-        .await
-        .context("building session")?;
-    session
-        .run_turn(&inst.problem_statement)
-        .await
-        .context("running the agent turn")?;
+    match agent {
+        Agent::Forge => {
+            // Bypass mode: a benchmark turn runs unattended, so no permission prompts. The agent
+            // edits the freshly-reset working tree; we read the diff back out afterwards.
+            let mut session = crate::build_session(false, Some(Mode::Bypass), false, None, model)
+                .await
+                .context("building session")?;
+            session
+                .run_turn(&inst.problem_statement)
+                .await
+                .context("running the agent turn")?;
+        }
+        Agent::ClaudeCode | Agent::Codex => {
+            run_external_agent(
+                agent,
+                &inst.problem_statement,
+                &dir,
+                model.as_deref(),
+                timeout_secs,
+            )
+            .await?;
+        }
+    }
     extract_patch(&dir)
+}
+
+/// Run an external agent CLI (Claude Code / Codex) as its OWN autonomous agent in `dir`, feeding the
+/// task on stdin. Both must run fully unattended (edit files + run commands without prompts) so they
+/// can actually solve the instance — the clone is disposable, so the broad autonomy is contained.
+async fn run_external_agent(
+    agent: Agent,
+    problem: &str,
+    dir: &Path,
+    model: Option<&str>,
+    timeout_secs: u64,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let (bin, mut args): (&str, Vec<String>) = match agent {
+        // `-p` reads the prompt from stdin; skip-permissions so edits + shell run unattended.
+        Agent::ClaudeCode => (
+            "claude",
+            vec!["-p".into(), "--dangerously-skip-permissions".into()],
+        ),
+        // `exec` is codex's non-interactive mode; `--full-auto` = workspace-write + never-ask.
+        Agent::Codex => (
+            "codex",
+            vec![
+                "exec".into(),
+                "--skip-git-repo-check".into(),
+                "--full-auto".into(),
+            ],
+        ),
+        Agent::Forge => unreachable!("forge takes the in-process path"),
+    };
+    if let Some(m) = model {
+        args.push("--model".into());
+        args.push(m.to_string());
+    }
+
+    let mut child = tokio::process::Command::new(bin)
+        .args(&args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning `{bin}` — is it installed and on PATH?"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(problem.as_bytes()).await.ok();
+        stdin.shutdown().await.ok();
+    }
+
+    let status =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait()).await;
+    match status {
+        Ok(Ok(st)) if st.success() => Ok(()),
+        // A non-zero exit is common (the agent may "fail" yet still have edited files) — don't abort
+        // the instance; the diff (possibly empty) is captured by the caller either way.
+        Ok(Ok(st)) => {
+            eprintln!("  (note: {bin} exited {st})");
+            Ok(())
+        }
+        Ok(Err(e)) => Err(anyhow::anyhow!("waiting on {bin}: {e}")),
+        Err(_) => {
+            let _ = child.start_kill();
+            anyhow::bail!("{bin} timed out after {timeout_secs}s")
+        }
+    }
 }
 
 #[cfg(test)]

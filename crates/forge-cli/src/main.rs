@@ -87,12 +87,19 @@ enum BenchCmd {
         /// Only run the first N instances (smoke runs).
         #[arg(long)]
         limit: Option<usize>,
-        /// Pin a specific model (else the mesh routes each turn).
+        /// Pin a specific model. For --agent forge a Forge model id (provider::model); for
+        /// claude-code / codex the CLI's own model name (e.g. `opus`, `gpt-5-codex`).
         #[arg(long)]
         model: Option<String>,
         /// Directory to clone/reuse instance repos under.
         #[arg(long, default_value = ".forge/swe-bench")]
         workdir: std::path::PathBuf,
+        /// Which agent solves each instance — compare Forge against another CLI's own harness.
+        #[arg(long, value_enum, default_value_t = bench::Agent::Forge)]
+        agent: bench::Agent,
+        /// Per-instance wall-clock budget for an external agent (seconds).
+        #[arg(long, default_value_t = 1200)]
+        timeout_secs: u64,
     },
 }
 
@@ -714,7 +721,9 @@ async fn main() -> Result<()> {
                 limit,
                 model,
                 workdir,
-            } => bench::run_swe(dataset, out, limit, model, workdir).await,
+                agent,
+                timeout_secs,
+            } => bench::run_swe(dataset, out, limit, model, workdir, agent, timeout_secs).await,
         },
         Command::Commands => commands_cmd(),
         Command::Models { probe, clear } => models(probe, clear).await,
