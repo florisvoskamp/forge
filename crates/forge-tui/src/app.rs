@@ -255,6 +255,9 @@ pub struct App {
     streaming_active: bool,
     /// True while a turn is running (drives the thinking spinner).
     pub busy: bool,
+    /// Prompts the user typed while busy, queued to run after the current turn (shown in the
+    /// statusline as "⏳ N queued"). Maintained by the I/O shell.
+    pub queued: Vec<String>,
     /// Animation tick, advanced by the render loop while busy.
     pub tick: usize,
     /// Finalized scrollback lines, in arrival order; drained by the I/O shell.
@@ -1137,6 +1140,11 @@ impl App {
                 ReplayItem::Note(text) => self.flush.push(warning_line(text)),
             }
         }
+    }
+
+    /// Update the visible queued-prompts list (prompts typed while a turn was running).
+    pub fn set_queued(&mut self, queued: &[String]) {
+        self.queued = queued.to_vec();
     }
 
     /// Push a dim separator line after replaying a resumed session's transcript, so the user
@@ -2802,6 +2810,13 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
         line1.push(Span::styled(
             "◉ remote",
             Style::default().fg(OKGREEN).bold().bg(STATUSBG),
+        ));
+    }
+    if !app.queued.is_empty() {
+        line1.push(sep());
+        line1.push(Span::styled(
+            format!("⏳ {} queued", app.queued.len()),
+            Style::default().fg(WARNYEL).bold().bg(STATUSBG),
         ));
     }
 

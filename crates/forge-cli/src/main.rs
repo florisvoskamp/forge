@@ -3924,24 +3924,30 @@ async fn run_chat_tui(
             .await;
     }
 
-    // On a resumed session (`--continue` / `--resume <id>`): render the prior transcript into
-    // scrollback so the conversation reappears, then push a separator so the user can tell where
-    // the resumed history ends and new input begins.
+    // On a resumed session (`--continue` / `--resume <id>`): render the FULL prior transcript into
+    // scrollback (the user sees the entire original conversation, even the parts compaction folded
+    // away from the model's view), then a separator marking where new input begins.
+    let mut offer_resume_choice = false;
     {
         let s = session.lock().await;
-        let items = s.replay_items();
+        let items = s.replay_items_full();
         if !items.is_empty() {
             let sid8: String = s.session_id().chars().take(8).collect();
-            let n = s.history().len();
+            let n = items.len();
             app.replay_history(&items);
-            app.push_resume_separator(&format!("— resumed session {sid8} ({n} messages) —"));
+            app.push_resume_separator(&format!("— resumed session {sid8} ({n} entries) —"));
+            // If this session was compacted, the model only sees a summary. Offer the choice.
+            offer_resume_choice = s.was_compacted();
         }
     }
 
     // For bare `--resume` (Picker mode): open the session picker on the first frame so the user
-    // can choose which session to reattach to.
+    // can choose which session to reattach to. Otherwise, if we resumed a previously-compacted
+    // session, ask whether to continue compacted or reload the full history into the model's view.
     if open_picker_on_start {
         open_sessions_picker(&mut app, "")?;
+    } else if offer_resume_choice {
+        open_resume_choice_picker(&mut app);
     }
 
     // Project-scope commands/skills can steer the model; their first use this session is gated
@@ -3990,6 +3996,9 @@ async fn run_chat_tui(
     let mut prompt_history: Vec<String> = Vec::new();
     let mut history_pos: Option<usize> = None;
     let mut history_draft = String::new();
+    // Prompts typed while a turn is running, queued to run one-per-turn after it finishes
+    // (like Claude Code / aider). Drained in the done-handler below; cleared on interrupt.
+    let mut queued_prompts: Vec<String> = Vec::new();
 
     while !quit {
         if dirty {
@@ -4427,6 +4436,10 @@ async fn run_chat_tui(
                     turn_gen += 1; // discard the aborted turn's (now stale) done-signal
                     busy = false;
                     loop_state = None; // a `/loop` in progress stops on interrupt
+                    if !queued_prompts.is_empty() {
+                        queued_prompts.clear(); // interrupting drops the queued prompts too
+                        app.set_queued(&queued_prompts);
+                    }
                     pending = None;
                     pending_question = None;
                     app.prompt = None;
@@ -4476,7 +4489,32 @@ async fn run_chat_tui(
                     InputOutcome::Editing => {}
                 }
             } else if busy {
-                // Mid-turn: ignore typing (quit is already handled above).
+                // Mid-turn: let the user keep typing and QUEUE submitted prompts to run after the
+                // current turn finishes (Claude Code / aider style). Only plain text editing +
+                // Enter is honored here; palette, commands, history and temper-cycling wait until
+                // the turn is idle. A `/command` is held back (it needs the idle session).
+                let outcome = if app.try_delete_paste_block(key) {
+                    InputOutcome::Editing
+                } else {
+                    handle_key(&mut app.input, &mut app.input_cursor, key)
+                };
+                if let InputOutcome::Submit(raw_line) = outcome {
+                    let (line, _imgs) = app.resolve_paste_blocks(raw_line);
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        // nothing to queue
+                    } else if trimmed.starts_with('/') && !trimmed.starts_with("//") {
+                        app.note("⏳ commands run when the turn is idle — finish or Esc first");
+                    } else {
+                        queued_prompts.push(line.clone());
+                        app.set_queued(&queued_prompts);
+                        app.note(&format!(
+                            "⏳ queued ({} pending) — runs after this turn",
+                            queued_prompts.len()
+                        ));
+                    }
+                }
+                dirty = true;
             } else if matches!(key, KeyKind::Char('f') | KeyKind::Char('F'))
                 && app.pending_shell_fix.is_some()
             {
@@ -4953,6 +4991,25 @@ async fn run_chat_tui(
                     } else {
                         loop_state = Some(ls); // a different turn finished; keep waiting
                     }
+                }
+                // Drain a queued prompt (typed while this turn was running): run it as the next
+                // turn, ahead of auto-compaction (the queued turn auto-compacts itself if needed).
+                if turn_handle.is_none() && !queued_prompts.is_empty() {
+                    let next = queued_prompts.remove(0);
+                    app.set_queued(&queued_prompts);
+                    if prompt_history.last() != Some(&next) {
+                        prompt_history.push(next.clone());
+                    }
+                    turn_gen += 1;
+                    turn_handle = Some(spawn_turn(
+                        &next,
+                        &session,
+                        &done_tx,
+                        turn_gen,
+                        &mut app,
+                        &mut busy,
+                        &mut busy_since,
+                    ));
                 }
                 // Auto-compact: when no new turn was spawned (not a loop iteration) and the
                 // context gauge is above AUTO_COMPACT_THRESHOLD, quietly run /compact so the
@@ -6109,6 +6166,29 @@ fn session_title(preview: Option<&str>) -> String {
     }
 }
 
+/// Offer, on resuming a previously-compacted session, whether the MODEL should continue with the
+/// compacted context (fast, fits) or re-read the full original history. Either way the user already
+/// sees the full conversation in scrollback. Resolved in `picker_accept`.
+fn open_resume_choice_picker(app: &mut forge_tui::App) {
+    let rows = vec![
+        forge_tui::PickerRow {
+            id: "compacted".into(),
+            title: "Continue with the compacted context (recommended)".into(),
+            subtitle: "the model reads a summary of earlier turns — fast, fits the window".into(),
+        },
+        forge_tui::PickerRow {
+            id: "full".into(),
+            title: "Reload the FULL history into context (uncompacted)".into(),
+            subtitle: "the model re-reads the entire conversation — may auto-compact again".into(),
+        },
+    ];
+    app.picker.open_with(
+        forge_tui::PickerKind::ResumeMode,
+        "this session was compacted — how should the model continue?",
+        rows,
+    );
+}
+
 fn open_sessions_picker(app: &mut forge_tui::App, query: &str) -> Result<()> {
     let store = open_store()?;
     let list = store.list_sessions().context("listing sessions")?;
@@ -6340,11 +6420,11 @@ async fn picker_accept(
 ) -> Result<()> {
     match kind {
         forge_tui::PickerKind::Sessions => {
-            let items = {
+            let (items, compacted) = {
                 let mut s = session.lock().await;
                 s.reset_resumed(&row.id)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                s.replay_items()
+                (s.replay_items_full(), s.was_compacted())
             };
             tui.clear_screen();
             app.note(&format!(
@@ -6352,6 +6432,10 @@ async fn picker_accept(
                 row.id.chars().take(8).collect::<String>()
             ));
             app.replay_history(&items);
+            // If it was compacted, immediately offer compacted-vs-full for the model's context.
+            if compacted {
+                open_resume_choice_picker(app);
+            }
         }
         forge_tui::PickerKind::Checkpoints => {
             let seq: i64 = row.id.parse().unwrap_or(0);
@@ -6385,6 +6469,21 @@ async fn picker_accept(
         forge_tui::PickerKind::AssayChoice => {}
         // The models browser drills/steps within the render loop; Enter never resolves here.
         forge_tui::PickerKind::Models => {}
+        forge_tui::PickerKind::ResumeMode => {
+            if row.id == "full" {
+                let n = {
+                    let mut s = session.lock().await;
+                    s.reload_full_context()
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    s.history().len()
+                };
+                app.note(&format!(
+                    "● reloaded the full history into context ({n} messages, uncompacted)"
+                ));
+            } else {
+                app.note("● continuing with the compacted context");
+            }
+        }
     }
     Ok(())
 }

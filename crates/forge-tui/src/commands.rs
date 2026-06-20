@@ -676,6 +676,9 @@ pub enum PickerKind {
     AssayChoice,
     /// Browse available models (`/models`): a provider list that drills into per-provider models.
     Models,
+    /// On resuming a previously-compacted session: continue with the compacted context, or reload
+    /// the full original history into the model's view.
+    ResumeMode,
 }
 
 /// One row in an interactive picker: an opaque `id` the loop acts on, plus two display strings.

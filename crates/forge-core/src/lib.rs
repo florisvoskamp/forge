@@ -23,6 +23,7 @@ pub mod llm_router;
 pub mod permission;
 pub mod snapshot;
 pub mod subagent;
+pub mod tokens;
 pub mod worktree;
 
 pub use llm_router::LlmRouter;
@@ -138,35 +139,94 @@ pub struct RewindOutcome {
     pub rewound_prompt: Option<String>,
 }
 
-/// Chars-per-token used to convert a model's token window into a character budget for trimming and
-/// to estimate transcript size for auto-compaction. Deliberately CONSERVATIVE (3, not the ~4
-/// English average): a coding agent's transcript is dense with code/JSON/tool output that tokenizes
-/// closer to ~3 chars/token, so assuming 4 lets the real token count exceed the window — the input
-/// then overflows, the provider rejects it, and (because overflow surfaces as a transient error)
-/// the mesh benches a healthy model and churns the whole failover chain. Under-estimating the ratio
-/// keeps the trimmed input safely inside the window and makes auto-compaction trigger on time.
+/// Conservative chars-per-token used ONLY as a fallback when slicing a single oversized message
+/// down to a token budget (real token offsets aren't worth the cost there). Counting elsewhere uses
+/// the real BPE tokenizer ([`tokens`]); this 3 under-estimates so the sliced text stays within
+/// budget rather than overflowing.
 const CHARS_PER_TOKEN: usize = 3;
 
-/// Trim a transcript to fit within `budget_chars` (an already-derived character budget for the
-/// model's context window minus the reserved reply). System messages are ALWAYS kept (the standing
+/// Render a sequence of messages into TUI [`ReplayItem`](forge_tui::ReplayItem)s — user prompts,
+/// assistant text, tool calls (with args), tool results (matched to their call's name via
+/// `tool_call_id`), and the compaction marker. Shared by the model-facing replay
+/// ([`Session::replay_items`]) and the full-history replay ([`Session::replay_items_full`]).
+fn messages_to_replay_items(msgs: &[Message]) -> Vec<forge_tui::ReplayItem> {
+    use forge_tui::ReplayItem;
+    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for m in msgs {
+        match m.role {
+            Role::User => {
+                if !m.content.trim().is_empty() {
+                    out.push(ReplayItem::User(m.content.clone()));
+                }
+            }
+            Role::Assistant => {
+                if !m.content.trim().is_empty() {
+                    out.push(ReplayItem::Assistant(m.content.clone()));
+                }
+                for tc in &m.tool_calls {
+                    names.insert(tc.id.clone(), tc.name.clone());
+                    let args = serde_json::to_string(&tc.args).unwrap_or_default();
+                    out.push(ReplayItem::Tool {
+                        name: tc.name.clone(),
+                        args,
+                    });
+                }
+            }
+            Role::Tool => {
+                let name = m
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|id| names.get(id).cloned())
+                    .unwrap_or_else(|| "tool".to_string());
+                let summary = m.content.lines().next().unwrap_or("").to_string();
+                // The success flag isn't persisted; an error result conventionally starts with
+                // "error". Good enough to color the replayed line.
+                let ok = !summary.trim_start().to_lowercase().starts_with("error");
+                out.push(ReplayItem::ToolResult { name, ok, summary });
+            }
+            Role::System => {
+                // Only the compaction marker represents real prior conversation; other System
+                // messages (per-turn guidance/project prompt) are machinery — skip them.
+                if m.content.starts_with("[Earlier conversation summarized") {
+                    let first = m.content.lines().next().unwrap_or("").to_string();
+                    out.push(ReplayItem::Note(first.trim_matches(['[', ']']).to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Real token cost of one message: its content (BPE-counted, cached) + the chat framing overhead +
+/// any tool-call name/arguments it carries (which the model also pays for).
+fn message_tokens(m: &Message) -> usize {
+    let mut n = tokens::count_message(&m.content);
+    for tc in &m.tool_calls {
+        n += tokens::count_text(&tc.name) + tokens::count_text(&tc.args.to_string());
+    }
+    n
+}
+
+/// Trim a transcript to fit within `budget_tokens` (the model's context window minus the reserved
+/// reply), counted with the real BPE tokenizer. System messages are ALWAYS kept (the standing
 /// instructions); the rest are included newest-first until the budget is hit, then re-ordered to
 /// the original sequence. If even the single most-recent message overflows alone, its content is
 /// truncated from the FRONT (keeping the latest text — usually the actual request). Returns the
 /// input unchanged when it already fits. This is what stops a long conversation from overflowing a
 /// model's window and failing the turn as "unavailable" across every model.
-fn fit_messages(messages: &[Message], budget_chars: usize) -> Vec<Message> {
-    let msg_chars = |m: &Message| m.content.chars().count() + 16; // +16 ≈ role label + framing
-    let total: usize = messages.iter().map(msg_chars).sum();
-    if total <= budget_chars {
+fn fit_messages(messages: &[Message], budget_tokens: usize) -> Vec<Message> {
+    let total: usize = messages.iter().map(message_tokens).sum();
+    if total <= budget_tokens {
         return messages.to_vec();
     }
     // System messages are non-negotiable context; reserve their cost up front.
     let system_cost: usize = messages
         .iter()
         .filter(|m| m.role == Role::System)
-        .map(msg_chars)
+        .map(message_tokens)
         .sum();
-    let mut remaining = budget_chars.saturating_sub(system_cost);
+    let mut remaining = budget_tokens.saturating_sub(system_cost);
 
     // Walk non-system messages newest→oldest, keeping each that fits.
     let mut keep_idx = std::collections::HashSet::new();
@@ -174,15 +234,16 @@ fn fit_messages(messages: &[Message], budget_chars: usize) -> Vec<Message> {
         if m.role == Role::System {
             continue;
         }
-        let cost = msg_chars(m);
+        let cost = message_tokens(m);
         if cost <= remaining {
             remaining -= cost;
             keep_idx.insert(i);
         } else if keep_idx.is_empty() {
             // Nothing kept yet and even this newest message is too big — truncate it from the
-            // front so the latest words survive, and stop (the budget is spent).
+            // front so the latest words survive, and stop (the budget is spent). Slice by a
+            // conservative char-per-token bound (exact token offsets aren't worth it here).
             let mut m = m.clone();
-            let keep_chars = remaining.saturating_sub(48); // room for the marker
+            let keep_chars = remaining.saturating_sub(48).saturating_mul(CHARS_PER_TOKEN);
             if keep_chars > 0 {
                 let chars: Vec<char> = m.content.chars().collect();
                 let start = chars.len().saturating_sub(keep_chars);
@@ -626,52 +687,57 @@ impl Session {
     /// echo (the old [`history`](Self::history) dropped every tool-only assistant turn). Tool
     /// results are matched back to their call's name via the `tool_call_id`.
     pub fn replay_items(&self) -> Vec<forge_tui::ReplayItem> {
-        use forge_tui::ReplayItem;
-        let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut out = Vec::new();
-        for m in &self.transcript {
-            match m.role {
-                Role::User => {
-                    if !m.content.trim().is_empty() {
-                        out.push(ReplayItem::User(m.content.clone()));
-                    }
-                }
-                Role::Assistant => {
-                    if !m.content.trim().is_empty() {
-                        out.push(ReplayItem::Assistant(m.content.clone()));
-                    }
-                    for tc in &m.tool_calls {
-                        names.insert(tc.id.clone(), tc.name.clone());
-                        let args = serde_json::to_string(&tc.args).unwrap_or_default();
-                        out.push(ReplayItem::Tool {
-                            name: tc.name.clone(),
-                            args,
-                        });
-                    }
-                }
-                Role::Tool => {
-                    let name = m
-                        .tool_call_id
-                        .as_ref()
-                        .and_then(|id| names.get(id).cloned())
-                        .unwrap_or_else(|| "tool".to_string());
-                    let summary = m.content.lines().next().unwrap_or("").to_string();
-                    // The success flag isn't persisted; an error result conventionally starts with
-                    // "error". Good enough to color the replayed line.
-                    let ok = !summary.trim_start().to_lowercase().starts_with("error");
-                    out.push(ReplayItem::ToolResult { name, ok, summary });
-                }
-                Role::System => {
-                    // Only the compaction marker represents real prior conversation; other System
-                    // messages (per-turn guidance/project prompt) are machinery — skip them.
-                    if m.content.starts_with("[Earlier conversation summarized") {
-                        let first = m.content.lines().next().unwrap_or("").to_string();
-                        out.push(ReplayItem::Note(first.trim_matches(['[', ']']).to_string()));
-                    }
-                }
+        messages_to_replay_items(&self.transcript)
+    }
+
+    /// Like [`replay_items`](Self::replay_items) but over the FULL original history (including
+    /// messages that compaction folded away), read straight from the store rather than the
+    /// model-facing in-memory transcript. This is what lets the USER scroll back through the entire
+    /// untouched conversation after a resume, even though the model only ever saw the compacted
+    /// view. Falls back to the in-memory transcript if the store read fails.
+    pub fn replay_items_full(&self) -> Vec<forge_tui::ReplayItem> {
+        match self.store.load_all_messages(&self.id) {
+            Ok(stored) => {
+                let msgs: Vec<Message> = stored
+                    .into_iter()
+                    .map(|m| Message {
+                        role: m.role,
+                        content: m.content,
+                        tool_calls: m.tool_calls,
+                        tool_call_id: m.tool_call_id,
+                        images: Vec::new(),
+                    })
+                    .collect();
+                messages_to_replay_items(&msgs)
             }
+            Err(_) => self.replay_items(),
         }
-        out
+    }
+
+    /// Whether this session was compacted at least once (its model context is a summary, not the
+    /// full history) — the signal for offering "continue compacted vs reload full" on resume.
+    pub fn was_compacted(&self) -> bool {
+        self.store.session_has_compaction(&self.id).unwrap_or(false)
+    }
+
+    /// Replace the model-facing transcript with the FULL, uncompacted history — the user chose, on
+    /// resume, to continue WITHOUT compaction so the model re-reads the entire original
+    /// conversation. (It may exceed the window; the next turn's auto-compaction handles that, now
+    /// that token counting is precise.) The user-visible scrollback already shows everything.
+    pub fn reload_full_context(&mut self) -> Result<(), CoreError> {
+        let stored = self.store.load_all_messages(&self.id)?;
+        self.seq = stored.len() as i64;
+        self.transcript = stored
+            .into_iter()
+            .map(|m| Message {
+                role: m.role,
+                content: m.content,
+                tool_calls: m.tool_calls,
+                tool_call_id: m.tool_call_id,
+                images: Vec::new(),
+            })
+            .collect();
+        Ok(())
     }
 
     /// Reconfigure this session in place as a **fresh** one (new id, empty transcript), keeping
@@ -1177,12 +1243,12 @@ impl Session {
     /// window (which otherwise fails the turn as "unavailable" on every model). Cheap; computed per
     /// active model each step so failover to a smaller-window model re-trims appropriately.
     fn transcript_for(&self, model: &str) -> Vec<Message> {
-        let window = self.effective_context_window(model);
-        // Reserve the reply budget + a 10% slack against the rough chars/token estimate.
-        let reserve = self.config.mesh.max_output_tokens.max(1024);
-        let input_tokens = (window.saturating_sub(reserve) as u64) * 9 / 10;
-        let budget_chars = (input_tokens as usize).saturating_mul(CHARS_PER_TOKEN);
-        fit_messages(&self.transcript, budget_chars.max(2048))
+        let window = self.effective_context_window(model) as usize;
+        let reserve = self.config.mesh.max_output_tokens.max(1024) as usize;
+        // Real-token budget: window minus the reply reservation, with 5% headroom for the small
+        // magnitude difference between our o200k counter and the target model's own tokenizer.
+        let budget_tokens = window.saturating_sub(reserve) * 95 / 100;
+        fit_messages(&self.transcript, budget_tokens.max(256))
     }
 
     /// System prompt for the architect planner phase. Instructs the planner to produce a concrete
@@ -1362,15 +1428,13 @@ Rules:\n\
         Ok(Some(resp.content))
     }
 
-    /// Rough token estimate of the current transcript (chars / [`CHARS_PER_TOKEN`], + small
-    /// per-message framing). Used to decide compaction; not billed.
+    /// Real BPE token count of the current transcript (content + tool calls + per-message framing),
+    /// via [`tokens`]. Used to decide compaction + drive the gauge; not billed.
     fn estimated_transcript_tokens(&self) -> u64 {
-        let chars: usize = self
-            .transcript
+        self.transcript
             .iter()
-            .map(|m| m.content.chars().count() + 16)
-            .sum();
-        (chars / CHARS_PER_TOKEN) as u64
+            .map(|m| message_tokens(m) as u64)
+            .sum()
     }
 
     /// Whether the transcript comfortably fits `model`'s window — under 80% of the post-reply room.
@@ -3561,7 +3625,7 @@ mod tests {
         let mut s = scripted_session("No", asks.clone());
         // One giant message: over 80% of the 32k floor in tokens, but too few messages for
         // compact() to do real work (so the gate's decision is what we're testing).
-        s.transcript.push(Message::user("x".repeat(200_000)));
+        s.transcript.push(Message::user("data ".repeat(40_000)));
         assert!(
             !s.transcript_fits("ollama::tiny"),
             "overflows the small window"
@@ -3577,14 +3641,14 @@ mod tests {
     async fn always_answer_silences_further_prompts() {
         let asks = Arc::new(Mutex::new(0));
         let mut s = scripted_session("Always", asks.clone());
-        s.transcript.push(Message::user("x".repeat(200_000)));
+        s.transcript.push(Message::user("data ".repeat(40_000)));
         assert!(
             s.admit_failover_model("ollama::tiny").await.unwrap(),
             "Always → admit"
         );
         assert!(s.always_compact_on_switch, "the session flag is set");
         // A second over-window switch proceeds silently (no further prompt).
-        s.transcript.push(Message::user("x".repeat(200_000)));
+        s.transcript.push(Message::user("data ".repeat(40_000)));
         assert!(s.admit_failover_model("ollama::tiny").await.unwrap());
         assert_eq!(*asks.lock().unwrap(), 1, "asked only the first time");
     }
@@ -4445,6 +4509,61 @@ mod tests {
         let report = store.current_benched_report().unwrap();
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].0, "bad::model");
+    }
+
+    #[tokio::test]
+    async fn full_history_survives_compaction_for_the_user_view() {
+        // After compaction the model sees a summary, but the USER must still be able to view the
+        // entire original conversation, and can opt to reload it into the model's context.
+        let provider = Arc::new(SummarizingProvider);
+        let router = Arc::new(HeuristicRouter::new(Config::default()));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            provider,
+            router,
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+        let sid = session.id().to_string();
+        for i in 0..10 {
+            store
+                .add_message(&sid, i, Role::User, &format!("turn {i}"), None)
+                .unwrap();
+        }
+        store
+            .compact_session_store(&sid, "SUMMARY of turns 0..6", 3)
+            .unwrap();
+
+        session.reset_resumed(&sid).unwrap();
+        // Model context is the compacted view…
+        assert!(
+            session.history().len() < 10,
+            "model sees the compacted view"
+        );
+        // …but the user's full replay shows all 10 original turns.
+        let full_users = session
+            .replay_items_full()
+            .into_iter()
+            .filter(|i| matches!(i, forge_tui::ReplayItem::User(_)))
+            .count();
+        assert_eq!(full_users, 10, "full replay shows every original user turn");
+        assert!(session.was_compacted());
+
+        // Reloading the full history puts all 10 turns back into the model context.
+        session.reload_full_context().unwrap();
+        let model_users = session
+            .transcript
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count();
+        assert_eq!(
+            model_users, 10,
+            "reload_full_context restores the uncompacted context"
+        );
     }
 
     #[tokio::test]

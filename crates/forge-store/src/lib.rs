@@ -1005,6 +1005,45 @@ impl Store {
         Ok(msgs)
     }
 
+    /// ALL messages of a session in turn order, INCLUDING soft-deleted rows (compacted-away or
+    /// `/undo`-rewound) and WITHOUT prepending the summary marker — the genuine, untouched
+    /// conversation. The model only ever sees the compacted view ([`load_messages`](Self::load_messages)),
+    /// but this lets the USER still read the FULL original history in scrollback after a resume.
+    pub fn load_all_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT role, content, model, tool_calls_json, tool_call_id
+             FROM message WHERE session_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            let role: String = row.get(0)?;
+            let tool_calls_json: Option<String> = row.get(3)?;
+            let tool_calls = tool_calls_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            Ok(StoredMessage {
+                role: Role::parse(&role).unwrap_or(Role::User),
+                content: row.get(1)?,
+                model: row.get(2)?,
+                tool_calls,
+                tool_call_id: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Whether this session has a stored compaction summary (was compacted at least once) — the
+    /// signal for offering "compact first vs continue uncompacted" when resuming it.
+    pub fn session_has_compaction(&self, session_id: &str) -> Result<bool> {
+        let n: i64 = self.lock()?.query_row(
+            "SELECT COUNT(*) FROM session_compaction WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Persist the compacted view of a session: soft-delete the oldest active messages (keeping
     /// the last `keep_count`) and upsert `summary` into `session_compaction`. On the next resume,
     /// [`load_messages`](Self::load_messages) prepends a System message with the summary so the
@@ -1861,6 +1900,41 @@ mod tests {
         assert_eq!(sessions[0].message_count, 2);
         assert_eq!(sessions[1].id, a);
         assert_eq!(sessions[1].message_count, 1);
+    }
+
+    #[test]
+    fn load_all_messages_keeps_compacted_away_history_for_the_user() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("/x", "default").unwrap();
+        for i in 0..10 {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            store
+                .add_message(&sid, i, role, &format!("message {i}"), None)
+                .unwrap();
+        }
+        assert!(!store.session_has_compaction(&sid).unwrap());
+        // Compact: keep the 3 most-recent, summarize (soft-delete) the rest.
+        store.compact_session_store(&sid, "SUMMARY", 3).unwrap();
+        assert!(store.session_has_compaction(&sid).unwrap());
+
+        // The model view is the summary + the 3 recent messages…
+        let model_view = store.load_messages(&sid).unwrap();
+        assert_eq!(model_view.len(), 4, "summary + 3 recent");
+        // …but the USER's full view still has every original message, with no summary marker.
+        let full = store.load_all_messages(&sid).unwrap();
+        assert_eq!(
+            full.len(),
+            10,
+            "full history retains every original message"
+        );
+        assert_eq!(
+            full[0].content, "message 0",
+            "the compacted-away first turn survives"
+        );
     }
 
     #[test]
