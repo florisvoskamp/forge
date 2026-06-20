@@ -1192,63 +1192,106 @@ Rules:\n\
         }
 
         let planner = self.resolve_planner_model();
-        self.presenter.emit(PresenterEvent::Routing {
-            tier: forge_types::TaskTier::Complex.as_str().to_string(),
-            model: planner.clone(),
-            rationale: "architect plan phase (no tools)".to_string(),
-        });
-
-        // Build the transcript window for the planner, then prepend the planner system prompt.
-        let mut planner_msgs = self.transcript_for(&planner);
-        planner_msgs.insert(0, Message::system(Self::ARCHITECT_PLANNER_SYSTEM));
+        // Cross-provider failover chain for the plan phase: the resolved planner first, then the
+        // mesh's Complex-tier chain (deduped, planner removed). Without this, a single rate-limit
+        // on the planner would abort the whole architect turn before the edit loop ever runs.
+        let failover = self.config.mesh.failover;
+        let fallbacks: Vec<String> = if failover {
+            let budget = self.budget_snapshot();
+            let health = self.store.current_benched().unwrap_or_default();
+            let quota = self.live_quota();
+            let d = self
+                .router
+                .route_hinted(
+                    "plan a complex software task",
+                    budget,
+                    &health,
+                    &quota,
+                    Some(TaskTier::Complex),
+                )
+                .await;
+            std::iter::once(d.model)
+                .chain(d.fallbacks)
+                .filter(|m| m != &planner)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let stream_idle = std::time::Duration::from_secs(self.config.mesh.stream_idle_timeout_secs);
         let completion_opts = CompletionOptions {
             effort: self.pinned_effort,
         };
 
-        // Collect plan text while streaming it live to the presenter.
-        let mut plan_text = String::new();
-        let result = {
-            let provider = &self.provider;
-            let presenter = &mut self.presenter;
-            let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let act = std::sync::Arc::clone(&activity);
-            let mut sink = |ev: StreamEvent| {
-                act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let StreamEvent::Text(ref t) = ev {
-                    plan_text.push_str(t);
-                }
-                match ev {
-                    StreamEvent::Text(t) => presenter.emit(PresenterEvent::AssistantDelta(t)),
-                    StreamEvent::Reasoning(t) => presenter.emit(PresenterEvent::Reasoning(t)),
-                    _ => {}
-                }
+        let mut chain = fallbacks.into_iter();
+        let mut model = planner;
+        let mut resp = loop {
+            self.presenter.emit(PresenterEvent::Routing {
+                tier: forge_types::TaskTier::Complex.as_str().to_string(),
+                model: model.clone(),
+                rationale: "architect plan phase (no tools)".to_string(),
+            });
+
+            // Re-window the transcript for THIS model (a smaller fallback still fits), then prepend
+            // the planner system prompt.
+            let mut planner_msgs = self.transcript_for(&model);
+            planner_msgs.insert(0, Message::system(Self::ARCHITECT_PLANNER_SYSTEM));
+
+            // Collect plan text while streaming it live to the presenter.
+            let mut plan_text = String::new();
+            let result = {
+                let provider = &self.provider;
+                let presenter = &mut self.presenter;
+                let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let act = std::sync::Arc::clone(&activity);
+                let mut sink = |ev: StreamEvent| {
+                    act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let StreamEvent::Text(ref t) = ev {
+                        plan_text.push_str(t);
+                    }
+                    match ev {
+                        StreamEvent::Text(t) => presenter.emit(PresenterEvent::AssistantDelta(t)),
+                        StreamEvent::Reasoning(t) => presenter.emit(PresenterEvent::Reasoning(t)),
+                        _ => {}
+                    }
+                };
+                // Empty tool slice — the planner must not call tools.
+                let fut =
+                    provider.complete_with(&model, &planner_msgs, &[], &completion_opts, &mut sink);
+                stream_with_idle_timeout(fut, &activity, stream_idle).await
             };
-            // Empty tool slice — the planner must not call tools.
-            let fut =
-                provider.complete_with(&planner, &planner_msgs, &[], &completion_opts, &mut sink);
-            stream_with_idle_timeout(fut, &activity, stream_idle).await
+
+            match result {
+                Ok(mut r) => {
+                    // Use the streamed text if the provider returns empty content (some do).
+                    if r.content.is_empty() && !plan_text.is_empty() {
+                        r.content = plan_text;
+                    }
+                    break r;
+                }
+                Err(e) if failover && e.is_retryable() => {
+                    match self.advance_fallback(&model, &e, &mut chain, "architect plan") {
+                        Some(next) => model = next,
+                        None => return Err(CoreError::Provider(e)),
+                    }
+                }
+                Err(e) => return Err(CoreError::Provider(e)),
+            }
         };
 
-        let mut resp = result.map_err(CoreError::Provider)?;
         if !resp.content.is_empty() {
             self.presenter.emit(PresenterEvent::AssistantDone);
         }
-        // Use the streamed text if the provider returns empty content (some providers do).
-        if resp.content.is_empty() && !plan_text.is_empty() {
-            resp.content = plan_text;
-        }
 
         // Record cost/usage for the plan phase.
-        resp.usage.cost_usd = self.pricing.cost_for_usage(&planner, &resp.usage);
+        resp.usage.cost_usd = self.pricing.cost_for_usage(&model, &resp.usage);
         let seq = self.next_seq();
         let msg_id = self.store.add_message_full(
             &self.id,
             seq,
             Role::Assistant,
             &resp.content,
-            Some(&planner),
+            Some(&model),
             &[],
             None,
         )?;
@@ -1330,6 +1373,40 @@ Rules:\n\
         }
     }
 
+    /// Bench (or, for a permanent incapability, exclude) `model` after a retryable error and
+    /// return the next model to try from `chain`, or `None` when the chain is exhausted. Emits the
+    /// standard failover warning. Shared by the single-shot auxiliary calls (compaction, the
+    /// architect plan phase) so a transient rate-limit on one provider no longer kills the whole
+    /// turn — they now fail over down a chain exactly like the main model loop.
+    fn advance_fallback(
+        &mut self,
+        model: &str,
+        err: &forge_provider::ProviderError,
+        chain: &mut dyn Iterator<Item = String>,
+        label: &str,
+    ) -> Option<String> {
+        let reason = err.reason();
+        let default_cooldown =
+            std::time::Duration::from_secs(self.config.mesh.failover_cooldown_secs);
+        if err.is_permanent() {
+            let _ = self.store.exclude_model(model, reason);
+        } else {
+            let _ = self
+                .store
+                .bench_for(model, err.cooldown(default_cooldown), reason);
+        }
+        let next = chain.next();
+        match &next {
+            Some(n) => self.presenter.emit(PresenterEvent::Warning(format!(
+                "{model} {reason} — {label} failing over to {n}"
+            ))),
+            None => self.presenter.emit(PresenterEvent::Warning(format!(
+                "{model} {reason} — {label} chain exhausted"
+            ))),
+        }
+        next
+    }
+
     pub async fn compact(&mut self) -> Result<(usize, usize), CoreError> {
         let before = self.transcript.len();
         if before <= COMPACT_KEEP_RECENT + COMPACT_MIN_OLDER {
@@ -1367,12 +1444,29 @@ Rules:\n\
             .await;
 
         let messages = [Message::system(COMPACT_SYSTEM), Message::user(rendered)];
-        let mut sink = |_: StreamEvent| {};
-        let resp = self
-            .provider
-            .complete(&decision.model, &messages, &[], &mut sink)
-            .await
-            .map_err(CoreError::Provider)?;
+        // Fail over down the routed chain on a transient error: a rate-limited summarizer must not
+        // kill the turn — compaction also runs mid-failover (admit_failover_model), so a dead
+        // model here would otherwise abort an otherwise-recoverable turn.
+        let failover = self.config.mesh.failover;
+        let mut chain = decision.fallbacks.clone().into_iter();
+        let mut model = decision.model.clone();
+        let resp = loop {
+            let mut sink = |_: StreamEvent| {};
+            match self
+                .provider
+                .complete(&model, &messages, &[], &mut sink)
+                .await
+            {
+                Ok(r) => break r,
+                Err(e) if failover && e.is_retryable() => {
+                    match self.advance_fallback(&model, &e, &mut chain, "compact") {
+                        Some(next) => model = next,
+                        None => return Err(CoreError::Provider(e)),
+                    }
+                }
+                Err(e) => return Err(CoreError::Provider(e)),
+            }
+        };
         let _ = self
             .store
             .record_side_call_usage(&self.id, "compact/summarize", &resp.usage);
@@ -1394,8 +1488,7 @@ Rules:\n\
 
         let after = self.transcript.len();
         self.presenter.emit(PresenterEvent::Warning(format!(
-            "compacted {before} messages → {after} (summary via {})",
-            decision.model
+            "compacted {before} messages → {after} (summary via {model})"
         )));
         Ok((before, after))
     }
@@ -4223,6 +4316,35 @@ mod tests {
         assert!(session.transcript[0].content.contains("summarized"));
         // The most recent message is preserved verbatim at the tail.
         assert_eq!(session.transcript.last().unwrap().content, "message 11");
+    }
+
+    #[tokio::test]
+    async fn compact_fails_over_when_the_summarizer_is_rate_limited() {
+        // Regression: a rate-limited compaction summarizer must NOT kill the turn. It also runs
+        // mid-failover (admit_failover_model), so a dead model here would otherwise abort an
+        // otherwise-recoverable turn. It must walk the routed fallback chain instead.
+        let provider = Arc::new(FlakyProvider {
+            bad: ["bad::model".to_string()].into_iter().collect(),
+            err: rate_limited,
+        });
+        let router = Arc::new(FixedRouter {
+            model: "bad::model".into(),
+            fallbacks: vec!["good::model".into()],
+        });
+        let (store, mut session) = fixed_session(provider, router);
+        for i in 0..12 {
+            session
+                .transcript
+                .push(Message::user(format!("message {i}")));
+        }
+        let (before, after) = session.compact().await.unwrap();
+        assert_eq!(before, 12);
+        assert_eq!(after, COMPACT_KEEP_RECENT + 1);
+        // The fallback produced the summary, and the rate-limited primary was benched.
+        assert!(session.transcript[0].content.contains("recovered"));
+        let report = store.current_benched_report().unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].0, "bad::model");
     }
 
     #[tokio::test]

@@ -574,7 +574,13 @@ impl HeuristicRouter {
         // Demote a near-limit subscription (Warning, L3) to the back — still a fallback, but the
         // mesh tries everything else first. Stable, so it preserves the order within each group.
         usable.sort_by_key(|m| quota.is_pressured(forge_config::provider_of(m)));
-        usable
+        // Provider-diverse failover: round-robin across providers so one provider's rate-limit
+        // storm (e.g. a free tier with many models) can't dominate the head of the chain. The
+        // primary pick — position 0 — is unchanged (it's the top-ranked model, its provider's
+        // first entry, taken first), but the *tail* now alternates providers so failover crosses
+        // to a different provider (other free tiers, the claude/codex subscription bridges) within
+        // a hop or two instead of churning through one provider's entire benched block.
+        interleave_by_provider(usable)
     }
 
     /// Build the ordered failover chain for the routed tier: that tier's usable models first,
@@ -599,6 +605,42 @@ impl HeuristicRouter {
         }
         chain
     }
+}
+
+/// Re-thread a rank-ordered model list so providers alternate, while preserving each provider's
+/// internal order (so a provider's best model is still tried before its second-best). Position 0
+/// is unchanged — it's the first model of the first-seen provider, i.e. the overall top-ranked
+/// entry — so the *primary pick* never changes; only the failover tail becomes provider-diverse.
+///
+/// Example: `[g1, g2, g3, claude, o1]` (g* = same provider) → `[g1, claude, o1, g2, g3]`. A 429
+/// storm on `g*` now costs every Nth slot instead of the whole head of the chain.
+fn interleave_by_provider(models: Vec<String>) -> Vec<String> {
+    use std::collections::VecDeque;
+    // Groups in first-seen (= rank) order; each keeps its models in rank order.
+    let mut groups: Vec<(String, VecDeque<String>)> = Vec::new();
+    for m in models {
+        let p = forge_config::provider_of(&m).to_string();
+        match groups.iter_mut().find(|(gp, _)| *gp == p) {
+            Some((_, q)) => q.push_back(m),
+            None => {
+                let mut q = VecDeque::new();
+                q.push_back(m);
+                groups.push((p, q));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut progressed = true;
+    while progressed {
+        progressed = false;
+        for (_, q) in groups.iter_mut() {
+            if let Some(m) = q.pop_front() {
+                out.push(m);
+                progressed = true;
+            }
+        }
+    }
+    out
 }
 
 /// A `(u8, f64)`-comparable cost key. `f64` isn't `Ord`, so wrap it for use inside tuple
@@ -794,6 +836,34 @@ impl Router for HeuristicRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interleave_keeps_primary_but_spreads_providers() {
+        // A free tier (gemini) floods the head; subscription + another provider sit behind it.
+        let ranked = vec![
+            "gemini::g1".to_string(),
+            "gemini::g2".to_string(),
+            "gemini::g3".to_string(),
+            "anthropic::claude".to_string(),
+            "groq::q1".to_string(),
+            "gemini::g4".to_string(),
+        ];
+        let out = interleave_by_provider(ranked);
+        // Primary pick (position 0) is unchanged — still the overall top-ranked model.
+        assert_eq!(out[0], "gemini::g1");
+        // The very next entries cross to OTHER providers, not gemini's benched siblings, so a
+        // gemini rate-limit storm reaches claude/groq within one or two failover hops.
+        assert_eq!(out[1], "anthropic::claude");
+        assert_eq!(out[2], "groq::q1");
+        assert_eq!(out[3], "gemini::g2");
+        // No model is lost and each provider keeps its internal rank order.
+        assert_eq!(out.len(), 6);
+        let gemini: Vec<&String> = out.iter().filter(|m| m.starts_with("gemini::")).collect();
+        assert_eq!(
+            gemini,
+            ["gemini::g1", "gemini::g2", "gemini::g3", "gemini::g4"]
+        );
+    }
 
     fn router() -> HeuristicRouter {
         // Treat every provider as available so tier-classification tests are deterministic
