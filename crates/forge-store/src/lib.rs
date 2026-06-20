@@ -885,10 +885,14 @@ impl Store {
     /// there are no sessions yet.
     pub fn most_recent_session_id(&self) -> Result<Option<String>> {
         let conn = self.lock()?;
+        // Order by LAST ACTIVITY (newest message), not creation time, so `--continue` reattaches
+        // the session the user actually used most recently — not whichever was created last.
         let result = conn
             .query_row(
-                "SELECT id FROM session WHERE parent_session_id IS NULL \
-                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                "SELECT s.id FROM session s WHERE s.parent_session_id IS NULL \
+                 ORDER BY COALESCE( \
+                   (SELECT MAX(m.created_at) FROM message m WHERE m.session_id = s.id), \
+                   s.created_at) DESC, s.rowid DESC LIMIT 1",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -896,18 +900,21 @@ impl Store {
         Ok(result)
     }
 
-    /// Past sessions, newest first (by insertion order, then creation time).
-    /// Excludes subagent child sessions (`parent_session_id IS NOT NULL`) so the picker
-    /// and the `forge sessions` command only surface top-level sessions.
+    /// Past sessions, **most-recently-used first** (by newest message, falling back to creation
+    /// time), so the picker lists the sessions you're likely to resume at the top. Excludes
+    /// subagent child sessions (`parent_session_id IS NOT NULL`) so the picker and the
+    /// `forge sessions` command only surface top-level sessions.
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT s.id, s.cwd, s.permission_mode, s.created_at, s.total_cost_usd,
                     (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id),
                     (SELECT content FROM message m WHERE m.session_id = s.id
-                       AND m.role = 'user' ORDER BY m.seq LIMIT 1)
+                       AND m.role = 'user' ORDER BY m.seq LIMIT 1),
+                    COALESCE((SELECT MAX(m.created_at) FROM message m WHERE m.session_id = s.id),
+                             s.created_at) AS last_activity
              FROM session s WHERE s.parent_session_id IS NULL \
-             ORDER BY s.created_at DESC, s.rowid DESC",
+             ORDER BY last_activity DESC, s.rowid DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(SessionSummary {
@@ -918,6 +925,7 @@ impl Store {
                 total_cost_usd: row.get(4)?,
                 message_count: row.get(5)?,
                 preview: row.get(6)?,
+                last_activity: row.get(7)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1262,6 +1270,9 @@ pub struct SessionSummary {
     pub message_count: i64,
     /// First user message, if any.
     pub preview: Option<String>,
+    /// Unix seconds of the newest message (falls back to the session's creation time when the
+    /// session has no messages). Drives the most-recently-used ordering + the picker's age column.
+    pub last_activity: i64,
 }
 
 // ---- Lattice: code-intelligence graph (code-intelligence.md) ----

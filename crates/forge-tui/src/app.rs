@@ -1091,18 +1091,26 @@ impl App {
         self.flush.push(TextLine::default());
     }
 
-    /// Render a resumed session's prior transcript into scrollback (after a `/resume` swap), so
-    /// the conversation reappears without restarting. User turns echo like live input; assistant
-    /// turns render markdown under the `⚒ forge` header.
-    pub fn replay_history(&mut self, msgs: &[(forge_types::Role, String)]) {
-        for (role, content) in msgs {
-            match role {
-                forge_types::Role::User => self.submit_user(content),
-                _ => {
+    /// Render a resumed session's prior transcript into scrollback (after a `/resume` swap), so the
+    /// FULL conversation reappears — user turns, assistant text, AND the tool calls/results between
+    /// them — instead of a sparse user-only echo. User turns echo like live input; assistant turns
+    /// render markdown under the `⚒ forge` header; tool activity renders exactly like it did live.
+    pub fn replay_history(&mut self, items: &[ReplayItem]) {
+        for item in items {
+            match item {
+                ReplayItem::User(content) => self.submit_user(content),
+                ReplayItem::Assistant(content) => {
                     self.flush.push(header_line("⚒ forge", ORANGE));
                     self.flush.extend(crate::render::markdown_to_lines(content));
                     self.flush.push(TextLine::default());
                 }
+                ReplayItem::Tool { name, args } => {
+                    self.flush.push(tool_start_line(name, args));
+                }
+                ReplayItem::ToolResult { name, ok, summary } => {
+                    self.flush.push(tool_result_line(name, *ok, summary));
+                }
+                ReplayItem::Note(text) => self.flush.push(warning_line(text)),
             }
         }
     }
@@ -1173,6 +1181,27 @@ fn header_line(label: &str, color: Color) -> TextLine<'static> {
 
 fn body_line(text: &str) -> TextLine<'static> {
     TextLine::from(format!("  {text}"))
+}
+
+/// One renderable item of a resumed session's transcript. Built by the core from the rehydrated
+/// messages and replayed by [`App::replay_history`] so a resumed session shows the full
+/// conversation — text *and* tool activity — exactly as it looked live (not a user-only echo).
+#[derive(Debug, Clone)]
+pub enum ReplayItem {
+    /// A user prompt.
+    User(String),
+    /// Assistant answer text (markdown).
+    Assistant(String),
+    /// A tool the assistant invoked, with its (compacted) arguments.
+    Tool { name: String, args: String },
+    /// A tool's result line.
+    ToolResult {
+        name: String,
+        ok: bool,
+        summary: String,
+    },
+    /// A dim advisory (e.g. the "earlier conversation summarized" compaction marker).
+    Note(String),
 }
 
 fn warning_line(msg: &str) -> TextLine<'static> {
