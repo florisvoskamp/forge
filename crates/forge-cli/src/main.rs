@@ -20,6 +20,7 @@ use forge_types::TaskTier;
 
 mod assay_output;
 mod balance;
+mod bench;
 mod benchmarks;
 mod bridge_stats;
 mod context_windows;
@@ -70,6 +71,29 @@ impl FailOnSeverity {
         };
         sev_ord >= self
     }
+}
+
+#[derive(Subcommand)]
+enum BenchCmd {
+    /// Generate SWE-bench predictions: run Forge on each instance and write predictions.jsonl
+    /// (score it with the official `swebench` evaluator — see docs/benchmarks/swe-bench.md).
+    Swe {
+        /// SWE-bench dataset file (JSONL or a JSON array of instances).
+        #[arg(long)]
+        dataset: std::path::PathBuf,
+        /// Where to write predictions.jsonl.
+        #[arg(long, default_value = "predictions.jsonl")]
+        out: std::path::PathBuf,
+        /// Only run the first N instances (smoke runs).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Pin a specific model (else the mesh routes each turn).
+        #[arg(long)]
+        model: Option<String>,
+        /// Directory to clone/reuse instance repos under.
+        #[arg(long, default_value = ".forge/swe-bench")]
+        workdir: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -183,6 +207,11 @@ enum Command {
     Assay {
         #[command(subcommand)]
         sub: AssayCmd,
+    },
+    /// Run Forge against an evaluation benchmark (e.g. SWE-bench) and emit predictions.
+    Bench {
+        #[command(subcommand)]
+        sub: BenchCmd,
     },
     /// List discovered slash commands + skills (project and user scope) with their descriptions.
     Commands,
@@ -678,6 +707,15 @@ async fn main() -> Result<()> {
         Command::Sessions => sessions(),
         Command::Replay { ids, json } => replay_cmd(&ids, json),
         Command::Assay { sub } => assay_cmd(sub).await,
+        Command::Bench { sub } => match sub {
+            BenchCmd::Swe {
+                dataset,
+                out,
+                limit,
+                model,
+                workdir,
+            } => bench::run_swe(dataset, out, limit, model, workdir).await,
+        },
         Command::Commands => commands_cmd(),
         Command::Models { probe, clear } => models(probe, clear).await,
         Command::Mesh { prompt, json } => mesh_explain(prompt.join(" "), json).await,
