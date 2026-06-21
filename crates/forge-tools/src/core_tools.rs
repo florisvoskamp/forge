@@ -421,7 +421,18 @@ impl Tool for ApplyPatchTool {
         let patch = str_arg(args, "patch")?;
         let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
         let mut child = tokio::process::Command::new("git")
-            .args(["apply", "--recount", "--whitespace=nowarn", "-"])
+            // Apply byte-faithfully: a global core.autocrlf=true (the default on GitHub's
+            // Windows runners) would otherwise rewrite the patched file's line endings.
+            .args([
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "core.eol=lf",
+                "apply",
+                "--recount",
+                "--whitespace=nowarn",
+                "-",
+            ])
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
