@@ -741,10 +741,10 @@ pub struct MeshConfig {
     /// Frugal caps output tokens at 2048; Strict caps at 1024 and routes to free/sub only.
     #[serde(default)]
     pub credit_mode: CreditMode,
-    /// Self-review pass: after a turn makes edits, the SAME model critically re-examines its own
-    /// changes against the task and fixes any bug/incompleteness — one bounded round, no external
-    /// tools or test env needed. This is the leverage a single-pass harness lacks; on by default
-    /// because correctness beats the one extra call it costs (only fires on edit turns).
+    /// Self-review pass (opt-in): after a turn makes edits, the SAME model re-examines its own
+    /// changes against the task and may fix them — one bounded round, only on edit turns. OFF by
+    /// default: a same-model SWE-bench A/B showed the always-on version REGRESSED (the extra round
+    /// over-revised correct fixes). Kept as a lever to refine, not a default-on win.
     #[serde(default = "default_self_review")]
     pub self_review: bool,
     /// Architect mode (dual-model pipeline): when true, each turn runs a plan phase on a strong
@@ -825,7 +825,10 @@ fn default_failover() -> bool {
 }
 
 fn default_self_review() -> bool {
-    true
+    // OFF by default: on a same-model SWE-bench A/B the always-on review REGRESSED results
+    // (4/6 → 3/6) — the extra round let the model second-guess and break a fix that was already
+    // correct. Kept as an opt-in lever; needs a more conservative trigger before it's a net win.
+    false
 }
 
 fn default_failover_cooldown_secs() -> u64 {
@@ -1605,16 +1608,19 @@ mod tests {
     }
 
     #[test]
-    fn self_review_is_on_by_default() {
-        // The self-review leverage is on out-of-the-box (Rust default) AND when a config omits it.
-        assert!(Config::default().mesh.self_review, "Rust default");
+    fn self_review_is_off_by_default() {
+        // OFF by default (a same-model A/B showed the always-on version regressed); opt-in only.
+        assert!(!Config::default().mesh.self_review, "Rust default");
         let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
             .merge(figment::providers::Toml::string(
                 "[mesh]\nfailover = true\n",
             ))
             .extract()
             .unwrap();
-        assert!(cfg.mesh.self_review, "absent in TOML → serde default true");
+        assert!(
+            !cfg.mesh.self_review,
+            "absent in TOML → serde default false"
+        );
     }
 
     #[test]
