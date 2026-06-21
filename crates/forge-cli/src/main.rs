@@ -100,6 +100,16 @@ enum BenchCmd {
         /// Per-instance wall-clock budget for an external agent (seconds).
         #[arg(long, default_value_t = 1200)]
         timeout_secs: u64,
+        /// Run each instance this many times (separate seeds) for pass@k / best-of-k. >1 writes
+        /// one predictions file per seed (`<out>.seed1.jsonl`, …); aggregate with `bench passk`.
+        #[arg(long, default_value_t = 1)]
+        attempts: usize,
+    },
+    /// Aggregate pass@k from several swebench evaluation reports (one per seed).
+    Passk {
+        /// The `*.json` reports written by `run_evaluation`, one per seed.
+        #[arg(required = true)]
+        reports: Vec<std::path::PathBuf>,
     },
 }
 
@@ -723,7 +733,21 @@ async fn main() -> Result<()> {
                 workdir,
                 agent,
                 timeout_secs,
-            } => bench::run_swe(dataset, out, limit, model, workdir, agent, timeout_secs).await,
+                attempts,
+            } => {
+                bench::run_swe(
+                    dataset,
+                    out,
+                    limit,
+                    model,
+                    workdir,
+                    agent,
+                    timeout_secs,
+                    attempts,
+                )
+                .await
+            }
+            BenchCmd::Passk { reports } => bench::passk(&reports),
         },
         Command::Commands => commands_cmd(),
         Command::Models { probe, clear } => models(probe, clear).await,

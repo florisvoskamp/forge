@@ -92,6 +92,28 @@ done
 Use the **same model family** across agents (e.g. Forge pinned to `anthropic::claude-…` vs
 `--agent claude-code --model …`) to isolate the harness from the model.
 
+## Multiple seeds / pass@k (smoothing model variance)
+
+The models are non-deterministic, so a single run jitters ±1 on a small set. Run several seeds and
+aggregate:
+
+```bash
+# 3 seeds → preds.seed1.jsonl, preds.seed2.jsonl, preds.seed3.jsonl
+forge bench swe --dataset swe-lite.jsonl --agent forge --model claude-cli::sonnet \
+  --out preds-forge.jsonl --limit 20 --attempts 3
+
+# score each seed
+for s in 1 2 3; do
+  python -m swebench.harness.run_evaluation --dataset_name princeton-nlp/SWE-bench_Lite \
+    --predictions_path preds-forge.seed$s.jsonl --run_id forge_s$s
+done
+
+# pass@k = solved by ANY seed, plus each seed's own rate (variance visible)
+forge bench passk forge.forge_s1.json forge.forge_s2.json forge.forge_s3.json
+```
+
+Compare the same `--attempts` budget across agents (same model) for a fair pass@k head-to-head.
+
 ## A/B-ing harness changes
 
 Because the prediction step exercises Forge's real harness (system prompt, tools, agent loop,

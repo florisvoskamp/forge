@@ -149,9 +149,18 @@ fn extract_patch(dir: &Path) -> Result<String> {
     )
 }
 
-/// Generate predictions for (up to `limit`) instances from `dataset`, writing `predictions.jsonl`
-/// to `out`. Repos are prepared under `workdir` (clones are reused across runs). A failed instance
-/// records an empty patch (counts as unresolved) rather than aborting the whole sweep.
+/// Insert `.seed<k>` before the extension of `out` (e.g. `preds.jsonl` → `preds.seed2.jsonl`), so
+/// multi-attempt runs write one predictions file per seed for pass@k scoring.
+fn seed_path(out: &Path, seed: usize) -> PathBuf {
+    let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("preds");
+    let ext = out.extension().and_then(|s| s.to_str()).unwrap_or("jsonl");
+    out.with_file_name(format!("{stem}.seed{seed}.{ext}"))
+}
+
+/// Generate predictions for (up to `limit`) instances, optionally over `attempts` seeds (for
+/// pass@k / best-of-k). With one attempt, writes `out`; with several, writes `out.seed1.jsonl`,
+/// `out.seed2.jsonl`, … (each scored separately, then aggregated with `forge bench passk`). Repos
+/// are prepared under `workdir` (clones reused across runs + seeds).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_swe(
     dataset: PathBuf,
@@ -161,6 +170,7 @@ pub async fn run_swe(
     workdir: PathBuf,
     agent: Agent,
     timeout_secs: u64,
+    attempts: usize,
 ) -> Result<()> {
     let mut instances = load_instances(&dataset)?;
     if let Some(n) = limit {
@@ -169,10 +179,44 @@ pub async fn run_swe(
     if instances.is_empty() {
         anyhow::bail!("no instances in {}", dataset.display());
     }
+    let attempts = attempts.max(1);
+    for seed in 1..=attempts {
+        let seed_out = if attempts == 1 {
+            out.clone()
+        } else {
+            seed_path(&out, seed)
+        };
+        if attempts > 1 {
+            eprintln!("=== attempt {seed}/{attempts} ===");
+        }
+        run_one_sweep(
+            &instances,
+            model.clone(),
+            &workdir,
+            agent,
+            timeout_secs,
+            &seed_out,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// One full sweep over `instances`, writing predictions to `out`. A failed instance records an empty
+/// patch (counts as unresolved) rather than aborting the sweep.
+async fn run_one_sweep(
+    instances: &[SweInstance],
+    model: Option<String>,
+    workdir: &Path,
+    agent: Agent,
+    timeout_secs: u64,
+    out: &Path,
+) -> Result<()> {
     eprintln!(
-        "SWE-bench [{}]: {} instance(s); repos under {}",
+        "SWE-bench [{}]: {} instance(s) → {}; repos under {}",
         agent.label(),
         instances.len(),
+        out.display(),
         workdir.display()
     );
 
@@ -181,8 +225,7 @@ pub async fn run_swe(
     let total = instances.len();
     for (i, inst) in instances.iter().enumerate() {
         eprintln!("[{}/{}] {} ({})", i + 1, total, inst.instance_id, inst.repo);
-        let patch = match prepare_and_run(inst, &workdir, model.clone(), agent, timeout_secs).await
-        {
+        let patch = match prepare_and_run(inst, workdir, model.clone(), agent, timeout_secs).await {
             Ok(p) => {
                 let lines = p.lines().count();
                 eprintln!("  ✓ patch: {} lines", lines);
@@ -202,7 +245,7 @@ pub async fn run_swe(
         });
     }
 
-    std::fs::write(&out, predictions_to_jsonl(&preds))
+    std::fs::write(out, predictions_to_jsonl(&preds))
         .with_context(|| format!("writing {}", out.display()))?;
     let nonempty = preds.iter().filter(|p| !p.model_patch.is_empty()).count();
     eprintln!(
@@ -212,6 +255,54 @@ pub async fn run_swe(
         out.display()
     );
     eprintln!("score with the official evaluator — see docs/benchmarks/swe-bench.md");
+    Ok(())
+}
+
+/// Aggregate pass@k from several swebench evaluation reports (the `*.json` written by
+/// `run_evaluation`, one per seed). pass@k = an instance counts as solved if ANY seed resolved it;
+/// also prints each seed's own resolved count so variance is visible.
+pub fn passk(reports: &[PathBuf]) -> Result<()> {
+    use std::collections::BTreeSet;
+    if reports.is_empty() {
+        anyhow::bail!("pass@k needs at least one report (the *.json from run_evaluation)");
+    }
+    let mut union: BTreeSet<String> = BTreeSet::new();
+    let mut submitted = 0usize;
+    for (i, path) in reports.iter().enumerate() {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading report {}", path.display()))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        let resolved: Vec<String> = v
+            .get("resolved_ids")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        submitted = submitted.max(
+            v.get("submitted_instances")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as usize,
+        );
+        eprintln!(
+            "  seed {}: {} resolved  ({})",
+            i + 1,
+            resolved.len(),
+            path.display()
+        );
+        union.extend(resolved);
+    }
+    let k = reports.len();
+    let denom = submitted.max(union.len()).max(1);
+    eprintln!(
+        "pass@{k}: {} / {} resolved by at least one seed  ({:.0}%)",
+        union.len(),
+        denom,
+        union.len() as f64 / denom as f64 * 100.0
+    );
     Ok(())
 }
 
