@@ -15,8 +15,8 @@ mod sandbox;
 mod shell;
 mod web;
 pub use core_tools::{
-    DeleteFileTool, EditFileTool, GlobTool, ListDirTool, MultiEditTool, ReadFileTool, SearchTool,
-    WriteFileTool,
+    ApplyPatchTool, DeleteFileTool, EditFileTool, GlobTool, ListDirTool, MultiEditTool,
+    ReadFileTool, SearchTool, WriteFileTool,
 };
 pub use lattice_tool::LatticeTool;
 pub use sandbox::{ApplyResult, SandboxPolicy};
@@ -74,6 +74,7 @@ impl ToolRegistry {
         r.register(Box::new(WriteFileTool));
         r.register(Box::new(EditFileTool));
         r.register(Box::new(MultiEditTool));
+        r.register(Box::new(ApplyPatchTool));
         r.register(Box::new(DeleteFileTool));
         r.register(Box::new(ShellTool::default()));
         r.register(Box::new(ListDirTool));

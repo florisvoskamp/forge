@@ -388,6 +388,73 @@ fn apply_edits(content: &str, edits: &[(String, String)]) -> Result<String, Stri
     Ok(cur)
 }
 
+/// Apply a unified diff to the workspace via `git apply`. Mutates the workspace.
+pub struct ApplyPatchTool;
+
+#[async_trait]
+impl Tool for ApplyPatchTool {
+    fn name(&self) -> &str {
+        "apply_patch"
+    }
+    fn description(&self) -> &str {
+        "Apply a unified diff (git / `diff -u` format) to the workspace — best for multi-file or \
+         large changes where a patch is cleaner than edit_file. The `--- a/path` / `+++ b/path` \
+         headers name the files (a patch can also create or delete files). Applied with `git apply` \
+         (line-number drift tolerated); if it doesn't apply cleanly the error is returned verbatim \
+         so you can regenerate the patch. For small single-file edits prefer edit_file / multi_edit."
+    }
+    fn side_effect(&self) -> SideEffect {
+        SideEffect::Write
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "patch": { "type": "string", "description": "A unified diff to apply." },
+                "cwd": { "type": "string", "description": "Directory to apply in (default: current)." }
+            },
+            "required": ["patch"]
+        })
+    }
+    async fn run(&self, args: &Value) -> Result<String, ToolError> {
+        use tokio::io::AsyncWriteExt;
+        let patch = str_arg(args, "patch")?;
+        let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
+        let mut child = tokio::process::Command::new("git")
+            .args(["apply", "--recount", "--whitespace=nowarn", "-"])
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| ToolError::Failed(format!("spawning git apply: {e}")))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(patch.as_bytes()).await;
+            if !patch.ends_with('\n') {
+                let _ = stdin.write_all(b"\n").await; // git apply wants a trailing newline
+            }
+            let _ = stdin.shutdown().await;
+        }
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| ToolError::Failed(format!("running git apply: {e}")))?;
+        if out.status.success() {
+            let files = patch
+                .lines()
+                .filter(|l| l.starts_with("+++ "))
+                .count()
+                .max(1);
+            Ok(format!("applied patch ({files} file(s) changed)"))
+        } else {
+            Err(ToolError::Failed(format!(
+                "git apply failed (regenerate the patch against the current file): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+    }
+}
+
 /// Delete a file. Mutates the workspace.
 pub struct DeleteFileTool;
 
@@ -673,6 +740,28 @@ impl Tool for GlobTool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn apply_patch_applies_a_unified_diff() {
+        let dir = temp_dir("applypatch");
+        std::fs::write(dir.join("f.txt"), "a\nb\nc\n").unwrap();
+        let patch = "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+        let out = ApplyPatchTool
+            .run(&json!({ "patch": patch, "cwd": dir.to_str().unwrap() }))
+            .await;
+        assert!(out.is_ok(), "apply failed: {out:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "a\nB\nc\n"
+        );
+        // A patch that doesn't match the file is reported as an error (not silently dropped).
+        let bad = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-zzz\n+q\n";
+        assert!(ApplyPatchTool
+            .run(&json!({ "patch": bad, "cwd": dir.to_str().unwrap() }))
+            .await
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn apply_edits_is_atomic_and_ordered() {
