@@ -40,7 +40,7 @@ The v0.1 audit found three real gaps. All are now fixed:
 | Req | Feature | Status | Note |
 |-----|---------|--------|------|
 | FR-1 | Agent loop (stream, tools, iterate) | **done** | 10+ core tests |
-| FR-2 | Tool system (read/write/edit/list/search/shell) | **done** | shell tool + denylist + error interceptor |
+| FR-2 | Tool system (read/write/edit/list/search/shell) | **done** | shell tool + denylist + error interceptor; edit modalities: exact + whitespace-tolerant edit, atomic multi_edit, unified-diff apply_patch, cell-level notebook_edit (.ipynb) |
 | FR-3 | Multi-provider (genai) | **done** | contract-tested; 9+ providers + CLI bridge + free-tier auto-discovery |
 | FR-4 | Model Mesh routing | **done** | heuristic + `/model` in-session pin + failover + health + quota-aware |
 | FR-5 | Cost + budget | **done** | real day+month cap across sessions, hard stop, downshift, warn |
