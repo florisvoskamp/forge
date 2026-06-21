@@ -89,6 +89,48 @@ impl Tool for ReadFileTool {
     }
 }
 
+/// Whitespace-insensitive fallback for `edit_file`: when `old` doesn't match the file byte-for-byte
+/// (almost always a leading-indent / trailing-space difference), match it line-by-line ignoring each
+/// line's surrounding whitespace. Returns the edited content ONLY when exactly one contiguous block
+/// of lines matches (uniqueness preserved, so a near-miss can't hit the wrong place); otherwise
+/// `None`. `new` is inserted verbatim, keeping the matched block's trailing newline.
+fn flexible_replace(content: &str, old: &str, new: &str) -> Option<String> {
+    let old_lines: Vec<&str> = old.lines().map(str::trim).collect();
+    if old_lines.is_empty() {
+        return None;
+    }
+    // Lines WITH their `\n` terminators, so byte offsets reconstruct exactly.
+    let segs: Vec<&str> = content.split_inclusive('\n').collect();
+    if old_lines.len() > segs.len() {
+        return None;
+    }
+    let mut hits = Vec::new();
+    for i in 0..=(segs.len() - old_lines.len()) {
+        if (0..old_lines.len()).all(|j| segs[i + j].trim() == old_lines[j]) {
+            hits.push(i);
+        }
+    }
+    if hits.len() != 1 {
+        return None; // not found, or ambiguous — caller errors
+    }
+    let i = hits[0];
+    let start: usize = segs[..i].iter().map(|s| s.len()).sum();
+    let end: usize = start
+        + segs[i..i + old_lines.len()]
+            .iter()
+            .map(|s| s.len())
+            .sum::<usize>();
+    let mut replacement = new.to_string();
+    if content[start..end].ends_with('\n') && !replacement.ends_with('\n') {
+        replacement.push('\n');
+    }
+    let mut out = String::with_capacity(content.len() - (end - start) + replacement.len());
+    out.push_str(&content[..start]);
+    out.push_str(&replacement);
+    out.push_str(&content[end..]);
+    Some(out)
+}
+
 /// Hard cap on a single `read_file` result so one read can't flood the model's context. A whole
 /// file over this is truncated (head kept — imports/signatures live there) with a marker telling
 /// the model to request a specific line range instead.
@@ -205,19 +247,28 @@ impl Tool for EditFileTool {
 
         let content = tokio::fs::read_to_string(path).await?;
         let occurrences = content.matches(old).count();
-        match occurrences {
-            0 => return Err(ToolError::Failed(format!("`old` not found in {path}"))),
-            1 => {}
+        let (updated, note) = match occurrences {
+            1 => (content.replacen(old, new, 1), ""),
+            // No exact hit: the model's `old` usually differs only in indentation/whitespace.
+            // Retry with a per-line whitespace-insensitive match (still required to be UNIQUE) so a
+            // near-miss doesn't fail the edit — the #1 real-world edit-tool failure mode.
+            0 => match flexible_replace(&content, old, new) {
+                Some(u) => (u, " (matched ignoring whitespace)"),
+                None => {
+                    return Err(ToolError::Failed(format!(
+                        "`old` not found in {path} (also tried a whitespace-insensitive match; \
+                         add surrounding context so it matches exactly once)"
+                    )))
+                }
+            },
             n => {
                 return Err(ToolError::Failed(format!(
-                    "`old` is ambiguous: {n} occurrences in {path}"
+                    "`old` is ambiguous: {n} occurrences in {path} — add surrounding context"
                 )))
             }
-        }
-
-        let updated = content.replacen(old, new, 1);
+        };
         tokio::fs::write(path, &updated).await?;
-        Ok(format!("edited {path} (1 replacement)"))
+        Ok(format!("edited {path} (1 replacement){note}"))
     }
 
     async fn preview(&self, args: &Value) -> Option<FileDiff> {
@@ -225,12 +276,13 @@ impl Tool for EditFileTool {
         let old = str_arg(args, "old").ok()?;
         let new = str_arg(args, "new").ok()?;
         let content = tokio::fs::read_to_string(path).await.ok()?;
-        // Mirror run()'s exactly-one-occurrence rule; otherwise skip the diff and let run()
-        // surface the real error.
-        if content.matches(old).count() != 1 {
-            return None;
-        }
-        let updated = content.replacen(old, new, 1);
+        // Mirror run(): exact single match, else the whitespace-insensitive unique fallback; skip
+        // the diff (let run() surface the error) when neither resolves.
+        let updated = match content.matches(old).count() {
+            1 => content.replacen(old, new, 1),
+            0 => flexible_replace(&content, old, new)?,
+            _ => return None,
+        };
         Some(FileDiff {
             path: path.to_string(),
             kind: DiffKind::Modified,
@@ -527,6 +579,24 @@ impl Tool for GlobTool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn flexible_replace_matches_ignoring_whitespace_when_unique() {
+        let content = "fn a() {\n        let x = 1;\n}\n";
+        // `old` has different indentation than the file — exact match would miss.
+        let out = flexible_replace(content, "let x = 1;", "let x = 2;").unwrap();
+        assert!(out.contains("let x = 2;"), "replaced: {out:?}");
+        assert!(out.starts_with("fn a() {\n"), "rest preserved: {out:?}");
+        assert!(out.ends_with("}\n"), "trailing preserved: {out:?}");
+        // Ambiguous → None (two whitespace-equal matches).
+        let dup = "  v\n    v\n";
+        assert!(
+            flexible_replace(dup, "v", "w").is_none(),
+            "ambiguous → None"
+        );
+        // Genuinely absent → None.
+        assert!(flexible_replace(content, "let y = 9;", "z").is_none());
+    }
 
     #[test]
     fn cap_read_truncates_oversized_with_a_marker() {
