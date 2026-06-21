@@ -246,27 +246,8 @@ impl Tool for EditFileTool {
         let new = str_arg(args, "new")?;
 
         let content = tokio::fs::read_to_string(path).await?;
-        let occurrences = content.matches(old).count();
-        let (updated, note) = match occurrences {
-            1 => (content.replacen(old, new, 1), ""),
-            // No exact hit: the model's `old` usually differs only in indentation/whitespace.
-            // Retry with a per-line whitespace-insensitive match (still required to be UNIQUE) so a
-            // near-miss doesn't fail the edit — the #1 real-world edit-tool failure mode.
-            0 => match flexible_replace(&content, old, new) {
-                Some(u) => (u, " (matched ignoring whitespace)"),
-                None => {
-                    return Err(ToolError::Failed(format!(
-                        "`old` not found in {path} (also tried a whitespace-insensitive match; \
-                         add surrounding context so it matches exactly once)"
-                    )))
-                }
-            },
-            n => {
-                return Err(ToolError::Failed(format!(
-                    "`old` is ambiguous: {n} occurrences in {path} — add surrounding context"
-                )))
-            }
-        };
+        let (updated, note) = apply_edit(&content, old, new)
+            .map_err(|e| ToolError::Failed(format!("{e} (in {path})")))?;
         tokio::fs::write(path, &updated).await?;
         Ok(format!("edited {path} (1 replacement){note}"))
     }
@@ -276,13 +257,8 @@ impl Tool for EditFileTool {
         let old = str_arg(args, "old").ok()?;
         let new = str_arg(args, "new").ok()?;
         let content = tokio::fs::read_to_string(path).await.ok()?;
-        // Mirror run(): exact single match, else the whitespace-insensitive unique fallback; skip
-        // the diff (let run() surface the error) when neither resolves.
-        let updated = match content.matches(old).count() {
-            1 => content.replacen(old, new, 1),
-            0 => flexible_replace(&content, old, new)?,
-            _ => return None,
-        };
+        // Mirror run() (skip the diff and let run() surface the error when it can't apply).
+        let (updated, _) = apply_edit(&content, old, new).ok()?;
         Some(FileDiff {
             path: path.to_string(),
             kind: DiffKind::Modified,
@@ -292,6 +268,124 @@ impl Tool for EditFileTool {
             binary: false,
         })
     }
+}
+
+/// Apply one `old → new` replacement to `content`: an exact single match, else a UNIQUE
+/// whitespace-insensitive fallback ([`flexible_replace`]). Returns `(updated, note)` or a
+/// human-readable error. Shared by [`EditFileTool`] and [`MultiEditTool`].
+fn apply_edit(content: &str, old: &str, new: &str) -> Result<(String, &'static str), String> {
+    match content.matches(old).count() {
+        1 => Ok((content.replacen(old, new, 1), "")),
+        0 => flexible_replace(content, old, new)
+            .map(|u| (u, " (matched ignoring whitespace)"))
+            .ok_or_else(|| {
+                "`old` not found (also tried a whitespace-insensitive match; \
+                 add surrounding context so it matches exactly once)"
+                    .to_string()
+            }),
+        n => Err(format!(
+            "`old` is ambiguous: {n} occurrences — add surrounding context"
+        )),
+    }
+}
+
+/// Apply several `old → new` edits to ONE file in a single call. Mutates the workspace.
+pub struct MultiEditTool;
+
+#[async_trait]
+impl Tool for MultiEditTool {
+    fn name(&self) -> &str {
+        "multi_edit"
+    }
+    fn description(&self) -> &str {
+        "Apply several edits to ONE file in a single call, in order. Each edit is {old, new} with \
+         exactly edit_file's rules (each `old` exact + unique, with a whitespace-insensitive \
+         fallback). ATOMIC: applied in sequence to the in-memory file, and if ANY edit can't be \
+         applied the file is left untouched and the failing edit is reported — so partial edits \
+         never land. Prefer this over many edit_file calls when changing one file in several places."
+    }
+    fn side_effect(&self) -> SideEffect {
+        SideEffect::Write
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to edit." },
+                "edits": {
+                    "type": "array",
+                    "description": "Edits applied in order; each is {old, new} (same rules as edit_file).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old": { "type": "string" },
+                            "new": { "type": "string" }
+                        },
+                        "required": ["old", "new"]
+                    }
+                }
+            },
+            "required": ["path", "edits"]
+        })
+    }
+    async fn run(&self, args: &Value) -> Result<String, ToolError> {
+        let path = str_arg(args, "path")?;
+        let edits = multi_edit_pairs(args)?;
+        let original = tokio::fs::read_to_string(path).await?;
+        let updated = apply_edits(&original, &edits)
+            .map_err(|e| ToolError::Failed(format!("{e} (in {path}; no edits applied)")))?;
+        tokio::fs::write(path, &updated).await?;
+        Ok(format!("edited {path} ({} edits applied)", edits.len()))
+    }
+
+    async fn preview(&self, args: &Value) -> Option<FileDiff> {
+        let path = str_arg(args, "path").ok()?;
+        let edits = multi_edit_pairs(args).ok()?;
+        let original = tokio::fs::read_to_string(path).await.ok()?;
+        let updated = apply_edits(&original, &edits).ok()?;
+        Some(FileDiff {
+            path: path.to_string(),
+            kind: DiffKind::Modified,
+            old: Some(original),
+            new: Some(updated),
+            lang: lang_from_path(path),
+            binary: false,
+        })
+    }
+}
+
+/// Extract the `(old, new)` pairs from a `multi_edit` call's `edits` array.
+fn multi_edit_pairs(args: &Value) -> Result<Vec<(String, String)>, ToolError> {
+    let arr = args
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ToolError::Failed("`edits` must be an array of {old, new}".to_string()))?;
+    if arr.is_empty() {
+        return Err(ToolError::Failed("`edits` is empty".to_string()));
+    }
+    arr.iter()
+        .map(|e| {
+            let old = e.get("old").and_then(Value::as_str);
+            let new = e.get("new").and_then(Value::as_str);
+            match (old, new) {
+                (Some(o), Some(n)) => Ok((o.to_string(), n.to_string())),
+                _ => Err(ToolError::Failed(
+                    "each edit needs string `old` and `new`".to_string(),
+                )),
+            }
+        })
+        .collect()
+}
+
+/// Fold the edits over `content` in order (each on the running result), all-or-nothing: the first
+/// edit that can't apply aborts with `edit #k: <reason>` and the caller writes nothing.
+fn apply_edits(content: &str, edits: &[(String, String)]) -> Result<String, String> {
+    let mut cur = content.to_string();
+    for (k, (old, new)) in edits.iter().enumerate() {
+        let (next, _) = apply_edit(&cur, old, new).map_err(|e| format!("edit #{}: {e}", k + 1))?;
+        cur = next;
+    }
+    Ok(cur)
 }
 
 /// Delete a file. Mutates the workspace.
@@ -579,6 +673,31 @@ impl Tool for GlobTool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn apply_edits_is_atomic_and_ordered() {
+        let content = "a = 1\nb = 2\nc = 3\n";
+        // Both edits apply, in order.
+        let out = apply_edits(
+            content,
+            &[
+                ("a = 1".into(), "a = 10".into()),
+                ("c = 3".into(), "c = 30".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(out, "a = 10\nb = 2\nc = 30\n");
+        // A failing edit aborts the whole batch (atomic) and names which one.
+        let err = apply_edits(
+            content,
+            &[
+                ("a = 1".into(), "a = 10".into()),
+                ("nope".into(), "x".into()),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.starts_with("edit #2:"), "names the failing edit: {err}");
+    }
 
     #[test]
     fn flexible_replace_matches_ignoring_whitespace_when_unique() {
