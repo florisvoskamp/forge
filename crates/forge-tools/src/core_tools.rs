@@ -315,7 +315,20 @@ impl Tool for ListDirTool {
 /// Supports substring (default) or full regex matching, and an optional file-path glob filter.
 pub struct SearchTool;
 
-const SEARCH_MATCH_CAP: usize = 50;
+const SEARCH_MATCH_CAP: usize = 200;
+
+/// Directory names skipped by `search` and `glob` (in addition to all dot-dirs): heavy vendor /
+/// build / dependency trees that bury real results and aren't part of the source the agent edits.
+const SEARCH_SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "vendor",
+    "__pycache__",
+    "venv",
+    ".venv",
+];
 
 #[async_trait]
 impl Tool for SearchTool {
@@ -381,12 +394,17 @@ impl Tool for SearchTool {
             };
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') || name == "target" {
-                    continue;
+                if name.starts_with('.') {
+                    continue; // hidden files + dirs (.git, .venv, …)
                 }
                 let path = entry.path();
                 let Ok(ft) = entry.file_type() else { continue };
                 if ft.is_dir() {
+                    // Skip heavy vendor/build dirs so non-Rust repos (node_modules, venv, …) don't
+                    // bury real results. (`target` is now skipped only as a directory.)
+                    if SEARCH_SKIP_DIRS.contains(&name.as_str()) {
+                        continue;
+                    }
                     stack.push(path);
                 } else {
                     let rel = path.strip_prefix(root).unwrap_or(&path);
@@ -475,12 +493,17 @@ impl Tool for GlobTool {
             };
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') || name == "target" {
-                    continue;
+                if name.starts_with('.') {
+                    continue; // hidden files + dirs (.git, .venv, …)
                 }
                 let path = entry.path();
                 let Ok(ft) = entry.file_type() else { continue };
                 if ft.is_dir() {
+                    // Skip heavy vendor/build dirs so non-Rust repos (node_modules, venv, …) don't
+                    // bury real results. (`target` is now skipped only as a directory.)
+                    if SEARCH_SKIP_DIRS.contains(&name.as_str()) {
+                        continue;
+                    }
                     stack.push(path);
                 } else {
                     let rel = path.strip_prefix(root).unwrap_or(&path);
@@ -623,6 +646,8 @@ mod tests {
         std::fs::write(dir.join("target/t.txt"), "find ME").unwrap();
         std::fs::create_dir(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git/g.txt"), "find ME").unwrap();
+        std::fs::create_dir(dir.join("node_modules")).unwrap();
+        std::fs::write(dir.join("node_modules/n.txt"), "find ME").unwrap();
 
         let out = SearchTool
             .run(&json!({ "query": "find ME", "path": dir.to_str().unwrap() }))
@@ -632,6 +657,7 @@ mod tests {
         assert!(out.contains("a.txt:2: find ME here"), "got:\n{out}");
         assert!(!out.contains("target"), "must skip target/:\n{out}");
         assert!(!out.contains("g.txt"), "must skip .git/:\n{out}");
+        assert!(!out.contains("n.txt"), "must skip node_modules/:\n{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
