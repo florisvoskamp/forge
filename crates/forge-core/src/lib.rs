@@ -81,6 +81,21 @@ Communication:
 - When the task is done, stop and give a short summary of what changed. Don't ask whether to \
 proceed on work you can just do.";
 
+/// Injected for the self-review pass (mesh.self_review): the same model critically re-checks the
+/// edits it just made before the turn ends. Framed to FIND real defects (the common failure is a
+/// fix that's plausible but wrong/incomplete), but to stop cleanly when the work is sound — so it
+/// corrects hard cases without churning correct ones.
+const SELF_REVIEW_PROMPT: &str = "\
+Before finishing, review the changes you just made as a skeptical senior engineer seeing them for \
+the first time. Re-read the original task, then check your diff against it:
+- Does it actually solve the stated problem — the whole problem, not just the happy path?
+- Edge cases, error handling, off-by-one, wrong/edge inputs, and any case the task hints at.
+- Did you edit the right place, match existing conventions, and avoid breaking nearby behavior?
+- Is anything missing (a needed call site, a test, a related code path)?
+
+If you find a genuine problem, FIX it now with the tools. If the change is correct and complete, \
+say so in one line and stop — do NOT make changes for their own sake or second-guess a sound fix.";
+
 /// Whether a `shell` tool result reports a failure (non-zero exit, signal, timeout, or spawn
 /// error). The tool's first line is `shell: exit N in …`, `shell: timed out …`, `shell: error: …`,
 /// or `shell: failed to start …`; only `exit 0` is success.
@@ -2436,6 +2451,32 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                 self.presenter
                     .emit(PresenterEvent::Tasks(self.tasks.clone()));
             }
+        }
+
+        // ── Self-review pass (mesh.self_review) ───────────────────────────────────────────────
+        // One bounded round where the SAME model re-examines the edits it just made against the
+        // original task and fixes any bug/incompleteness — the self-correction leverage a
+        // single-pass harness lacks, needing no external tools or test env. Fires only on edit
+        // turns; runs BEFORE autofix so any fix it makes is then lint/test-checked too.
+        if self.config.mesh.self_review && self.edits_this_turn > 0 {
+            self.presenter.emit(PresenterEvent::Warning(
+                "self-review: re-checking the changes against the task".to_string(),
+            ));
+            self.transcript.push(Message::system(SELF_REVIEW_PROMPT));
+            let rv_specs = self.tool_specs();
+            // None decision: no failover/routing churn — keep the same model, like the autofix re-run.
+            let rv = self
+                .run_model_loop(
+                    active_model.clone(),
+                    &rv_specs,
+                    None,
+                    max_steps,
+                    stream_idle,
+                )
+                .await?;
+            // Keep the original answer text: the review fixes code, it doesn't re-answer the user.
+            context_tokens = rv.context_tokens;
+            active_model = rv.active_model;
         }
 
         // ── Autofix self-healing loop (autofix.md) ────────────────────────────────────────────

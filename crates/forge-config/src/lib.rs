@@ -741,6 +741,12 @@ pub struct MeshConfig {
     /// Frugal caps output tokens at 2048; Strict caps at 1024 and routes to free/sub only.
     #[serde(default)]
     pub credit_mode: CreditMode,
+    /// Self-review pass: after a turn makes edits, the SAME model critically re-examines its own
+    /// changes against the task and fixes any bug/incompleteness — one bounded round, no external
+    /// tools or test env needed. This is the leverage a single-pass harness lacks; on by default
+    /// because correctness beats the one extra call it costs (only fires on edit turns).
+    #[serde(default = "default_self_review")]
+    pub self_review: bool,
     /// Architect mode (dual-model pipeline): when true, each turn runs a plan phase on a strong
     /// model then an apply phase on a cheaper one. Off = single-model turns (default).
     #[serde(default)]
@@ -815,6 +821,10 @@ pub fn benchmark_api_key() -> Option<String> {
 }
 
 fn default_failover() -> bool {
+    true
+}
+
+fn default_self_review() -> bool {
     true
 }
 
@@ -1003,6 +1013,7 @@ impl Default for Config {
                 disabled: Vec::new(),
                 max_output_tokens: default_max_output_tokens(),
                 credit_mode: CreditMode::Normal,
+                self_review: default_self_review(),
                 architect_mode: false,
                 architect_model: None,
                 editor_model: None,
@@ -1591,6 +1602,19 @@ mod tests {
         // provider_of pulls the right prefix from a namespaced model id.
         assert_eq!(provider_of("groq::llama-3.3-70b-versatile"), "groq");
         assert_eq!(provider_of("opencode_go::deepseek-v4-flash"), "opencode_go");
+    }
+
+    #[test]
+    fn self_review_is_on_by_default() {
+        // The self-review leverage is on out-of-the-box (Rust default) AND when a config omits it.
+        assert!(Config::default().mesh.self_review, "Rust default");
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(figment::providers::Toml::string(
+                "[mesh]\nfailover = true\n",
+            ))
+            .extract()
+            .unwrap();
+        assert!(cfg.mesh.self_review, "absent in TOML → serde default true");
     }
 
     #[test]
