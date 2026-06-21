@@ -257,6 +257,18 @@ pub fn render_json(id: &str, entries: &[ReplayEntry]) -> String {
     serde_json::to_string_pretty(&obj).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
 }
 
+/// The original user prompts of a session, in turn order — the input to re-execution
+/// (`forge replay <id> --rerun`). Only `User` turns are real prompts; assistant/tool entries
+/// are model output. Blank entries are dropped so an empty turn can't feed the agent an empty
+/// prompt.
+pub fn user_prompts(entries: &[ReplayEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| e.role == Role::User && !e.content.trim().is_empty())
+        .map(|e| e.content.clone())
+        .collect()
+}
+
 /// Summary-level diff between two sessions.
 pub fn render_diff(id_a: &str, id_b: &str, d: &SessionDiff) -> String {
     let mut out = String::new();
@@ -342,6 +354,17 @@ mod tests {
         assert_eq!(s.models, vec!["openai::gpt-4o"]);
         assert!((s.total_cost - 0.05).abs() < 1e-9);
         assert_eq!(s.duration_secs(), Some(3));
+    }
+
+    #[test]
+    fn user_prompts_keeps_only_nonblank_user_turns_in_order() {
+        let entries = vec![
+            entry(0, Role::User, "first task", None, None),
+            entry(1, Role::Assistant, "working on it", Some("m"), Some(0.01)),
+            entry(2, Role::User, "   ", None, None), // blank turn — dropped
+            entry(3, Role::User, "second task", None, None),
+        ];
+        assert_eq!(user_prompts(&entries), vec!["first task", "second task"]);
     }
 
     #[test]

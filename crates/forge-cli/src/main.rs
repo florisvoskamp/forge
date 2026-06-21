@@ -219,6 +219,11 @@ enum Command {
         /// Only valid with a single session id.
         #[arg(long)]
         json: bool,
+        /// Re-execute the session's user prompts on the CURRENT model/mesh in a fresh session,
+        /// then diff the new run against the original (reproducibility audit). Tools run under
+        /// your normal permission mode, exactly as `forge run` would. Single id only.
+        #[arg(long)]
+        rerun: bool,
     },
     /// Inspect past assay runs stored in the database.
     Assay {
@@ -722,7 +727,13 @@ async fn main() -> Result<()> {
             chat(mock, mode, resume_mode, plain, model).await
         }
         Command::Sessions => sessions(),
-        Command::Replay { ids, json } => replay_cmd(&ids, json),
+        Command::Replay { ids, json, rerun } => {
+            if rerun {
+                replay_rerun_cmd(&ids).await
+            } else {
+                replay_cmd(&ids, json)
+            }
+        }
         Command::Assay { sub } => assay_cmd(sub).await,
         Command::Bench { sub } => match sub {
             BenchCmd::Swe {
@@ -1668,6 +1679,70 @@ fn replay_cmd(ids: &[String], json: bool) -> Result<()> {
         }
         _ => anyhow::bail!("usage: forge replay <id> [<id-to-diff-against>]"),
     }
+    Ok(())
+}
+
+/// `forge replay <id> --rerun` — re-execute a past session's user prompts on the CURRENT
+/// model/mesh in a fresh session, then diff the new run against the original. This is the
+/// "true model re-execution" half of session replay (the rest is read-only reconstruction):
+/// it answers "would today's model/config solve this the same way?" — auditable and
+/// reproducible. Tools run under the normal permission mode, exactly as `forge run` does, so a
+/// re-run is no more privileged than re-typing the prompts yourself.
+async fn replay_rerun_cmd(ids: &[String]) -> Result<()> {
+    let [one] = ids else {
+        anyhow::bail!("--rerun takes exactly one session id");
+    };
+    let store = open_store()?;
+    let mut matches = store
+        .matching_session_ids(one)
+        .with_context(|| format!("resolving session {one}"))?;
+    let id = match matches.len() {
+        0 => anyhow::bail!("no session matches '{one}' — see `forge sessions`"),
+        1 => matches.remove(0),
+        n => anyhow::bail!("'{one}' is ambiguous ({n} sessions) — use more characters"),
+    };
+    let original = store.load_replay(&id).context("loading original session")?;
+    let prompts = replay::user_prompts(&original);
+    if prompts.is_empty() {
+        anyhow::bail!(
+            "session {} has no user prompts to re-run",
+            &id[..id.len().min(8)]
+        );
+    }
+
+    // Re-run under the user's configured permission mode (mock=false): tools are gated exactly
+    // as a normal `forge run`, so re-execution is no more privileged than re-typing the prompts.
+    let mut session = build_session(false, None, false, None, None)
+        .await
+        .context("building the re-run session")?;
+    let new_id = session.session_id().to_string();
+    eprintln!(
+        "re-running {} prompt(s) from {} into fresh session {} …\n",
+        prompts.len(),
+        &id[..id.len().min(8)],
+        &new_id[..new_id.len().min(8)]
+    );
+    for (i, prompt) in prompts.iter().enumerate() {
+        eprintln!("── re-run turn {}/{} ──", i + 1, prompts.len());
+        session
+            .run_turn(prompt)
+            .await
+            .with_context(|| format!("re-running turn {}", i + 1))?;
+    }
+    drop(session); // release the session's store handle before we read the new record back
+
+    let store = open_store()?;
+    let replayed = store
+        .load_replay(&new_id)
+        .context("loading the re-run session")?;
+    let d = replay::diff(&original, &replayed);
+    let fa = &id[..id.len().min(8)];
+    let fb = &new_id[..new_id.len().min(8)];
+    print!("\n{}", replay::render_diff(fa, fb, &d));
+    print!(
+        "\n{}",
+        replay::render_turn_diff(fa, fb, &original, &replayed)
+    );
     Ok(())
 }
 

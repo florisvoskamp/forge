@@ -106,7 +106,7 @@ wave approaches.
 | Feature | What | Source |
 |---------|------|--------|
 | **Skills/agents marketplace** | Publish/import skills, commands, agents — "npm for AI workflows" (25% rev share). | Helm note; designed to plug into the command/skill system |
-| **Session replay** — **done** | Record prompts + model versions + outputs; replay + diff; auditable, reproducible AI. **Shipped:** `forge replay <id>` (turn-by-turn transcript) + `forge replay <a> <b>` (summary diff + per-turn content diff) + `/replay` in-session chat command + `forge replay <id> --json` (JSON export). **Deferred:** true model re-execution. | [session-replay.md](features/session-replay.md); Helm note |
+| **Session replay** — **done** | Record prompts + model versions + outputs; replay + diff; auditable, reproducible AI. **Shipped:** `forge replay <id>` (turn-by-turn transcript) + `forge replay <a> <b>` (summary diff + per-turn content diff) + `/replay` in-session chat command + `forge replay <id> --json` (JSON export) + `forge replay <id> --rerun` (re-execute the recorded user prompts on the current model/mesh in a fresh session, then auto-diff against the original — tools gated by the normal permission mode). | [session-replay.md](features/session-replay.md); Helm note |
 | **Import / migration layer** | **Claude + Codex done** (`forge import claude` / `codex`) | Auto-detect + import from Claude Code (skills/commands/agents), Codex CLI. **Shipped:** `forge import claude [--project]` copies `~/.claude/{commands,skills,agents}` (agents share the same .md format so it's a direct copy), and `forge import codex [--project]` copies `~/.codex/prompts/*.md` as commands. **Deferred:** Claude hooks/memory/settings import; Aider/Cursor/Continue. | Helm note; prerequisite for CC-compat in skills + MCP specs |
 | **Natural-language shell** — **done** | `forge nl "<question>"` — interprets plain-English query, runs appropriate shell commands, explains results. System prompt + git/cwd context injected; uses the existing `run_turn_with` guidance path. | Helm note |
 | **Shell error interceptor** — **done** | Command fails → AI auto-explains + offers a fix. **Shipped:** trivial-tier diagnosis on shell failure, transcript injection, one-key F to populate fix command, usage recorded against budget. **Deferred:** pattern cache. | [shell-error-interceptor.md](features/shell-error-interceptor.md); Helm note |
@@ -124,7 +124,7 @@ All Wave 1–3 features are shipped. Wave 4 items are the remaining moonshot / m
 Wave 1 (P0) ✓  shell-tool · permission-rules · budget-cap · provider-tests · tui-rich-rendering
 Wave 2 (P1) ✓  subagent-orchestration · Assay · commands/skills · MCP+OAuth · Lattice (full) · web-tools · tasks
 Wave 3 (P2) ✓  hooks · compaction+persist · ask_user · /model pin · banner/statusline · token-gauge
-Wave 4 (P3)    marketplace · session-replay (MVP ✓) · import/migration (Claude+Codex+Cursor+Aider ✓) ·
+Wave 4 (P3)    marketplace · session-replay (✓ incl. --rerun re-execution) · import/migration (Claude+Codex+Cursor+Aider ✓) ·
                NL shell ✓ · shell-error-interceptor (MVP ✓) · voice · more-providers · team-tier
 ```
 
