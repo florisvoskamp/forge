@@ -1,7 +1,9 @@
 # Session replay — auditable, reproducible runs
 
-> Status: **MVP done** — `forge replay <id>` (transcript) + `forge replay <a> <b>` (diff),
-> read-only over the persisted record. True model re-execution is deferred.
+> Status: **done** — `forge replay <id>` (transcript) + `forge replay <a> <b>` (diff),
+> read-only over the persisted record, plus `forge replay <id> --rerun` (true model
+> re-execution: re-issue the recorded prompts on the current model/mesh and diff vs. the
+> original).
 
 ## Why
 
@@ -55,8 +57,18 @@ turn does — every message (`role`, `content`, `model`, tool calls, timestamp) 
   role, created_at, content, model, token counts, cost_usd, and tool_calls. Suitable for
   external auditing, piping to `jq`, or feeding into analysis scripts.
 
-## Deferred
+## Re-execution (`--rerun`)
 
-- **True re-execution** — re-issue the recorded prompts against the recorded model versions
-  and diff the *new* output vs. the recorded one. Non-deterministic and needs live keys, so
-  it can't be verified offline; the inspect/compare half is the verifiable, high-value 80%.
+`forge replay <id> --rerun` re-issues the session's recorded **user** prompts (in turn order)
+on the *current* model/mesh in a fresh session, then auto-diffs the new run against the
+original (summary + per-turn content). This answers "would today's model/config solve this the
+same way?" — the reproducibility/audit half of the feature.
+
+- Tools run under the **normal permission mode** (e.g. `--mode bypass` to run unattended), so a
+  re-run is no more privileged than re-typing the prompts into `forge run`.
+- Only user turns are replayed; the model regenerates its own responses and tool calls.
+- Inherently non-deterministic (and costs live tokens), which is why it's opt-in and separate
+  from the always-safe read-only inspect/compare path.
+
+The pure prompt-extraction (`replay::user_prompts`) is unit-tested; the orchestration reuses
+the same `build_session` + `run_turn` path as `forge run`.
