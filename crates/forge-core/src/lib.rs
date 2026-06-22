@@ -909,6 +909,17 @@ impl Session {
         &self.id
     }
 
+    /// Persist the TUI view snapshot (opaque JSON) for this session so a resume restores the
+    /// on-screen activity/viewer state. Best-effort — a store error is ignored.
+    pub fn save_view_snapshot(&self, json: &str) {
+        let _ = self.store.update_session_view_snapshot(&self.id, json);
+    }
+
+    /// The TUI view snapshot persisted for this session, if any (set on the last turn).
+    pub fn view_snapshot(&self) -> Option<String> {
+        self.store.session_view_snapshot(&self.id).ok().flatten()
+    }
+
     /// The most recent assistant message's text, if any — used by `/loop` to decide whether the
     /// model signalled completion.
     pub fn last_assistant_text(&self) -> Option<&str> {

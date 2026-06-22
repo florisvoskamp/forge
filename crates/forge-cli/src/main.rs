@@ -4189,6 +4189,11 @@ async fn run_chat_tui(
             let n = items.len();
             app.replay_history(&items);
             app.push_resume_separator(&format!("— resumed session {sid8} ({n} entries) —"));
+            // Restore the on-screen view (activity panel, viewer, scroll) saved on the last turn,
+            // so resume reopens exactly where the user left off.
+            if let Some(json) = s.view_snapshot() {
+                app.restore_view_json(&json);
+            }
             // If this session was compacted, the model only sees a summary. Offer the choice.
             offer_resume_choice = s.was_compacted();
         }
@@ -5236,6 +5241,11 @@ async fn run_chat_tui(
                 busy = false;
                 turn_handle = None;
                 dirty = true;
+                // Persist the on-screen view (activity panel, viewer, scroll) as of this completed
+                // turn so a later resume restores it exactly. Skipped when there's nothing to save.
+                if let Some(json) = app.view_snapshot_json() {
+                    session.lock().await.save_view_snapshot(&json);
+                }
                 // `/loop`: if this was a loop turn, decide whether to run another iteration.
                 if let Some(ls) = loop_state.take() {
                     if ls.gen == g {
@@ -5498,6 +5508,10 @@ async fn run_chat_tui(
     {
         let (hooks, sid) = {
             let s = session.lock().await;
+            // Save the final view on clean exit so resuming this session restores the screen.
+            if let Some(json) = app.view_snapshot_json() {
+                s.save_view_snapshot(&json);
+            }
             (s.hooks().to_vec(), s.session_id().to_string())
         };
         forge_core::hooks::run_session_hooks(&hooks, forge_config::HookEvent::SessionEnd, &sid)
@@ -6703,11 +6717,11 @@ async fn picker_accept(
 ) -> Result<()> {
     match kind {
         forge_tui::PickerKind::Sessions => {
-            let (items, compacted) = {
+            let (items, compacted, view) = {
                 let mut s = session.lock().await;
                 s.reset_resumed(&row.id)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                (s.replay_items_full(), s.was_compacted())
+                (s.replay_items_full(), s.was_compacted(), s.view_snapshot())
             };
             tui.clear_screen();
             app.clear_transcript();
@@ -6716,6 +6730,10 @@ async fn picker_accept(
                 row.id.chars().take(8).collect::<String>()
             ));
             app.replay_history(&items);
+            // Restore the saved on-screen view (activity panel, viewer, scroll) for this session.
+            if let Some(json) = view {
+                app.restore_view_json(&json);
+            }
             // If it was compacted, immediately offer compacted-vs-full for the model's context.
             if compacted {
                 open_resume_choice_picker(app);

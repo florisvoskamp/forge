@@ -160,6 +160,7 @@ impl Store {
             "ALTER TABLE message ADD COLUMN tool_call_id TEXT",
             "ALTER TABLE message ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE session ADD COLUMN parent_session_id TEXT",
+            "ALTER TABLE session ADD COLUMN view_snapshot TEXT",
             "ALTER TABLE lattice_node ADD COLUMN pagerank REAL NOT NULL DEFAULT 0.0",
         ] {
             let _ = conn.execute(stmt, []);
@@ -208,6 +209,26 @@ impl Store {
         self.lock()?.execute(
             "UPDATE session SET permission_mode = ?2, updated_at = strftime('%s','now') WHERE id = ?1",
             (session_id, mode),
+        )?;
+        Ok(())
+    }
+
+    /// A session's persisted TUI view snapshot (opaque JSON), if one was saved. Used to restore the
+    /// exact on-screen state (activity panel, viewer, scroll) when the session is resumed.
+    pub fn session_view_snapshot(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self.lock()?.query_row(
+            "SELECT view_snapshot FROM session WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Persist a session's TUI view snapshot (opaque JSON). Written at the end of each completed
+    /// turn and on clean exit so a resume restores the screen as of the last prompt.
+    pub fn update_session_view_snapshot(&self, session_id: &str, json: &str) -> Result<()> {
+        self.lock()?.execute(
+            "UPDATE session SET view_snapshot = ?2, updated_at = strftime('%s','now') WHERE id = ?1",
+            (session_id, json),
         )?;
         Ok(())
     }
@@ -1691,6 +1712,21 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_snapshot_persists_per_session() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("/tmp", "default").unwrap();
+        // Absent until written.
+        assert_eq!(store.session_view_snapshot(&sid).unwrap(), None);
+        store
+            .update_session_view_snapshot(&sid, r#"{"viewer":{"selected":2}}"#)
+            .unwrap();
+        assert_eq!(
+            store.session_view_snapshot(&sid).unwrap().as_deref(),
+            Some(r#"{"viewer":{"selected":2}}"#)
+        );
+    }
 
     #[test]
     fn persist_a_turn() {

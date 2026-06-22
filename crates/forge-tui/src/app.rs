@@ -11,6 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
 use ratatui::Frame;
+use serde::{Deserialize, Serialize};
 
 use crate::{PresenterEvent, QChoice};
 
@@ -471,7 +472,7 @@ pub struct TranscriptView {
 
 /// State of the in-loop activity transcript viewer (full-screen mode). Selection + scroll position;
 /// `scroll == usize::MAX / 2` is the "tail" sentinel, clamped to the real max at render time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewerState {
     /// Index into the activity list (0 = main chat, then subagents, then critics).
     pub selected: usize,
@@ -489,6 +490,36 @@ impl Default for ViewerState {
             follow: true,
         }
     }
+}
+
+/// A serializable snapshot of the live TUI view (activity panel + viewer + scroll), persisted to the
+/// session at the end of each turn so a resume restores the exact on-screen state. The main
+/// conversation transcript is NOT included — it's already rehydrated from the message history on
+/// resume; this captures only the ephemeral view that history doesn't carry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ViewSnapshot {
+    pub subagents: Vec<SubagentSnapshot>,
+    pub assay_critics: Vec<forge_types::AssayCriticRow>,
+    pub assay_verifying: Option<usize>,
+    pub tasks: Vec<forge_types::TodoItem>,
+    pub activity_focused: bool,
+    pub activity_idx: usize,
+    pub viewer: Option<ViewerState>,
+    pub transcript_scroll: usize,
+    pub transcript_follow: bool,
+}
+
+/// Serializable form of a subagent row (the live `SubRow` isn't serde and is private).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubagentSnapshot {
+    pub id: String,
+    pub agent: String,
+    pub task: String,
+    pub model: Option<String>,
+    pub last: String,
+    pub log: Vec<String>,
+    pub done: bool,
+    pub cost: f64,
 }
 
 /// A keystroke, decoupled from crossterm so input handling is testable.
@@ -1509,6 +1540,83 @@ impl App {
         self.fold_main_log(&lines);
     }
 
+    /// Serialize the live view (activity panel, viewer, scroll, tasks) to JSON for session storage.
+    /// Returns `None` when there's nothing worth persisting (no activity, no viewer, no tasks) so a
+    /// plain chat session doesn't write an empty blob every turn.
+    pub fn view_snapshot_json(&self) -> Option<String> {
+        if self.subagents.is_empty()
+            && self.assay_critics.is_empty()
+            && self.tasks.is_empty()
+            && self.viewer.is_none()
+        {
+            return None;
+        }
+        serde_json::to_string(&self.view_snapshot()).ok()
+    }
+
+    /// Restore a view previously captured by [`view_snapshot_json`] (best-effort; malformed or
+    /// stale JSON is ignored). Called on resume after the transcript has been replayed.
+    pub fn restore_view_json(&mut self, json: &str) {
+        if let Ok(snap) = serde_json::from_str::<ViewSnapshot>(json) {
+            self.restore_view(snap);
+        }
+    }
+
+    fn view_snapshot(&self) -> ViewSnapshot {
+        ViewSnapshot {
+            subagents: self
+                .subagents
+                .iter()
+                .map(|r| SubagentSnapshot {
+                    id: r.id.clone(),
+                    agent: r.agent.clone(),
+                    task: r.task.clone(),
+                    model: r.model.clone(),
+                    last: r.last.clone(),
+                    log: r.log.clone(),
+                    done: r.done,
+                    cost: r.cost,
+                })
+                .collect(),
+            assay_critics: self.assay_critics.clone(),
+            assay_verifying: self.assay_verifying,
+            tasks: self.tasks.clone(),
+            activity_focused: self.activity_focused,
+            activity_idx: self.activity_idx,
+            viewer: self.viewer.clone(),
+            transcript_scroll: self.transcript_scroll,
+            transcript_follow: self.transcript_follow,
+        }
+    }
+
+    fn restore_view(&mut self, s: ViewSnapshot) {
+        self.subagents = s
+            .subagents
+            .into_iter()
+            .map(|r| SubRow {
+                id: r.id,
+                agent: r.agent,
+                task: r.task,
+                model: r.model,
+                last: r.last,
+                log: r.log,
+                done: r.done,
+                cost: r.cost,
+            })
+            .collect();
+        self.assay_critics = s.assay_critics;
+        self.assay_verifying = s.assay_verifying;
+        if !s.tasks.is_empty() {
+            self.tasks = s.tasks;
+        }
+        self.activity_focused = s.activity_focused;
+        self.activity_idx = s.activity_idx;
+        self.viewer = s.viewer;
+        self.transcript_scroll = s.transcript_scroll;
+        self.transcript_follow = s.transcript_follow;
+        self.clamp_activity_selection();
+    }
+
     /// Open the in-loop activity viewer at `selected` (full-screen mode). Renders over the whole
     /// frame using the main terminal — no nested alternate screen.
     pub fn open_viewer(&mut self, selected: usize) {
@@ -1578,10 +1686,17 @@ impl App {
         true
     }
 
-    /// Clear the full-screen transcript (`/clear`): wipe the rendered log and re-anchor at the tail.
-    /// The session/transcript on disk are untouched — this only clears what's drawn.
+    /// Clear the full-screen transcript (`/clear`, `/new`): wipe the rendered log, the activity
+    /// panel, and the viewer, re-anchoring at the tail. The session/transcript on disk are
+    /// untouched — this only resets what's drawn (and what a snapshot would capture).
     pub fn clear_transcript(&mut self) {
         self.main_log.clear();
+        self.subagents.clear();
+        self.assay_critics.clear();
+        self.assay_verifying = None;
+        self.viewer = None;
+        self.activity_focused = false;
+        self.activity_idx = 0;
         self.transcript_scroll = 0;
         self.transcript_follow = true;
     }
@@ -4512,5 +4627,39 @@ mod tests {
         assert!(app.viewer.is_none());
         // Closed viewer ignores keys (not consumed).
         assert!(!app.viewer_key(KeyKind::Down));
+    }
+
+    #[test]
+    fn view_snapshot_round_trips_activity_and_viewer() {
+        let mut app = App {
+            fullscreen: true,
+            ..Default::default()
+        };
+        app.apply(crate::PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "general".into(),
+            task: "scan".into(),
+            model: Some("opus".into()),
+        });
+        app.apply(crate::PresenterEvent::SubagentProgress {
+            id: "a".into(),
+            snippet: "working\n".into(),
+        });
+        app.open_viewer(1);
+        let json = app.view_snapshot_json().expect("activity → snapshot");
+
+        // A fresh app restores the same activity list + open viewer.
+        let mut restored = App::default();
+        restored.restore_view_json(&json);
+        assert_eq!(restored.activity_len(), 2, "main + 1 subagent");
+        assert_eq!(restored.viewer.as_ref().unwrap().selected, 1);
+        let views = restored.activity_views();
+        assert!(views[1]
+            .lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("working"))));
+
+        // A plain session (no activity / viewer / tasks) writes nothing.
+        assert!(App::default().view_snapshot_json().is_none());
     }
 }
