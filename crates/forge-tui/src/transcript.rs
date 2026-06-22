@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn long_lines_wrap_to_width() {
         let long = "x".repeat(200);
-        let vs = vec![TranscriptView {
+        let view = TranscriptView {
             kind: ActivityKind::MainChat,
             title: "main chat".into(),
             subtitle: String::new(),
@@ -394,9 +394,9 @@ mod tests {
             cost: 0.0,
             lines: vec![TextLine::from(Span::raw(long))],
             line_count: 1,
-        }];
+        };
         // One 200-char logical line wraps into several visual rows at width 40.
-        let wrapped = wrap_lines(&vs[0].lines, 39);
+        let wrapped = wrap_lines(&view.lines, 39);
         assert!(wrapped.len() >= 5, "wrapped into {} rows", wrapped.len());
     }
 }
