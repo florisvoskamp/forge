@@ -408,8 +408,15 @@ impl ForgeMcp {
             }
         };
         let mut on_event = |ev: subagent::Lifecycle| match ev {
-            subagent::Lifecycle::Start { id, agent, task } => {
-                write(serde_json::json!({"k":"start","id":id,"agent":agent,"task":task}));
+            subagent::Lifecycle::Start {
+                id,
+                agent,
+                task,
+                model,
+            } => {
+                write(
+                    serde_json::json!({"k":"start","id":id,"agent":agent,"task":task,"model":model}),
+                );
             }
             subagent::Lifecycle::Progress { id, snippet } => {
                 write(serde_json::json!({"k":"progress","id":id,"snippet":snippet}));

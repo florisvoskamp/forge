@@ -11,6 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
 use ratatui::Frame;
+use serde::{Deserialize, Serialize};
 
 use crate::{PresenterEvent, QChoice};
 
@@ -56,7 +57,11 @@ pub const STATUS_H: u16 = 1;
 pub const LIVE_H: u16 = 14;
 /// Max task / running-subagent rows shown in their sticky panels before summarizing the overflow.
 const TASKS_PANEL_MAX: usize = 6;
-const SUBAGENTS_PANEL_MAX: usize = 4;
+/// Max entry rows shown in the sticky activity panel before summarizing the overflow.
+const ACTIVITY_PANEL_MAX: usize = 8;
+/// Max styled lines retained for the "main chat" full-screen view (older lines drop off the front;
+/// the terminal's native scrollback still holds the complete history).
+const MAIN_LOG_MAX: usize = 5000;
 
 /// The Mesh routing decision currently displayed.
 #[derive(Debug, Clone, Default)]
@@ -292,11 +297,29 @@ pub struct App {
     /// A shell fix command from the last shell diagnosis. Pressing F (idle only) populates
     /// the input with this command for the user to review before submitting.
     pub pending_shell_fix: Option<String>,
-    /// When true, the subagent picker overlay is shown in the stream area (opened by Ctrl+O when
-    /// multiple subagents are in the current batch). ↑↓ navigate, Enter opens transcript, Esc closes.
-    pub subagent_picking: bool,
-    /// The currently highlighted row in the subagent picker.
-    pub subagent_pick_idx: usize,
+    /// When true, the sticky activity panel has keyboard focus: ↑↓ move the selection, Enter opens
+    /// the selected entry's full-screen transcript, Esc unfocuses. Toggled by Ctrl+O.
+    pub activity_focused: bool,
+    /// The highlighted row in the activity panel (0 = main chat, then subagents, then critics).
+    pub activity_idx: usize,
+    /// Full styled transcript of the main conversation, mirrored from the scrollback outbox so the
+    /// activity viewer can show "main chat" full-screen. Bounded to [`MAIN_LOG_MAX`] lines.
+    main_log: Vec<TextLine<'static>>,
+    /// True when the chat renders on the alternate screen (full-screen): the transcript is drawn
+    /// from [`main_log`] into a scrollable region and the panels are pinned at the bottom. When
+    /// false (inline mode), finalized lines flow into the terminal's native scrollback instead and
+    /// only the small pinned live region is drawn. Set once at startup.
+    pub fullscreen: bool,
+    /// Full-screen transcript scroll offset, in wrapped rows from the top. Only meaningful when
+    /// [`fullscreen`] is set.
+    pub transcript_scroll: usize,
+    /// While true, the full-screen transcript auto-scrolls to the tail as new lines arrive (a
+    /// normal terminal). Paging up pauses it; paging to the bottom (or End) resumes it.
+    pub transcript_follow: bool,
+    /// The in-loop activity transcript viewer, open while `Some` (full-screen mode only). It renders
+    /// over the whole frame using the MAIN terminal — no nested alternate screen — so it can never
+    /// collide with the chat. Inline mode uses the separate-alt-screen `run_transcript_viewer`.
+    pub viewer: Option<ViewerState>,
     /// The `/usage` overlay state.
     pub usage_overlay: UsageOverlay,
     /// The `/mesh` routing-inspector overlay state.
@@ -383,6 +406,8 @@ struct SubRow {
     id: String,
     agent: String,
     task: String,
+    /// The model this child routed to (shown in the activity panel). `None` until known.
+    model: Option<String>,
     /// Trailing edge of the child's streamed activity (RFC subagent-orchestration Phase 3b).
     last: String,
     /// Recent progress snippets, newest last, for the expandable detail view. Bounded so a chatty
@@ -392,15 +417,109 @@ struct SubRow {
     cost: f64,
 }
 
-/// An owned snapshot of one subagent for the full-screen transcript browser ([`App::subagent_views`]).
+/// What an [`ActivityRow`] / [`TranscriptView`] represents in the unified activity list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    /// The main conversation (top-level transcript).
+    MainChat,
+    /// A spawned child agent.
+    Subagent,
+    /// An assay critic.
+    AssayCritic,
+}
+
+/// Run state of one activity entry, kind-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityStatus {
+    Running,
+    Done,
+    Skipped,
+}
+
+/// A cheap, allocation-light row for the sticky activity panel: metadata only, no transcript lines.
+/// Built every frame, so it must NOT clone the (potentially large) transcript — that's deferred to
+/// [`App::activity_views`], which only runs when the full-screen viewer is open.
 #[derive(Debug, Clone)]
-pub struct SubagentView {
+pub struct ActivitySummary {
+    pub kind: ActivityKind,
+    pub title: String,
+    pub subtitle: String,
+    pub model: Option<String>,
+    pub status: ActivityStatus,
+    pub cost: f64,
+    pub line_count: usize,
+}
+
+/// One owned snapshot in the unified activity viewer: main chat, a subagent, or an assay critic.
+/// Carries pre-styled transcript lines so the full-screen viewer renders them exactly like the
+/// main chat (markdown + role coloring), wrapped to the terminal width.
+#[derive(Debug, Clone)]
+pub struct TranscriptView {
+    pub kind: ActivityKind,
+    /// Display title — "main chat", the agent name, or the critic lens.
+    pub title: String,
+    /// One-line subtitle: the task (subagent), the focus (critic), or empty (main chat).
+    pub subtitle: String,
+    /// The model this entry routed to, if known.
+    pub model: Option<String>,
+    pub status: ActivityStatus,
+    pub cost: f64,
+    /// The full transcript, pre-styled and ready to wrap+render in the viewer.
+    pub lines: Vec<TextLine<'static>>,
+    /// Plain-text count of source entries (for the panel's "N lines" hint).
+    pub line_count: usize,
+}
+
+/// State of the in-loop activity transcript viewer (full-screen mode). Selection + scroll position;
+/// `scroll == usize::MAX / 2` is the "tail" sentinel, clamped to the real max at render time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewerState {
+    /// Index into the activity list (0 = main chat, then subagents, then critics).
+    pub selected: usize,
+    /// Wrapped-row offset from the top; the tail sentinel while `follow`.
+    pub scroll: usize,
+    /// Auto-scroll to the tail as the selected entry grows.
+    pub follow: bool,
+}
+
+impl Default for ViewerState {
+    fn default() -> Self {
+        Self {
+            selected: 0,
+            scroll: usize::MAX / 2,
+            follow: true,
+        }
+    }
+}
+
+/// A serializable snapshot of the live TUI view (activity panel + viewer + scroll), persisted to the
+/// session at the end of each turn so a resume restores the exact on-screen state. The main
+/// conversation transcript is NOT included — it's already rehydrated from the message history on
+/// resume; this captures only the ephemeral view that history doesn't carry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ViewSnapshot {
+    pub subagents: Vec<SubagentSnapshot>,
+    pub assay_critics: Vec<forge_types::AssayCriticRow>,
+    pub assay_verifying: Option<usize>,
+    pub tasks: Vec<forge_types::TodoItem>,
+    pub activity_focused: bool,
+    pub activity_idx: usize,
+    pub viewer: Option<ViewerState>,
+    pub transcript_scroll: usize,
+    pub transcript_follow: bool,
+}
+
+/// Serializable form of a subagent row (the live `SubRow` isn't serde and is private).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubagentSnapshot {
+    pub id: String,
     pub agent: String,
     pub task: String,
+    pub model: Option<String>,
+    pub last: String,
+    pub log: Vec<String>,
     pub done: bool,
     pub cost: f64,
-    /// The child's full captured transcript (progress lines + the final result), oldest first.
-    pub log: Vec<String>,
 }
 
 /// A keystroke, decoupled from crossterm so input handling is testable.
@@ -437,6 +556,10 @@ pub enum KeyKind {
     CycleTemper,
     /// CTRL+O — toggle the expanded detail view for the active subagents (shell-handled).
     ToggleSubagentDetail,
+    /// PageUp — scroll the full-screen transcript up (shell-handled; ignored by the input line).
+    PageUp,
+    /// PageDown — scroll the full-screen transcript down (shell-handled).
+    PageDown,
 }
 
 /// The result of feeding a keystroke to the input line.
@@ -610,7 +733,9 @@ pub fn handle_key(input: &mut String, cursor: &mut usize, key: KeyKind) -> Input
         | KeyKind::Down
         | KeyKind::Tab
         | KeyKind::CycleTemper
-        | KeyKind::ToggleSubagentDetail => InputOutcome::Editing,
+        | KeyKind::ToggleSubagentDetail
+        | KeyKind::PageUp
+        | KeyKind::PageDown => InputOutcome::Editing,
     }
 }
 
@@ -695,7 +820,12 @@ impl App {
                 self.context_tokens = context_tokens;
                 self.context_limit = context_limit;
             }
-            PresenterEvent::SubagentStart { id, agent, task } => {
+            PresenterEvent::SubagentStart {
+                id,
+                agent,
+                task,
+                model,
+            } => {
                 // A new batch: the previous (all-finished) batch's rows are retained until now so
                 // their transcripts stay viewable (Ctrl+O); drop them as the next batch begins.
                 if !self.subagents.is_empty() && self.subagents.iter().all(|r| r.done) {
@@ -709,6 +839,7 @@ impl App {
                     id,
                     agent,
                     task,
+                    model,
                     last: String::new(),
                     log: Vec::new(),
                     done: false,
@@ -723,12 +854,22 @@ impl App {
                     if n > 80 {
                         row.last = row.last.chars().skip(n - 80).collect();
                     }
-                    // Keep the FULL transcript for the scrollable browser (Ctrl+O), capped only by
-                    // a high safety bound so a pathological child can't exhaust memory.
-                    const MAX_LOG: usize = 10_000;
-                    for piece in snippet.split('\n').filter(|p| !p.trim().is_empty()) {
-                        row.log.push(piece.trim().to_string());
+                    // Assemble the streamed token-fragments into coherent transcript lines: append
+                    // to the open last line, breaking only on real newlines. (Pushing each fragment
+                    // as its own line fragmented identifiers like `count_text` across many rows.)
+                    if row.log.is_empty() {
+                        row.log.push(String::new());
                     }
+                    for ch in snippet.chars() {
+                        if ch == '\n' {
+                            row.log.push(String::new());
+                        } else {
+                            row.log.last_mut().unwrap().push(ch);
+                        }
+                    }
+                    // Cap the transcript by a high safety bound so a pathological child can't
+                    // exhaust memory; keep the newest lines.
+                    const MAX_LOG: usize = 10_000;
                     if row.log.len() > MAX_LOG {
                         let drop = row.log.len() - MAX_LOG;
                         row.log.drain(0..drop);
@@ -747,14 +888,18 @@ impl App {
                 if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id) {
                     row.done = true;
                     row.cost = cost_usd;
-                    // Record the outcome at the tail of the transcript so the browser shows it.
+                    // Drop a trailing empty/partial line, then record the outcome at the tail of the
+                    // transcript so the browser shows it.
+                    if row.log.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+                        row.log.pop();
+                    }
                     row.log.push(String::new());
                     row.log.push(format!(
                         "── result ({}) ──",
                         if ok { "ok" } else { "failed" }
                     ));
-                    for piece in summary.split('\n').filter(|p| !p.trim().is_empty()) {
-                        row.log.push(piece.trim().to_string());
+                    for piece in summary.split('\n') {
+                        row.log.push(piece.to_string());
                     }
                 }
                 // When every child in the batch has reported, close the scrollback box. The rows
@@ -777,12 +922,15 @@ impl App {
                 )));
             }
             PresenterEvent::AssayCriticRow(row) => {
-                // Update the live panel: insert on Queued, merge status+model+cost on Done/Skipped.
+                // Update the live panel: insert on Queued, merge status+model+cost+output on Done/Skipped.
                 if let Some(existing) = self.assay_critics.iter_mut().find(|r| r.lens == row.lens) {
                     existing.status = row.status;
                     if row.model.is_some() {
                         existing.model = row.model;
                         existing.cost_usd = row.cost_usd;
+                    }
+                    if !row.output.is_empty() {
+                        existing.output = row.output;
                     }
                 } else {
                     self.assay_critics.push(row);
@@ -794,6 +942,7 @@ impl App {
             PresenterEvent::AssayReport(report) => {
                 self.assay_critics.clear();
                 self.assay_verifying = None;
+                self.clamp_activity_selection();
                 self.flush
                     .extend(crate::render::assay_report_lines(&report));
                 self.flush.push(TextLine::default());
@@ -806,6 +955,13 @@ impl App {
             }
             PresenterEvent::McpStatus(servers) => {
                 self.flush.extend(crate::render::mcp_status_lines(&servers));
+                self.flush.push(TextLine::default());
+            }
+            PresenterEvent::Recap { text } => {
+                self.flush.push(TextLine::from(vec![
+                    Span::styled("  ※ recap  ", Style::default().fg(ORANGE).bold()),
+                    Span::styled(text, Style::default().fg(Color::Rgb(205, 205, 215))),
+                ]));
                 self.flush.push(TextLine::default());
             }
             PresenterEvent::Done { .. } => self.done = true,
@@ -864,27 +1020,41 @@ impl App {
         self.assay_critics.len()
     }
 
-    /// Rows the live assay critics panel wants (0 = hidden). Header + one row per critic.
-    pub fn assay_panel_height(&self) -> u16 {
-        let n = self.assay_critics.len();
-        if n == 0 {
-            return 0;
-        }
-        1 + n as u16
+    /// True when there is subagent or assay activity to show in the sticky activity panel. The
+    /// panel (and its "main chat" entry) only appears while there's something to drill into.
+    pub fn has_activity(&self) -> bool {
+        !self.subagents.is_empty() || !self.assay_critics.is_empty()
     }
 
-    /// Rows the running-subagents panel wants in the live region (0 = hidden). Counts the whole
-    /// current batch (running + done) so the panel stays visible after all agents finish — without
-    /// this, Start + Result events arriving in the same render drain leave the panel at height 0
-    /// forever. The batch is cleared by [`on_turn_start`] when the user sends the next message.
-    pub fn subagents_panel_height(&self) -> u16 {
-        let n = self.subagents.len();
+    /// Number of rows in the activity list: main chat + each subagent + each assay critic.
+    pub fn activity_len(&self) -> usize {
+        if !self.has_activity() {
+            return 0;
+        }
+        1 + self.subagents.len() + self.assay_critics.len()
+    }
+
+    /// Rows the sticky activity panel wants in the live region (0 = hidden). Header + up to
+    /// [`ACTIVITY_PANEL_MAX`] entry rows + an overflow line.
+    pub fn activity_panel_height(&self) -> u16 {
+        let n = self.activity_len();
         if n == 0 {
             return 0;
         }
-        let shown = n.min(SUBAGENTS_PANEL_MAX);
-        let overflow = u16::from(n > SUBAGENTS_PANEL_MAX);
+        let shown = n.min(ACTIVITY_PANEL_MAX);
+        let overflow = u16::from(n > ACTIVITY_PANEL_MAX);
         1 + shown as u16 + overflow
+    }
+
+    /// Keep `activity_idx` within range as the list grows/shrinks; drop focus when empty.
+    fn clamp_activity_selection(&mut self) {
+        let n = self.activity_len();
+        if n == 0 {
+            self.activity_focused = false;
+            self.activity_idx = 0;
+        } else if self.activity_idx >= n {
+            self.activity_idx = n - 1;
+        }
     }
 
     /// Called at the start of each new user turn. Collapses the "done" subagent batch that the
@@ -893,23 +1063,172 @@ impl App {
         if !self.subagents.is_empty() && self.subagents.iter().all(|r| r.done) {
             self.subagents.clear();
         }
+        self.activity_focused = false;
+        self.activity_idx = 0;
         self.pending_shell_fix = None;
     }
 
-    /// Owned snapshot of the current batch's subagents (running + just-finished), in spawn order;
-    /// empty when no batch has run yet. Feeds the full-screen transcript browser (Ctrl+O), which
-    /// re-reads it as new progress is drained so a child's log updates live.
-    pub fn subagent_views(&self) -> Vec<SubagentView> {
-        self.subagents
-            .iter()
-            .map(|r| SubagentView {
-                agent: r.agent.clone(),
-                task: r.task.clone(),
-                done: r.done,
+    /// Cheap per-frame metadata for the sticky activity panel (no transcript cloning). Order:
+    /// main chat, then subagents, then assay critics. Empty when there's no activity.
+    pub fn activity_summaries(&self) -> Vec<ActivitySummary> {
+        if !self.has_activity() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.activity_len());
+        out.push(ActivitySummary {
+            kind: ActivityKind::MainChat,
+            title: "main chat".to_string(),
+            subtitle: String::new(),
+            model: self.routing.as_ref().map(|r| r.model.clone()),
+            status: if self.busy {
+                ActivityStatus::Running
+            } else {
+                ActivityStatus::Done
+            },
+            cost: self.cost_usd,
+            line_count: self.main_log.len(),
+        });
+        for r in &self.subagents {
+            out.push(ActivitySummary {
+                kind: ActivityKind::Subagent,
+                title: r.agent.clone(),
+                subtitle: r.task.clone(),
+                model: r.model.clone(),
+                status: if r.done {
+                    ActivityStatus::Done
+                } else {
+                    ActivityStatus::Running
+                },
                 cost: r.cost,
-                log: r.log.clone(),
-            })
-            .collect()
+                line_count: r.log.len(),
+            });
+        }
+        for c in &self.assay_critics {
+            use forge_types::AssayCriticStatus;
+            let (status, subtitle) = match &c.status {
+                AssayCriticStatus::Queued => (ActivityStatus::Running, c.focus.clone()),
+                AssayCriticStatus::Done { candidates } => {
+                    (ActivityStatus::Done, format!("{candidates} found"))
+                }
+                AssayCriticStatus::Skipped { reason } => {
+                    (ActivityStatus::Skipped, format!("skipped ({reason})"))
+                }
+            };
+            out.push(ActivitySummary {
+                kind: ActivityKind::AssayCritic,
+                title: c.lens.clone(),
+                subtitle,
+                model: c.model.clone(),
+                status,
+                cost: c.cost_usd,
+                line_count: c.output.lines().count(),
+            });
+        }
+        out
+    }
+
+    /// Build the unified activity views (main chat + subagents + assay critics), in panel order, so
+    /// the full-screen viewer can render any of them. Heavier (clones transcripts + renders
+    /// markdown) — call ONLY when the full-screen viewer is open, never per render frame.
+    /// Empty when there's no activity (see [`has_activity`]).
+    pub fn activity_views(&self) -> Vec<TranscriptView> {
+        if !self.has_activity() {
+            return Vec::new();
+        }
+        let mut views = Vec::with_capacity(self.activity_len());
+
+        // 0: main chat — the real, already-styled transcript lines plus anything still pending in
+        // the flush outbox (so the view updates live even while the full-screen viewer is open).
+        let mut main_lines = self.main_log.clone();
+        main_lines.extend(self.flush.iter().cloned());
+        let main_count = main_lines.len();
+        views.push(TranscriptView {
+            kind: ActivityKind::MainChat,
+            title: "main chat".to_string(),
+            subtitle: String::new(),
+            model: self.routing.as_ref().map(|r| r.model.clone()),
+            status: if self.busy {
+                ActivityStatus::Running
+            } else {
+                ActivityStatus::Done
+            },
+            cost: self.cost_usd,
+            lines: main_lines,
+            line_count: main_count,
+        });
+
+        // Subagents, in spawn order. The transcript is streamed token-fragments assembled into
+        // lines — render as plain styled text (markdown would mangle the partial streaming).
+        for r in &self.subagents {
+            let lines: Vec<TextLine<'static>> = if r.log.iter().all(|l| l.trim().is_empty()) {
+                vec![TextLine::from(Span::styled(
+                    "(no activity captured yet)",
+                    Style::default().fg(DIM),
+                ))]
+            } else {
+                r.log
+                    .iter()
+                    .map(|l| {
+                        let style = if l.starts_with("── result") {
+                            Style::default().fg(ORANGE)
+                        } else {
+                            Style::default().fg(Color::Rgb(205, 205, 215))
+                        };
+                        TextLine::from(Span::styled(l.clone(), style))
+                    })
+                    .collect()
+            };
+            views.push(TranscriptView {
+                kind: ActivityKind::Subagent,
+                title: r.agent.clone(),
+                subtitle: r.task.clone(),
+                model: r.model.clone(),
+                status: if r.done {
+                    ActivityStatus::Done
+                } else {
+                    ActivityStatus::Running
+                },
+                cost: r.cost,
+                lines,
+                line_count: r.log.len(),
+            });
+        }
+
+        // Assay critics, in panel order.
+        for c in &self.assay_critics {
+            use forge_types::AssayCriticStatus;
+            let (status, subtitle) = match &c.status {
+                AssayCriticStatus::Queued => (ActivityStatus::Running, c.focus.clone()),
+                AssayCriticStatus::Done { candidates } => (
+                    ActivityStatus::Done,
+                    format!("{candidates} found · {}", c.focus),
+                ),
+                AssayCriticStatus::Skipped { reason } => {
+                    (ActivityStatus::Skipped, format!("skipped ({reason})"))
+                }
+            };
+            let lines = if c.output.trim().is_empty() {
+                vec![TextLine::from(Span::styled(
+                    "(no output yet)",
+                    Style::default().fg(DIM),
+                ))]
+            } else {
+                crate::render::markdown_to_lines(&c.output)
+            };
+            let line_count = c.output.lines().count();
+            views.push(TranscriptView {
+                kind: ActivityKind::AssayCritic,
+                title: c.lens.clone(),
+                subtitle,
+                model: c.model.clone(),
+                status,
+                cost: c.cost_usd,
+                lines,
+                line_count,
+            });
+        }
+
+        views
     }
 
     /// Update the active temper label. The colored statusline segment is the live indicator —
@@ -1185,9 +1504,12 @@ impl App {
         }
     }
 
-    /// Take the finalized scrollback lines queued since the last call.
+    /// Take the finalized scrollback lines queued since the last call. Each line is also mirrored
+    /// into [`main_log`] so the activity viewer can show the full "main chat" transcript.
     pub fn drain_flush(&mut self) -> Vec<TextLine<'static>> {
-        std::mem::take(&mut self.flush)
+        let lines = std::mem::take(&mut self.flush);
+        self.fold_main_log(&lines);
+        lines
     }
 
     /// Like [`drain_flush`], but also folds each line's plain text into the remote transcript ring
@@ -1198,7 +1520,241 @@ impl App {
         for l in &lines {
             self.push_remote_transcript_line(l);
         }
+        self.fold_main_log(&lines);
         lines
+    }
+
+    /// Append out-of-band scrollback (banner, command output, `/clear` marker, …) directly into the
+    /// full-screen transcript log. In inline mode these lines go to the terminal's native scrollback
+    /// instead (the I/O shell calls `Tui::insert_lines`); in full-screen mode the transcript IS the
+    /// log, so they must land here. Auto-tails the view (`transcript_follow`).
+    pub fn push_scrollback(&mut self, lines: Vec<TextLine<'static>>) {
+        self.fold_main_log(&lines);
+    }
+
+    /// Like [`push_scrollback`] but for plain multi-line text (e.g. command output that isn't
+    /// pre-styled). Full-screen counterpart to `Tui::print_text`.
+    pub fn push_scrollback_text(&mut self, text: &str) {
+        let lines: Vec<TextLine<'static>> =
+            text.lines().map(|s| TextLine::from(s.to_owned())).collect();
+        self.fold_main_log(&lines);
+    }
+
+    /// Serialize the live view (activity panel, viewer, scroll, tasks) to JSON for session storage.
+    /// Returns `None` when there's nothing worth persisting (no activity, no viewer, no tasks) so a
+    /// plain chat session doesn't write an empty blob every turn.
+    pub fn view_snapshot_json(&self) -> Option<String> {
+        if self.subagents.is_empty()
+            && self.assay_critics.is_empty()
+            && self.tasks.is_empty()
+            && self.viewer.is_none()
+        {
+            return None;
+        }
+        serde_json::to_string(&self.view_snapshot()).ok()
+    }
+
+    /// Restore a view previously captured by [`view_snapshot_json`] (best-effort; malformed or
+    /// stale JSON is ignored). Called on resume after the transcript has been replayed.
+    pub fn restore_view_json(&mut self, json: &str) {
+        if let Ok(snap) = serde_json::from_str::<ViewSnapshot>(json) {
+            self.restore_view(snap);
+        }
+    }
+
+    fn view_snapshot(&self) -> ViewSnapshot {
+        ViewSnapshot {
+            subagents: self
+                .subagents
+                .iter()
+                .map(|r| SubagentSnapshot {
+                    id: r.id.clone(),
+                    agent: r.agent.clone(),
+                    task: r.task.clone(),
+                    model: r.model.clone(),
+                    last: r.last.clone(),
+                    log: r.log.clone(),
+                    done: r.done,
+                    cost: r.cost,
+                })
+                .collect(),
+            assay_critics: self.assay_critics.clone(),
+            assay_verifying: self.assay_verifying,
+            tasks: self.tasks.clone(),
+            activity_focused: self.activity_focused,
+            activity_idx: self.activity_idx,
+            viewer: self.viewer.clone(),
+            transcript_scroll: self.transcript_scroll,
+            transcript_follow: self.transcript_follow,
+        }
+    }
+
+    fn restore_view(&mut self, s: ViewSnapshot) {
+        self.subagents = s
+            .subagents
+            .into_iter()
+            .map(|r| SubRow {
+                id: r.id,
+                agent: r.agent,
+                task: r.task,
+                model: r.model,
+                last: r.last,
+                log: r.log,
+                done: r.done,
+                cost: r.cost,
+            })
+            .collect();
+        self.assay_critics = s.assay_critics;
+        self.assay_verifying = s.assay_verifying;
+        if !s.tasks.is_empty() {
+            self.tasks = s.tasks;
+        }
+        self.activity_focused = s.activity_focused;
+        self.activity_idx = s.activity_idx;
+        self.viewer = s.viewer;
+        self.transcript_scroll = s.transcript_scroll;
+        self.transcript_follow = s.transcript_follow;
+        self.clamp_activity_selection();
+    }
+
+    /// Open the in-loop activity viewer at `selected` (full-screen mode). Renders over the whole
+    /// frame using the main terminal — no nested alternate screen.
+    pub fn open_viewer(&mut self, selected: usize) {
+        let n = self.activity_len();
+        if n == 0 {
+            return;
+        }
+        self.viewer = Some(ViewerState {
+            selected: selected.min(n - 1),
+            ..ViewerState::default()
+        });
+    }
+
+    /// Feed a keystroke to the in-loop activity viewer. Returns true if the viewer consumed it (it
+    /// is open). Esc closes it. ↑↓/PgUp/PgDn scroll, ←→/Tab switch entry, g/G top/tail.
+    pub fn viewer_key(&mut self, key: KeyKind) -> bool {
+        let n = self.activity_len().max(1);
+        let Some(v) = self.viewer.as_mut() else {
+            return false;
+        };
+        match key {
+            KeyKind::Esc => self.viewer = None,
+            KeyKind::Up => {
+                v.follow = false;
+                v.scroll = v.scroll.saturating_sub(1);
+            }
+            KeyKind::Down => v.scroll = v.scroll.saturating_add(1),
+            KeyKind::PageUp => {
+                v.follow = false;
+                v.scroll = v.scroll.saturating_sub(10);
+            }
+            KeyKind::PageDown => v.scroll = v.scroll.saturating_add(10),
+            KeyKind::Home => {
+                v.follow = false;
+                v.scroll = 0;
+            }
+            KeyKind::End => {
+                v.follow = true;
+                v.scroll = usize::MAX / 2;
+            }
+            KeyKind::Right | KeyKind::Tab => {
+                v.selected = (v.selected + 1) % n;
+                v.scroll = usize::MAX / 2;
+                v.follow = true;
+            }
+            KeyKind::Left => {
+                v.selected = (v.selected + n - 1) % n;
+                v.scroll = usize::MAX / 2;
+                v.follow = true;
+            }
+            KeyKind::Char('q') => self.viewer = None,
+            KeyKind::Char('k') => {
+                v.follow = false;
+                v.scroll = v.scroll.saturating_sub(1);
+            }
+            KeyKind::Char('j') | KeyKind::Char(' ') => v.scroll = v.scroll.saturating_add(1),
+            KeyKind::Char('g') => {
+                v.follow = false;
+                v.scroll = 0;
+            }
+            KeyKind::Char('G') => {
+                v.follow = true;
+                v.scroll = usize::MAX / 2;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Clear the full-screen transcript (`/clear`, `/new`): wipe the rendered log, the activity
+    /// panel, and the viewer, re-anchoring at the tail. The session/transcript on disk are
+    /// untouched — this only resets what's drawn (and what a snapshot would capture).
+    pub fn clear_transcript(&mut self) {
+        self.main_log.clear();
+        self.subagents.clear();
+        self.assay_critics.clear();
+        self.assay_verifying = None;
+        self.viewer = None;
+        self.activity_focused = false;
+        self.activity_idx = 0;
+        self.transcript_scroll = 0;
+        self.transcript_follow = true;
+    }
+
+    /// Wrapped-row metrics for the full-screen transcript: total rows at the given width, and the
+    /// max scroll offset given a visible body height. Used by the I/O shell to clamp paging.
+    pub fn transcript_metrics(&self, width: u16, body_h: u16) -> (usize, usize) {
+        let total = self.wrapped_transcript(width).len();
+        let max_scroll = total.saturating_sub(body_h.max(1) as usize);
+        (total, max_scroll)
+    }
+
+    /// Scroll the full-screen transcript up by `rows` (toward the top); pauses auto-follow.
+    pub fn transcript_scroll_up(&mut self, rows: usize) {
+        self.transcript_follow = false;
+        self.transcript_scroll = self.transcript_scroll.saturating_sub(rows);
+    }
+
+    /// Scroll the full-screen transcript down by `rows`; resumes follow at the bottom.
+    pub fn transcript_scroll_down(&mut self, rows: usize, max_scroll: usize) {
+        self.transcript_scroll = (self.transcript_scroll + rows).min(max_scroll);
+        if self.transcript_scroll >= max_scroll {
+            self.transcript_follow = true;
+        }
+    }
+
+    /// Jump to the top of the full-screen transcript; pauses follow.
+    pub fn transcript_to_top(&mut self) {
+        self.transcript_follow = false;
+        self.transcript_scroll = 0;
+    }
+
+    /// Jump to the tail of the full-screen transcript; resumes follow.
+    pub fn transcript_to_bottom(&mut self) {
+        self.transcript_follow = true;
+        self.transcript_scroll = usize::MAX / 2;
+    }
+
+    /// The full-screen transcript body: finalized `main_log` plus the in-flight reply edge, each
+    /// wrapped to `width`. Pure; the wrap mirrors the activity viewer's so scroll math is exact.
+    fn wrapped_transcript(&self, width: u16) -> Vec<TextLine<'static>> {
+        let mut lines = self.main_log.clone();
+        if self.streaming_active {
+            lines.push(TextLine::from(vec![
+                Span::raw(format!("  {}", self.streaming)),
+                Span::styled("▌", Style::default().fg(ORANGE)),
+            ]));
+        }
+        crate::transcript::wrap_lines(&lines, width.saturating_sub(1) as usize)
+    }
+
+    /// Append flushed lines to the bounded main-chat log used by the activity viewer.
+    fn fold_main_log(&mut self, lines: &[TextLine<'static>]) {
+        self.main_log.extend(lines.iter().cloned());
+        if self.main_log.len() > MAIN_LOG_MAX {
+            let drop = self.main_log.len() - MAIN_LOG_MAX;
+            self.main_log.drain(0..drop);
+        }
     }
 
     fn push_remote_transcript_line(&mut self, line: &TextLine<'static>) {
@@ -1399,15 +1955,6 @@ fn subagent_footer_line(n: usize, total_usd: f64) -> TextLine<'static> {
 
 /// A still-running subagent row for the live preview (animated spinner). Shows the child's live
 /// activity tail once it starts streaming, falling back to the task before then.
-fn subagent_running_line(spin: &str, agent: &str, task: &str, last: &str) -> TextLine<'static> {
-    let detail = if last.trim().is_empty() { task } else { last };
-    TextLine::from(vec![
-        Span::styled(format!("  {spin} "), Style::default().fg(TOOLCYAN)),
-        Span::styled(format!("[{agent}] "), Style::default().fg(TOOLCYAN).bold()),
-        Span::styled(truncate(detail, 50), Style::default().fg(DIM)),
-    ])
-}
-
 fn tool_result_line(name: &str, ok: bool, summary: &str) -> TextLine<'static> {
     let (mark, color) = if ok {
         ("  ✓ ", OKGREEN)
@@ -1504,6 +2051,20 @@ fn truncate(s: &str, max: usize) -> String {
 /// The inline viewport is never resized at runtime — recreating it would corrupt the scrollback.
 /// The stream area shrinks as panels grow but always keeps ≥1 row (MIN_STREAM guarantee).
 pub fn render_live(frame: &mut Frame, app: &App) {
+    // The in-loop activity viewer (full-screen mode) takes over the whole frame, rendered through
+    // the SAME terminal as the chat — no nested alternate screen, so it can't collide with it.
+    if let Some(v) = &app.viewer {
+        let views = app.activity_views();
+        let scroll = if v.follow { usize::MAX / 2 } else { v.scroll };
+        let a = frame.area();
+        frame.render_widget(
+            Paragraph::new(crate::transcript::transcript_lines(
+                &views, v.selected, scroll, a.height, a.width,
+            )),
+            a,
+        );
+        return;
+    }
     const MIN_STREAM: u16 = 1;
     // The input box grows with wrapped/multiline content (capped); the stream area absorbs the
     // change, so the inline viewport's total height is untouched (never resized at runtime).
@@ -1516,21 +2077,21 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     let avail = frame.area().height.saturating_sub(fixed);
     let panel_avail = avail.saturating_sub(MIN_STREAM);
 
-    // Subagent panel gets at most half; assay panel gets at most half of what remains; tasks get
-    // the rest. Panels are typically mutually exclusive (assay and subagents don't run together).
-    let sub_h = app.subagents_panel_height().min(panel_avail / 2);
-    let assay_h = app
-        .assay_panel_height()
-        .min(panel_avail.saturating_sub(sub_h) / 2);
-    let task_h = app
-        .tasks_panel_height()
-        .min(panel_avail.saturating_sub(sub_h + assay_h));
-    let stream_h = avail.saturating_sub(sub_h + assay_h + task_h);
+    // The activity panel (main chat + subagents + critics) and the tasks panel each want their
+    // full height. When both fit in the panel budget (always true in full-screen mode, where the
+    // live region spans the terminal) they each get it — so the activity list shows every entry up
+    // to its cap, like the tasks list. Only when the inline budget is contended do we split it,
+    // giving each panel a fair half but letting the smaller one keep its full size.
+    let (activity_h, task_h) = split_panel_budget(
+        app.activity_panel_height(),
+        app.tasks_panel_height(),
+        panel_avail,
+    );
+    let stream_h = avail.saturating_sub(activity_h + task_h);
 
     let areas = Layout::vertical([
         Constraint::Length(stream_h),
-        Constraint::Length(sub_h),
-        Constraint::Length(assay_h),
+        Constraint::Length(activity_h),
         Constraint::Length(task_h),
         Constraint::Length(PERMISSION_H),
         Constraint::Length(input_h),
@@ -1539,38 +2100,36 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     ])
     .split(frame.area());
 
-    // areas[0]: stream preview (or modal overlay when palette / picker / agent-picker is open).
+    // areas[0]: the main region. A modal overlay (palette / picker) takes it when open; otherwise
+    // it's the scrollable transcript in full-screen mode, or just the in-flight reply edge inline.
     if app.palette.open {
         render_palette(frame, areas[0], app);
     } else if app.at_picker.open {
         render_at_path_picker(frame, areas[0], app);
     } else if app.picker.open {
         render_picker(frame, areas[0], app);
-    } else if app.subagent_picking {
-        render_subagent_picker(frame, areas[0], app);
+    } else if app.fullscreen {
+        render_transcript_area(frame, areas[0], app);
     } else {
         render_preview(frame, areas[0], app);
     }
-    if sub_h > 0 {
-        render_subagents_panel(frame, areas[1], app);
-    }
-    if assay_h > 0 {
-        render_assay_panel(frame, areas[2], app);
+    if activity_h > 0 {
+        render_activity_panel(frame, areas[1], app);
     }
     if task_h > 0 {
         frame.render_widget(
-            Paragraph::new(tasks_panel_lines(&app.tasks, areas[3].height)),
-            areas[3],
+            Paragraph::new(tasks_panel_lines(&app.tasks, areas[2].height)),
+            areas[2],
         );
     }
     if app.prompt.is_some() {
-        render_permission(frame, areas[4], app);
+        render_permission(frame, areas[3], app);
     }
-    render_input(frame, areas[5], app);
+    render_input(frame, areas[4], app);
     if band_h > 0 {
-        render_compact_band(frame, areas[6], app);
+        render_compact_band(frame, areas[5], app);
     }
-    render_statusline(frame, areas[7], app);
+    render_statusline(frame, areas[6], app);
     // Usage overlay renders last so it appears on top of everything.
     render_usage_overlay(frame, app);
     render_mesh_overlay(frame, app);
@@ -1735,6 +2294,43 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
 
 /// The in-flight streaming reply's trailing edge, scrolled to its bottom so the freshest
 /// text and the `▌` cursor stay visible.
+/// Divide the panel budget between the activity panel (`want_a`) and the tasks panel (`want_t`).
+/// If both fit, each gets its full desired height. Otherwise split fairly: each keeps up to half,
+/// and any slack the smaller panel doesn't use is handed to the larger one.
+fn split_panel_budget(want_a: u16, want_t: u16, budget: u16) -> (u16, u16) {
+    if want_a + want_t <= budget {
+        return (want_a, want_t);
+    }
+    let half = budget / 2;
+    if want_a <= half {
+        (want_a, budget.saturating_sub(want_a).min(want_t))
+    } else if want_t <= half {
+        (budget.saturating_sub(want_t).min(want_a), want_t)
+    } else {
+        (half, budget.saturating_sub(half).min(want_t))
+    }
+}
+
+/// Render the full-screen transcript: the finalized conversation (`main_log`) plus the in-flight
+/// reply edge, wrapped to the area width and scrolled to `transcript_scroll` (or the tail while
+/// following). This is the full-screen counterpart to the inline scrollback + [`render_preview`].
+fn render_transcript_area(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let body_h = area.height as usize;
+    let wrapped = app.wrapped_transcript(area.width);
+    let total = wrapped.len();
+    let max_scroll = total.saturating_sub(body_h);
+    let scroll = if app.transcript_follow {
+        max_scroll
+    } else {
+        app.transcript_scroll.min(max_scroll)
+    };
+    let lines: Vec<TextLine> = wrapped.into_iter().skip(scroll).take(body_h).collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
     // Only the in-flight reply edge lives here now; the task + subagent panels are their own
     // always-visible regions (see `render_live`), so streaming no longer hides them.
@@ -1750,164 +2346,111 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// The subagent picker overlay: shown in the stream area when Ctrl+O is pressed with multiple
-/// agents. ↑↓ navigate, Enter opens that agent's full transcript, Esc closes.
-fn render_subagent_picker(frame: &mut Frame, area: Rect, app: &App) {
+/// Short model label: strip the `provider::` prefix so the panel shows e.g. `opus` not
+/// `anthropic::claude-opus-4-8`-style fully-qualified ids.
+fn model_short(model: Option<&str>) -> String {
+    match model {
+        Some(m) if !m.is_empty() => m.split("::").last().unwrap_or(m).to_string(),
+        _ => "…".to_string(),
+    }
+}
+
+/// The unified sticky activity panel: lists the main chat plus every subagent and assay critic in
+/// one navigable list. When focused (Ctrl+O) the selected row is highlighted and ↑↓ move it; Enter
+/// opens that entry's full-screen transcript. Themed per kind: ● main chat, ⚒ subagent, ⚖ critic.
+fn render_activity_panel(frame: &mut Frame, area: Rect, app: &App) {
     if area.height == 0 {
         return;
     }
-    let views = app.subagent_views();
+    // Cheap per-frame metadata only — building full transcripts here would clone the whole main
+    // log + re-render markdown every frame (jank/ghosting). Full views are built lazily on Enter.
+    let views = app.activity_summaries();
     if views.is_empty() {
         return;
     }
     let h = area.height as usize;
+    let w = area.width as usize;
+    let spin = SPINNER[app.tick % SPINNER.len()];
+    let focused = app.activity_focused;
+
     let mut lines: Vec<TextLine> = Vec::with_capacity(h);
+    let hint = if focused {
+        "↑↓ select · ⏎ open · esc"
+    } else {
+        "^O focus"
+    };
     lines.push(TextLine::from(vec![
         Span::styled(
-            format!("  ⚒ agents ({}) ", views.len()),
+            format!("  ⚒ activity ({})  ", views.len()),
             Style::default().fg(ORANGE).bold(),
         ),
-        Span::styled(
-            "↑↓ select  ·  Enter open  ·  Esc close",
-            Style::default().fg(DIM),
-        ),
+        Span::styled(hint, Style::default().fg(DIM)),
     ]));
-    let list_h = h.saturating_sub(1);
-    let start = app
-        .subagent_pick_idx
-        .saturating_sub(list_h.saturating_sub(1));
-    for (i, v) in views.iter().enumerate().skip(start).take(list_h) {
-        let selected = i == app.subagent_pick_idx;
-        let marker = if selected { "▸ " } else { "  " };
-        let status = if v.done { "done" } else { "…" };
-        let name_style = if selected {
+
+    let body_h = h.saturating_sub(1);
+    // Scroll so the selected row stays visible when the list overflows the panel.
+    let start = if focused {
+        app.activity_idx.saturating_sub(body_h.saturating_sub(1))
+    } else {
+        0
+    };
+    let overflow = views.len() > start + body_h;
+    let row_budget = if overflow {
+        body_h.saturating_sub(1)
+    } else {
+        body_h
+    };
+
+    for (i, v) in views.iter().enumerate().skip(start).take(row_budget) {
+        let selected = focused && i == app.activity_idx;
+        let marker = if selected { "▸" } else { " " };
+        let (kind_glyph, kind_color) = match v.kind {
+            ActivityKind::MainChat => ("●", TOOLCYAN),
+            ActivityKind::Subagent => ("⚒", ORANGE),
+            ActivityKind::AssayCritic => ("⚖", WARNYEL),
+        };
+        let status_span = match v.status {
+            ActivityStatus::Running => Span::styled(format!("{spin} "), Style::default().fg(DIM)),
+            ActivityStatus::Done => Span::styled("✓ ", Style::default().fg(OKGREEN)),
+            ActivityStatus::Skipped => Span::styled("⏭ ", Style::default().fg(DIM)),
+        };
+        let title_style = if selected {
             Style::default().fg(ORANGE).bold()
         } else {
-            Style::default().fg(TOOLCYAN)
+            Style::default().fg(kind_color).bold()
         };
-        lines.push(TextLine::from(vec![
-            Span::styled(format!("  {marker}[{}] ", v.agent), name_style),
-            Span::styled(
-                format!("${:.4}  {status}  ", v.cost),
-                Style::default().fg(DIM),
-            ),
-            Span::styled(truncate(&v.task, 44), Style::default().fg(DIM)),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// The sticky running-subagents panel (its own live region): a header (with the Ctrl+O hint) then
-/// one animated row per running child, sized to `area.height`, overflow summarized.
-fn render_subagents_panel(frame: &mut Frame, area: Rect, app: &App) {
-    if app.subagents.is_empty() {
-        return;
-    }
-    let running: Vec<&SubRow> = app.subagents.iter().filter(|r| !r.done).collect();
-    let h = area.height as usize;
-    let mut lines: Vec<TextLine> = Vec::with_capacity(h);
-
-    if running.is_empty() {
-        // All agents in the batch finished — show a "done" summary until on_turn_start clears it.
-        let n = app.subagents.len();
-        lines.push(TextLine::from(vec![
-            Span::styled(
-                format!("  ⚒ subagents ({n} done)"),
-                Style::default().fg(TOOLCYAN).bold(),
-            ),
-            Span::styled("  ^O transcript", Style::default().fg(DIM)),
-        ]));
-        let body_h = h.saturating_sub(1);
-        for r in app.subagents.iter().take(body_h) {
-            lines.push(TextLine::from(Span::styled(
-                format!("    ✓ {}  {}", r.agent, r.task),
-                Style::default().fg(DIM),
-            )));
-        }
-    } else {
-        let spin = SPINNER[app.tick % SPINNER.len()];
-        lines.push(TextLine::from(vec![
-            Span::styled(
-                format!("  ⚒ subagents ({} running)", running.len()),
-                Style::default().fg(TOOLCYAN).bold(),
-            ),
-            Span::styled("  ^O transcript", Style::default().fg(DIM)),
-        ]));
-        let body_h = h.saturating_sub(1);
-        for r in running.iter().take(body_h) {
-            lines.push(subagent_running_line(spin, &r.agent, &r.task, &r.last));
-        }
-        if running.len() > body_h {
-            lines.pop();
-            lines.push(TextLine::from(Span::styled(
-                format!("  … +{} more running", running.len() - body_h + 1),
-                Style::default().fg(DIM),
-            )));
-        }
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// The sticky live-assay panel: header showing critic count + verifying state, then one row per
-/// critic with its lens, focus brief, status, model, and cost. Cleared when AssayReport arrives.
-fn render_assay_panel(frame: &mut Frame, area: Rect, app: &App) {
-    use forge_types::AssayCriticStatus;
-    if app.assay_critics.is_empty() {
-        return;
-    }
-    let spin = SPINNER[app.tick % SPINNER.len()];
-    let total = app.assay_critics.len();
-    let done = app
-        .assay_critics
-        .iter()
-        .filter(|r| !matches!(r.status, AssayCriticStatus::Queued))
-        .count();
-    let header = if let Some(n) = app.assay_verifying {
-        format!("  ⚖ assay  {done}/{total} critics · verifying {n}…")
-    } else {
-        format!("  ⚒ assay  {done}/{total} critics")
-    };
-    let h = area.height as usize;
-    let mut lines: Vec<TextLine> = Vec::with_capacity(h);
-    lines.push(TextLine::from(Span::styled(
-        header,
-        Style::default().fg(ORANGE).bold(),
-    )));
-    let body_h = h.saturating_sub(1);
-    for r in app.assay_critics.iter().take(body_h) {
-        let focus_short = truncate(&r.focus, 28);
-        let (label, style) = match &r.status {
-            AssayCriticStatus::Queued => (
-                format!("{spin} {}  {}", r.lens, focus_short),
-                Style::default().fg(DIM),
-            ),
-            AssayCriticStatus::Done { candidates } => {
-                let model = r
-                    .model
-                    .as_deref()
-                    .and_then(|m| m.split("::").last())
-                    .unwrap_or("?");
-                let cost = if r.cost_usd > 0.0 {
-                    format!("  ${:.4}", r.cost_usd)
-                } else {
-                    String::new()
-                };
-                (
-                    format!("✓ {}  {candidates} found{cost}  [{model}]", r.lens),
-                    Style::default().fg(OKGREEN),
-                )
-            }
-            AssayCriticStatus::Skipped { reason } => (
-                format!("⏭ {}  skipped ({})", r.lens, truncate(reason, 30)),
-                Style::default().fg(DIM),
-            ),
+        let model = model_short(v.model.as_deref());
+        // Trailing detail: line count for chats, the subtitle (findings/focus) for critics.
+        let detail = match v.kind {
+            ActivityKind::AssayCritic => v.subtitle.clone(),
+            _ => format!("{} ln", v.line_count),
         };
-        lines.push(TextLine::from(Span::styled(format!("  {label}"), style)));
+        let cost = if v.cost > 0.0 {
+            format!("  ${:.4}", v.cost)
+        } else {
+            String::new()
+        };
+        let head = format!("  {marker} {kind_glyph} ");
+        let used = head.chars().count() + v.title.chars().count() + model.len() + 8;
+        let detail_max = w.saturating_sub(used).max(8);
+        lines.push(TextLine::from(vec![
+            Span::styled(
+                head,
+                Style::default().fg(if selected { ORANGE } else { DIM }),
+            ),
+            status_span,
+            Span::styled(format!("{} ", v.title), title_style),
+            Span::styled(format!("[{model}]  "), Style::default().fg(DIM)),
+            Span::styled(
+                format!("{}{cost}", truncate(&detail, detail_max)),
+                Style::default().fg(DIM),
+            ),
+        ]));
     }
-    if app.assay_critics.len() > body_h {
-        lines.pop();
+    if overflow {
+        let hidden = views.len() - (start + row_budget);
         lines.push(TextLine::from(Span::styled(
-            format!("  … +{} more", app.assay_critics.len() - body_h + 1),
+            format!("    … +{hidden} more"),
             Style::default().fg(DIM),
         )));
     }
@@ -1920,43 +2463,71 @@ fn render_assay_panel(frame: &mut Frame, area: Rect, app: &App) {
 fn tasks_panel_lines(tasks: &[forge_types::TodoItem], height: u16) -> Vec<TextLine<'static>> {
     use forge_types::TodoStatus;
     let h = height as usize;
-    let done = tasks
+    let total = tasks.len();
+    let done_count = tasks
         .iter()
         .filter(|t| t.status == TodoStatus::Done)
         .count();
+    let in_progress_count = tasks
+        .iter()
+        .filter(|t| t.status == TodoStatus::InProgress)
+        .count();
+    let open_count = tasks
+        .iter()
+        .filter(|t| t.status == TodoStatus::Pending)
+        .count();
+    let header = format!(
+        "  ⚒ {total} tasks ({done_count} done, {in_progress_count} in progress, {open_count} open)"
+    );
     let mut lines = vec![TextLine::from(Span::styled(
-        format!("  ⚒ tasks ({done}/{} done)", tasks.len()),
+        header,
         Style::default().fg(ORANGE).bold(),
     ))];
     let body_h = h.saturating_sub(1);
-    // Prioritize showing in-progress + pending items; if everything won't fit, lead with the
-    // active item so the user always sees what's happening now.
-    let mut idxs: Vec<usize> = (0..tasks.len()).collect();
-    if tasks.len() > body_h {
-        idxs.sort_by_key(|&i| match tasks[i].status {
-            TodoStatus::InProgress => 0,
-            TodoStatus::Pending => 1,
-            TodoStatus::Done => 2,
-        });
-    }
-    let shown = idxs
-        .len()
-        .min(body_h.saturating_sub(usize::from(tasks.len() > body_h)));
-    for &i in idxs.iter().take(shown) {
+    // Prioritize: in-progress first, then pending, then done.
+    let mut idxs: Vec<usize> = (0..total).collect();
+    idxs.sort_by_key(|&i| match tasks[i].status {
+        TodoStatus::InProgress => 0,
+        TodoStatus::Pending => 1,
+        TodoStatus::Done => 2,
+    });
+    // Count non-done (always show) vs done (may be truncated).
+    let non_done: Vec<usize> = idxs
+        .iter()
+        .copied()
+        .filter(|&i| tasks[i].status != TodoStatus::Done)
+        .collect();
+    let done_idxs: Vec<usize> = idxs
+        .iter()
+        .copied()
+        .filter(|&i| tasks[i].status == TodoStatus::Done)
+        .collect();
+    // Always show all non-done; fill remaining rows with done items.
+    let rows_for_done = body_h
+        .saturating_sub(non_done.len())
+        .saturating_sub(usize::from(!done_idxs.is_empty()));
+    let show_done = rows_for_done.min(done_idxs.len());
+    let overflow_done = done_idxs.len().saturating_sub(show_done);
+    let shown_idxs: Vec<usize> = non_done
+        .iter()
+        .chain(done_idxs.iter().take(show_done))
+        .copied()
+        .collect();
+    for &i in &shown_idxs {
         let t = &tasks[i];
-        let style = match t.status {
-            TodoStatus::Done => Style::default().fg(DIM),
-            TodoStatus::InProgress => Style::default().fg(ORANGE).bold(),
-            TodoStatus::Pending => Style::default().fg(Color::Rgb(205, 205, 215)),
+        let (glyph, style) = match t.status {
+            TodoStatus::Done => ("✔", Style::default().fg(DIM)),
+            TodoStatus::InProgress => ("◼", Style::default().fg(ORANGE).bold()),
+            TodoStatus::Pending => ("○", Style::default().fg(Color::Rgb(205, 205, 215))),
         };
         lines.push(TextLine::from(Span::styled(
-            format!("    {} {}", t.status.marker(), truncate(&t.title, 60)),
+            format!("  {glyph} {}", truncate(&t.title, 62)),
             style,
         )));
     }
-    if tasks.len() > shown {
+    if overflow_done > 0 {
         lines.push(TextLine::from(Span::styled(
-            format!("    … +{} more", tasks.len() - shown),
+            format!("   … +{overflow_done} completed"),
             Style::default().fg(DIM),
         )));
     }
@@ -3139,29 +3710,28 @@ mod tests {
             id: "a".into(),
             agent: "reviewer".into(),
             task: "review the diff".into(),
+            model: Some("anthropic::opus".into()),
         });
         app.apply(PresenterEvent::SubagentStart {
             id: "b".into(),
             agent: "general".into(),
             task: "find call sites".into(),
+            model: Some("groq::llama".into()),
         });
 
-        // Both children animate in the live region while running.
+        // Both children appear in the unified activity list while running.
         let live = screen(&app);
         assert!(
             live.contains("reviewer"),
-            "running child shown live: {live}"
+            "running child shown in activity list: {live}"
         );
+        // The activity panel shows each child's model (stripped to the short name).
+        assert!(live.contains("[opus]"), "child model shown: {live}");
 
-        // A streamed activity delta shows in that child's row (Phase 3b live streaming).
         app.apply(PresenterEvent::SubagentProgress {
             id: "a".into(),
             snippet: "inspecting auth".into(),
         });
-        assert!(
-            screen(&app).contains("inspecting auth"),
-            "child's live activity tail shows in its row"
-        );
 
         app.apply(PresenterEvent::SubagentResult {
             id: "a".into(),
@@ -3188,8 +3758,8 @@ mod tests {
         // group box also lands in scrollback. on_turn_start collapses the panel for the next turn.
         let done_screen = screen(&app);
         assert!(
-            done_screen.contains("subagents (2 done)"),
-            "panel shows done count: {done_screen}"
+            done_screen.contains("activity ("),
+            "activity panel visible: {done_screen}"
         );
         assert!(
             done_screen.contains("reviewer"),
@@ -3730,9 +4300,12 @@ mod tests {
             todo("ship it", TodoStatus::Pending),
         ]));
         let s = screen(&app);
-        assert!(s.contains("tasks (1/3 done)"), "panel header + count: {s}");
+        assert!(
+            s.contains("3 tasks (1 done, 1 in progress, 1 open)"),
+            "panel header + breakdown: {s}"
+        );
         // The in-progress item is shown with its glyph (prioritized into the small region).
-        assert!(s.contains('◐'), "in-progress glyph shown: {s}");
+        assert!(s.contains('◼'), "in-progress glyph shown: {s}");
 
         // Emptying the list collapses the panel.
         app.apply(PresenterEvent::Tasks(vec![]));
@@ -3764,13 +4337,14 @@ mod tests {
             id: "a".into(),
             agent: "reviewer".into(),
             task: "review the diff".into(),
+            model: Some("anthropic::opus".into()),
         });
         app.apply(PresenterEvent::AssistantDelta("thinking out loud".into()));
         let s = screen(&app);
         assert!(s.contains("thinking out loud"), "stream shown: {s}");
         assert!(
-            s.contains("subagents (1 running)"),
-            "subagent panel stays visible while streaming: {s}"
+            s.contains("activity ("),
+            "activity panel stays visible while streaming: {s}"
         );
     }
 
@@ -3782,13 +4356,11 @@ mod tests {
             id: "a".into(),
             agent: "reviewer".into(),
             task: "review the diff".into(),
+            model: Some("anthropic::opus".into()),
         });
         assert_eq!(app.running_subagents(), 1);
         let s = screen(&app);
-        assert!(
-            s.contains("subagents (1 running)"),
-            "panel header while running: {s}"
-        );
+        assert!(s.contains("activity ("), "panel header while running: {s}");
         assert!(s.contains("reviewer"), "agent label shown: {s}");
 
         // After SubagentResult the panel stays visible (shows "done") so it's never invisible
@@ -3807,14 +4379,14 @@ mod tests {
         );
         let s = screen(&app);
         assert!(
-            s.contains("subagents (1 done)"),
+            s.contains("activity ("),
             "panel stays visible showing done state: {s}"
         );
 
         // The panel collapses at the START of the next user turn, not immediately on result.
         app.on_turn_start();
         assert!(
-            !screen(&app).contains("subagents ("),
+            !screen(&app).contains("activity ("),
             "panel collapses after on_turn_start: {s}"
         );
     }
@@ -3885,12 +4457,14 @@ mod tests {
             id: "a".into(),
             agent: "general".into(),
             task: "find call sites".into(),
+            model: Some("groq::llama".into()),
         });
-        // More progress than the old 200-snippet cap — the full transcript must be kept.
+        // More progress than the old 200-snippet cap — the full transcript must be kept. Each
+        // snippet ends in a newline so the line-assembler keeps them as distinct lines.
         for i in 0..250 {
             app.apply(PresenterEvent::SubagentProgress {
                 id: "a".into(),
-                snippet: format!("step {i}"),
+                snippet: format!("step {i}\n"),
             });
         }
         app.apply(PresenterEvent::SubagentResult {
@@ -3900,19 +4474,25 @@ mod tests {
             summary: "found 3 call sites".into(),
             cost_usd: 0.01,
         });
-        // Views are retained after the batch finishes (so Ctrl+O can still open them).
-        let views = app.subagent_views();
-        assert_eq!(views.len(), 1);
-        let v = &views[0];
+        // activity_views = main chat (index 0) + the subagent (index 1), retained after the batch
+        // finishes so the full-screen viewer can still open them.
+        let views = app.activity_views();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].kind, ActivityKind::MainChat);
+        let v = &views[1];
+        assert_eq!(v.kind, ActivityKind::Subagent);
+        assert_eq!(v.status, ActivityStatus::Done);
+        assert!(v.line_count > 200, "full log kept: {}", v.line_count);
+        let body: String = v
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(body.contains("step 0"), "oldest line kept: {body}");
+        assert!(body.contains("step 249"), "newest line kept");
         assert!(
-            v.done && v.log.len() > 200,
-            "full log kept: {}",
-            v.log.len()
-        );
-        assert!(v.log.iter().any(|l| l == "step 0"), "oldest line kept");
-        assert!(v.log.iter().any(|l| l == "step 249"), "newest line kept");
-        assert!(
-            v.log.iter().any(|l| l.contains("found 3 call sites")),
+            body.contains("found 3 call sites"),
             "result appended to transcript"
         );
 
@@ -3921,9 +4501,11 @@ mod tests {
             id: "b".into(),
             agent: "general".into(),
             task: "next".into(),
+            model: None,
         });
-        assert_eq!(app.subagent_views().len(), 1);
-        assert_eq!(app.subagent_views()[0].task, "next");
+        let views = app.activity_views();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[1].subtitle, "next");
     }
 
     #[test]
@@ -3962,5 +4544,122 @@ mod tests {
                 .contains(ratatui::style::Modifier::BOLD)),
             "// escape is not highlighted as a command"
         );
+    }
+
+    #[test]
+    fn panel_budget_gives_both_full_height_when_they_fit() {
+        // Full-screen mode: a generous budget → each panel keeps its full desired height.
+        assert_eq!(split_panel_budget(9, 7, 40), (9, 7));
+    }
+
+    #[test]
+    fn panel_budget_splits_fairly_when_contended() {
+        // Both want more than half of a tight inline budget → fair split, neither starved.
+        let (a, t) = split_panel_budget(9, 7, 10);
+        assert_eq!(a + t, 10, "uses the whole budget");
+        assert!(a >= 4 && t >= 4, "neither panel is starved: {a},{t}");
+        // A small panel keeps its full size; the big one takes the slack.
+        assert_eq!(split_panel_budget(2, 9, 10), (2, 8));
+    }
+
+    #[test]
+    fn fullscreen_transcript_renders_log_tail_and_clears() {
+        let mut app = App {
+            fullscreen: true,
+            transcript_follow: true,
+            ..Default::default()
+        };
+        app.push_scrollback(
+            (0..30)
+                .map(|i| TextLine::from(format!("line {i}")))
+                .collect(),
+        );
+        // Following → the tail is visible, the head scrolled off, in a 5-row body.
+        let area = Rect::new(0, 0, 40, 5);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 5)).unwrap();
+        term.draw(|f| render_transcript_area(f, area, &app))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("line 29"), "tail visible: {text:?}");
+        assert!(!text.contains("line 0 "), "head scrolled off");
+        // /clear empties the rendered transcript.
+        app.clear_transcript();
+        assert_eq!(app.wrapped_transcript(40).len(), 0);
+    }
+
+    #[test]
+    fn in_loop_viewer_opens_navigates_and_closes() {
+        let mut app = App {
+            fullscreen: true,
+            ..Default::default()
+        };
+        // No activity → open is a no-op (nothing to view).
+        app.open_viewer(0);
+        assert!(app.viewer.is_none());
+
+        // Two subagents → activity list is [main, sub, sub] (len 3).
+        app.apply(crate::PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "general".into(),
+            task: "x".into(),
+            model: Some("m".into()),
+        });
+        app.apply(crate::PresenterEvent::SubagentStart {
+            id: "b".into(),
+            agent: "general".into(),
+            task: "y".into(),
+            model: Some("m".into()),
+        });
+        app.open_viewer(1);
+        assert_eq!(app.viewer.as_ref().unwrap().selected, 1);
+
+        // Right/Left switch entries (wrapping); a modal key is always consumed.
+        assert!(app.viewer_key(KeyKind::Right));
+        assert_eq!(app.viewer.as_ref().unwrap().selected, 2);
+        assert!(app.viewer_key(KeyKind::Right)); // wraps 2 → 0
+        assert_eq!(app.viewer.as_ref().unwrap().selected, 0);
+
+        // Up pauses follow; Esc closes.
+        app.viewer_key(KeyKind::Up);
+        assert!(!app.viewer.as_ref().unwrap().follow);
+        app.viewer_key(KeyKind::Esc);
+        assert!(app.viewer.is_none());
+        // Closed viewer ignores keys (not consumed).
+        assert!(!app.viewer_key(KeyKind::Down));
+    }
+
+    #[test]
+    fn view_snapshot_round_trips_activity_and_viewer() {
+        let mut app = App {
+            fullscreen: true,
+            ..Default::default()
+        };
+        app.apply(crate::PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "general".into(),
+            task: "scan".into(),
+            model: Some("opus".into()),
+        });
+        app.apply(crate::PresenterEvent::SubagentProgress {
+            id: "a".into(),
+            snippet: "working\n".into(),
+        });
+        app.open_viewer(1);
+        let json = app.view_snapshot_json().expect("activity → snapshot");
+
+        // A fresh app restores the same activity list + open viewer.
+        let mut restored = App::default();
+        restored.restore_view_json(&json);
+        assert_eq!(restored.activity_len(), 2, "main + 1 subagent");
+        assert_eq!(restored.viewer.as_ref().unwrap().selected, 1);
+        let views = restored.activity_views();
+        assert!(views[1]
+            .lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("working"))));
+
+        // A plain session (no activity / viewer / tasks) writes nothing.
+        assert!(App::default().view_snapshot_json().is_none());
     }
 }

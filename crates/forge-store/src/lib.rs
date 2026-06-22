@@ -12,10 +12,10 @@ use rusqlite::{Connection, OptionalExtension};
 mod schema;
 
 /// How long a permanently-failed model (a [`Store::exclude_model`] capability exclusion) stays out
-/// of routing before it's re-probed: 7 days. Long enough to stop the per-session churn of
-/// re-trying models that can't do tool calling, short enough that a provider adding support is
-/// picked up within a week.
-const CAPABILITY_EXCLUSION_SECS: i64 = 7 * 24 * 60 * 60;
+/// of routing before it's re-probed: 24 hours. Long enough to stop the per-session churn of
+/// re-trying models that can't do tool calling, short enough that a transient misclassification or
+/// a provider adding support is picked up the next day (was 7 days — too sticky).
+const CAPABILITY_EXCLUSION_SECS: i64 = 24 * 60 * 60;
 
 /// Half-open `[start, end)` epoch-second bounds of `now`'s **local** calendar day. Computed
 /// in Rust (not SQLite `strftime`) so the day rolls at the user's midnight and survives DST.
@@ -160,6 +160,7 @@ impl Store {
             "ALTER TABLE message ADD COLUMN tool_call_id TEXT",
             "ALTER TABLE message ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE session ADD COLUMN parent_session_id TEXT",
+            "ALTER TABLE session ADD COLUMN view_snapshot TEXT",
             "ALTER TABLE lattice_node ADD COLUMN pagerank REAL NOT NULL DEFAULT 0.0",
         ] {
             let _ = conn.execute(stmt, []);
@@ -208,6 +209,26 @@ impl Store {
         self.lock()?.execute(
             "UPDATE session SET permission_mode = ?2, updated_at = strftime('%s','now') WHERE id = ?1",
             (session_id, mode),
+        )?;
+        Ok(())
+    }
+
+    /// A session's persisted TUI view snapshot (opaque JSON), if one was saved. Used to restore the
+    /// exact on-screen state (activity panel, viewer, scroll) when the session is resumed.
+    pub fn session_view_snapshot(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self.lock()?.query_row(
+            "SELECT view_snapshot FROM session WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Persist a session's TUI view snapshot (opaque JSON). Written at the end of each completed
+    /// turn and on clean exit so a resume restores the screen as of the last prompt.
+    pub fn update_session_view_snapshot(&self, session_id: &str, json: &str) -> Result<()> {
+        self.lock()?.execute(
+            "UPDATE session SET view_snapshot = ?2, updated_at = strftime('%s','now') WHERE id = ?1",
+            (session_id, json),
         )?;
         Ok(())
     }
@@ -1693,6 +1714,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn view_snapshot_persists_per_session() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("/tmp", "default").unwrap();
+        // Absent until written.
+        assert_eq!(store.session_view_snapshot(&sid).unwrap(), None);
+        store
+            .update_session_view_snapshot(&sid, r#"{"viewer":{"selected":2}}"#)
+            .unwrap();
+        assert_eq!(
+            store.session_view_snapshot(&sid).unwrap().as_deref(),
+            Some(r#"{"viewer":{"selected":2}}"#)
+        );
+    }
+
+    #[test]
     fn persist_a_turn() {
         let store = Store::open_in_memory().unwrap();
         let sid = store.create_session("/tmp", "default").unwrap();
@@ -2268,8 +2304,8 @@ mod tests {
             .find(|(m, _, _)| m == "dead::no-tools")
             .unwrap();
         assert!(
-            row.1 > now + 6 * 24 * 60 * 60,
-            "exclusion window is ~7 days"
+            row.1 > now + 23 * 60 * 60 && row.1 <= now + 25 * 60 * 60,
+            "exclusion window is ~24 hours"
         );
         assert!(row.2.starts_with("excluded:"));
 

@@ -87,12 +87,16 @@ pub enum AssayProgress {
     },
     CriticQueued {
         lens: FindingCategory,
+        /// First model in the failover chain — the one the critic will try first.
+        expected_model: String,
     },
     CriticDone {
         lens: FindingCategory,
         candidates: usize,
         model: String,
         cost_usd: f64,
+        /// Raw model output (for the detail overlay). May be JSON + prose.
+        output: String,
     },
     CriticSkipped {
         lens: FindingCategory,
@@ -210,7 +214,7 @@ pub fn scope_to_budget(
 pub fn progress_line(p: &AssayProgress) -> String {
     match p {
         AssayProgress::Started { critics } => format!("⚒ assay — running {critics} critics…"),
-        AssayProgress::CriticQueued { lens } => format!("⏳ {} queued", lens.as_str()),
+        AssayProgress::CriticQueued { lens, .. } => format!("⏳ {} queued", lens.as_str()),
         AssayProgress::CriticDone {
             lens, candidates, ..
         } => {
@@ -253,7 +257,15 @@ pub async fn run_assay(
     // 1. Critics — bounded concurrency (a semaphore), results surfaced as they finish (JoinSet).
     let mut critic_set = tokio::task::JoinSet::new();
     for lens in lenses {
-        on_progress(AssayProgress::CriticQueued { lens });
+        let expected_model = models
+            .models_for(lens)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        on_progress(AssayProgress::CriticQueued {
+            lens,
+            expected_model,
+        });
         let (provider, source, pricing, models, store, sem) = (
             provider.clone(),
             source.clone(),
@@ -268,7 +280,7 @@ pub async fn run_assay(
             let chain = models.models_for(lens);
             match complete_with_failover(&provider, &pricing, &store, &chain, cooldown, &msgs).await
             {
-                Ok((text, c, model)) => (lens, Ok((parse_candidates(&text), model)), c),
+                Ok((text, c, model)) => (lens, Ok((parse_candidates(&text), model, text)), c),
                 Err(e) => (lens, Err(e), 0.0),
             }
         });
@@ -277,13 +289,14 @@ pub async fn run_assay(
     let mut candidates: Vec<(FindingCategory, Candidate)> = Vec::new();
     while let Some(joined) = critic_set.join_next().await {
         match joined {
-            Ok((lens, Ok((cands, model)), c)) => {
+            Ok((lens, Ok((cands, model, output)), c)) => {
                 cost += c;
                 on_progress(AssayProgress::CriticDone {
                     lens,
                     candidates: cands.len(),
                     model,
                     cost_usd: c,
+                    output,
                 });
                 candidates.extend(cands.into_iter().map(|cand| (lens, cand)));
             }

@@ -250,6 +250,40 @@ pub struct SubagentOutcome {
 /// Run one child agent to completion against `child_id` (a persisted child session): route the
 /// task independently, run the model↔tool loop with read-only tools, persist messages + usage
 /// to the child session (so its cost rolls into the shared budget), and return the answer.
+/// Route one child's task through the mesh (deterministic, no model API call): an agent type may
+/// pin a tier; otherwise the task is routed around currently-benched models. Used both inside
+/// [`run_subagent`] and by [`orchestrate`] up front, so the live panel can show the child's model
+/// the moment it starts (not only when it finishes).
+pub async fn route_child(
+    ctx: &AgentCtx,
+    agent: &ResolvedAgent,
+    budget: BudgetState,
+) -> RoutingDecision {
+    match agent
+        .tier
+        .and_then(|t| ctx.config.model_for(t).map(|m| (t, m)))
+    {
+        Some((tier, model)) => RoutingDecision {
+            tier,
+            model: model.to_string(),
+            rationale: format!("pinned by agent type '{}'", agent.name),
+            fallbacks: Vec::new(),
+        },
+        // Route around benched models too (model-health-failover): a child still avoids a
+        // model the parent just rate-limited.
+        None => {
+            let health = ctx.store.current_benched().unwrap_or_default();
+            let quota = ctx
+                .store
+                .current_quota()
+                .unwrap_or_default()
+                .with_plans(ctx.config.mesh.subscriptions.clone())
+                .with_conserve(ctx.config.mesh.subscription_conserve);
+            ctx.router.route(&agent.task, budget, &health, &quota).await
+        }
+    }
+}
+
 pub async fn run_subagent(
     ctx: &AgentCtx,
     child_id: &str,
@@ -287,29 +321,7 @@ pub async fn run_subagent(
     }
 
     // Routing: an agent type may pin a tier; otherwise route the task through the mesh.
-    let decision = match agent
-        .tier
-        .and_then(|t| ctx.config.model_for(t).map(|m| (t, m)))
-    {
-        Some((tier, model)) => RoutingDecision {
-            tier,
-            model: model.to_string(),
-            rationale: format!("pinned by agent type '{}'", agent.name),
-            fallbacks: Vec::new(),
-        },
-        // Route around benched models too (model-health-failover): a child still avoids a
-        // model the parent just rate-limited.
-        None => {
-            let health = ctx.store.current_benched().unwrap_or_default();
-            let quota = ctx
-                .store
-                .current_quota()
-                .unwrap_or_default()
-                .with_plans(ctx.config.mesh.subscriptions.clone())
-                .with_conserve(ctx.config.mesh.subscription_conserve);
-            ctx.router.route(task, budget, &health, &quota).await
-        }
-    };
+    let decision = route_child(ctx, agent, budget).await;
 
     let mut transcript = vec![Message::system(&agent.system_prompt), Message::user(task)];
     let mut seq: i64 = 0;
@@ -485,6 +497,8 @@ pub enum Lifecycle<'a> {
         id: &'a str,
         agent: &'a str,
         task: &'a str,
+        /// The model this child routed to (shown in the live panel from the moment it starts).
+        model: &'a str,
     },
     /// A live activity snippet (streamed text/reasoning) from a still-running child.
     Progress { id: &'a str, snippet: &'a str },
@@ -548,10 +562,13 @@ pub async fn orchestrate(
         let child_id = ctx
             .store
             .create_child_session(".", &mode_label, parent_id)?;
+        // Route up front (deterministic, no API call) so the panel shows the model immediately.
+        let child_model = route_child(ctx, &resolved, budget).await.model;
         on_event(Lifecycle::Start {
             id: &child_id,
             agent: &resolved.name,
             task: &resolved.task,
+            model: &child_model,
         });
         ids.push(child_id.clone());
 

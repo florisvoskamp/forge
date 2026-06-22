@@ -51,6 +51,9 @@ fn drive_pty(script: &[(&str, u64)]) -> (bool, String) {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_forge"));
     cmd.arg("chat");
     cmd.arg("--mock");
+    // Inline viewport: drives the native-scrollback path so the PTY capture is deterministic
+    // (the default full-screen mode renders on the alternate screen, which is harder to assert on).
+    cmd.arg("--inline");
     cmd.cwd(&dir);
     // Isolate the store in the temp dir — the real store now lives in a per-user data dir, so
     // without this the e2e would read/write the developer's actual session+usage DB.
