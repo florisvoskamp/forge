@@ -1,7 +1,8 @@
-//! The dynamic `/config` editor overlay: a fuzzy-searchable, importance-ordered list of every
-//! scalar setting (discovered by `forge_config::config_leaves`), edited in place. State, input
-//! handling, and rendering all live here (no `forge-config` dependency); the I/O shell feeds it
-//! rows and performs the validated writes via the [`ConfigAction`] it returns.
+//! The friendly `/config` editor overlay: settings grouped into labeled sections, each shown with a
+//! human label and a type-appropriate control — bools toggle, enums cycle, numbers/text/secrets are
+//! typed. Fuzzy search filters across all of them; a detail line shows help, type, default, and
+//! source for the selected row. State, input handling, and rendering live here (no `forge-config`
+//! dependency); the I/O shell feeds it rows and performs the validated writes via [`ConfigAction`].
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
@@ -10,7 +11,6 @@ use ratatui::Frame;
 
 use crate::app::KeyKind;
 
-// Local brand palette (mirrors app.rs).
 use ratatui::style::Color;
 const ORANGE: Color = Color::Rgb(255, 145, 60);
 const DIM: Color = Color::Rgb(110, 110, 120);
@@ -19,30 +19,75 @@ const OKGREEN: Color = Color::Rgb(120, 210, 140);
 const WARN: Color = Color::Rgb(235, 120, 110);
 const VERY_DIM: Color = Color::Rgb(80, 80, 90);
 
-/// One editable setting row (the TUI-side mirror of `forge_config::SettingLeaf`).
+/// The editing control a row uses.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum RowKind {
+    Bool,
+    Int,
+    Float,
+    /// A fixed set of valid values, cycled with ←/→.
+    Enum(Vec<String>),
+    #[default]
+    Text,
+    /// A secret (API key): masked, edits route to the keyring.
+    Secret,
+}
+
+/// One editable setting row (the TUI-side mirror of `forge_config::SettingDescriptor`).
 #[derive(Debug, Clone, Default)]
 pub struct SettingRow {
     pub path: String,
-    /// Current value, rendered.
-    pub display: String,
-    /// Short type tag (`bool`/`int`/`float`/`text`/`secret`).
-    pub type_tag: String,
-    /// One-line help shown for the selected row.
+    pub group: String,
+    pub label: String,
     pub help: Option<String>,
-    /// A secret (API key): the value is masked, edits route to the keyring not config.toml.
-    pub secret: bool,
+    pub kind: RowKind,
+    /// Current value, rendered.
+    pub value: String,
+    /// Built-in default, rendered (for the detail line).
+    pub default: String,
+    /// Overridden from a config file.
+    pub modified: bool,
+    /// "user" | "project" | "default".
+    pub source: String,
 }
 
-/// What the I/O shell should do after a keystroke (it owns the `forge-config` writes).
+impl SettingRow {
+    fn is_secret(&self) -> bool {
+        self.kind == RowKind::Secret
+    }
+    /// The next/previous enum value, or `None` for non-enum rows.
+    fn cycled(&self, forward: bool) -> Option<String> {
+        let RowKind::Enum(opts) = &self.kind else {
+            return None;
+        };
+        if opts.is_empty() {
+            return None;
+        }
+        let cur = opts.iter().position(|o| o == &self.value).unwrap_or(0);
+        let n = opts.len();
+        let next = if forward {
+            (cur + 1) % n
+        } else {
+            (cur + n - 1) % n
+        };
+        Some(opts[next].clone())
+    }
+}
+
+/// What the I/O shell should do after a keystroke.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigAction {
     None,
-    /// Persist `value` at `path` in the current scope, then refresh rows.
+    /// Persist `value` at `path` (config.toml, or the keyring for secrets), then refresh.
     Save {
         path: String,
         value: String,
     },
-    /// Scope toggled — reload the rows (effective values may differ to show).
+    /// Reset `path` to its default (clear the override), then refresh.
+    Reset {
+        path: String,
+    },
+    /// Scope toggled — reload rows.
     Reload,
     /// Editor closed.
     Close,
@@ -52,22 +97,18 @@ pub enum ConfigAction {
 #[derive(Debug, Clone, Default)]
 pub struct ConfigEditor {
     pub open: bool,
-    /// false = user config (`~/.config/forge`), true = project (`./.forge`).
+    /// false = user config, true = project.
     pub project_scope: bool,
-    /// All settings (importance-ordered), populated by the I/O shell.
     pub rows: Vec<SettingRow>,
-    /// Fuzzy filter text.
     pub filter: String,
-    /// Index into the FILTERED list.
+    /// Index into the FILTERED row list.
     pub selected: usize,
-    /// `Some(buffer)` while editing the selected value.
+    /// `Some(buffer)` while typing a number/text/secret value.
     pub editing: Option<String>,
-    /// Transient status (last save result), shown in the footer.
     pub status: Option<String>,
 }
 
 impl ConfigEditor {
-    /// Open the editor with freshly-loaded rows.
     pub fn open_with(&mut self, rows: Vec<SettingRow>) {
         self.open = true;
         self.rows = rows;
@@ -77,7 +118,7 @@ impl ConfigEditor {
         self.status = None;
     }
 
-    /// Indices (into `rows`) passing the fuzzy filter, in display order.
+    /// Row indices passing the fuzzy filter (matched on label OR path), in order.
     pub fn matches(&self) -> Vec<usize> {
         if self.filter.is_empty() {
             return (0..self.rows.len()).collect();
@@ -85,12 +126,13 @@ impl ConfigEditor {
         self.rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| fuzzy_subseq(&self.filter, &r.path))
+            .filter(|(_, r)| {
+                fuzzy_subseq(&self.filter, &r.label) || fuzzy_subseq(&self.filter, &r.path)
+            })
             .map(|(i, _)| i)
             .collect()
     }
 
-    /// The currently-highlighted row, if any.
     pub fn selected_row(&self) -> Option<&SettingRow> {
         let m = self.matches();
         m.get(self.selected).map(|&i| &self.rows[i])
@@ -105,11 +147,12 @@ impl ConfigEditor {
         }
     }
 
-    /// Feed a keystroke; returns the I/O action to perform. Modal: while editing, keys edit the
-    /// value buffer; otherwise they filter / navigate / open an edit / toggle scope / close.
+    /// Feed a keystroke; returns the I/O action. Modal: while typing a value, keys edit the buffer;
+    /// otherwise bools toggle (Enter), enums cycle (←/→/Enter), numbers/text/secrets open an input,
+    /// Del resets to default, Tab switches scope, typing filters.
     pub fn handle_key(&mut self, key: KeyKind) -> ConfigAction {
         if let Some(buf) = self.editing.as_mut() {
-            match key {
+            return match key {
                 KeyKind::Char(c) => {
                     buf.push(c);
                     ConfigAction::None
@@ -133,59 +176,93 @@ impl ConfigEditor {
                     }
                 }
                 _ => ConfigAction::None,
+            };
+        }
+        match key {
+            KeyKind::Esc => {
+                self.open = false;
+                ConfigAction::Close
             }
-        } else {
-            match key {
-                KeyKind::Esc => {
-                    self.open = false;
-                    ConfigAction::Close
+            KeyKind::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                ConfigAction::None
+            }
+            KeyKind::Down => {
+                let n = self.matches().len();
+                if n > 0 && self.selected + 1 < n {
+                    self.selected += 1;
                 }
-                KeyKind::Up => {
-                    self.selected = self.selected.saturating_sub(1);
-                    ConfigAction::None
-                }
-                KeyKind::Down => {
-                    let n = self.matches().len();
-                    if n > 0 && self.selected + 1 < n {
-                        self.selected += 1;
-                    }
-                    ConfigAction::None
-                }
-                KeyKind::Tab => {
-                    self.project_scope = !self.project_scope;
-                    ConfigAction::Reload
-                }
-                KeyKind::Enter => {
-                    if let Some(r) = self.selected_row() {
-                        // Secrets start empty (never prefill the masked value); bools pre-fill the
-                        // toggle for a one-keystroke flip; everything else pre-fills its value.
-                        self.editing = Some(if r.secret {
-                            String::new()
-                        } else if r.type_tag == "bool" {
-                            (r.display != "true").to_string()
-                        } else {
-                            r.display.clone()
-                        });
-                    }
-                    ConfigAction::None
-                }
-                KeyKind::Backspace => {
-                    self.filter.pop();
-                    self.clamp();
-                    ConfigAction::None
-                }
-                KeyKind::Char(c) => {
-                    self.filter.push(c);
-                    self.selected = 0;
-                    ConfigAction::None
-                }
+                ConfigAction::None
+            }
+            KeyKind::Tab => {
+                self.project_scope = !self.project_scope;
+                ConfigAction::Reload
+            }
+            // Del resets the selected setting to its default.
+            KeyKind::DeleteForward => match self.selected_row() {
+                Some(r) if !r.is_secret() => ConfigAction::Reset {
+                    path: r.path.clone(),
+                },
                 _ => ConfigAction::None,
+            },
+            // Enum cycle (Enter/→ next, ← prev).
+            KeyKind::Left | KeyKind::Right
+                if matches!(self.selected_row().map(|r| &r.kind), Some(RowKind::Enum(_))) =>
+            {
+                let fwd = matches!(key, KeyKind::Right);
+                match self.selected_row().and_then(|r| {
+                    r.cycled(fwd).map(|v| ConfigAction::Save {
+                        path: r.path.clone(),
+                        value: v,
+                    })
+                }) {
+                    Some(a) => a,
+                    None => ConfigAction::None,
+                }
             }
+            KeyKind::Enter => {
+                let Some(r) = self.selected_row() else {
+                    return ConfigAction::None;
+                };
+                match &r.kind {
+                    RowKind::Bool => ConfigAction::Save {
+                        path: r.path.clone(),
+                        value: (r.value != "true").to_string(),
+                    },
+                    RowKind::Enum(_) => match r.cycled(true) {
+                        Some(v) => ConfigAction::Save {
+                            path: r.path.clone(),
+                            value: v,
+                        },
+                        None => ConfigAction::None,
+                    },
+                    // Number / text / secret → open an input (secrets start empty).
+                    _ => {
+                        self.editing = Some(if r.is_secret() {
+                            String::new()
+                        } else {
+                            r.value.clone()
+                        });
+                        ConfigAction::None
+                    }
+                }
+            }
+            KeyKind::Backspace => {
+                self.filter.pop();
+                self.clamp();
+                ConfigAction::None
+            }
+            KeyKind::Char(c) => {
+                self.filter.push(c);
+                self.selected = 0;
+                ConfigAction::None
+            }
+            _ => ConfigAction::None,
         }
     }
 }
 
-/// Case-insensitive subsequence match (the chars of `needle` appear in order in `haystack`).
+/// Case-insensitive subsequence match.
 fn fuzzy_subseq(needle: &str, haystack: &str) -> bool {
     let mut hay = haystack.chars().map(|c| c.to_ascii_lowercase());
     for nc in needle.chars().map(|c| c.to_ascii_lowercase()) {
@@ -196,30 +273,78 @@ fn fuzzy_subseq(needle: &str, haystack: &str) -> bool {
     true
 }
 
+/// A rendered line of the editor body: a section header, or a setting row (by row index).
+enum Disp {
+    Header(String),
+    Row(usize),
+}
+
+/// Build the interleaved display list (section headers + the filtered rows under them).
+fn display_items(ed: &ConfigEditor, matches: &[usize]) -> Vec<Disp> {
+    let mut items = Vec::new();
+    let mut last_group = String::new();
+    for &ri in matches {
+        let g = &ed.rows[ri].group;
+        if g != &last_group {
+            items.push(Disp::Header(g.clone()));
+            last_group = g.clone();
+        }
+        items.push(Disp::Row(ri));
+    }
+    items
+}
+
+/// Render the value control for a row: `[● on]`/`[○ off]`, `‹ value ›`, masked secret, or the value.
+fn value_span(r: &SettingRow, sel: bool) -> Span<'static> {
+    let style = Style::default().fg(if sel { OKGREEN } else { DIM });
+    match &r.kind {
+        RowKind::Bool => {
+            let on = r.value == "true";
+            Span::styled(
+                if on {
+                    "[● on]".to_string()
+                } else {
+                    "[○ off]".to_string()
+                },
+                Style::default().fg(if on { OKGREEN } else { DIM }),
+            )
+        }
+        RowKind::Enum(_) => Span::styled(format!("‹ {} ›", r.value), style),
+        RowKind::Secret => Span::styled(r.value.clone(), style),
+        _ => {
+            let v = if r.value.is_empty() {
+                "—".to_string()
+            } else {
+                truncate(&r.value, 30)
+            };
+            Span::styled(v, style)
+        }
+    }
+}
+
 /// Render the editor as a full-frame overlay (called last, on top of everything).
 pub fn render_config_overlay(frame: &mut Frame, ed: &ConfigEditor) {
     if !ed.open {
         return;
     }
     let area = frame.area();
-    if area.height < 4 || area.width < 20 {
+    if area.height < 6 || area.width < 24 {
         return;
     }
     frame.render_widget(Clear, area);
-
     let w = area.width as usize;
-    let scope = if ed.project_scope {
-        "project (./.forge)"
-    } else {
-        "user (~/.config/forge)"
-    };
+    let h = area.height as usize;
     let matches = ed.matches();
+    let scope = if ed.project_scope { "project" } else { "user" };
 
-    let mut lines: Vec<TextLine> = Vec::with_capacity(area.height as usize);
+    let mut lines: Vec<TextLine> = Vec::with_capacity(h);
     lines.push(TextLine::from(vec![
         Span::styled("  ⚒ config  ", Style::default().fg(ORANGE).bold()),
-        Span::styled(format!("scope: {scope}"), Style::default().fg(USER)),
-        Span::styled("  ·  Tab switch scope", Style::default().fg(VERY_DIM)),
+        Span::styled(
+            format!("writing to {scope} scope"),
+            Style::default().fg(USER),
+        ),
+        Span::styled("  ·  Tab switch", Style::default().fg(VERY_DIM)),
     ]));
     lines.push(TextLine::from(vec![
         Span::styled("  search ", Style::default().fg(DIM)),
@@ -238,66 +363,114 @@ pub fn render_config_overlay(frame: &mut Frame, ed: &ConfigEditor) {
     ]));
     lines.push(TextLine::default());
 
-    // Body: reserve 3 header + 3 footer rows (help + status + hints); window to the selection.
-    let body_h = (area.height as usize).saturating_sub(6).max(1);
-    let start = ed.selected.saturating_sub(body_h.saturating_sub(1));
-    for (row, &ri) in matches.iter().enumerate().skip(start).take(body_h) {
-        let r = &ed.rows[ri];
-        let sel = row == ed.selected;
-        let marker = if sel { "▸ " } else { "  " };
-        let editing_here = sel && ed.editing.is_some();
-        let value_span = if editing_here {
-            let buf = ed.editing.as_deref().unwrap_or("");
-            // Secrets are masked while typing.
-            let shown = if r.secret {
-                "•".repeat(buf.chars().count())
-            } else {
-                buf.to_string()
-            };
-            Span::styled(
-                format!("{shown}▌"),
+    // Body: interleave headers + rows; window around the selected row. Reserve 3 header + 4 footer.
+    let items = display_items(ed, &matches);
+    let sel_disp = items
+        .iter()
+        .position(|d| matches!(d, Disp::Row(ri) if matches.get(ed.selected) == Some(ri)))
+        .unwrap_or(0);
+    let body_h = h.saturating_sub(7).max(1);
+    let start = sel_disp
+        .saturating_sub(body_h / 2)
+        .min(items.len().saturating_sub(body_h));
+    let label_col = w.saturating_sub(40).clamp(14, 40);
+    for d in items.iter().skip(start).take(body_h) {
+        match d {
+            Disp::Header(g) => lines.push(TextLine::from(Span::styled(
+                format!("  {g}"),
                 Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(
-                truncate(&r.display, 28),
-                Style::default().fg(if sel { OKGREEN } else { DIM }),
-            )
-        };
-        let path_style = if sel {
-            Style::default().fg(ORANGE).bold()
-        } else {
-            Style::default().fg(USER)
-        };
-        let path_col = w.saturating_sub(44).clamp(16, 56);
-        lines.push(TextLine::from(vec![
-            Span::styled(format!("  {marker}"), path_style),
-            Span::styled(
-                format!("{:<width$}", truncate(&r.path, path_col), width = path_col),
-                path_style,
-            ),
-            Span::styled(
-                format!("  {:<6} ", r.type_tag),
-                Style::default().fg(VERY_DIM),
-            ),
-            value_span,
-        ]));
+            ))),
+            Disp::Row(ri) => {
+                let r = &ed.rows[*ri];
+                let sel = matches.get(ed.selected) == Some(ri);
+                let marker = if sel { "▸" } else { " " };
+                let editing_here = sel && ed.editing.is_some();
+                let value = if editing_here {
+                    let buf = ed.editing.as_deref().unwrap_or("");
+                    let shown = if r.is_secret() {
+                        "•".repeat(buf.chars().count())
+                    } else {
+                        buf.to_string()
+                    };
+                    Span::styled(
+                        format!("{shown}▌"),
+                        Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    value_span(r, sel)
+                };
+                let label_style = if sel {
+                    Style::default().fg(ORANGE).bold()
+                } else {
+                    Style::default().fg(USER)
+                };
+                let mods = if r.modified {
+                    Span::styled(" ●", Style::default().fg(WARN))
+                } else {
+                    Span::raw("")
+                };
+                lines.push(TextLine::from(vec![
+                    Span::styled(format!("    {marker} "), label_style),
+                    Span::styled(
+                        format!(
+                            "{:<width$}",
+                            truncate(&r.label, label_col),
+                            width = label_col
+                        ),
+                        label_style,
+                    ),
+                    Span::raw("  "),
+                    value,
+                    mods,
+                ]));
+            }
+        }
     }
-    while lines.len() < (area.height as usize).saturating_sub(3) {
+    while lines.len() < h.saturating_sub(4) {
         lines.push(TextLine::default());
     }
 
-    // Help line for the selected setting (the "what does this do" the editor was missing).
-    let help = ed
-        .selected_row()
-        .and_then(|r| r.help.clone())
-        .unwrap_or_else(|| "(no description)".to_string());
-    lines.push(TextLine::from(Span::styled(
-        format!("  {}", truncate(&help, w.saturating_sub(4))),
-        Style::default().fg(USER),
-    )));
+    // Detail line: the selected setting's identity (type · default · source).
+    if let Some(r) = ed.selected_row() {
+        let kind = match &r.kind {
+            RowKind::Bool => "on/off".to_string(),
+            RowKind::Int => "number".to_string(),
+            RowKind::Float => "number".to_string(),
+            RowKind::Enum(o) => format!("one of: {}", o.join(" / ")),
+            RowKind::Secret => "secret (keyring)".to_string(),
+            RowKind::Text => "text".to_string(),
+        };
+        let dflt = if r.is_secret() {
+            String::new()
+        } else {
+            format!(
+                " · default: {}",
+                if r.default.is_empty() {
+                    "—"
+                } else {
+                    &r.default
+                }
+            )
+        };
+        lines.push(TextLine::from(Span::styled(
+            format!(
+                "  {} · {kind}{dflt} · source: {}",
+                truncate(&r.path, w.saturating_sub(40).max(10)),
+                r.source
+            ),
+            Style::default().fg(VERY_DIM),
+        )));
+        let help = r.help.clone().unwrap_or_default();
+        lines.push(TextLine::from(Span::styled(
+            format!("  {}", truncate(&help, w.saturating_sub(4))),
+            Style::default().fg(USER),
+        )));
+    } else {
+        lines.push(TextLine::default());
+        lines.push(TextLine::default());
+    }
 
-    // Footer: status (if any) + key hints.
+    // Status (last save/reset result).
     if let Some(s) = &ed.status {
         let color = if s.starts_with('✓') { OKGREEN } else { WARN };
         lines.push(TextLine::from(Span::styled(
@@ -307,10 +480,16 @@ pub fn render_config_overlay(frame: &mut Frame, ed: &ConfigEditor) {
     } else {
         lines.push(TextLine::default());
     }
+
+    // Key hints — context-sensitive.
     let hint = if ed.editing.is_some() {
         "  type a value · Enter save · Esc cancel"
     } else {
-        "  ↑↓ move · Enter edit · Tab scope · Esc close"
+        match ed.selected_row().map(|r| &r.kind) {
+            Some(RowKind::Bool) => "  Enter toggle · Del reset · Tab scope · Esc close",
+            Some(RowKind::Enum(_)) => "  ←/→ change · Del reset · Tab scope · Esc close",
+            _ => "  Enter edit · Del reset · Tab scope · Esc close",
+        }
     };
     lines.push(TextLine::from(Span::styled(
         hint,
@@ -335,88 +514,135 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    fn row(path: &str, display: &str, type_tag: &str) -> SettingRow {
+    fn brow(path: &str, label: &str, group: &str, value: &str) -> SettingRow {
         SettingRow {
             path: path.into(),
-            display: display.into(),
-            type_tag: type_tag.into(),
+            label: label.into(),
+            group: group.into(),
+            kind: RowKind::Bool,
+            value: value.into(),
             ..Default::default()
         }
     }
 
-    fn rows() -> Vec<SettingRow> {
-        vec![
-            row("tui.fullscreen", "true", "bool"),
-            row("local.autostart", "false", "bool"),
-            row("mesh.daily_cap_usd", "10", "float"),
-        ]
+    fn ed_with(rows: Vec<SettingRow>) -> ConfigEditor {
+        let mut ed = ConfigEditor::default();
+        ed.open_with(rows);
+        ed
     }
 
     #[test]
-    fn secret_row_starts_empty_and_masks() {
-        let mut ed = ConfigEditor::default();
-        ed.open_with(vec![SettingRow {
-            path: "key.openai".into(),
-            display: "● set".into(),
-            type_tag: "secret".into(),
-            secret: true,
-            ..Default::default()
-        }]);
-        ed.handle_key(KeyKind::Enter); // begin editing the secret
-        assert_eq!(ed.editing.as_deref(), Some("")); // never prefilled with the value
-    }
-
-    #[test]
-    fn fuzzy_filter_narrows_rows() {
-        let mut ed = ConfigEditor::default();
-        ed.open_with(rows());
-        ed.filter = "autos".into();
-        let m = ed.matches();
-        assert_eq!(m.len(), 1);
-        assert_eq!(ed.rows[m[0]].path, "local.autostart");
-    }
-
-    #[test]
-    fn enter_on_bool_prefills_the_toggle() {
-        let mut ed = ConfigEditor::default();
-        ed.open_with(rows()); // selected=0 → tui.fullscreen=true
-        assert_eq!(ed.handle_key(KeyKind::Enter), ConfigAction::None);
-        assert_eq!(ed.editing.as_deref(), Some("false")); // flipped
-    }
-
-    #[test]
-    fn editing_then_enter_emits_save() {
-        let mut ed = ConfigEditor::default();
-        ed.open_with(rows());
-        ed.filter = "daily".into();
-        ed.handle_key(KeyKind::Enter); // begin edit (prefill "10")
-        ed.handle_key(KeyKind::Backspace);
-        ed.handle_key(KeyKind::Backspace);
-        ed.handle_key(KeyKind::Char('2'));
-        ed.handle_key(KeyKind::Char('5'));
+    fn bool_enter_toggles_and_saves() {
+        let mut ed = ed_with(vec![brow(
+            "tui.fullscreen",
+            "Full-screen TUI",
+            "Interface",
+            "true",
+        )]);
         assert_eq!(
             ed.handle_key(KeyKind::Enter),
             ConfigAction::Save {
-                path: "mesh.daily_cap_usd".into(),
-                value: "25".into()
+                path: "tui.fullscreen".into(),
+                value: "false".into()
+            }
+        );
+        assert!(ed.editing.is_none()); // no text editing for bools
+    }
+
+    #[test]
+    fn enum_cycles_with_arrows() {
+        let mut ed = ed_with(vec![SettingRow {
+            path: "mesh.credit_mode".into(),
+            label: "Credit conservation".into(),
+            group: "Mesh & Cost".into(),
+            kind: RowKind::Enum(vec!["normal".into(), "frugal".into(), "strict".into()]),
+            value: "frugal".into(),
+            ..Default::default()
+        }]);
+        assert_eq!(
+            ed.handle_key(KeyKind::Right),
+            ConfigAction::Save {
+                path: "mesh.credit_mode".into(),
+                value: "strict".into()
+            }
+        );
+        assert_eq!(
+            ed.handle_key(KeyKind::Left),
+            ConfigAction::Save {
+                path: "mesh.credit_mode".into(),
+                value: "normal".into()
             }
         );
     }
 
     #[test]
-    fn tab_toggles_scope_and_requests_reload() {
-        let mut ed = ConfigEditor::default();
-        ed.open_with(rows());
-        assert!(!ed.project_scope);
-        assert_eq!(ed.handle_key(KeyKind::Tab), ConfigAction::Reload);
-        assert!(ed.project_scope);
+    fn del_resets_to_default() {
+        let mut ed = ed_with(vec![brow(
+            "tui.fullscreen",
+            "Full-screen TUI",
+            "Interface",
+            "true",
+        )]);
+        assert_eq!(
+            ed.handle_key(KeyKind::DeleteForward),
+            ConfigAction::Reset {
+                path: "tui.fullscreen".into()
+            }
+        );
     }
 
     #[test]
-    fn esc_closes() {
-        let mut ed = ConfigEditor::default();
-        ed.open_with(rows());
-        assert_eq!(ed.handle_key(KeyKind::Esc), ConfigAction::Close);
-        assert!(!ed.open);
+    fn text_row_opens_input_then_saves() {
+        let mut ed = ed_with(vec![SettingRow {
+            path: "local.model".into(),
+            label: "Model".into(),
+            group: "Local LLM".into(),
+            kind: RowKind::Text,
+            value: String::new(),
+            ..Default::default()
+        }]);
+        ed.handle_key(KeyKind::Enter); // open input
+        assert!(ed.editing.is_some());
+        ed.handle_key(KeyKind::Char('g'));
+        ed.handle_key(KeyKind::Char('4'));
+        assert_eq!(
+            ed.handle_key(KeyKind::Enter),
+            ConfigAction::Save {
+                path: "local.model".into(),
+                value: "g4".into()
+            }
+        );
+    }
+
+    #[test]
+    fn secret_starts_empty_and_masks() {
+        let mut ed = ed_with(vec![SettingRow {
+            path: "key.openai".into(),
+            label: "OpenAI key".into(),
+            group: "Providers & Keys".into(),
+            kind: RowKind::Secret,
+            value: "● set".into(),
+            ..Default::default()
+        }]);
+        ed.handle_key(KeyKind::Enter);
+        assert_eq!(ed.editing.as_deref(), Some("")); // never prefilled
+    }
+
+    #[test]
+    fn fuzzy_filter_matches_label_or_path() {
+        let ed = ed_with(vec![
+            brow("tui.fullscreen", "Full-screen TUI", "Interface", "true"),
+            brow(
+                "local.autostart",
+                "Auto-start on launch",
+                "Local LLM",
+                "false",
+            ),
+        ]);
+        let mut e = ed;
+        e.filter = "autostart".into(); // matches the path
+        assert_eq!(e.matches().len(), 1);
+        e.filter = "full".into(); // matches the label
+        assert_eq!(e.matches().len(), 1);
     }
 }

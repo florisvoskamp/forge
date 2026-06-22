@@ -52,7 +52,7 @@ pub use commands::{
     CommandAction, Palette, PaletteEntry, Picker, PickerKind, PickerRow, RemoteMode, SlashToken,
     COMMANDS,
 };
-pub use config_editor::{ConfigAction, ConfigEditor, SettingRow};
+pub use config_editor::{ConfigAction, ConfigEditor, RowKind, SettingRow};
 pub use driver::{ChannelPresenter, InputEvent, Tui, UiMsg};
 pub use init_wizard::{BridgeItem, ProviderItem, WizardInput, WizardOutcome};
 /// A styled scrollback line, re-exported so binaries can route out-of-band output to the right

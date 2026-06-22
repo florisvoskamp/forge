@@ -4481,37 +4481,50 @@ fn emit_text(tui: &mut forge_tui::Tui, app: &mut forge_tui::App, text: &str) {
     }
 }
 
-/// Every editable setting (importance-ordered), as `/config` editor rows: API keys first (so the
-/// provider keys the old wizard owned are managed here too), then the discovered scalar settings.
+/// Every editable setting as `/config` editor rows, grouped: "Providers & Keys" (API keys, keyring)
+/// first, then the discovered scalar settings (friendly labels, control kind, default, source).
 fn config_editor_rows() -> Vec<forge_tui::SettingRow> {
-    // API keys (stored in the OS keyring, never in config.toml). Shown set/unset; edits route to
-    // the keyring. These lead the list because they're the first thing a new user needs.
     let mut rows: Vec<forge_tui::SettingRow> = forge_config::known_key_providers()
         .map(|p| forge_tui::SettingRow {
             path: format!("key.{p}"),
-            display: if forge_config::has_api_key(p) {
+            group: "Providers & Keys".to_string(),
+            label: format!("{} API key", provider_label(p)),
+            help: Some(format!(
+                "API key for {p}, stored in the OS keyring. Enter to set; empty to remove."
+            )),
+            kind: forge_tui::RowKind::Secret,
+            value: if forge_config::has_api_key(p) {
                 "● set".to_string()
             } else {
                 "○ not set".to_string()
             },
-            type_tag: "secret".to_string(),
-            help: Some(format!(
-                "API key for {p} (stored in the OS keyring). Enter to set; empty to remove."
-            )),
-            secret: true,
+            default: String::new(),
+            modified: forge_config::has_api_key(p),
+            source: "keyring".to_string(),
         })
         .collect();
-    rows.extend(
-        forge_config::config_leaves()
-            .into_iter()
-            .map(|l| forge_tui::SettingRow {
-                path: l.path.clone(),
-                display: l.value.display(),
-                type_tag: l.value.type_tag().to_string(),
-                help: forge_config::setting_help(&l.path).map(str::to_string),
-                secret: false,
-            }),
-    );
+    rows.extend(forge_config::config_descriptors().into_iter().map(|d| {
+        let kind = match d.kind {
+            forge_config::SettingKind::Bool => forge_tui::RowKind::Bool,
+            forge_config::SettingKind::Int => forge_tui::RowKind::Int,
+            forge_config::SettingKind::Float => forge_tui::RowKind::Float,
+            forge_config::SettingKind::Text => forge_tui::RowKind::Text,
+            forge_config::SettingKind::Enum(opts) => {
+                forge_tui::RowKind::Enum(opts.into_iter().map(str::to_string).collect())
+            }
+        };
+        forge_tui::SettingRow {
+            path: d.path,
+            group: d.group,
+            label: d.label,
+            help: d.help,
+            kind,
+            value: d.value.display(),
+            default: d.default.display(),
+            modified: d.modified,
+            source: d.source.to_string(),
+        }
+    }));
     rows
 }
 
@@ -4804,6 +4817,21 @@ async fn run_chat_tui(
                             Ok(()) => {
                                 app.config_editor.rows = config_editor_rows();
                                 app.config_editor.status = Some(format!("✓ saved {path}"));
+                            }
+                            Err(e) => app.config_editor.status = Some(format!("✗ {e}")),
+                        }
+                    }
+                    forge_tui::ConfigAction::Reset { path } => {
+                        let scope = if app.config_editor.project_scope {
+                            forge_config::ConfigScope::Project
+                        } else {
+                            forge_config::ConfigScope::User
+                        };
+                        match forge_config::reset_config_value(scope, &path) {
+                            Ok(()) => {
+                                app.config_editor.rows = config_editor_rows();
+                                app.config_editor.status =
+                                    Some(format!("✓ reset {path} to default"));
                             }
                             Err(e) => app.config_editor.status = Some(format!("✗ {e}")),
                         }

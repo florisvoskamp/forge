@@ -1454,6 +1454,206 @@ fn priority_rank(path: &str) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// The editing control a setting should use in the `/config` UI.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingKind {
+    /// On/off — toggled, never typed.
+    Bool,
+    Int,
+    Float,
+    /// A fixed set of valid values — cycled / picked, never typed.
+    Enum(Vec<&'static str>),
+    Text,
+}
+
+/// A fully-described setting for the friendly `/config` editor: friendly label + group, help, the
+/// editing control, the current/default values, whether it's been overridden, and from where.
+#[derive(Debug, Clone)]
+pub struct SettingDescriptor {
+    pub path: String,
+    /// Section header it groups under (e.g. "Mesh & Cost").
+    pub group: String,
+    /// Friendly display name (e.g. "Daily spend cap").
+    pub label: String,
+    pub help: Option<String>,
+    pub kind: SettingKind,
+    /// Current effective value.
+    pub value: SettingValue,
+    /// Built-in default value.
+    pub default: SettingValue,
+    /// True when set in a config file (overrides the default).
+    pub modified: bool,
+    /// Where the effective value comes from: "project" | "user" | "default".
+    pub source: &'static str,
+}
+
+/// Valid values for an enum-typed setting (so the editor can cycle them instead of free text).
+pub fn setting_options(path: &str) -> Option<Vec<&'static str>> {
+    Some(match path {
+        "permission_mode" => vec!["default", "accept-edits", "bypass", "plan"],
+        "mesh.credit_mode" => vec!["normal", "frugal", "strict"],
+        "mesh.classifier" => vec!["heuristic", "llm"],
+        "mesh.default_effort" => vec!["low", "medium", "high", "xhigh", "max"],
+        "lattice.embeddings.backend" => vec!["auto", "ollama", "openai", "gemini"],
+        _ => return None,
+    })
+}
+
+/// The section group and friendly label for a setting path. Curated for common settings; anything
+/// else derives a sensible group (from the first path segment) + label (humanized last segment), so
+/// new fields still slot in nicely without code changes.
+pub fn setting_group_and_label(path: &str) -> (String, String) {
+    let curated = match path {
+        "permission_mode" => Some(("Safety", "Permission mode")),
+        "mesh.credit_mode" => Some(("Mesh & Cost", "Credit conservation")),
+        "mesh.daily_cap_usd" => Some(("Mesh & Cost", "Daily spend cap (USD)")),
+        "mesh.weekly_cap_usd" => Some(("Mesh & Cost", "Weekly spend cap (USD)")),
+        "mesh.monthly_cap_usd" => Some(("Mesh & Cost", "Monthly spend cap (USD)")),
+        "mesh.classifier" => Some(("Mesh & Cost", "Task classifier")),
+        "mesh.classifier_model" => Some(("Mesh & Cost", "Classifier model")),
+        "mesh.prefer_subscription" => Some(("Mesh & Cost", "Prefer subscriptions")),
+        "mesh.max_output_tokens" => Some(("Mesh & Cost", "Max output tokens")),
+        "mesh.architect_mode" => Some(("Mesh & Cost", "Architect mode")),
+        "mesh.architect_model" => Some(("Mesh & Cost", "Architect model")),
+        "mesh.editor_model" => Some(("Mesh & Cost", "Editor model")),
+        "mesh.self_review" => Some(("Mesh & Cost", "Self-review writes")),
+        "mesh.default_effort" => Some(("Mesh & Cost", "Default reasoning effort")),
+        "local.autostart" => Some(("Local LLM", "Auto-start on launch")),
+        "local.model" => Some(("Local LLM", "Model (Ollama tag)")),
+        "local.endpoint" => Some(("Local LLM", "Ollama endpoint")),
+        "tui.fullscreen" => Some(("Interface", "Full-screen TUI")),
+        "recap.enabled" => Some(("Interface", "Per-turn recap")),
+        "shell.explain_errors" => Some(("Shell", "Explain failed commands")),
+        "lattice.enabled" => Some(("Code Intelligence", "Enabled")),
+        "lattice.inject" => Some(("Code Intelligence", "Auto-inject context")),
+        "lattice.watch" => Some(("Code Intelligence", "Watch & reindex")),
+        "lattice.embeddings.backend" => Some(("Code Intelligence", "Embeddings backend")),
+        "autofix.enabled" => Some(("Autofix", "Enabled")),
+        "autofix.max_iterations" => Some(("Autofix", "Max iterations")),
+        "assay.gate_enabled" => Some(("Assay", "Review gate")),
+        "assay.max_cost_usd" => Some(("Assay", "Max cost (USD)")),
+        "git.coauthor" => Some(("Git", "Co-author commits")),
+        "lsp.enabled" => Some(("Code Intelligence", "LSP diagnostics")),
+        _ => None,
+    };
+    if let Some((g, l)) = curated {
+        return (g.to_string(), l.to_string());
+    }
+    // Fallback: group from the top segment, label humanized from the last segment.
+    let top = path.split('.').next().unwrap_or(path);
+    let last = path.rsplit('.').next().unwrap_or(path);
+    (humanize(top), humanize(last))
+}
+
+fn humanize(s: &str) -> String {
+    let mut out = String::new();
+    for (i, word) in s.split('_').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let mut cs = word.chars();
+        if let Some(c) = cs.next() {
+            out.extend(c.to_uppercase());
+            out.push_str(cs.as_str());
+        }
+    }
+    out
+}
+
+/// Build the full descriptor list for the friendly `/config` editor: every scalar setting with its
+/// group, label, help, control kind, value, default, modified flag, and source — importance-ordered.
+pub fn config_descriptors() -> Vec<SettingDescriptor> {
+    // Effective leaves (defaults + user + project).
+    let leaves = config_leaves();
+    // Default-only values, for the "default" column + modified detection.
+    let default_value = serde_json::to_value(Config::default()).unwrap_or(serde_json::Value::Null);
+    let mut default_leaves = Vec::new();
+    flatten_value("", &default_value, &mut default_leaves);
+    let defaults: std::collections::HashMap<String, SettingValue> = default_leaves
+        .into_iter()
+        .map(|l| (l.path, l.value))
+        .collect();
+    // Which file set each path (for source + modified).
+    let user_table = read_table(scope_path(ConfigScope::User).ok().as_deref());
+    let project_table = read_table(Some(std::path::Path::new("./.forge/config.toml")));
+
+    let mut descriptors: Vec<SettingDescriptor> = leaves
+        .into_iter()
+        .map(|l| {
+            let (group, label) = setting_group_and_label(&l.path);
+            let kind = match setting_options(&l.path) {
+                Some(opts) => SettingKind::Enum(opts),
+                None => match l.value {
+                    SettingValue::Bool(_) => SettingKind::Bool,
+                    SettingValue::Int(_) => SettingKind::Int,
+                    SettingValue::Float(_) => SettingKind::Float,
+                    _ => SettingKind::Text,
+                },
+            };
+            let in_project = project_table
+                .as_ref()
+                .is_some_and(|t| dotted_present(t, &l.path));
+            let in_user = user_table
+                .as_ref()
+                .is_some_and(|t| dotted_present(t, &l.path));
+            let source = if in_project {
+                "project"
+            } else if in_user {
+                "user"
+            } else {
+                "default"
+            };
+            let default = defaults
+                .get(&l.path)
+                .cloned()
+                .unwrap_or(SettingValue::Unset);
+            SettingDescriptor {
+                help: setting_help(&l.path).map(str::to_string),
+                kind,
+                value: l.value,
+                modified: in_project || in_user,
+                default,
+                group,
+                label,
+                source,
+                path: l.path,
+            }
+        })
+        .collect();
+    // Group rows so each section is contiguous; sections ordered by the importance of their first
+    // member (descriptors are already importance-ordered), rows kept in that order within a group.
+    let mut group_order: Vec<String> = Vec::new();
+    for d in &descriptors {
+        if !group_order.contains(&d.group) {
+            group_order.push(d.group.clone());
+        }
+    }
+    descriptors.sort_by_key(|d| {
+        group_order
+            .iter()
+            .position(|g| g == &d.group)
+            .unwrap_or(usize::MAX)
+    });
+    descriptors
+}
+
+fn read_table(path: Option<&std::path::Path>) -> Option<toml::Table> {
+    let p = path?;
+    std::fs::read_to_string(p).ok()?.parse().ok()
+}
+
+fn dotted_present(table: &toml::Table, path: &str) -> bool {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut cur = table;
+    for p in &parts[..parts.len() - 1] {
+        match cur.get(*p).and_then(|v| v.as_table()) {
+            Some(t) => cur = t,
+            None => return false,
+        }
+    }
+    cur.contains_key(parts[parts.len() - 1])
+}
+
 fn flatten_value(prefix: &str, value: &serde_json::Value, out: &mut Vec<SettingLeaf>) {
     use serde_json::Value;
     match value {
@@ -1570,6 +1770,25 @@ pub fn set_config_value(scope: ConfigScope, path: &str, raw: &str) -> Result<(),
         .extract::<Config>()
         .map_err(|e| ConfigError::Write(format!("invalid value for {path}: {e}")))?;
 
+    std::fs::write(&file, body).map_err(|e| ConfigError::Write(e.to_string()))?;
+    Ok(())
+}
+
+/// Reset a setting to its default by removing it from the given scope's `config.toml` (and, when
+/// resetting user scope, also from the project file if present, so the default actually takes
+/// effect). No-op if absent. The remaining file is validated.
+pub fn reset_config_value(scope: ConfigScope, path: &str) -> Result<(), ConfigError> {
+    let file = scope_path(scope)?;
+    let Some(text) = std::fs::read_to_string(&file).ok() else {
+        return Ok(()); // nothing written → already default
+    };
+    let mut root: toml::Table = text.parse().unwrap_or_default();
+    remove_dotted(&mut root, path);
+    let body = toml::to_string_pretty(&root).map_err(|e| ConfigError::Write(e.to_string()))?;
+    Figment::from(Serialized::defaults(Config::default()))
+        .merge(Toml::string(&body))
+        .extract::<Config>()
+        .map_err(|e| ConfigError::Write(format!("invalid config after reset of {path}: {e}")))?;
     std::fs::write(&file, body).map_err(|e| ConfigError::Write(e.to_string()))?;
     Ok(())
 }
