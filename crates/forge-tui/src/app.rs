@@ -420,6 +420,20 @@ pub enum ActivityStatus {
     Skipped,
 }
 
+/// A cheap, allocation-light row for the sticky activity panel: metadata only, no transcript lines.
+/// Built every frame, so it must NOT clone the (potentially large) transcript — that's deferred to
+/// [`App::activity_views`], which only runs when the full-screen viewer is open.
+#[derive(Debug, Clone)]
+pub struct ActivitySummary {
+    pub kind: ActivityKind,
+    pub title: String,
+    pub subtitle: String,
+    pub model: Option<String>,
+    pub status: ActivityStatus,
+    pub cost: f64,
+    pub line_count: usize,
+}
+
 /// One owned snapshot in the unified activity viewer: main chat, a subagent, or an assay critic.
 /// Carries pre-styled transcript lines so the full-screen viewer renders them exactly like the
 /// main chat (markdown + role coloring), wrapped to the terminal width.
@@ -766,12 +780,22 @@ impl App {
                     if n > 80 {
                         row.last = row.last.chars().skip(n - 80).collect();
                     }
-                    // Keep the FULL transcript for the scrollable browser (Ctrl+O), capped only by
-                    // a high safety bound so a pathological child can't exhaust memory.
-                    const MAX_LOG: usize = 10_000;
-                    for piece in snippet.split('\n').filter(|p| !p.trim().is_empty()) {
-                        row.log.push(piece.trim().to_string());
+                    // Assemble the streamed token-fragments into coherent transcript lines: append
+                    // to the open last line, breaking only on real newlines. (Pushing each fragment
+                    // as its own line fragmented identifiers like `count_text` across many rows.)
+                    if row.log.is_empty() {
+                        row.log.push(String::new());
                     }
+                    for ch in snippet.chars() {
+                        if ch == '\n' {
+                            row.log.push(String::new());
+                        } else {
+                            row.log.last_mut().unwrap().push(ch);
+                        }
+                    }
+                    // Cap the transcript by a high safety bound so a pathological child can't
+                    // exhaust memory; keep the newest lines.
+                    const MAX_LOG: usize = 10_000;
                     if row.log.len() > MAX_LOG {
                         let drop = row.log.len() - MAX_LOG;
                         row.log.drain(0..drop);
@@ -790,14 +814,18 @@ impl App {
                 if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id) {
                     row.done = true;
                     row.cost = cost_usd;
-                    // Record the outcome at the tail of the transcript so the browser shows it.
+                    // Drop a trailing empty/partial line, then record the outcome at the tail of the
+                    // transcript so the browser shows it.
+                    if row.log.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+                        row.log.pop();
+                    }
                     row.log.push(String::new());
                     row.log.push(format!(
                         "── result ({}) ──",
                         if ok { "ok" } else { "failed" }
                     ));
-                    for piece in summary.split('\n').filter(|p| !p.trim().is_empty()) {
-                        row.log.push(piece.trim().to_string());
+                    for piece in summary.split('\n') {
+                        row.log.push(piece.to_string());
                     }
                 }
                 // When every child in the batch has reported, close the scrollback box. The rows
@@ -966,8 +994,68 @@ impl App {
         self.pending_shell_fix = None;
     }
 
+    /// Cheap per-frame metadata for the sticky activity panel (no transcript cloning). Order:
+    /// main chat, then subagents, then assay critics. Empty when there's no activity.
+    pub fn activity_summaries(&self) -> Vec<ActivitySummary> {
+        if !self.has_activity() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.activity_len());
+        out.push(ActivitySummary {
+            kind: ActivityKind::MainChat,
+            title: "main chat".to_string(),
+            subtitle: String::new(),
+            model: self.routing.as_ref().map(|r| r.model.clone()),
+            status: if self.busy {
+                ActivityStatus::Running
+            } else {
+                ActivityStatus::Done
+            },
+            cost: self.cost_usd,
+            line_count: self.main_log.len(),
+        });
+        for r in &self.subagents {
+            out.push(ActivitySummary {
+                kind: ActivityKind::Subagent,
+                title: r.agent.clone(),
+                subtitle: r.task.clone(),
+                model: r.model.clone(),
+                status: if r.done {
+                    ActivityStatus::Done
+                } else {
+                    ActivityStatus::Running
+                },
+                cost: r.cost,
+                line_count: r.log.len(),
+            });
+        }
+        for c in &self.assay_critics {
+            use forge_types::AssayCriticStatus;
+            let (status, subtitle) = match &c.status {
+                AssayCriticStatus::Queued => (ActivityStatus::Running, c.focus.clone()),
+                AssayCriticStatus::Done { candidates } => {
+                    (ActivityStatus::Done, format!("{candidates} found"))
+                }
+                AssayCriticStatus::Skipped { reason } => {
+                    (ActivityStatus::Skipped, format!("skipped ({reason})"))
+                }
+            };
+            out.push(ActivitySummary {
+                kind: ActivityKind::AssayCritic,
+                title: c.lens.clone(),
+                subtitle,
+                model: c.model.clone(),
+                status,
+                cost: c.cost_usd,
+                line_count: c.output.lines().count(),
+            });
+        }
+        out
+    }
+
     /// Build the unified activity views (main chat + subagents + assay critics), in panel order, so
-    /// the full-screen viewer can render any of them. Re-read each frame so live logs update.
+    /// the full-screen viewer can render any of them. Heavier (clones transcripts + renders
+    /// markdown) — call ONLY when the full-screen viewer is open, never per render frame.
     /// Empty when there's no activity (see [`has_activity`]).
     pub fn activity_views(&self) -> Vec<TranscriptView> {
         if !self.has_activity() {
@@ -995,16 +1083,26 @@ impl App {
             line_count: main_count,
         });
 
-        // Subagents, in spawn order.
+        // Subagents, in spawn order. The transcript is streamed token-fragments assembled into
+        // lines — render as plain styled text (markdown would mangle the partial streaming).
         for r in &self.subagents {
-            let body = r.log.join("\n");
-            let lines = if body.trim().is_empty() {
+            let lines: Vec<TextLine<'static>> = if r.log.iter().all(|l| l.trim().is_empty()) {
                 vec![TextLine::from(Span::styled(
                     "(no activity captured yet)",
                     Style::default().fg(DIM),
                 ))]
             } else {
-                crate::render::markdown_to_lines(&body)
+                r.log
+                    .iter()
+                    .map(|l| {
+                        let style = if l.starts_with("── result") {
+                            Style::default().fg(ORANGE)
+                        } else {
+                            Style::default().fg(Color::Rgb(205, 205, 215))
+                        };
+                        TextLine::from(Span::styled(l.clone(), style))
+                    })
+                    .collect()
             };
             views.push(TranscriptView {
                 kind: ActivityKind::Subagent,
@@ -1908,7 +2006,9 @@ fn render_activity_panel(frame: &mut Frame, area: Rect, app: &App) {
     if area.height == 0 {
         return;
     }
-    let views = app.activity_views();
+    // Cheap per-frame metadata only — building full transcripts here would clone the whole main
+    // log + re-render markdown every frame (jank/ghosting). Full views are built lazily on Enter.
+    let views = app.activity_summaries();
     if views.is_empty() {
         return;
     }
@@ -4003,11 +4103,12 @@ mod tests {
             task: "find call sites".into(),
             model: Some("groq::llama".into()),
         });
-        // More progress than the old 200-snippet cap — the full transcript must be kept.
+        // More progress than the old 200-snippet cap — the full transcript must be kept. Each
+        // snippet ends in a newline so the line-assembler keeps them as distinct lines.
         for i in 0..250 {
             app.apply(PresenterEvent::SubagentProgress {
                 id: "a".into(),
-                snippet: format!("step {i}"),
+                snippet: format!("step {i}\n"),
             });
         }
         app.apply(PresenterEvent::SubagentResult {
