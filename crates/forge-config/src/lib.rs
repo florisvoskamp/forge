@@ -1350,6 +1350,250 @@ pub fn append_allow_rule(tool: &str) -> std::io::Result<()> {
     f.write_all(entry.as_bytes())
 }
 
+// ----------------------------------------------------------------------------------------------
+// Dynamic config editor backing (`/config`). The settable surface is *discovered* by walking the
+// serialized Config — every scalar field appears automatically, and a newly-added field needs no
+// extra code here. Complex sections (lists/maps: hooks, mcp, permission rules) are excluded; they
+// have dedicated commands (`/hooks`, `/mcp`, …).
+// ----------------------------------------------------------------------------------------------
+
+/// Where a `/config` edit is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScope {
+    /// `~/.config/forge/config.toml` — applies everywhere.
+    User,
+    /// `./.forge/config.toml` — repo-local override.
+    Project,
+}
+
+/// A single editable scalar setting: its dotted path and current value/type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingLeaf {
+    pub path: String,
+    pub value: SettingValue,
+}
+
+/// The typed value of a [`SettingLeaf`] (only scalars are editable here).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    /// An unset optional (serialized `null`) — edited as text, empty clears it.
+    Unset,
+}
+
+impl SettingValue {
+    /// A short type tag for the editor UI.
+    pub fn type_tag(&self) -> &'static str {
+        match self {
+            SettingValue::Bool(_) => "bool",
+            SettingValue::Int(_) => "int",
+            SettingValue::Float(_) => "float",
+            SettingValue::Str(_) | SettingValue::Unset => "text",
+        }
+    }
+
+    /// How the current value renders in the editor.
+    pub fn display(&self) -> String {
+        match self {
+            SettingValue::Bool(b) => b.to_string(),
+            SettingValue::Int(i) => i.to_string(),
+            SettingValue::Float(f) => f.to_string(),
+            SettingValue::Str(s) => s.clone(),
+            SettingValue::Unset => String::new(),
+        }
+    }
+}
+
+/// Top-level sections that are NOT scalar-editable here — each has its own command/flow.
+const COMPLEX_SECTIONS: &[&str] = &["hooks", "mcp", "permissions"];
+
+/// Importance order for the editor: these path prefixes sort first (in this order); everything else
+/// follows alphabetically. New fields therefore appear automatically, just lower in the list until
+/// curated here.
+const PRIORITY_PREFIXES: &[&str] = &[
+    "permission_mode",
+    "mesh.credit_mode",
+    "mesh.daily_cap_usd",
+    "mesh.monthly_cap_usd",
+    "mesh.weekly_cap_usd",
+    "local.autostart",
+    "local.model",
+    "tui.fullscreen",
+    "recap.enabled",
+    "mesh",
+    "local",
+    "tui",
+];
+
+/// Discover every scalar setting from the *effective* config (defaults + user + project), as
+/// importance-ordered dotted-path leaves. Arrays and the complex sections are skipped.
+pub fn config_leaves() -> Vec<SettingLeaf> {
+    let cfg = load().unwrap_or_default();
+    let value = serde_json::to_value(&cfg).unwrap_or(serde_json::Value::Null);
+    let mut out = Vec::new();
+    flatten_value("", &value, &mut out);
+    out.sort_by(|a, b| {
+        priority_rank(&a.path)
+            .cmp(&priority_rank(&b.path))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    out
+}
+
+fn priority_rank(path: &str) -> usize {
+    // Most specific matching prefix wins (so `mesh.credit_mode` beats the `mesh` catch-all).
+    PRIORITY_PREFIXES
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| path == **p || path.starts_with(&format!("{p}.")))
+        .map(|(i, _)| i)
+        .min()
+        .unwrap_or(usize::MAX)
+}
+
+fn flatten_value(prefix: &str, value: &serde_json::Value, out: &mut Vec<SettingLeaf>) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                // Skip complex top-level sections entirely (their own commands own them).
+                if prefix.is_empty() && COMPLEX_SECTIONS.contains(&k.as_str()) {
+                    continue;
+                }
+                let path = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                flatten_value(&path, v, out);
+            }
+        }
+        // Arrays are complex — excluded here.
+        Value::Array(_) => {}
+        Value::Bool(b) => out.push(leaf(prefix, SettingValue::Bool(*b))),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                out.push(leaf(prefix, SettingValue::Int(i)));
+            } else if let Some(f) = n.as_f64() {
+                out.push(leaf(prefix, SettingValue::Float(f)));
+            }
+        }
+        Value::String(s) => out.push(leaf(prefix, SettingValue::Str(s.clone()))),
+        Value::Null => out.push(leaf(prefix, SettingValue::Unset)),
+    }
+}
+
+fn leaf(path: &str, value: SettingValue) -> SettingLeaf {
+    SettingLeaf {
+        path: path.to_string(),
+        value,
+    }
+}
+
+/// The config file path for a scope.
+pub fn scope_path(scope: ConfigScope) -> Result<PathBuf, ConfigError> {
+    match scope {
+        ConfigScope::User => Ok(config_dir().ok_or(ConfigError::NoConfigDir)?.join("config.toml")),
+        ConfigScope::Project => Ok(PathBuf::from("./.forge/config.toml")),
+    }
+}
+
+/// Set a dotted-path scalar in the given scope's `config.toml`, preserving every other key. `raw` is
+/// coerced to the leaf's existing type (bool/int/float/text); an empty value on an optional clears
+/// it. The result is validated by re-extracting the whole `Config` — a bad value (e.g. an invalid
+/// enum) is rejected and the file is left untouched.
+pub fn set_config_value(scope: ConfigScope, path: &str, raw: &str) -> Result<(), ConfigError> {
+    let leaves = config_leaves();
+    let existing = leaves.iter().find(|l| l.path == path);
+    let coerced = coerce_value(raw, existing.map(|l| &l.value))?;
+
+    let file = scope_path(scope)?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ConfigError::Write(e.to_string()))?;
+    }
+    let mut root: toml::Table = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+
+    match coerced {
+        Some(v) => set_dotted(&mut root, path, v),
+        None => remove_dotted(&mut root, path), // empty → clear the optional
+    }
+
+    // Validate: the file must still extract to a Config layered over the defaults.
+    let body = toml::to_string_pretty(&root).map_err(|e| ConfigError::Write(e.to_string()))?;
+    Figment::from(Serialized::defaults(Config::default()))
+        .merge(Toml::string(&body))
+        .extract::<Config>()
+        .map_err(|e| ConfigError::Write(format!("invalid value for {path}: {e}")))?;
+
+    std::fs::write(&file, body).map_err(|e| ConfigError::Write(e.to_string()))?;
+    Ok(())
+}
+
+/// Coerce raw input to a TOML value matching the existing leaf's type. `None` = clear (empty input
+/// on an optional/text). Errors on a malformed bool/number.
+fn coerce_value(raw: &str, existing: Option<&SettingValue>) -> Result<Option<toml::Value>, ConfigError> {
+    let t = raw.trim();
+    match existing {
+        Some(SettingValue::Bool(_)) => {
+            let b = match t.to_ascii_lowercase().as_str() {
+                "true" | "on" | "yes" | "1" => true,
+                "false" | "off" | "no" | "0" => false,
+                _ => return Err(ConfigError::Write(format!("expected a boolean, got '{raw}'"))),
+            };
+            Ok(Some(toml::Value::Boolean(b)))
+        }
+        Some(SettingValue::Int(_)) => t
+            .parse::<i64>()
+            .map(|i| Some(toml::Value::Integer(i)))
+            .map_err(|_| ConfigError::Write(format!("expected an integer, got '{raw}'"))),
+        Some(SettingValue::Float(_)) => t
+            .parse::<f64>()
+            .map(|f| Some(toml::Value::Float(f)))
+            .map_err(|_| ConfigError::Write(format!("expected a number, got '{raw}'"))),
+        // Text or unset/optional: empty clears, otherwise a string.
+        _ => {
+            if t.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(toml::Value::String(t.to_string())))
+            }
+        }
+    }
+}
+
+fn set_dotted(root: &mut toml::Table, path: &str, val: toml::Value) {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut cur = root;
+    for p in &parts[..parts.len() - 1] {
+        let entry = cur
+            .entry(p.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !entry.is_table() {
+            *entry = toml::Value::Table(toml::Table::new());
+        }
+        cur = entry.as_table_mut().unwrap();
+    }
+    cur.insert(parts[parts.len() - 1].to_string(), val);
+}
+
+fn remove_dotted(root: &mut toml::Table, path: &str) {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut cur = root;
+    for p in &parts[..parts.len() - 1] {
+        match cur.get_mut(*p).and_then(|v| v.as_table_mut()) {
+            Some(t) => cur = t,
+            None => return,
+        }
+    }
+    cur.remove(parts[parts.len() - 1]);
+}
+
 /// Persist the CLI-bridge subscription plans into the user `config.toml`, preserving every other
 /// key already in the file (`forge init`). Returns the path written. Set `[mesh.subscriptions]`
 /// without disturbing the rest of the config — secrets are NEVER written here (keys go to the
@@ -1551,6 +1795,59 @@ pub fn inject_provider_keys() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_leaves_discovers_scalars_and_skips_complex_sections() {
+        let value = serde_json::to_value(Config::default()).unwrap();
+        let mut leaves = Vec::new();
+        flatten_value("", &value, &mut leaves);
+        let paths: Vec<&str> = leaves.iter().map(|l| l.path.as_str()).collect();
+        // Known scalars are discovered automatically.
+        assert!(paths.contains(&"tui.fullscreen"));
+        assert!(paths.contains(&"local.autostart"));
+        assert!(paths.contains(&"recap.enabled"));
+        // Complex sections are excluded (their own commands own them).
+        assert!(!paths.iter().any(|p| p.starts_with("hooks")));
+        assert!(!paths.iter().any(|p| p.starts_with("mcp")));
+        assert!(!paths.iter().any(|p| p.starts_with("permissions")));
+    }
+
+    #[test]
+    fn priority_orders_important_settings_first() {
+        // permission_mode outranks an arbitrary deep field; most-specific prefix wins.
+        assert!(priority_rank("permission_mode") < priority_rank("lattice.embeddings.model"));
+        assert!(priority_rank("mesh.credit_mode") < priority_rank("mesh.disabled"));
+        assert_eq!(priority_rank("some.unlisted.field"), usize::MAX);
+    }
+
+    #[test]
+    fn coerce_respects_existing_type() {
+        assert_eq!(
+            coerce_value("on", Some(&SettingValue::Bool(false))).unwrap(),
+            Some(toml::Value::Boolean(true))
+        );
+        assert_eq!(
+            coerce_value("42", Some(&SettingValue::Int(0))).unwrap(),
+            Some(toml::Value::Integer(42))
+        );
+        // Bad bool/int are rejected, not silently stringified.
+        assert!(coerce_value("maybe", Some(&SettingValue::Bool(false))).is_err());
+        assert!(coerce_value("3.x", Some(&SettingValue::Int(0))).is_err());
+        // Empty on an optional clears it.
+        assert_eq!(coerce_value("", Some(&SettingValue::Unset)).unwrap(), None);
+    }
+
+    #[test]
+    fn set_and_remove_dotted_paths() {
+        let mut root = toml::Table::new();
+        set_dotted(&mut root, "local.model", toml::Value::String("gemma4:12b".into()));
+        assert_eq!(
+            root["local"]["model"].as_str(),
+            Some("gemma4:12b")
+        );
+        remove_dotted(&mut root, "local.model");
+        assert!(root["local"].as_table().unwrap().get("model").is_none());
+    }
 
     #[test]
     fn hook_matcher_filters_by_tool_name() {
