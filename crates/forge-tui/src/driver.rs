@@ -133,8 +133,13 @@ pub struct Tui {
     fullscreen: bool,
 }
 
-/// Install (once) a panic hook that disables raw mode before the default hook prints, so a
-/// panic anywhere can never leave the terminal stuck. Idempotent across `Tui`/`TuiPresenter`.
+/// Set while a full-screen (alternate-screen) TUI is active, so the panic hook knows to leave the
+/// alternate screen before printing — otherwise a panic message would be lost on the alt buffer.
+static IN_ALT_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Install (once) a panic hook that disables raw mode (and leaves the alternate screen, if active)
+/// before the default hook prints, so a panic anywhere can never leave the terminal stuck or
+/// swallow the message. Idempotent across `Tui`/`TuiPresenter`.
 pub fn install_panic_restore() {
     use std::sync::Once;
     static HOOK: Once = Once::new();
@@ -142,6 +147,9 @@ pub fn install_panic_restore() {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
+            if IN_ALT_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+            }
             let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
             prev(info);
         }));
@@ -158,6 +166,7 @@ impl Tui {
         crossterm::execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
         if fullscreen {
             crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+            IN_ALT_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::with_options(
@@ -326,6 +335,7 @@ impl Drop for Tui {
     fn drop(&mut self) {
         let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste, DisableFocusChange);
         if self.fullscreen {
+            IN_ALT_SCREEN.store(false, std::sync::atomic::Ordering::Relaxed);
             let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
         }
         let _ = disable_raw_mode();
