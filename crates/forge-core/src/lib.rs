@@ -909,6 +909,17 @@ impl Session {
         &self.id
     }
 
+    /// Persist the TUI view snapshot (opaque JSON) for this session so a resume restores the
+    /// on-screen activity/viewer state. Best-effort — a store error is ignored.
+    pub fn save_view_snapshot(&self, json: &str) {
+        let _ = self.store.update_session_view_snapshot(&self.id, json);
+    }
+
+    /// The TUI view snapshot persisted for this session, if any (set on the last turn).
+    pub fn view_snapshot(&self) -> Option<String> {
+        self.store.session_view_snapshot(&self.id).ok().flatten()
+    }
+
     /// The most recent assistant message's text, if any — used by `/loop` to decide whether the
     /// model signalled completion.
     pub fn last_assistant_text(&self) -> Option<&str> {
@@ -1090,13 +1101,17 @@ impl Session {
         // Surface each critic/verifier as it finishes so the run shows live activity.
         let presenter = &mut self.presenter;
         let mut on_progress = |p: assay::AssayProgress| match &p {
-            assay::AssayProgress::CriticQueued { lens } => {
+            assay::AssayProgress::CriticQueued {
+                lens,
+                expected_model,
+            } => {
                 presenter.emit(PresenterEvent::AssayCriticRow(
                     forge_types::AssayCriticRow {
                         lens: lens.as_str().to_string(),
                         focus: assay::lens_brief(*lens).to_string(),
-                        model: None,
+                        model: Some(expected_model.clone()),
                         cost_usd: 0.0,
+                        output: String::new(),
                         status: forge_types::AssayCriticStatus::Queued,
                     },
                 ));
@@ -1106,6 +1121,7 @@ impl Session {
                 candidates,
                 model,
                 cost_usd,
+                output,
             } => {
                 presenter.emit(PresenterEvent::AssayCriticRow(
                     forge_types::AssayCriticRow {
@@ -1113,6 +1129,7 @@ impl Session {
                         focus: assay::lens_brief(*lens).to_string(),
                         model: Some(model.clone()),
                         cost_usd: *cost_usd,
+                        output: output.clone(),
                         status: forge_types::AssayCriticStatus::Done {
                             candidates: *candidates,
                         },
@@ -1126,6 +1143,7 @@ impl Session {
                         focus: assay::lens_brief(*lens).to_string(),
                         model: None,
                         cost_usd: 0.0,
+                        output: String::new(),
                         status: forge_types::AssayCriticStatus::Skipped {
                             reason: reason.clone(),
                         },
@@ -1805,6 +1823,66 @@ Rules:\n\
         Ok((before, after))
     }
 
+    const RECAP_SYSTEM: &'static str = "You are a one-line summarizer for a coding assistant. \
+Given the user's request and the assistant's response, write a SINGLE sentence (≤12 words, \
+past tense, no punctuation at end) that captures what was accomplished. \
+Output ONLY that sentence — no preamble, no quotation marks.";
+
+    /// After a turn completes, make one cheap trivial-tier call to generate a one-line recap,
+    /// emitted via [`PresenterEvent::Recap`]. Best-effort: silently skipped on budget exhaustion
+    /// or any model error so it can never derail the session.
+    async fn generate_recap(&mut self, prompt: &str, final_text: &str) {
+        if !self.config.recap.enabled {
+            return;
+        }
+        let budget = BudgetState {
+            spent_today_usd: self.store.spend_today_usd().unwrap_or(0.0),
+            daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_week_usd: self.store.spend_this_week_usd().unwrap_or(0.0),
+            weekly_cap_usd: self.config.mesh.weekly_budget_usd,
+            spent_month_usd: self.store.spend_this_month_usd().unwrap_or(0.0),
+            monthly_cap_usd: self.config.mesh.monthly_cap_usd,
+            warn_fraction: self.config.mesh.warn_threshold,
+        };
+        if budget.status() == BudgetStatus::Exhausted {
+            return;
+        }
+        let health = self.store.current_benched().unwrap_or_default();
+        let quota = self.live_quota();
+        let decision = self
+            .router
+            .route_hinted(
+                "summarize in one sentence",
+                budget,
+                &health,
+                &quota,
+                Some(TaskTier::Trivial),
+            )
+            .await;
+        let user_snippet: String = prompt.chars().take(400).collect();
+        let assistant_snippet: String = final_text.chars().take(800).collect();
+        let messages = [
+            Message::system(Self::RECAP_SYSTEM),
+            Message::user(format!(
+                "User request:\n{user_snippet}\n\nAssistant response:\n{assistant_snippet}"
+            )),
+        ];
+        let mut sink = |_: StreamEvent| {};
+        if let Ok(r) = self
+            .provider
+            .complete(&decision.model, &messages, &[], &mut sink)
+            .await
+        {
+            let _ = self
+                .store
+                .record_side_call_usage(&self.id, "recap", &r.usage);
+            let text = r.content.trim().to_string();
+            if !text.is_empty() {
+                self.presenter.emit(PresenterEvent::Recap { text });
+            }
+        }
+    }
+
     /// On a failed shell command, make one cheap trivial-tier model call explaining the likely
     /// cause + a concrete fix, surfaced via [`PresenterEvent::ShellDiagnosis`]. Best-effort: it
     /// is skipped when the budget is exhausted and stays silent on any model error, so it can
@@ -1987,7 +2065,12 @@ Rules:\n\
                                     StreamEvent::ToolFinished { name, ok, summary } => presenter
                                         .emit(PresenterEvent::ToolResult { name, ok, summary }),
                                     StreamEvent::SubagentStarted { id, agent, task } => presenter
-                                        .emit(PresenterEvent::SubagentStart { id, agent, task }),
+                                        .emit(PresenterEvent::SubagentStart {
+                                            id,
+                                            agent,
+                                            task,
+                                            model: None,
+                                        }),
                                     StreamEvent::SubagentProgress { id, snippet } => presenter
                                         .emit(PresenterEvent::SubagentProgress { id, snippet }),
                                     StreamEvent::SubagentFinished {
@@ -2636,6 +2719,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         self.presenter.emit(PresenterEvent::Done {
             final_text: final_text.clone(),
         });
+        self.generate_recap(prompt, &final_text).await;
         Ok(final_text)
     }
 
@@ -3362,13 +3446,17 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         // (running children animate live; completed ones fold into the scrollback box).
         let presenter = &mut self.presenter;
         let mut on_event = |ev: subagent::Lifecycle| match ev {
-            subagent::Lifecycle::Start { id, agent, task } => {
-                presenter.emit(PresenterEvent::SubagentStart {
-                    id: id.to_string(),
-                    agent: agent.to_string(),
-                    task: task.to_string(),
-                })
-            }
+            subagent::Lifecycle::Start {
+                id,
+                agent,
+                task,
+                model,
+            } => presenter.emit(PresenterEvent::SubagentStart {
+                id: id.to_string(),
+                agent: agent.to_string(),
+                task: task.to_string(),
+                model: Some(model.to_string()),
+            }),
             subagent::Lifecycle::Progress { id, snippet } => {
                 presenter.emit(PresenterEvent::SubagentProgress {
                     id: id.to_string(),
@@ -5330,7 +5418,10 @@ mod tests {
     #[tokio::test]
     async fn resume_rehydrates_transcript_and_continues_same_session() {
         let path = std::env::temp_dir().join(format!("forge-resume-{}.db", forge_types::new_id()));
-        let config = Config::default();
+        // This test asserts message_count == transcript length; the per-turn recap side-call would
+        // add a usage row (counted by message_count, not rehydrated), so disable it here.
+        let mut config = Config::default();
+        config.recap.enabled = false;
 
         // First run on a file-backed store, then drop it.
         let (id, cost1, msgs1) = {

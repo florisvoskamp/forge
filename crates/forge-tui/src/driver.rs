@@ -8,10 +8,13 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
-    Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
 };
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use forge_types::SideEffect;
 use ratatui::backend::CrosstermBackend;
 use ratatui::text::Line as TextLine;
@@ -30,6 +33,12 @@ pub enum InputEvent {
     /// The terminal window gained (`true`) or lost (`false`) focus. Drives the input cursor's
     /// focused/hollow appearance (EnableFocusChange must be active).
     Focus(bool),
+    /// A mouse wheel scroll (`up = true` scrolls toward the top). Only emitted in full-screen mode,
+    /// where mouse capture is on, so the wheel scrolls the transcript instead of the terminal
+    /// translating it into ↑/↓ keys (which would walk the prompt history).
+    Scroll {
+        up: bool,
+    },
 }
 
 /// A message from a running turn to the render loop.
@@ -117,15 +126,27 @@ impl Presenter for ChannelPresenter {
     }
 }
 
-/// Owns the terminal for the render loop. Uses an *inline* viewport (no alternate screen):
-/// finalized lines flow into the terminal's native scrollback via [`Tui::insert_lines`],
-/// and only the small pinned live region is redrawn each frame.
+/// Owns the terminal for the render loop. Two modes:
+/// - **inline** (`fullscreen = false`): an inline viewport (no alternate screen). Finalized lines
+///   flow into the terminal's native scrollback via [`Tui::insert_lines`]; only the small pinned
+///   live region is redrawn each frame.
+/// - **fullscreen** (`fullscreen = true`, the default): an alternate-screen viewport spanning the
+///   whole terminal. There is no native scrollback to corrupt — the transcript is rendered from
+///   `App::main_log` into a scrollable region, so [`Tui::insert_lines`] is a no-op (the caller
+///   folds lines into the app log instead). Round-tripping into the full-screen activity viewer
+///   can't disturb the conversation.
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    fullscreen: bool,
 }
 
-/// Install (once) a panic hook that disables raw mode before the default hook prints, so a
-/// panic anywhere can never leave the terminal stuck. Idempotent across `Tui`/`TuiPresenter`.
+/// Set while a full-screen (alternate-screen) TUI is active, so the panic hook knows to leave the
+/// alternate screen before printing — otherwise a panic message would be lost on the alt buffer.
+static IN_ALT_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Install (once) a panic hook that disables raw mode (and leaves the alternate screen, if active)
+/// before the default hook prints, so a panic anywhere can never leave the terminal stuck or
+/// swallow the message. Idempotent across `Tui`/`TuiPresenter`.
 pub fn install_panic_restore() {
     use std::sync::Once;
     static HOOK: Once = Once::new();
@@ -133,6 +154,10 @@ pub fn install_panic_restore() {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
+            if IN_ALT_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ =
+                    crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            }
             let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
             prev(info);
         }));
@@ -140,26 +165,45 @@ pub fn install_panic_restore() {
 }
 
 impl Tui {
-    pub fn new() -> io::Result<Self> {
+    pub fn new(fullscreen: bool) -> io::Result<Self> {
         // Belt-and-suspenders: if *anything* panics while the terminal is in raw mode, restore
         // it before the panic prints — otherwise a panic would leave the shell wedged (no echo,
         // Ctrl-C inert). `Drop` covers the normal/unwind path; this covers the print itself.
         install_panic_restore();
         enable_raw_mode()?;
         crossterm::execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
+        if fullscreen {
+            // Capture the mouse so the wheel reaches us as scroll events. Without this the terminal
+            // translates the wheel into ↑/↓ keys on the alternate screen (walking prompt history).
+            crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+            IN_ALT_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(LIVE_H),
+                viewport: viewport(fullscreen),
             },
         )?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            fullscreen,
+        })
+    }
+
+    /// Whether this TUI renders on the alternate screen (full-screen) rather than inline.
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen
     }
 
     /// Current terminal width (for building width-dependent scrollback like the banner).
     pub fn width(&self) -> u16 {
         self.terminal.size().map(|s| s.width).unwrap_or(80)
+    }
+
+    /// Current terminal height (for sizing the full-screen transcript page when paging).
+    pub fn height(&self) -> u16 {
+        self.terminal.size().map(|s| s.height).unwrap_or(24)
     }
 
     /// Push plain multi-line text into the scrollback (convenience over [`insert_lines`]).
@@ -170,8 +214,10 @@ impl Tui {
     }
 
     /// Push finalized lines into the terminal's native scrollback, above the live region.
+    /// In full-screen mode there is no native scrollback — the transcript is rendered from the
+    /// app's `main_log` — so this is a no-op and the caller must fold the lines into the app log.
     pub fn insert_lines(&mut self, lines: Vec<TextLine<'static>>) {
-        if lines.is_empty() {
+        if lines.is_empty() || self.fullscreen {
             return;
         }
         let width = self.width();
@@ -203,6 +249,11 @@ impl Tui {
             Event::Paste(s) => return Ok(Some(InputEvent::Paste(s))),
             Event::FocusGained => return Ok(Some(InputEvent::Focus(true))),
             Event::FocusLost => return Ok(Some(InputEvent::Focus(false))),
+            Event::Mouse(m) => match m.kind {
+                MouseEventKind::ScrollUp => return Ok(Some(InputEvent::Scroll { up: true })),
+                MouseEventKind::ScrollDown => return Ok(Some(InputEvent::Scroll { up: false })),
+                _ => return Ok(None),
+            },
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 let key = match k.code {
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -250,6 +301,8 @@ impl Tui {
                     KeyCode::Right => KeyKind::Right,
                     KeyCode::Home => KeyKind::Home,
                     KeyCode::End => KeyKind::End,
+                    KeyCode::PageUp => KeyKind::PageUp,
+                    KeyCode::PageDown => KeyKind::PageDown,
                     KeyCode::Tab => KeyKind::Tab,
                     _ => return Ok(None),
                 };
@@ -260,18 +313,23 @@ impl Tui {
         Ok(None)
     }
 
-    /// Run a full-screen takeover (e.g. the `/config` wizard) that owns its own alternate
-    /// screen + raw mode and restores them on exit. Afterwards the chat's raw mode is back
-    /// off and the alt-screen excursion left the inline cursor stale, so re-enter raw mode and
-    /// rebuild the inline viewport. The conversation scrollback above is untouched.
+    /// Run a full-screen takeover (e.g. the `/config` wizard or the activity viewer) that owns its
+    /// own alternate screen + raw mode and restores them on exit. Afterwards the chat's raw mode is
+    /// back off and the alt-screen excursion left our cursor/viewport stale, so re-enter raw mode
+    /// and rebuild the viewport. In inline mode this re-anchors the small live region above the
+    /// untouched scrollback; in full-screen mode we re-enter our own alternate screen and force a
+    /// full redraw, so the excursion can never duplicate panels or the input box.
     pub fn run_fullscreen<T>(&mut self, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
         let out = f();
         enable_raw_mode()?;
+        if self.fullscreen {
+            crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        }
         let backend = CrosstermBackend::new(io::stdout());
         self.terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(LIVE_H),
+                viewport: viewport(self.fullscreen),
             },
         )?;
         let _ = self.terminal.clear();
@@ -279,12 +337,26 @@ impl Tui {
     }
 }
 
+/// The ratatui viewport for a given mode: an inline pinned region, or the whole alternate screen.
+fn viewport(fullscreen: bool) -> Viewport {
+    if fullscreen {
+        Viewport::Fullscreen
+    } else {
+        Viewport::Inline(LIVE_H)
+    }
+}
+
 impl Drop for Tui {
     fn drop(&mut self) {
         let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste, DisableFocusChange);
+        if self.fullscreen {
+            IN_ALT_SCREEN.store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        }
         let _ = disable_raw_mode();
         let _ = self.terminal.show_cursor();
-        // No alternate screen to leave: the conversation stays in the user's scrollback.
+        // Inline mode: the conversation stays in the user's scrollback. Full-screen mode: we just
+        // left the alternate screen, restoring whatever was on the terminal before.
         println!();
     }
 }

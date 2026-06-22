@@ -42,9 +42,9 @@ pub mod select;
 mod transcript;
 mod tui;
 pub use app::{
-    banner_lines, handle_key, lattice_view_lines, render_mesh_overlay, render_usage_overlay, App,
-    InputOutcome, KeyKind, MeshCandRow, MeshOverlay, MeshQuotaRow, RemoteSnapshot, ReplayItem,
-    SubagentView, UsageOverlay,
+    banner_lines, handle_key, lattice_view_lines, render_mesh_overlay, render_usage_overlay,
+    ActivityKind, ActivityStatus, App, InputOutcome, KeyKind, MeshCandRow, MeshOverlay,
+    MeshQuotaRow, RemoteSnapshot, ReplayItem, TranscriptView, UsageOverlay,
 };
 pub use commands::{
     at_token_at, filter_commands, parse_command, slash_token_at, AtPathPicker, AtToken, Command,
@@ -53,8 +53,11 @@ pub use commands::{
 };
 pub use driver::{ChannelPresenter, InputEvent, Tui, UiMsg};
 pub use init_wizard::{BridgeItem, ProviderItem, WizardInput, WizardOutcome};
+/// A styled scrollback line, re-exported so binaries can route out-of-band output to the right
+/// sink (native scrollback inline, or the transcript log full-screen) without depending on ratatui.
+pub use ratatui::text::Line as ScrollbackLine;
 pub use select::{select_multi, SelectItem};
-pub use transcript::{run_subagent_transcript, transcript_lines};
+pub use transcript::{run_transcript_viewer, transcript_lines};
 pub use tui::TuiPresenter;
 
 // `QChoice`, `resolve_answer`, `NO_ANSWER` are defined above and re-exported at crate root.
@@ -155,6 +158,9 @@ pub enum PresenterEvent {
         id: String,
         agent: String,
         task: String,
+        /// The model the child routed to, when known up front (native path). `None` on the
+        /// provider-stream path where the model isn't surfaced.
+        model: Option<String>,
     },
     /// A live activity snippet from a still-running subagent (streamed text/reasoning).
     SubagentProgress {
@@ -191,6 +197,10 @@ pub enum PresenterEvent {
         symbols: usize,
         files: usize,
         tokens: usize,
+    },
+    /// A one-line AI-generated recap of what was accomplished this turn, shown in scrollback.
+    Recap {
+        text: String,
     },
     /// A failed shell command was auto-diagnosed by the model (shell-error-interceptor.md):
     /// a short likely-cause + suggested fix, surfaced alongside the tool result.
@@ -397,6 +407,9 @@ impl Presenter for HeadlessPresenter {
                 if let Some(cmd) = fix {
                     println!("    fix: {cmd}");
                 }
+            }
+            PresenterEvent::Recap { text } => {
+                println!("  ※ recap  {text}");
             }
             // The final answer was already streamed via AssistantText; Done is a
             // lifecycle marker, so the headless renderer needs no extra output here.

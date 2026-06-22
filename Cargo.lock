@@ -1760,6 +1760,8 @@ dependencies = [
  "forge-types",
  "pulldown-cmark",
  "ratatui",
+ "serde",
+ "serde_json",
  "similar",
  "syntect",
  "tokio",

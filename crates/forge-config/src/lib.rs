@@ -85,6 +85,13 @@ pub struct Config {
     /// Assay-gated auto-review of write turns before they finish (assay-gate.md). Off = inert.
     #[serde(default)]
     pub assay: AssayConfig,
+    /// Per-turn recap: a one-line AI-generated summary after each completed turn. On by default;
+    /// disable in /config if you find it noisy.
+    #[serde(default)]
+    pub recap: RecapConfig,
+    /// Interactive TUI rendering (chat). Controls inline vs. full-screen (alternate-screen) mode.
+    #[serde(default)]
+    pub tui: TuiConfig,
 }
 
 /// When a hook fires.
@@ -305,6 +312,49 @@ impl Default for ShellConfig {
 }
 
 fn default_explain_errors() -> bool {
+    true
+}
+
+/// Per-turn recap: a one-line AI-generated summary shown in scrollback after each completed turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecapConfig {
+    /// Emit a `※ recap …` line after each completed turn. Default: true. Disable in /config.
+    #[serde(default = "default_recap_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for RecapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_recap_enabled(),
+        }
+    }
+}
+
+fn default_recap_enabled() -> bool {
+    true
+}
+
+/// Interactive chat TUI rendering mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiConfig {
+    /// Render the chat on the alternate screen (full-screen), with a scrollable transcript and
+    /// the panels pinned at the bottom. Default: true. When false, the chat runs inline in the
+    /// terminal's native scrollback (a small pinned live region). The `--inline` / `--fullscreen`
+    /// flags on `forge chat` override this per-invocation.
+    #[serde(default = "default_tui_fullscreen")]
+    pub fullscreen: bool,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            fullscreen: default_tui_fullscreen(),
+        }
+    }
+}
+
+fn default_tui_fullscreen() -> bool {
     true
 }
 
@@ -1032,6 +1082,8 @@ impl Default for Config {
             lsp: LspConfig::default(),
             autofix: AutofixConfig::default(),
             assay: AssayConfig::default(),
+            recap: RecapConfig::default(),
+            tui: TuiConfig::default(),
         }
     }
 }

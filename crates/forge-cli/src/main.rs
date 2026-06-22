@@ -204,6 +204,14 @@ enum Command {
         /// Force plain line output instead of the interactive TUI.
         #[arg(long)]
         plain: bool,
+        /// Run the TUI inline in the terminal's native scrollback instead of full-screen.
+        /// Overrides the `[tui] fullscreen` config for this invocation.
+        #[arg(long, conflicts_with = "fullscreen")]
+        inline: bool,
+        /// Force the full-screen (alternate-screen) TUI, overriding the config. This is the
+        /// default; use `--inline` to opt out.
+        #[arg(long)]
+        fullscreen: bool,
         /// Pin a specific model (e.g. `openai::gpt-4o`), bypassing mesh classification.
         #[arg(long)]
         model: Option<String>,
@@ -239,10 +247,16 @@ enum Command {
     Commands,
     /// Show the auto-discovered model catalog and the mesh's best pick per tier.
     Models {
-        /// Actively ping every discovered model and persist the result: clear healthy ones,
-        /// bench the ones that rate-limit / fail auth (so the mesh routes around them).
+        /// Re-ping the currently benched/excluded models and persist the result (clear the ones
+        /// that recovered, re-bench the still-dead). Cheap: only touches benched models, not the
+        /// whole catalog. Use `--probe --all` to ping every discovered model (costs real money on
+        /// paid providers).
         #[arg(long)]
         probe: bool,
+        /// With `--probe`, ping EVERY discovered model, not just the benched ones. This calls each
+        /// paid model once and can cost a few dollars across a large catalog.
+        #[arg(long)]
+        all: bool,
         /// Clear all stale model benches (forget every rate-limited/unavailable mark) and exit.
         #[arg(long)]
         clear: bool,
@@ -720,11 +734,23 @@ async fn main() -> Result<()> {
             r#continue,
             resume,
             plain,
+            inline,
+            fullscreen,
             model,
         } => {
             let store = open_store()?;
             let resume_mode = resolve_resume_mode(r#continue, resume, &store, plain)?;
-            chat(mock, mode, resume_mode, plain, model).await
+            // Full-screen unless `--inline`; `--fullscreen` / `--inline` override the config default.
+            let fullscreen = if inline {
+                false
+            } else if fullscreen {
+                true
+            } else {
+                forge_config::load()
+                    .map(|c| c.tui.fullscreen)
+                    .unwrap_or(true)
+            };
+            chat(mock, mode, resume_mode, plain, fullscreen, model).await
         }
         Command::Sessions => sessions(),
         Command::Replay { ids, json, rerun } => {
@@ -761,7 +787,7 @@ async fn main() -> Result<()> {
             BenchCmd::Passk { reports } => bench::passk(&reports),
         },
         Command::Commands => commands_cmd(),
-        Command::Models { probe, clear } => models(probe, clear).await,
+        Command::Models { probe, all, clear } => models(probe, all, clear).await,
         Command::Mesh { prompt, json } => mesh_explain(prompt.join(" "), json).await,
         Command::Benchmarks { refresh } => benchmarks_cmd(refresh).await,
         Command::Auth { provider, remove } => auth(&provider, remove),
@@ -2625,7 +2651,7 @@ async fn drop_unaffordable_models(models: &mut Vec<String>) {
 
 /// `forge models [--probe]`: discover the usable models + show the mesh's capability-ranked pick
 /// per tier. With `--probe`, also ping each model and persist health (the user-driven rescan).
-async fn models(probe: bool, clear: bool) -> Result<()> {
+async fn models(probe: bool, probe_all: bool, clear: bool) -> Result<()> {
     if clear {
         let store = open_store()?;
         let n = store
@@ -2646,7 +2672,30 @@ async fn models(probe: bool, clear: bool) -> Result<()> {
     let store = open_store()?;
 
     if probe {
-        probe_models(&cat, &config, &store).await?;
+        // Default: only re-probe the benched/excluded models (cheap — that's the whole point of a
+        // recheck). `--all` pings every discovered model (costs real money on paid providers).
+        let targets: Vec<String> = if probe_all {
+            cat.models().to_vec()
+        } else {
+            let benched = store.current_benched().unwrap_or_default();
+            cat.models()
+                .iter()
+                .filter(|m| benched.is_benched(m))
+                .cloned()
+                .collect()
+        };
+        if targets.is_empty() {
+            println!(
+                "no benched models to recheck — all {} discovered models are healthy. \
+                 Use `--probe --all` to force a full re-ping.",
+                cat.models().len()
+            );
+        } else {
+            if !probe_all {
+                println!("rechecking {} benched model(s)…", targets.len());
+            }
+            probe_models(&targets, &config, &store).await?;
+        }
         println!();
     }
 
@@ -2698,7 +2747,10 @@ async fn models(probe: bool, clear: bool) -> Result<()> {
         println!("  {:<9} {pick}", tier.as_str());
     }
     if !probe {
-        println!("\ntip: `forge models --probe` pings each model and benches the dead ones.");
+        println!(
+            "\ntip: `forge models --probe` rechecks only the benched models (cheap); \
+             add `--all` to re-ping every model (costs money on paid providers)."
+        );
     }
     Ok(())
 }
@@ -3046,7 +3098,7 @@ fn mesh_explanation_json(e: &forge_mesh::RoutingExplanation) -> String {
 /// Ping every discovered model with a 1-token request; clear the healthy ones and bench the
 /// ones that rate-limit / fail auth / are down, so the mesh routes around them.
 async fn probe_models(
-    cat: &forge_mesh::ModelCatalog,
+    targets: &[String],
     config: &forge_config::Config,
     store: &Store,
 ) -> Result<()> {
@@ -3067,8 +3119,8 @@ async fn probe_models(
     }];
     let mut sink = |_: forge_provider::StreamEvent| {};
 
-    println!("probing {} models…", cat.models().len());
-    for m in cat.models() {
+    println!("probing {} model(s)…", targets.len());
+    for m in targets {
         let res = tokio::time::timeout(
             Duration::from_secs(20),
             provider.complete(m, &ping, &probe_tool, &mut sink),
@@ -3690,8 +3742,8 @@ async fn build_session_with(
 
     let lsp_config = config.lsp.clone();
     let mut session = match resume {
-        Some(prefix) => {
-            let full = resolve_session(&store, &prefix)?;
+        Some(ref prefix) => {
+            let full = resolve_session(&store, prefix)?;
             Session::resume(store, provider, router, tools, presenter, config, &full)
                 .with_context(|| format!("resuming session {full}"))?
         }
@@ -3733,11 +3785,14 @@ async fn build_session_with(
 
     // Connect external MCP servers (mcp-client.md). Skipped for the offline mock. Per-server
     // failures are isolated inside connect_all (each lands `failed` with a reason); we surface the
-    // whole listing once so connection state — including failures — is visible at startup.
+    // whole listing once on a fresh session (resume suppresses it — the transcript separator
+    // already orients the user, and the MCP panel is always reachable via `/mcp`).
     if !mock && config_has_mcp {
         let manager = std::sync::Arc::new(forge_mcp::McpManager::connect_all(&mcp_config).await);
         session.set_mcp(Some(manager));
-        session.announce_mcp();
+        if resume.is_none() {
+            session.announce_mcp();
+        }
     }
     if lsp_config.enabled {
         session.set_lsp(Some(std::sync::Arc::new(
@@ -3922,12 +3977,13 @@ async fn chat(
     mode: Option<Mode>,
     resume_mode: ResumeMode,
     plain: bool,
+    fullscreen: bool,
     pin: Option<String>,
 ) -> Result<()> {
     maybe_first_run_setup(mock)?;
     // Default to the interactive (animated) TUI on a real terminal.
     if !plain && std::io::stdout().is_terminal() {
-        return run_chat_tui(mock, mode, resume_mode, pin).await;
+        return run_chat_tui(mock, mode, resume_mode, fullscreen, pin).await;
     }
 
     // Plain line mode: read prompts from stdin.
@@ -3994,10 +4050,35 @@ impl Drop for DoneGuard {
 
 /// Animated TUI chat loop: renders at ~16fps, runs each turn on a task so a spinner
 /// ticks (and streamed tokens flow) while the model works.
+/// Emit pre-styled out-of-band lines to the conversation, respecting the viewport mode: inline →
+/// the terminal's native scrollback; full-screen → the app's transcript log (since there's no
+/// native scrollback in alternate-screen mode).
+fn emit_scrollback(
+    tui: &mut forge_tui::Tui,
+    app: &mut forge_tui::App,
+    lines: Vec<forge_tui::ScrollbackLine<'static>>,
+) {
+    if tui.is_fullscreen() {
+        app.push_scrollback(lines);
+    } else {
+        tui.insert_lines(lines);
+    }
+}
+
+/// Like [`emit_scrollback`] but for plain (unstyled) multi-line text.
+fn emit_text(tui: &mut forge_tui::Tui, app: &mut forge_tui::App, text: &str) {
+    if tui.is_fullscreen() {
+        app.push_scrollback_text(text);
+    } else {
+        tui.print_text(text);
+    }
+}
+
 async fn run_chat_tui(
     mock: bool,
     mode: Option<Mode>,
     resume_mode: ResumeMode,
+    fullscreen: bool,
     pin: Option<String>,
 ) -> Result<()> {
     use forge_tui::{
@@ -4009,8 +4090,8 @@ async fn run_chat_tui(
     let (done_tx, done_rx) = std::sync::mpsc::channel::<u64>();
     // For Picker mode we start a fresh session; the picker fires on the first frame.
     let open_picker_on_start = matches!(resume_mode, ResumeMode::Picker);
-    let resume_id = match resume_mode {
-        ResumeMode::Id(id) => Some(id),
+    let resume_id = match &resume_mode {
+        ResumeMode::Id(id) => Some(id.clone()),
         ResumeMode::Fresh | ResumeMode::Picker => None,
     };
     let session = build_session_with(
@@ -4044,10 +4125,20 @@ async fn run_chat_tui(
         });
     }
 
-    let mut tui = Tui::new().context("initializing TUI")?;
-    // The welcome banner is a one-time print into scrollback (not a render branch).
-    tui.insert_lines(banner_lines(tui.width()));
+    let mut tui = Tui::new(fullscreen).context("initializing TUI")?;
     let mut app = App::default();
+    app.fullscreen = fullscreen;
+    app.transcript_follow = true;
+    // Welcome banner only on a fresh session — resumes show the transcript separator instead. In
+    // full-screen mode there's no native scrollback, so banner lines go into the transcript log.
+    if matches!(resume_mode, ResumeMode::Fresh) {
+        let banner = banner_lines(tui.width());
+        if fullscreen {
+            app.push_scrollback(banner);
+        } else {
+            tui.insert_lines(banner);
+        }
+    }
     app.temper = session.lock().await.temper().label().to_string();
 
     // Discover file-based slash commands + skills (command-skill-system.md). Feed them into the
@@ -4098,6 +4189,11 @@ async fn run_chat_tui(
             let n = items.len();
             app.replay_history(&items);
             app.push_resume_separator(&format!("— resumed session {sid8} ({n} entries) —"));
+            // Restore the on-screen view (activity panel, viewer, scroll) saved on the last turn,
+            // so resume reopens exactly where the user left off.
+            if let Some(json) = s.view_snapshot() {
+                app.restore_view_json(&json);
+            }
             // If this session was compacted, the model only sees a summary. Offer the choice.
             offer_resume_choice = s.was_compacted();
         }
@@ -4163,6 +4259,11 @@ async fn run_chat_tui(
     let mut queued_prompts: Vec<String> = Vec::new();
 
     while !quit {
+        // While the in-loop activity viewer is open during a running turn, redraw every frame so
+        // the selected entry's transcript tails live (subagent/critic output streams in).
+        if app.viewer.is_some() && busy {
+            dirty = true;
+        }
         if dirty {
             app.busy = busy;
             tui.draw(&app);
@@ -4202,8 +4303,36 @@ async fn run_chat_tui(
                     }
                     continue;
                 }
+                forge_tui::InputEvent::Scroll { up } => {
+                    // Mouse wheel (full-screen only): scroll the open activity viewer, else the
+                    // main transcript. A few rows per notch feels natural.
+                    const STEP: usize = 3;
+                    if app.viewer.is_some() {
+                        let key = if up { KeyKind::Up } else { KeyKind::Down };
+                        for _ in 0..STEP {
+                            app.viewer_key(key);
+                        }
+                    } else if app.fullscreen {
+                        if up {
+                            app.transcript_scroll_up(STEP);
+                        } else {
+                            let body = tui.height().saturating_sub(8).max(1);
+                            let (_, max_scroll) = app.transcript_metrics(tui.width(), body);
+                            app.transcript_scroll_down(STEP, max_scroll);
+                        }
+                    }
+                    continue;
+                }
                 forge_tui::InputEvent::Key(k) => k,
             };
+
+            // The in-loop activity viewer (full-screen mode) is modal while open: it owns every key
+            // (scroll / switch entry / Esc to close). Rendered through the main terminal, so there's
+            // no nested alternate screen to collide with the chat.
+            if app.viewer_key(key) {
+                dirty = true;
+                continue;
+            }
 
             // The command palette is modal while open: it owns every key. Esc dismisses it
             // (so the user isn't surprised by a quit); Ctrl-C still maps to Esc → here it just
@@ -4515,73 +4644,86 @@ async fn run_chat_tui(
                 continue;
             }
 
-            // When the subagent picker overlay is open, ↑↓ navigate, Enter opens that agent's
-            // full-screen transcript, Esc/Ctrl+O closes the picker.
-            if app.subagent_picking {
-                match key {
-                    KeyKind::Up => {
-                        app.subagent_pick_idx = app.subagent_pick_idx.saturating_sub(1);
-                    }
-                    KeyKind::Down => {
-                        let n = app.subagent_views().len();
-                        app.subagent_pick_idx =
-                            (app.subagent_pick_idx + 1).min(n.saturating_sub(1));
-                    }
-                    KeyKind::Enter => {
-                        let idx = app.subagent_pick_idx;
-                        app.subagent_picking = false;
-                        tui.run_fullscreen(|| {
-                            forge_tui::run_subagent_transcript(idx, || {
-                                while let Ok(msg) = rx.try_recv() {
-                                    match msg {
-                                        UiMsg::Event(e) => app.apply(e),
-                                        UiMsg::Permission { reply, .. } => {
-                                            let _ = reply.send(false);
-                                        }
-                                        UiMsg::Question { reply, .. } => {
-                                            let _ = reply.send(forge_tui::NO_ANSWER.to_string());
-                                        }
-                                    }
-                                }
-                                app.subagent_views()
-                            })
-                        })?;
-                    }
-                    KeyKind::Esc | KeyKind::ToggleSubagentDetail => {
-                        app.subagent_picking = false;
-                    }
-                    _ => {}
+            // Full-screen mode: PageUp/PageDown scroll the transcript region. The render re-clamps
+            // the offset to the visible area, so an over-scroll is harmless; here we approximate the
+            // page (and the follow-resume threshold) from the terminal height.
+            if app.fullscreen && matches!(key, KeyKind::PageUp | KeyKind::PageDown) {
+                let body = tui.height().saturating_sub(8).max(1);
+                if matches!(key, KeyKind::PageUp) {
+                    app.transcript_scroll_up(body as usize);
+                } else {
+                    let (_, max_scroll) = app.transcript_metrics(tui.width(), body);
+                    app.transcript_scroll_down(body as usize, max_scroll);
                 }
                 dirty = true;
                 continue;
             }
 
-            // Ctrl+O: open the subagent transcript browser. With a single agent, open it directly;
-            // with multiple agents, open the picker overlay first so the user can choose which one.
+            // Ctrl+O toggles focus on the sticky activity panel (main chat + subagents + critics).
+            // When focused, ↑↓ move the selection and Enter opens the full-screen transcript viewer.
             if matches!(key, KeyKind::ToggleSubagentDetail) {
-                let views = app.subagent_views();
-                if !views.is_empty() {
-                    if views.len() == 1 {
-                        tui.run_fullscreen(|| {
-                            forge_tui::run_subagent_transcript(0, || {
-                                while let Ok(msg) = rx.try_recv() {
-                                    match msg {
-                                        UiMsg::Event(e) => app.apply(e),
-                                        UiMsg::Permission { reply, .. } => {
-                                            let _ = reply.send(false);
-                                        }
-                                        UiMsg::Question { reply, .. } => {
-                                            let _ = reply.send(forge_tui::NO_ANSWER.to_string());
+                if app.has_activity() {
+                    app.activity_focused = !app.activity_focused;
+                    if app.activity_focused {
+                        app.activity_idx =
+                            app.activity_idx.min(app.activity_len().saturating_sub(1));
+                    }
+                }
+                dirty = true;
+                continue;
+            }
+
+            // While the activity panel has focus: ↑↓ move the selection (wrapping), Enter opens the
+            // selected entry's full-screen transcript viewer, Esc unfocuses. Handled before the
+            // global Esc so Esc steps out of the panel instead of quitting.
+            if app.activity_focused {
+                match key {
+                    KeyKind::Up => {
+                        let n = app.activity_len();
+                        if n > 0 {
+                            app.activity_idx = (app.activity_idx + n - 1) % n;
+                        }
+                    }
+                    KeyKind::Down => {
+                        let n = app.activity_len();
+                        if n > 0 {
+                            app.activity_idx = (app.activity_idx + 1) % n;
+                        }
+                    }
+                    KeyKind::Enter => {
+                        let idx = app.activity_idx;
+                        if app.fullscreen {
+                            // Full-screen: open the in-loop viewer (same terminal, no nested
+                            // alt-screen). The main render loop keeps draining events, so the
+                            // selected entry auto-updates while open.
+                            app.open_viewer(idx);
+                            app.activity_focused = false;
+                        } else {
+                            // Inline: the live region is tiny, so take over a separate alternate
+                            // screen for the viewer and drain events in its refresh closure.
+                            tui.run_fullscreen(|| {
+                                forge_tui::run_transcript_viewer(idx, || {
+                                    while let Ok(msg) = rx.try_recv() {
+                                        match msg {
+                                            UiMsg::Event(e) => app.apply(e),
+                                            UiMsg::Permission { reply, .. } => {
+                                                let _ = reply.send(false);
+                                            }
+                                            UiMsg::Question { reply, .. } => {
+                                                let _ =
+                                                    reply.send(forge_tui::NO_ANSWER.to_string());
+                                            }
                                         }
                                     }
-                                }
-                                app.subagent_views()
-                            })
-                        })?;
-                    } else {
-                        app.subagent_picking = true;
-                        app.subagent_pick_idx = 0;
+                                    app.activity_views()
+                                })
+                            })?;
+                        }
                     }
+                    KeyKind::Esc => {
+                        app.activity_focused = false;
+                    }
+                    _ => {}
                 }
                 dirty = true;
                 continue;
@@ -5119,6 +5261,11 @@ async fn run_chat_tui(
                 busy = false;
                 turn_handle = None;
                 dirty = true;
+                // Persist the on-screen view (activity panel, viewer, scroll) as of this completed
+                // turn so a later resume restores it exactly. Skipped when there's nothing to save.
+                if let Some(json) = app.view_snapshot_json() {
+                    session.lock().await.save_view_snapshot(&json);
+                }
                 // `/loop`: if this was a loop turn, decide whether to run another iteration.
                 if let Some(ls) = loop_state.take() {
                     if ls.gen == g {
@@ -5301,7 +5448,9 @@ async fn run_chat_tui(
                 Ok(None) => {
                     app.mesh_overlay.open = false;
                     mesh_load_rx = None;
-                    tui.print_text(
+                    emit_text(
+                        &mut tui,
+                        &mut app,
                         "mesh: auto-discovery routing is off (no model catalog) — nothing to inspect",
                     );
                     dirty = true;
@@ -5379,6 +5528,10 @@ async fn run_chat_tui(
     {
         let (hooks, sid) = {
             let s = session.lock().await;
+            // Save the final view on clean exit so resuming this session restores the screen.
+            if let Some(json) = app.view_snapshot_json() {
+                s.save_view_snapshot(&json);
+            }
             (s.hooks().to_vec(), s.session_id().to_string())
         };
         forge_core::hooks::run_session_hooks(&hooks, forge_config::HookEvent::SessionEnd, &sid)
@@ -5705,6 +5858,7 @@ async fn dispatch_command(
         CommandAction::Quit => return Ok(DispatchOutcome::Quit),
         CommandAction::ClearScreen => {
             tui.clear_screen();
+            app.clear_transcript();
             app.note("— screen cleared —");
         }
         CommandAction::New => {
@@ -5714,6 +5868,7 @@ async fn dispatch_command(
                 s.reset_fresh(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
             }
             tui.clear_screen();
+            app.clear_transcript();
             app.note("● new session");
         }
         // `/mode` opens the operating-mode (temper) picker — a reliable, discoverable alternative
@@ -5936,7 +6091,7 @@ async fn dispatch_command(
                             &rows(&v.dependents),
                             why,
                         );
-                        tui.insert_lines(lines);
+                        emit_scrollback(tui, app, lines);
                     }
                 }
             }
@@ -6085,7 +6240,7 @@ and keep going."
                     }
                 }
             };
-            tui.print_text(&text);
+            emit_text(tui, app, &text);
         }
         CommandAction::Usage => {
             // Open immediately with fast session data; bridge stats load in background.
@@ -6582,18 +6737,23 @@ async fn picker_accept(
 ) -> Result<()> {
     match kind {
         forge_tui::PickerKind::Sessions => {
-            let (items, compacted) = {
+            let (items, compacted, view) = {
                 let mut s = session.lock().await;
                 s.reset_resumed(&row.id)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                (s.replay_items_full(), s.was_compacted())
+                (s.replay_items_full(), s.was_compacted(), s.view_snapshot())
             };
             tui.clear_screen();
+            app.clear_transcript();
             app.note(&format!(
                 "● resumed {}",
                 row.id.chars().take(8).collect::<String>()
             ));
             app.replay_history(&items);
+            // Restore the saved on-screen view (activity panel, viewer, scroll) for this session.
+            if let Some(json) = view {
+                app.restore_view_json(&json);
+            }
             // If it was compacted, immediately offer compacted-vs-full for the model's context.
             if compacted {
                 open_resume_choice_picker(app);
@@ -6607,6 +6767,7 @@ async fn picker_accept(
                 (s.replay_items(), outcome)
             };
             tui.clear_screen();
+            app.clear_transcript();
             app.note("● rewound to that point");
             app.replay_history(&items);
             note_restore(app, &outcome.restore);
