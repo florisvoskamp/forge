@@ -4303,6 +4303,26 @@ async fn run_chat_tui(
                     }
                     continue;
                 }
+                forge_tui::InputEvent::Scroll { up } => {
+                    // Mouse wheel (full-screen only): scroll the open activity viewer, else the
+                    // main transcript. A few rows per notch feels natural.
+                    const STEP: usize = 3;
+                    if app.viewer.is_some() {
+                        let key = if up { KeyKind::Up } else { KeyKind::Down };
+                        for _ in 0..STEP {
+                            app.viewer_key(key);
+                        }
+                    } else if app.fullscreen {
+                        if up {
+                            app.transcript_scroll_up(STEP);
+                        } else {
+                            let body = tui.height().saturating_sub(8).max(1);
+                            let (_, max_scroll) = app.transcript_metrics(tui.width(), body);
+                            app.transcript_scroll_down(STEP, max_scroll);
+                        }
+                    }
+                    continue;
+                }
                 forge_tui::InputEvent::Key(k) => k,
             };
 

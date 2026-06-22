@@ -8,8 +8,9 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
-    Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -32,6 +33,12 @@ pub enum InputEvent {
     /// The terminal window gained (`true`) or lost (`false`) focus. Drives the input cursor's
     /// focused/hollow appearance (EnableFocusChange must be active).
     Focus(bool),
+    /// A mouse wheel scroll (`up = true` scrolls toward the top). Only emitted in full-screen mode,
+    /// where mouse capture is on, so the wheel scrolls the transcript instead of the terminal
+    /// translating it into ↑/↓ keys (which would walk the prompt history).
+    Scroll {
+        up: bool,
+    },
 }
 
 /// A message from a running turn to the render loop.
@@ -148,7 +155,8 @@ pub fn install_panic_restore() {
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
             if IN_ALT_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+                let _ =
+                    crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
             }
             let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
             prev(info);
@@ -165,7 +173,9 @@ impl Tui {
         enable_raw_mode()?;
         crossterm::execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
         if fullscreen {
-            crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+            // Capture the mouse so the wheel reaches us as scroll events. Without this the terminal
+            // translates the wheel into ↑/↓ keys on the alternate screen (walking prompt history).
+            crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
             IN_ALT_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let backend = CrosstermBackend::new(io::stdout());
@@ -239,6 +249,11 @@ impl Tui {
             Event::Paste(s) => return Ok(Some(InputEvent::Paste(s))),
             Event::FocusGained => return Ok(Some(InputEvent::Focus(true))),
             Event::FocusLost => return Ok(Some(InputEvent::Focus(false))),
+            Event::Mouse(m) => match m.kind {
+                MouseEventKind::ScrollUp => return Ok(Some(InputEvent::Scroll { up: true })),
+                MouseEventKind::ScrollDown => return Ok(Some(InputEvent::Scroll { up: false })),
+                _ => return Ok(None),
+            },
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 let key = match k.code {
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -308,7 +323,7 @@ impl Tui {
         let out = f();
         enable_raw_mode()?;
         if self.fullscreen {
-            crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+            crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         }
         let backend = CrosstermBackend::new(io::stdout());
         self.terminal = Terminal::with_options(
@@ -336,7 +351,7 @@ impl Drop for Tui {
         let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste, DisableFocusChange);
         if self.fullscreen {
             IN_ALT_SCREEN.store(false, std::sync::atomic::Ordering::Relaxed);
-            let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         }
         let _ = disable_raw_mode();
         let _ = self.terminal.show_cursor();
