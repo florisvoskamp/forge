@@ -3690,8 +3690,8 @@ async fn build_session_with(
 
     let lsp_config = config.lsp.clone();
     let mut session = match resume {
-        Some(prefix) => {
-            let full = resolve_session(&store, &prefix)?;
+        Some(ref prefix) => {
+            let full = resolve_session(&store, prefix)?;
             Session::resume(store, provider, router, tools, presenter, config, &full)
                 .with_context(|| format!("resuming session {full}"))?
         }
@@ -3733,11 +3733,14 @@ async fn build_session_with(
 
     // Connect external MCP servers (mcp-client.md). Skipped for the offline mock. Per-server
     // failures are isolated inside connect_all (each lands `failed` with a reason); we surface the
-    // whole listing once so connection state — including failures — is visible at startup.
+    // whole listing once on a fresh session (resume suppresses it — the transcript separator
+    // already orients the user, and the MCP panel is always reachable via `/mcp`).
     if !mock && config_has_mcp {
         let manager = std::sync::Arc::new(forge_mcp::McpManager::connect_all(&mcp_config).await);
         session.set_mcp(Some(manager));
-        session.announce_mcp();
+        if resume.is_none() {
+            session.announce_mcp();
+        }
     }
     if lsp_config.enabled {
         session.set_lsp(Some(std::sync::Arc::new(
@@ -4009,8 +4012,8 @@ async fn run_chat_tui(
     let (done_tx, done_rx) = std::sync::mpsc::channel::<u64>();
     // For Picker mode we start a fresh session; the picker fires on the first frame.
     let open_picker_on_start = matches!(resume_mode, ResumeMode::Picker);
-    let resume_id = match resume_mode {
-        ResumeMode::Id(id) => Some(id),
+    let resume_id = match &resume_mode {
+        ResumeMode::Id(id) => Some(id.clone()),
         ResumeMode::Fresh | ResumeMode::Picker => None,
     };
     let session = build_session_with(
@@ -4045,8 +4048,10 @@ async fn run_chat_tui(
     }
 
     let mut tui = Tui::new().context("initializing TUI")?;
-    // The welcome banner is a one-time print into scrollback (not a render branch).
-    tui.insert_lines(banner_lines(tui.width()));
+    // Welcome banner only on a fresh session — resumes show the transcript separator instead.
+    if matches!(resume_mode, ResumeMode::Fresh) {
+        tui.insert_lines(banner_lines(tui.width()));
+    }
     let mut app = App::default();
     app.temper = session.lock().await.temper().label().to_string();
 
@@ -4556,8 +4561,32 @@ async fn run_chat_tui(
                 continue;
             }
 
-            // Ctrl+O: open the subagent transcript browser. With a single agent, open it directly;
-            // with multiple agents, open the picker overlay first so the user can choose which one.
+            // When the assay detail overlay is open, ↑↓ cycle critics, Esc/Ctrl+O closes it.
+            if app.assay_detail_idx.is_some() {
+                match key {
+                    KeyKind::Up => {
+                        let n = app.running_assay_critics();
+                        app.assay_detail_idx = app
+                            .assay_detail_idx
+                            .map(|i| if i == 0 { n.saturating_sub(1) } else { i - 1 });
+                    }
+                    KeyKind::Down => {
+                        let n = app.running_assay_critics();
+                        app.assay_detail_idx =
+                            app.assay_detail_idx.map(|i| (i + 1) % n.max(1));
+                    }
+                    KeyKind::Esc | KeyKind::ToggleSubagentDetail => {
+                        app.assay_detail_idx = None;
+                    }
+                    _ => {}
+                }
+                dirty = true;
+                continue;
+            }
+
+            // Ctrl+O: open the subagent transcript browser, or toggle the assay detail overlay.
+            // Subagents take priority; when only assay critics are visible, Ctrl+O cycles through
+            // them (first press opens critic 0, next press opens critic 1, Esc closes).
             if matches!(key, KeyKind::ToggleSubagentDetail) {
                 let views = app.subagent_views();
                 if !views.is_empty() {
@@ -4582,6 +4611,14 @@ async fn run_chat_tui(
                         app.subagent_picking = true;
                         app.subagent_pick_idx = 0;
                     }
+                } else if app.running_assay_critics() > 0 {
+                    // Cycle through assay critics with each Ctrl+O press.
+                    let n = app.running_assay_critics();
+                    let next = app
+                        .assay_detail_idx
+                        .map(|i| (i + 1) % n)
+                        .unwrap_or(0);
+                    app.assay_detail_idx = Some(next);
                 }
                 dirty = true;
                 continue;

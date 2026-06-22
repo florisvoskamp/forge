@@ -471,10 +471,12 @@ pub struct AssayCriticRow {
     pub lens: String,
     /// One-line description of what this lens checks (e.g. "bugs, wrong logic, panics").
     pub focus: String,
-    /// The model that ran this critic — `None` until the critic completes.
+    /// The model that ran (or will try first for) this critic.
     pub model: Option<String>,
     /// Cost of this critic call in USD — 0.0 until the critic completes.
     pub cost_usd: f64,
+    /// Raw model output captured when the critic finished (empty while queued/skipped).
+    pub output: String,
     pub status: AssayCriticStatus,
 }
 

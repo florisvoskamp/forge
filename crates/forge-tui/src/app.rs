@@ -297,6 +297,8 @@ pub struct App {
     pub subagent_picking: bool,
     /// The currently highlighted row in the subagent picker.
     pub subagent_pick_idx: usize,
+    /// When `Some`, the assay detail overlay is open showing that critic's raw output.
+    pub assay_detail_idx: Option<usize>,
     /// The `/usage` overlay state.
     pub usage_overlay: UsageOverlay,
     /// The `/mesh` routing-inspector overlay state.
@@ -777,12 +779,15 @@ impl App {
                 )));
             }
             PresenterEvent::AssayCriticRow(row) => {
-                // Update the live panel: insert on Queued, merge status+model+cost on Done/Skipped.
+                // Update the live panel: insert on Queued, merge status+model+cost+output on Done/Skipped.
                 if let Some(existing) = self.assay_critics.iter_mut().find(|r| r.lens == row.lens) {
                     existing.status = row.status;
                     if row.model.is_some() {
                         existing.model = row.model;
                         existing.cost_usd = row.cost_usd;
+                    }
+                    if !row.output.is_empty() {
+                        existing.output = row.output;
                     }
                 } else {
                     self.assay_critics.push(row);
@@ -794,6 +799,7 @@ impl App {
             PresenterEvent::AssayReport(report) => {
                 self.assay_critics.clear();
                 self.assay_verifying = None;
+                self.assay_detail_idx = None;
                 self.flush
                     .extend(crate::render::assay_report_lines(&report));
                 self.flush.push(TextLine::default());
@@ -1548,6 +1554,8 @@ pub fn render_live(frame: &mut Frame, app: &App) {
         render_picker(frame, areas[0], app);
     } else if app.subagent_picking {
         render_subagent_picker(frame, areas[0], app);
+    } else if app.assay_detail_idx.is_some() {
+        render_assay_detail(frame, areas[0], app);
     } else {
         render_preview(frame, areas[0], app);
     }
@@ -1848,6 +1856,54 @@ fn render_subagents_panel(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Assay detail overlay: fills the stream area with the raw output of the selected critic.
+pub fn render_assay_detail(frame: &mut Frame, area: Rect, app: &App) {
+    use forge_types::AssayCriticStatus;
+    let Some(idx) = app.assay_detail_idx else {
+        return;
+    };
+    let Some(r) = app.assay_critics.get(idx) else {
+        return;
+    };
+    if area.height == 0 {
+        return;
+    }
+    let h = area.height as usize;
+    let mut lines: Vec<TextLine> = Vec::with_capacity(h);
+    let model = r
+        .model
+        .as_deref()
+        .and_then(|m| m.split("::").last())
+        .unwrap_or("?");
+    let status_label = match &r.status {
+        AssayCriticStatus::Queued => "running…".to_string(),
+        AssayCriticStatus::Done { candidates } => format!("{candidates} found"),
+        AssayCriticStatus::Skipped { reason } => format!("skipped ({reason})"),
+    };
+    lines.push(TextLine::from(vec![
+        Span::styled(
+            format!("  ⚒ {} · {} · {} · {} ", r.lens, r.focus, model, status_label),
+            Style::default().fg(ORANGE).bold(),
+        ),
+        Span::styled("Esc close", Style::default().fg(DIM)),
+    ]));
+    let body_h = h.saturating_sub(1);
+    if r.output.is_empty() {
+        lines.push(TextLine::from(Span::styled(
+            "  (no output yet)",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        for line in r.output.lines().take(body_h) {
+            lines.push(TextLine::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 /// The sticky live-assay panel: header showing critic count + verifying state, then one row per
 /// critic with its lens, focus brief, status, model, and cost. Cleared when AssayReport arrives.
 fn render_assay_panel(frame: &mut Frame, area: Rect, app: &App) {
@@ -1869,36 +1925,36 @@ fn render_assay_panel(frame: &mut Frame, area: Rect, app: &App) {
     };
     let h = area.height as usize;
     let mut lines: Vec<TextLine> = Vec::with_capacity(h);
-    lines.push(TextLine::from(Span::styled(
-        header,
-        Style::default().fg(ORANGE).bold(),
-    )));
+    lines.push(TextLine::from(vec![
+        Span::styled(header, Style::default().fg(ORANGE).bold()),
+        Span::styled("  ^O detail", Style::default().fg(DIM)),
+    ]));
     let body_h = h.saturating_sub(1);
     for r in app.assay_critics.iter().take(body_h) {
-        let focus_short = truncate(&r.focus, 28);
+        let model_short = r
+            .model
+            .as_deref()
+            .and_then(|m| m.split("::").last())
+            .unwrap_or("?");
+        let focus_short = truncate(&r.focus, 26);
         let (label, style) = match &r.status {
             AssayCriticStatus::Queued => (
-                format!("{spin} {}  {}", r.lens, focus_short),
+                format!("{spin} {}  {}  [{model_short}]", r.lens, focus_short),
                 Style::default().fg(DIM),
             ),
             AssayCriticStatus::Done { candidates } => {
-                let model = r
-                    .model
-                    .as_deref()
-                    .and_then(|m| m.split("::").last())
-                    .unwrap_or("?");
                 let cost = if r.cost_usd > 0.0 {
                     format!("  ${:.4}", r.cost_usd)
                 } else {
                     String::new()
                 };
                 (
-                    format!("✓ {}  {candidates} found{cost}  [{model}]", r.lens),
+                    format!("✓ {}  {candidates} found{cost}  [{model_short}]", r.lens),
                     Style::default().fg(OKGREEN),
                 )
             }
             AssayCriticStatus::Skipped { reason } => (
-                format!("⏭ {}  skipped ({})", r.lens, truncate(reason, 30)),
+                format!("⏭ {}  skipped ({})  [{model_short}]", r.lens, truncate(reason, 26)),
                 Style::default().fg(DIM),
             ),
         };

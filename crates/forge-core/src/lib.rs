@@ -1090,13 +1090,17 @@ impl Session {
         // Surface each critic/verifier as it finishes so the run shows live activity.
         let presenter = &mut self.presenter;
         let mut on_progress = |p: assay::AssayProgress| match &p {
-            assay::AssayProgress::CriticQueued { lens } => {
+            assay::AssayProgress::CriticQueued {
+                lens,
+                expected_model,
+            } => {
                 presenter.emit(PresenterEvent::AssayCriticRow(
                     forge_types::AssayCriticRow {
                         lens: lens.as_str().to_string(),
                         focus: assay::lens_brief(*lens).to_string(),
-                        model: None,
+                        model: Some(expected_model.clone()),
                         cost_usd: 0.0,
+                        output: String::new(),
                         status: forge_types::AssayCriticStatus::Queued,
                     },
                 ));
@@ -1106,6 +1110,7 @@ impl Session {
                 candidates,
                 model,
                 cost_usd,
+                output,
             } => {
                 presenter.emit(PresenterEvent::AssayCriticRow(
                     forge_types::AssayCriticRow {
@@ -1113,6 +1118,7 @@ impl Session {
                         focus: assay::lens_brief(*lens).to_string(),
                         model: Some(model.clone()),
                         cost_usd: *cost_usd,
+                        output: output.clone(),
                         status: forge_types::AssayCriticStatus::Done {
                             candidates: *candidates,
                         },
@@ -1126,6 +1132,7 @@ impl Session {
                         focus: assay::lens_brief(*lens).to_string(),
                         model: None,
                         cost_usd: 0.0,
+                        output: String::new(),
                         status: forge_types::AssayCriticStatus::Skipped {
                             reason: reason.clone(),
                         },
