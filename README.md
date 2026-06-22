@@ -30,6 +30,7 @@ $ forge lattice query "UserRepository"
 |----------|----------|
 | **Model Mesh** | Auto-discovery, cost-tiered routing, benchmark ranking, health-aware failover, subscription bridges, daily/weekly/monthly budget caps, credit-conservation modes |
 | **Providers** | Anthropic, OpenAI, Ollama, Claude Code CLI, Codex CLI, Groq, Gemini, DeepSeek, OpenRouter, xAI, Cerebras, and more |
+| **Local LLMs** | `forge local` detects your hardware, recommends a Gemma model that fits, installs + runs it via Ollama (auto-installing Ollama if needed), opt-in autostart; animated picker menu |
 | **Planning mode** | `/plan` investigates read-only and proposes a plan; `/execute` approves it and carries it out |
 | **Code Intelligence** | Lattice: tree-sitter symbol graph (9 languages), semantic embeddings, hybrid retrieval, blast-radius, call-chain, git provenance |
 | **LSP feedback** | Live diagnostics from a language server fed back after edits so the model self-corrects (`[lsp]`, opt-in; rust/ts/js/python/go) |
@@ -39,7 +40,7 @@ $ forge lattice query "UserRepository"
 | **Vision** | Attach images by `/image <path>` or paste them straight into the input bar as inline blocks |
 | **Assay** | Parallel critic crew, adversarial verification, ranked findings, git scopes (diff/branch/since), lens selection, auto-diff vs prior run; opt-in auto-review gate over a turn's diff (`[assay] auto_review`, warn/block) |
 | **MCP** | Client for external MCP servers (stdio + HTTP/SSE), OAuth 2.0 + PKCE, deferred loading, allowlist gating |
-| **TUI** | ratatui live progress, cost meter, context-window token gauge, fuzzy command palette, session/checkpoint pickers, `/usage` + `/mesh` overlays, `/model` picker, `/effort` reasoning knob, focus-aware blinking cursor |
+| **TUI** | Full-screen (alternate-screen) by default with a scrollable transcript + pinned panels (`--inline` to opt out); ratatui live progress, cost meter, context-window token gauge, fuzzy command palette, dynamic `/config` settings editor (every setting, searchable), unified activity viewer (subagents + critics), session/checkpoint pickers, `/usage` + `/mesh` overlays, `/model` picker, `/effort` reasoning knob |
 | **Skills & Commands** | Markdown prompt templates + skill methodology injection; Claude Code format compatible |
 | **Subagents** | Parallel fan-out (`spawn_agents`), mesh-routed children, live TUI tree, depth-limited, opt-in git-worktree isolation for write-capable children |
 | **Session Management** | Checkpoints, `/undo` with file restore, session replay + JSON export, transcript diff, assay run history |
@@ -98,14 +99,16 @@ Requires a recent stable Rust toolchain.
 ## Quick Start
 
 ```bash
-# First-run wizard (API keys + subscription plans)
-forge init
+# Guided setup: API keys + subscription plans + optional local LLM
+# (runs automatically on first launch; re-run anytime)
+forge setup
 
-# Generate project memory the agent auto-loads next session
-forge chat          # then type: /init
+# Optional: run a local model that fits your machine (via Ollama)
+forge local                 # animated menu; or: forge local install
 
-# Interactive chat
+# Interactive chat (full-screen TUI; --inline for native scrollback)
 forge chat
+# In chat: /config edits any setting · /model picks a model · /init writes project memory
 
 # One-shot task
 forge run "refactor the auth middleware to use tower layers"
@@ -175,10 +178,16 @@ Interactive multi-turn session with the full TUI.
 ```bash
 forge chat
 forge chat --resume abc123                      # resume a previous session
+forge chat --continue                           # resume the most recent session
 forge chat --model anthropic::claude-opus-4-8   # pin a model
 forge chat --mode accept-edits                  # auto-allow file writes
+forge chat --inline                             # inline scrollback instead of full-screen
 forge chat --plain                              # headless / CI mode
 ```
+
+The TUI is full-screen by default (scrollable transcript, pinned panels, mouse-wheel
+scroll). Use `--inline` (or `[tui] fullscreen = false`) for the classic inline-scrollback
+mode. `Ctrl+O` opens the activity viewer (main chat + subagents + critics).
 
 **In-session slash commands:**
 
@@ -208,7 +217,7 @@ forge chat --plain                              # headless / CI mode
 | `/image <path>` | Attach an image to the next message (vision) |
 | `/thinking` | Toggle display of model reasoning/thinking blocks |
 | `/remote [--lan\|--local\|--anywhere]` | Toggle browser remote control |
-| `/config` | Open configuration wizard |
+| `/config` | Dynamic settings editor — fuzzy-search + edit any setting (and API keys); Tab toggles user/project scope |
 | `/clear` | Clear the screen (keep the session) |
 | `/` | Open command palette (fuzzy-find skills + commands) |
 
@@ -235,11 +244,37 @@ forge run --tui "debug the startup crash"      # with live TUI
 forge run --mode bypass "apply all the diffs"  # no prompts
 ```
 
+### `forge setup`
+
+```bash
+forge setup              # guided: API keys + subscription plans + optional local LLM
+forge init               # alias for `forge setup`
+```
+
+Runs automatically on first launch when nothing is configured.
+
+### `forge local`
+
+Run local LLMs via [Ollama](https://ollama.com) (also a first-class mesh provider, `ollama::<tag>`).
+
+```bash
+forge local              # animated menu (install / start / status)
+forge local detect       # show your specs + recommended Gemma models
+forge local install      # install the recommended model (installs Ollama if missing)
+forge local install gemma4-12b   # install a specific catalog model
+forge local start [key]  # ensure the runtime + model are up
+forge local list         # models already pulled
+forge local status       # runtime, models, autostart config
+```
+
+Enable `[local] autostart = true` (with `[local] model = "gemma4:12b"`) to start your local model when `forge chat` launches.
+
 ### `forge models`
 
 ```bash
 forge models            # catalog overview + auto-pick per tier
-forge models --probe    # ping every model, persist health results
+forge models --probe    # recheck only benched/excluded models (cheap)
+forge models --probe --all  # re-ping every model (costs money on paid providers)
 forge models --clear    # forget all benched/rate-limited marks
 ```
 
