@@ -42,12 +42,17 @@ fn browse<F: FnMut() -> Vec<SubagentView>>(
 ) -> io::Result<()> {
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut selected = initial_selected;
-    let mut scroll = 0usize;
+    // Start at the tail so the user immediately sees the most recent activity.
+    let mut scroll = usize::MAX / 2;
+    let mut follow = true; // auto-scroll to tail while agent is running
     loop {
         let views = refresh();
         let n = views.len().max(1);
         selected = selected.min(n - 1);
         let log_len = views.get(selected).map(|v| v.log.len()).unwrap_or(0);
+        if follow {
+            scroll = usize::MAX / 2;
+        }
         scroll = scroll.min(log_len.saturating_sub(1));
         term.draw(|f| {
             let a = f.area();
@@ -71,21 +76,43 @@ fn browse<F: FnMut() -> Vec<SubagentView>>(
         }
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
-            KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
-            KeyCode::PageUp | KeyCode::Char('u') => scroll = scroll.saturating_sub(10),
-            KeyCode::PageDown | KeyCode::Char('d') | KeyCode::Char(' ') => {
-                scroll = scroll.saturating_add(10)
+            KeyCode::Up | KeyCode::Char('k') => {
+                follow = false;
+                scroll = scroll.saturating_sub(1);
             }
-            KeyCode::Home | KeyCode::Char('g') => scroll = 0,
-            KeyCode::End | KeyCode::Char('G') => scroll = usize::MAX / 2,
+            KeyCode::Down | KeyCode::Char('j') => {
+                scroll = scroll.saturating_add(1);
+                if scroll >= log_len.saturating_sub(1) {
+                    follow = true;
+                }
+            }
+            KeyCode::PageUp | KeyCode::Char('u') => {
+                follow = false;
+                scroll = scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown | KeyCode::Char('d') | KeyCode::Char(' ') => {
+                scroll = scroll.saturating_add(10);
+                if scroll >= log_len.saturating_sub(1) {
+                    follow = true;
+                }
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                follow = false;
+                scroll = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                follow = true;
+                scroll = usize::MAX / 2;
+            }
             KeyCode::Right | KeyCode::Tab => {
                 selected = (selected + 1) % n;
-                scroll = 0;
+                follow = true;
+                scroll = usize::MAX / 2;
             }
             KeyCode::Left | KeyCode::BackTab => {
                 selected = (selected + n - 1) % n;
-                scroll = 0;
+                follow = true;
+                scroll = usize::MAX / 2;
             }
             _ => {}
         }
@@ -97,6 +124,9 @@ const ORANGE: Color = Color::Rgb(255, 145, 60);
 const DIM: Color = Color::Rgb(110, 110, 120);
 const TOOLCYAN: Color = Color::Rgb(120, 200, 215);
 const BODY: Color = Color::Rgb(205, 205, 215);
+const OKGREEN: Color = Color::Rgb(100, 200, 120);
+const WARNRED: Color = Color::Rgb(220, 80, 80);
+const VERY_DIM: Color = Color::Rgb(80, 80, 90);
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() > max {
@@ -107,6 +137,41 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Classify a log entry line into a display color based on its content.
+fn line_color(entry: &str) -> Color {
+    let t = entry.trim();
+    // Tool call lines: start with a known tool name or "⚒"/"→"
+    if t.starts_with("⚒") || t.starts_with("※") {
+        return ORANGE;
+    }
+    // Success markers
+    if t.starts_with("✔") || t.starts_with("✓") || t.starts_with("ok ") || t.contains(" → ok")
+    {
+        return OKGREEN;
+    }
+    // Error / warning markers
+    if t.starts_with("✗")
+        || t.starts_with("error:")
+        || t.starts_with("Error:")
+        || t.starts_with("failed")
+        || t.contains("FAILED")
+    {
+        return WARNRED;
+    }
+    // Tool invocations (Read / Edit / Write / Bash / shell / etc.)
+    let tool_prefixes = [
+        "Read ", "Edit ", "Write ", "Bash ", "shell ", "→ ", "tool:", "Tool:", "⚙",
+    ];
+    if tool_prefixes.iter().any(|p| t.starts_with(p)) {
+        return TOOLCYAN;
+    }
+    // System/meta lines (dim)
+    if t.starts_with('[') || t.starts_with("//") || t.starts_with('#') || t.starts_with("--") {
+        return VERY_DIM;
+    }
+    BODY
 }
 
 /// Build the transcript view for `views[selected]` scrolled to `scroll`, sized to `height`×`width`:
@@ -120,6 +185,7 @@ pub fn transcript_lines(
     width: u16,
 ) -> Vec<TextLine<'static>> {
     let h = height as usize;
+    let w = width as usize;
     if views.is_empty() {
         return vec![
             TextLine::from(Span::styled(
@@ -134,27 +200,38 @@ pub fn transcript_lines(
     }
     let selected = selected.min(views.len() - 1);
     let view = &views[selected];
-    let status = if view.done { "done" } else { "running" };
-    let title_w = (width as usize).saturating_sub(40);
+    let status_glyph = if view.done { "✔ done" } else { "… running" };
+    let cost_label = if view.cost > 0.0 {
+        format!(" · ${:.4}", view.cost)
+    } else {
+        String::new()
+    };
+    // Header row 1: agent selector + name + status
+    let nav_hint = if views.len() > 1 {
+        format!("  [{}/{}]  ", selected + 1, views.len())
+    } else {
+        "  ".to_string()
+    };
     let mut lines = vec![
         TextLine::from(vec![
             Span::styled(
-                format!("  ⚒ transcript [{}/{}] ", selected + 1, views.len()),
+                "  ⚒ ",
                 Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{} ", view.agent),
+                view.agent.clone(),
                 Style::default().fg(TOOLCYAN).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("· {status} · ${:.4}", view.cost),
+                format!("  {status_glyph}{cost_label}"),
                 Style::default().fg(DIM),
             ),
+            Span::styled(nav_hint, Style::default().fg(VERY_DIM)),
         ]),
-        TextLine::from(Span::styled(
-            format!("  {}", truncate(&view.task, title_w.max(10))),
+        TextLine::from(vec![Span::styled(
+            format!("  {}", truncate(&view.task, w.saturating_sub(4))),
             Style::default().fg(DIM),
-        )),
+        )]),
     ];
 
     // Body: the log window. Reserve 2 header + 1 footer rows.
@@ -169,9 +246,10 @@ pub fn transcript_lines(
         )));
     }
     for entry in view.log.iter().skip(scroll).take(body_h) {
+        let color = line_color(entry);
         lines.push(TextLine::from(Span::styled(
-            format!("  {}", truncate(entry, width.saturating_sub(2) as usize)),
-            Style::default().fg(BODY),
+            format!("  {}", truncate(entry, w.saturating_sub(2))),
+            Style::default().fg(color),
         )));
     }
     // Pad so the footer sits at the bottom of the region.
@@ -179,14 +257,15 @@ pub fn transcript_lines(
         lines.push(TextLine::default());
     }
     let shown_end = (scroll + body_h).min(total);
+    let follow_hint = "  G tail · g top · ←→ switch · Esc close";
     lines.push(TextLine::from(Span::styled(
         format!(
-            "  ── {}-{}/{} lines · ↑↓ scroll · ←→ switch agent · Esc close ──",
+            "  ── {}-{}/{} lines{follow_hint} ──",
             scroll.min(total.saturating_sub(1)) + usize::from(total > 0),
             shown_end,
-            total
+            total,
         ),
-        Style::default().fg(DIM),
+        Style::default().fg(VERY_DIM),
     )));
     lines
 }

@@ -4566,14 +4566,17 @@ async fn run_chat_tui(
                 match key {
                     KeyKind::Up => {
                         let n = app.running_assay_critics();
-                        app.assay_detail_idx = app
-                            .assay_detail_idx
-                            .map(|i| if i == 0 { n.saturating_sub(1) } else { i - 1 });
+                        app.assay_detail_idx = app.assay_detail_idx.map(|i| {
+                            if i == 0 {
+                                n.saturating_sub(1)
+                            } else {
+                                i - 1
+                            }
+                        });
                     }
                     KeyKind::Down => {
                         let n = app.running_assay_critics();
-                        app.assay_detail_idx =
-                            app.assay_detail_idx.map(|i| (i + 1) % n.max(1));
+                        app.assay_detail_idx = app.assay_detail_idx.map(|i| (i + 1) % n.max(1));
                     }
                     KeyKind::Esc | KeyKind::ToggleSubagentDetail => {
                         app.assay_detail_idx = None;
@@ -4614,10 +4617,7 @@ async fn run_chat_tui(
                 } else if app.running_assay_critics() > 0 {
                     // Cycle through assay critics with each Ctrl+O press.
                     let n = app.running_assay_critics();
-                    let next = app
-                        .assay_detail_idx
-                        .map(|i| (i + 1) % n)
-                        .unwrap_or(0);
+                    let next = app.assay_detail_idx.map(|i| (i + 1) % n).unwrap_or(0);
                     app.assay_detail_idx = Some(next);
                 }
                 dirty = true;

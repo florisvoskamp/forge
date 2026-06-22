@@ -192,6 +192,10 @@ pub enum PresenterEvent {
         files: usize,
         tokens: usize,
     },
+    /// A one-line AI-generated recap of what was accomplished this turn, shown in scrollback.
+    Recap {
+        text: String,
+    },
     /// A failed shell command was auto-diagnosed by the model (shell-error-interceptor.md):
     /// a short likely-cause + suggested fix, surfaced alongside the tool result.
     ShellDiagnosis {
@@ -397,6 +401,9 @@ impl Presenter for HeadlessPresenter {
                 if let Some(cmd) = fix {
                     println!("    fix: {cmd}");
                 }
+            }
+            PresenterEvent::Recap { text } => {
+                println!("  ※ recap  {text}");
             }
             // The final answer was already streamed via AssistantText; Done is a
             // lifecycle marker, so the headless renderer needs no extra output here.

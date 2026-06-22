@@ -1812,6 +1812,66 @@ Rules:\n\
         Ok((before, after))
     }
 
+    const RECAP_SYSTEM: &'static str = "You are a one-line summarizer for a coding assistant. \
+Given the user's request and the assistant's response, write a SINGLE sentence (≤12 words, \
+past tense, no punctuation at end) that captures what was accomplished. \
+Output ONLY that sentence — no preamble, no quotation marks.";
+
+    /// After a turn completes, make one cheap trivial-tier call to generate a one-line recap,
+    /// emitted via [`PresenterEvent::Recap`]. Best-effort: silently skipped on budget exhaustion
+    /// or any model error so it can never derail the session.
+    async fn generate_recap(&mut self, prompt: &str, final_text: &str) {
+        if !self.config.recap.enabled {
+            return;
+        }
+        let budget = BudgetState {
+            spent_today_usd: self.store.spend_today_usd().unwrap_or(0.0),
+            daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_week_usd: self.store.spend_this_week_usd().unwrap_or(0.0),
+            weekly_cap_usd: self.config.mesh.weekly_budget_usd,
+            spent_month_usd: self.store.spend_this_month_usd().unwrap_or(0.0),
+            monthly_cap_usd: self.config.mesh.monthly_cap_usd,
+            warn_fraction: self.config.mesh.warn_threshold,
+        };
+        if budget.status() == BudgetStatus::Exhausted {
+            return;
+        }
+        let health = self.store.current_benched().unwrap_or_default();
+        let quota = self.live_quota();
+        let decision = self
+            .router
+            .route_hinted(
+                "summarize in one sentence",
+                budget,
+                &health,
+                &quota,
+                Some(TaskTier::Trivial),
+            )
+            .await;
+        let user_snippet: String = prompt.chars().take(400).collect();
+        let assistant_snippet: String = final_text.chars().take(800).collect();
+        let messages = [
+            Message::system(Self::RECAP_SYSTEM),
+            Message::user(format!(
+                "User request:\n{user_snippet}\n\nAssistant response:\n{assistant_snippet}"
+            )),
+        ];
+        let mut sink = |_: StreamEvent| {};
+        if let Ok(r) = self
+            .provider
+            .complete(&decision.model, &messages, &[], &mut sink)
+            .await
+        {
+            let _ = self
+                .store
+                .record_side_call_usage(&self.id, "recap", &r.usage);
+            let text = r.content.trim().to_string();
+            if !text.is_empty() {
+                self.presenter.emit(PresenterEvent::Recap { text });
+            }
+        }
+    }
+
     /// On a failed shell command, make one cheap trivial-tier model call explaining the likely
     /// cause + a concrete fix, surfaced via [`PresenterEvent::ShellDiagnosis`]. Best-effort: it
     /// is skipped when the budget is exhausted and stays silent on any model error, so it can
@@ -2643,6 +2703,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         self.presenter.emit(PresenterEvent::Done {
             final_text: final_text.clone(),
         });
+        self.generate_recap(prompt, &final_text).await;
         Ok(final_text)
     }
 

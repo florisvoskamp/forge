@@ -814,6 +814,13 @@ impl App {
                 self.flush.extend(crate::render::mcp_status_lines(&servers));
                 self.flush.push(TextLine::default());
             }
+            PresenterEvent::Recap { text } => {
+                self.flush.push(TextLine::from(vec![
+                    Span::styled("  ※ recap  ", Style::default().fg(ORANGE).bold()),
+                    Span::styled(text, Style::default().fg(Color::Rgb(205, 205, 215))),
+                ]));
+                self.flush.push(TextLine::default());
+            }
             PresenterEvent::Done { .. } => self.done = true,
             PresenterEvent::QuotaUpdate {
                 provider,
@@ -1769,38 +1776,61 @@ fn render_subagent_picker(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let h = area.height as usize;
+    let w = area.width as usize;
     let mut lines: Vec<TextLine> = Vec::with_capacity(h);
     lines.push(TextLine::from(vec![
         Span::styled(
-            format!("  ⚒ agents ({}) ", views.len()),
+            format!("  ⚒ subagents ({})  ", views.len()),
             Style::default().fg(ORANGE).bold(),
         ),
         Span::styled(
-            "↑↓ select  ·  Enter open  ·  Esc close",
+            "↑↓ select · Enter transcript · Esc close",
             Style::default().fg(DIM),
         ),
     ]));
-    let list_h = h.saturating_sub(1);
+    // Each agent takes 2 rows: name+cost row + activity snippet row.
+    let rows_per_agent = 2usize;
+    let visible_agents = (h.saturating_sub(1)) / rows_per_agent;
     let start = app
         .subagent_pick_idx
-        .saturating_sub(list_h.saturating_sub(1));
-    for (i, v) in views.iter().enumerate().skip(start).take(list_h) {
+        .saturating_sub(visible_agents.saturating_sub(1));
+    for (i, v) in views.iter().enumerate().skip(start).take(visible_agents) {
         let selected = i == app.subagent_pick_idx;
-        let marker = if selected { "▸ " } else { "  " };
-        let status = if v.done { "done" } else { "…" };
+        let marker = if selected { "▸" } else { " " };
+        let status_glyph = if v.done { "✔" } else { "…" };
         let name_style = if selected {
             Style::default().fg(ORANGE).bold()
         } else {
-            Style::default().fg(TOOLCYAN)
+            Style::default().fg(TOOLCYAN).bold()
         };
+        let log_count = v.log.len();
+        let cost_label = if v.cost > 0.0 {
+            format!("${:.4}", v.cost)
+        } else {
+            String::new()
+        };
+        let task_max = w.saturating_sub(28);
         lines.push(TextLine::from(vec![
-            Span::styled(format!("  {marker}[{}] ", v.agent), name_style),
+            Span::styled(format!("  {marker} "), Style::default().fg(ORANGE)),
+            Span::styled(format!("{status_glyph} "), Style::default().fg(DIM)),
+            Span::styled(format!("{} ", v.agent), name_style),
             Span::styled(
-                format!("${:.4}  {status}  ", v.cost),
+                format!("{cost_label}  {log_count} lines  "),
                 Style::default().fg(DIM),
             ),
-            Span::styled(truncate(&v.task, 44), Style::default().fg(DIM)),
+            Span::styled(truncate(&v.task, task_max), Style::default().fg(DIM)),
         ]));
+        // Activity snippet: last log line, dimmer.
+        let snippet = v
+            .log
+            .last()
+            .map(|s| s.as_str())
+            .unwrap_or("(no activity yet)");
+        let snippet_max = w.saturating_sub(6);
+        lines.push(TextLine::from(Span::styled(
+            format!("      {}", truncate(snippet, snippet_max)),
+            Style::default().fg(Color::Rgb(90, 90, 100)),
+        )));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -1882,7 +1912,10 @@ pub fn render_assay_detail(frame: &mut Frame, area: Rect, app: &App) {
     };
     lines.push(TextLine::from(vec![
         Span::styled(
-            format!("  ⚒ {} · {} · {} · {} ", r.lens, r.focus, model, status_label),
+            format!(
+                "  ⚒ {} · {} · {} · {} ",
+                r.lens, r.focus, model, status_label
+            ),
             Style::default().fg(ORANGE).bold(),
         ),
         Span::styled("Esc close", Style::default().fg(DIM)),
@@ -1954,7 +1987,11 @@ fn render_assay_panel(frame: &mut Frame, area: Rect, app: &App) {
                 )
             }
             AssayCriticStatus::Skipped { reason } => (
-                format!("⏭ {}  skipped ({})  [{model_short}]", r.lens, truncate(reason, 26)),
+                format!(
+                    "⏭ {}  skipped ({})  [{model_short}]",
+                    r.lens,
+                    truncate(reason, 26)
+                ),
                 Style::default().fg(DIM),
             ),
         };
@@ -1976,43 +2013,71 @@ fn render_assay_panel(frame: &mut Frame, area: Rect, app: &App) {
 fn tasks_panel_lines(tasks: &[forge_types::TodoItem], height: u16) -> Vec<TextLine<'static>> {
     use forge_types::TodoStatus;
     let h = height as usize;
-    let done = tasks
+    let total = tasks.len();
+    let done_count = tasks
         .iter()
         .filter(|t| t.status == TodoStatus::Done)
         .count();
+    let in_progress_count = tasks
+        .iter()
+        .filter(|t| t.status == TodoStatus::InProgress)
+        .count();
+    let open_count = tasks
+        .iter()
+        .filter(|t| t.status == TodoStatus::Pending)
+        .count();
+    let header = format!(
+        "  ⚒ {total} tasks ({done_count} done, {in_progress_count} in progress, {open_count} open)"
+    );
     let mut lines = vec![TextLine::from(Span::styled(
-        format!("  ⚒ tasks ({done}/{} done)", tasks.len()),
+        header,
         Style::default().fg(ORANGE).bold(),
     ))];
     let body_h = h.saturating_sub(1);
-    // Prioritize showing in-progress + pending items; if everything won't fit, lead with the
-    // active item so the user always sees what's happening now.
-    let mut idxs: Vec<usize> = (0..tasks.len()).collect();
-    if tasks.len() > body_h {
-        idxs.sort_by_key(|&i| match tasks[i].status {
-            TodoStatus::InProgress => 0,
-            TodoStatus::Pending => 1,
-            TodoStatus::Done => 2,
-        });
-    }
-    let shown = idxs
-        .len()
-        .min(body_h.saturating_sub(usize::from(tasks.len() > body_h)));
-    for &i in idxs.iter().take(shown) {
+    // Prioritize: in-progress first, then pending, then done.
+    let mut idxs: Vec<usize> = (0..total).collect();
+    idxs.sort_by_key(|&i| match tasks[i].status {
+        TodoStatus::InProgress => 0,
+        TodoStatus::Pending => 1,
+        TodoStatus::Done => 2,
+    });
+    // Count non-done (always show) vs done (may be truncated).
+    let non_done: Vec<usize> = idxs
+        .iter()
+        .copied()
+        .filter(|&i| tasks[i].status != TodoStatus::Done)
+        .collect();
+    let done_idxs: Vec<usize> = idxs
+        .iter()
+        .copied()
+        .filter(|&i| tasks[i].status == TodoStatus::Done)
+        .collect();
+    // Always show all non-done; fill remaining rows with done items.
+    let rows_for_done = body_h
+        .saturating_sub(non_done.len())
+        .saturating_sub(usize::from(!done_idxs.is_empty()));
+    let show_done = rows_for_done.min(done_idxs.len());
+    let overflow_done = done_idxs.len().saturating_sub(show_done);
+    let shown_idxs: Vec<usize> = non_done
+        .iter()
+        .chain(done_idxs.iter().take(show_done))
+        .copied()
+        .collect();
+    for &i in &shown_idxs {
         let t = &tasks[i];
-        let style = match t.status {
-            TodoStatus::Done => Style::default().fg(DIM),
-            TodoStatus::InProgress => Style::default().fg(ORANGE).bold(),
-            TodoStatus::Pending => Style::default().fg(Color::Rgb(205, 205, 215)),
+        let (glyph, style) = match t.status {
+            TodoStatus::Done => ("✔", Style::default().fg(DIM)),
+            TodoStatus::InProgress => ("◼", Style::default().fg(ORANGE).bold()),
+            TodoStatus::Pending => ("○", Style::default().fg(Color::Rgb(205, 205, 215))),
         };
         lines.push(TextLine::from(Span::styled(
-            format!("    {} {}", t.status.marker(), truncate(&t.title, 60)),
+            format!("  {glyph} {}", truncate(&t.title, 62)),
             style,
         )));
     }
-    if tasks.len() > shown {
+    if overflow_done > 0 {
         lines.push(TextLine::from(Span::styled(
-            format!("    … +{} more", tasks.len() - shown),
+            format!("   … +{overflow_done} completed"),
             Style::default().fg(DIM),
         )));
     }

@@ -85,6 +85,10 @@ pub struct Config {
     /// Assay-gated auto-review of write turns before they finish (assay-gate.md). Off = inert.
     #[serde(default)]
     pub assay: AssayConfig,
+    /// Per-turn recap: a one-line AI-generated summary after each completed turn. On by default;
+    /// disable in /config if you find it noisy.
+    #[serde(default)]
+    pub recap: RecapConfig,
 }
 
 /// When a hook fires.
@@ -305,6 +309,26 @@ impl Default for ShellConfig {
 }
 
 fn default_explain_errors() -> bool {
+    true
+}
+
+/// Per-turn recap: a one-line AI-generated summary shown in scrollback after each completed turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecapConfig {
+    /// Emit a `※ recap …` line after each completed turn. Default: true. Disable in /config.
+    #[serde(default = "default_recap_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for RecapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_recap_enabled(),
+        }
+    }
+}
+
+fn default_recap_enabled() -> bool {
     true
 }
 
@@ -1032,6 +1056,7 @@ impl Default for Config {
             lsp: LspConfig::default(),
             autofix: AutofixConfig::default(),
             assay: AssayConfig::default(),
+            recap: RecapConfig::default(),
         }
     }
 }
