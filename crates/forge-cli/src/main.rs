@@ -204,6 +204,14 @@ enum Command {
         /// Force plain line output instead of the interactive TUI.
         #[arg(long)]
         plain: bool,
+        /// Run the TUI inline in the terminal's native scrollback instead of full-screen.
+        /// Overrides the `[tui] fullscreen` config for this invocation.
+        #[arg(long, conflicts_with = "fullscreen")]
+        inline: bool,
+        /// Force the full-screen (alternate-screen) TUI, overriding the config. This is the
+        /// default; use `--inline` to opt out.
+        #[arg(long)]
+        fullscreen: bool,
         /// Pin a specific model (e.g. `openai::gpt-4o`), bypassing mesh classification.
         #[arg(long)]
         model: Option<String>,
@@ -726,11 +734,23 @@ async fn main() -> Result<()> {
             r#continue,
             resume,
             plain,
+            inline,
+            fullscreen,
             model,
         } => {
             let store = open_store()?;
             let resume_mode = resolve_resume_mode(r#continue, resume, &store, plain)?;
-            chat(mock, mode, resume_mode, plain, model).await
+            // Full-screen unless `--inline`; `--fullscreen` / `--inline` override the config default.
+            let fullscreen = if inline {
+                false
+            } else if fullscreen {
+                true
+            } else {
+                forge_config::load()
+                    .map(|c| c.tui.fullscreen)
+                    .unwrap_or(true)
+            };
+            chat(mock, mode, resume_mode, plain, fullscreen, model).await
         }
         Command::Sessions => sessions(),
         Command::Replay { ids, json, rerun } => {
@@ -3957,12 +3977,13 @@ async fn chat(
     mode: Option<Mode>,
     resume_mode: ResumeMode,
     plain: bool,
+    fullscreen: bool,
     pin: Option<String>,
 ) -> Result<()> {
     maybe_first_run_setup(mock)?;
     // Default to the interactive (animated) TUI on a real terminal.
     if !plain && std::io::stdout().is_terminal() {
-        return run_chat_tui(mock, mode, resume_mode, pin).await;
+        return run_chat_tui(mock, mode, resume_mode, fullscreen, pin).await;
     }
 
     // Plain line mode: read prompts from stdin.
@@ -4029,10 +4050,35 @@ impl Drop for DoneGuard {
 
 /// Animated TUI chat loop: renders at ~16fps, runs each turn on a task so a spinner
 /// ticks (and streamed tokens flow) while the model works.
+/// Emit pre-styled out-of-band lines to the conversation, respecting the viewport mode: inline →
+/// the terminal's native scrollback; full-screen → the app's transcript log (since there's no
+/// native scrollback in alternate-screen mode).
+fn emit_scrollback(
+    tui: &mut forge_tui::Tui,
+    app: &mut forge_tui::App,
+    lines: Vec<forge_tui::ScrollbackLine<'static>>,
+) {
+    if tui.is_fullscreen() {
+        app.push_scrollback(lines);
+    } else {
+        tui.insert_lines(lines);
+    }
+}
+
+/// Like [`emit_scrollback`] but for plain (unstyled) multi-line text.
+fn emit_text(tui: &mut forge_tui::Tui, app: &mut forge_tui::App, text: &str) {
+    if tui.is_fullscreen() {
+        app.push_scrollback_text(text);
+    } else {
+        tui.print_text(text);
+    }
+}
+
 async fn run_chat_tui(
     mock: bool,
     mode: Option<Mode>,
     resume_mode: ResumeMode,
+    fullscreen: bool,
     pin: Option<String>,
 ) -> Result<()> {
     use forge_tui::{
@@ -4079,12 +4125,20 @@ async fn run_chat_tui(
         });
     }
 
-    let mut tui = Tui::new().context("initializing TUI")?;
-    // Welcome banner only on a fresh session — resumes show the transcript separator instead.
-    if matches!(resume_mode, ResumeMode::Fresh) {
-        tui.insert_lines(banner_lines(tui.width()));
-    }
+    let mut tui = Tui::new(fullscreen).context("initializing TUI")?;
     let mut app = App::default();
+    app.fullscreen = fullscreen;
+    app.transcript_follow = true;
+    // Welcome banner only on a fresh session — resumes show the transcript separator instead. In
+    // full-screen mode there's no native scrollback, so banner lines go into the transcript log.
+    if matches!(resume_mode, ResumeMode::Fresh) {
+        let banner = banner_lines(tui.width());
+        if fullscreen {
+            app.push_scrollback(banner);
+        } else {
+            tui.insert_lines(banner);
+        }
+    }
     app.temper = session.lock().await.temper().label().to_string();
 
     // Discover file-based slash commands + skills (command-skill-system.md). Feed them into the
@@ -4549,6 +4603,21 @@ async fn run_chat_tui(
                     KeyKind::Tab | KeyKind::CycleTemper | KeyKind::ToggleSubagentDetail => {}
                     _ => {}
                 }
+                continue;
+            }
+
+            // Full-screen mode: PageUp/PageDown scroll the transcript region. The render re-clamps
+            // the offset to the visible area, so an over-scroll is harmless; here we approximate the
+            // page (and the follow-resume threshold) from the terminal height.
+            if app.fullscreen && matches!(key, KeyKind::PageUp | KeyKind::PageDown) {
+                let body = tui.height().saturating_sub(8).max(1);
+                if matches!(key, KeyKind::PageUp) {
+                    app.transcript_scroll_up(body as usize);
+                } else {
+                    let (_, max_scroll) = app.transcript_metrics(tui.width(), body);
+                    app.transcript_scroll_down(body as usize, max_scroll);
+                }
+                dirty = true;
                 continue;
             }
 
@@ -5325,7 +5394,9 @@ async fn run_chat_tui(
                 Ok(None) => {
                     app.mesh_overlay.open = false;
                     mesh_load_rx = None;
-                    tui.print_text(
+                    emit_text(
+                        &mut tui,
+                        &mut app,
                         "mesh: auto-discovery routing is off (no model catalog) — nothing to inspect",
                     );
                     dirty = true;
@@ -5729,6 +5800,7 @@ async fn dispatch_command(
         CommandAction::Quit => return Ok(DispatchOutcome::Quit),
         CommandAction::ClearScreen => {
             tui.clear_screen();
+            app.clear_transcript();
             app.note("— screen cleared —");
         }
         CommandAction::New => {
@@ -5738,6 +5810,7 @@ async fn dispatch_command(
                 s.reset_fresh(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
             }
             tui.clear_screen();
+            app.clear_transcript();
             app.note("● new session");
         }
         // `/mode` opens the operating-mode (temper) picker — a reliable, discoverable alternative
@@ -5960,7 +6033,7 @@ async fn dispatch_command(
                             &rows(&v.dependents),
                             why,
                         );
-                        tui.insert_lines(lines);
+                        emit_scrollback(tui, app, lines);
                     }
                 }
             }
@@ -6109,7 +6182,7 @@ and keep going."
                     }
                 }
             };
-            tui.print_text(&text);
+            emit_text(tui, app, &text);
         }
         CommandAction::Usage => {
             // Open immediately with fast session data; bridge stats load in background.
@@ -6613,6 +6686,7 @@ async fn picker_accept(
                 (s.replay_items_full(), s.was_compacted())
             };
             tui.clear_screen();
+            app.clear_transcript();
             app.note(&format!(
                 "● resumed {}",
                 row.id.chars().take(8).collect::<String>()
@@ -6631,6 +6705,7 @@ async fn picker_accept(
                 (s.replay_items(), outcome)
             };
             tui.clear_screen();
+            app.clear_transcript();
             app.note("● rewound to that point");
             app.replay_history(&items);
             note_restore(app, &outcome.restore);

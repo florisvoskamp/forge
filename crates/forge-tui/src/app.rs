@@ -304,6 +304,17 @@ pub struct App {
     /// Full styled transcript of the main conversation, mirrored from the scrollback outbox so the
     /// activity viewer can show "main chat" full-screen. Bounded to [`MAIN_LOG_MAX`] lines.
     main_log: Vec<TextLine<'static>>,
+    /// True when the chat renders on the alternate screen (full-screen): the transcript is drawn
+    /// from [`main_log`] into a scrollable region and the panels are pinned at the bottom. When
+    /// false (inline mode), finalized lines flow into the terminal's native scrollback instead and
+    /// only the small pinned live region is drawn. Set once at startup.
+    pub fullscreen: bool,
+    /// Full-screen transcript scroll offset, in wrapped rows from the top. Only meaningful when
+    /// [`fullscreen`] is set.
+    pub transcript_scroll: usize,
+    /// While true, the full-screen transcript auto-scrolls to the tail as new lines arrive (a
+    /// normal terminal). Paging up pauses it; paging to the bottom (or End) resumes it.
+    pub transcript_follow: bool,
     /// The `/usage` overlay state.
     pub usage_overlay: UsageOverlay,
     /// The `/mesh` routing-inspector overlay state.
@@ -488,6 +499,10 @@ pub enum KeyKind {
     CycleTemper,
     /// CTRL+O — toggle the expanded detail view for the active subagents (shell-handled).
     ToggleSubagentDetail,
+    /// PageUp — scroll the full-screen transcript up (shell-handled; ignored by the input line).
+    PageUp,
+    /// PageDown — scroll the full-screen transcript down (shell-handled).
+    PageDown,
 }
 
 /// The result of feeding a keystroke to the input line.
@@ -661,7 +676,9 @@ pub fn handle_key(input: &mut String, cursor: &mut usize, key: KeyKind) -> Input
         | KeyKind::Down
         | KeyKind::Tab
         | KeyKind::CycleTemper
-        | KeyKind::ToggleSubagentDetail => InputOutcome::Editing,
+        | KeyKind::ToggleSubagentDetail
+        | KeyKind::PageUp
+        | KeyKind::PageDown => InputOutcome::Editing,
     }
 }
 
@@ -1450,6 +1467,77 @@ impl App {
         lines
     }
 
+    /// Append out-of-band scrollback (banner, command output, `/clear` marker, …) directly into the
+    /// full-screen transcript log. In inline mode these lines go to the terminal's native scrollback
+    /// instead (the I/O shell calls `Tui::insert_lines`); in full-screen mode the transcript IS the
+    /// log, so they must land here. Auto-tails the view (`transcript_follow`).
+    pub fn push_scrollback(&mut self, lines: Vec<TextLine<'static>>) {
+        self.fold_main_log(&lines);
+    }
+
+    /// Like [`push_scrollback`] but for plain multi-line text (e.g. command output that isn't
+    /// pre-styled). Full-screen counterpart to `Tui::print_text`.
+    pub fn push_scrollback_text(&mut self, text: &str) {
+        let lines: Vec<TextLine<'static>> =
+            text.lines().map(|s| TextLine::from(s.to_owned())).collect();
+        self.fold_main_log(&lines);
+    }
+
+    /// Clear the full-screen transcript (`/clear`): wipe the rendered log and re-anchor at the tail.
+    /// The session/transcript on disk are untouched — this only clears what's drawn.
+    pub fn clear_transcript(&mut self) {
+        self.main_log.clear();
+        self.transcript_scroll = 0;
+        self.transcript_follow = true;
+    }
+
+    /// Wrapped-row metrics for the full-screen transcript: total rows at the given width, and the
+    /// max scroll offset given a visible body height. Used by the I/O shell to clamp paging.
+    pub fn transcript_metrics(&self, width: u16, body_h: u16) -> (usize, usize) {
+        let total = self.wrapped_transcript(width).len();
+        let max_scroll = total.saturating_sub(body_h.max(1) as usize);
+        (total, max_scroll)
+    }
+
+    /// Scroll the full-screen transcript up by `rows` (toward the top); pauses auto-follow.
+    pub fn transcript_scroll_up(&mut self, rows: usize) {
+        self.transcript_follow = false;
+        self.transcript_scroll = self.transcript_scroll.saturating_sub(rows);
+    }
+
+    /// Scroll the full-screen transcript down by `rows`; resumes follow at the bottom.
+    pub fn transcript_scroll_down(&mut self, rows: usize, max_scroll: usize) {
+        self.transcript_scroll = (self.transcript_scroll + rows).min(max_scroll);
+        if self.transcript_scroll >= max_scroll {
+            self.transcript_follow = true;
+        }
+    }
+
+    /// Jump to the top of the full-screen transcript; pauses follow.
+    pub fn transcript_to_top(&mut self) {
+        self.transcript_follow = false;
+        self.transcript_scroll = 0;
+    }
+
+    /// Jump to the tail of the full-screen transcript; resumes follow.
+    pub fn transcript_to_bottom(&mut self) {
+        self.transcript_follow = true;
+        self.transcript_scroll = usize::MAX / 2;
+    }
+
+    /// The full-screen transcript body: finalized `main_log` plus the in-flight reply edge, each
+    /// wrapped to `width`. Pure; the wrap mirrors the activity viewer's so scroll math is exact.
+    fn wrapped_transcript(&self, width: u16) -> Vec<TextLine<'static>> {
+        let mut lines = self.main_log.clone();
+        if self.streaming_active {
+            lines.push(TextLine::from(vec![
+                Span::raw(format!("  {}", self.streaming)),
+                Span::styled("▌", Style::default().fg(ORANGE)),
+            ]));
+        }
+        crate::transcript::wrap_lines(&lines, width.saturating_sub(1) as usize)
+    }
+
     /// Append flushed lines to the bounded main-chat log used by the activity viewer.
     fn fold_main_log(&mut self, lines: &[TextLine<'static>]) {
         self.main_log.extend(lines.iter().cloned());
@@ -1765,12 +1853,16 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     let avail = frame.area().height.saturating_sub(fixed);
     let panel_avail = avail.saturating_sub(MIN_STREAM);
 
-    // The unified activity panel (main chat + subagents + critics) gets at most half; tasks get
-    // the rest of the panel budget.
-    let activity_h = app.activity_panel_height().min(panel_avail / 2);
-    let task_h = app
-        .tasks_panel_height()
-        .min(panel_avail.saturating_sub(activity_h));
+    // The activity panel (main chat + subagents + critics) and the tasks panel each want their
+    // full height. When both fit in the panel budget (always true in full-screen mode, where the
+    // live region spans the terminal) they each get it — so the activity list shows every entry up
+    // to its cap, like the tasks list. Only when the inline budget is contended do we split it,
+    // giving each panel a fair half but letting the smaller one keep its full size.
+    let (activity_h, task_h) = split_panel_budget(
+        app.activity_panel_height(),
+        app.tasks_panel_height(),
+        panel_avail,
+    );
     let stream_h = avail.saturating_sub(activity_h + task_h);
 
     let areas = Layout::vertical([
@@ -1784,13 +1876,16 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     ])
     .split(frame.area());
 
-    // areas[0]: stream preview (or modal overlay when palette / picker is open).
+    // areas[0]: the main region. A modal overlay (palette / picker) takes it when open; otherwise
+    // it's the scrollable transcript in full-screen mode, or just the in-flight reply edge inline.
     if app.palette.open {
         render_palette(frame, areas[0], app);
     } else if app.at_picker.open {
         render_at_path_picker(frame, areas[0], app);
     } else if app.picker.open {
         render_picker(frame, areas[0], app);
+    } else if app.fullscreen {
+        render_transcript_area(frame, areas[0], app);
     } else {
         render_preview(frame, areas[0], app);
     }
@@ -1975,6 +2070,43 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
 
 /// The in-flight streaming reply's trailing edge, scrolled to its bottom so the freshest
 /// text and the `▌` cursor stay visible.
+/// Divide the panel budget between the activity panel (`want_a`) and the tasks panel (`want_t`).
+/// If both fit, each gets its full desired height. Otherwise split fairly: each keeps up to half,
+/// and any slack the smaller panel doesn't use is handed to the larger one.
+fn split_panel_budget(want_a: u16, want_t: u16, budget: u16) -> (u16, u16) {
+    if want_a + want_t <= budget {
+        return (want_a, want_t);
+    }
+    let half = budget / 2;
+    if want_a <= half {
+        (want_a, budget.saturating_sub(want_a).min(want_t))
+    } else if want_t <= half {
+        (budget.saturating_sub(want_t).min(want_a), want_t)
+    } else {
+        (half, budget.saturating_sub(half).min(want_t))
+    }
+}
+
+/// Render the full-screen transcript: the finalized conversation (`main_log`) plus the in-flight
+/// reply edge, wrapped to the area width and scrolled to `transcript_scroll` (or the tail while
+/// following). This is the full-screen counterpart to the inline scrollback + [`render_preview`].
+fn render_transcript_area(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let body_h = area.height as usize;
+    let wrapped = app.wrapped_transcript(area.width);
+    let total = wrapped.len();
+    let max_scroll = total.saturating_sub(body_h);
+    let scroll = if app.transcript_follow {
+        max_scroll
+    } else {
+        app.transcript_scroll.min(max_scroll)
+    };
+    let lines: Vec<TextLine> = wrapped.into_iter().skip(scroll).take(body_h).collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
     // Only the in-flight reply edge lives here now; the task + subagent panels are their own
     // always-visible regions (see `render_live`), so streaming no longer hides them.
@@ -4188,5 +4320,47 @@ mod tests {
                 .contains(ratatui::style::Modifier::BOLD)),
             "// escape is not highlighted as a command"
         );
+    }
+
+    #[test]
+    fn panel_budget_gives_both_full_height_when_they_fit() {
+        // Full-screen mode: a generous budget → each panel keeps its full desired height.
+        assert_eq!(split_panel_budget(9, 7, 40), (9, 7));
+    }
+
+    #[test]
+    fn panel_budget_splits_fairly_when_contended() {
+        // Both want more than half of a tight inline budget → fair split, neither starved.
+        let (a, t) = split_panel_budget(9, 7, 10);
+        assert_eq!(a + t, 10, "uses the whole budget");
+        assert!(a >= 4 && t >= 4, "neither panel is starved: {a},{t}");
+        // A small panel keeps its full size; the big one takes the slack.
+        assert_eq!(split_panel_budget(2, 9, 10), (2, 8));
+    }
+
+    #[test]
+    fn fullscreen_transcript_renders_log_tail_and_clears() {
+        let mut app = App {
+            fullscreen: true,
+            transcript_follow: true,
+            ..Default::default()
+        };
+        app.push_scrollback(
+            (0..30)
+                .map(|i| TextLine::from(format!("line {i}")))
+                .collect(),
+        );
+        // Following → the tail is visible, the head scrolled off, in a 5-row body.
+        let area = Rect::new(0, 0, 40, 5);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 5)).unwrap();
+        term.draw(|f| render_transcript_area(f, area, &app))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("line 29"), "tail visible: {text:?}");
+        assert!(!text.contains("line 0 "), "head scrolled off");
+        // /clear empties the rendered transcript.
+        app.clear_transcript();
+        assert_eq!(app.wrapped_transcript(40).len(), 0);
     }
 }

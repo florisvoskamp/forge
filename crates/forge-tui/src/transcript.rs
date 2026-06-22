@@ -147,7 +147,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// Wrap one styled line to `width` columns, preserving each span's style across the break. A blank
 /// line stays one blank line. Char-based (approximates display width); deterministic so the scroll
 /// math is exact.
-fn wrap_lines(lines: &[TextLine<'_>], width: usize) -> Vec<TextLine<'static>> {
+pub(crate) fn wrap_lines(lines: &[TextLine<'_>], width: usize) -> Vec<TextLine<'static>> {
     if width == 0 {
         return lines
             .iter()

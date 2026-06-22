@@ -53,6 +53,9 @@ pub use commands::{
 };
 pub use driver::{ChannelPresenter, InputEvent, Tui, UiMsg};
 pub use init_wizard::{BridgeItem, ProviderItem, WizardInput, WizardOutcome};
+/// A styled scrollback line, re-exported so binaries can route out-of-band output to the right
+/// sink (native scrollback inline, or the transcript log full-screen) without depending on ratatui.
+pub use ratatui::text::Line as ScrollbackLine;
 pub use select::{select_multi, SelectItem};
 pub use transcript::{run_transcript_viewer, transcript_lines};
 pub use tui::TuiPresenter;
