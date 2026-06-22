@@ -315,6 +315,10 @@ pub struct App {
     /// While true, the full-screen transcript auto-scrolls to the tail as new lines arrive (a
     /// normal terminal). Paging up pauses it; paging to the bottom (or End) resumes it.
     pub transcript_follow: bool,
+    /// The in-loop activity transcript viewer, open while `Some` (full-screen mode only). It renders
+    /// over the whole frame using the MAIN terminal — no nested alternate screen — so it can never
+    /// collide with the chat. Inline mode uses the separate-alt-screen `run_transcript_viewer`.
+    pub viewer: Option<ViewerState>,
     /// The `/usage` overlay state.
     pub usage_overlay: UsageOverlay,
     /// The `/mesh` routing-inspector overlay state.
@@ -463,6 +467,28 @@ pub struct TranscriptView {
     pub lines: Vec<TextLine<'static>>,
     /// Plain-text count of source entries (for the panel's "N lines" hint).
     pub line_count: usize,
+}
+
+/// State of the in-loop activity transcript viewer (full-screen mode). Selection + scroll position;
+/// `scroll == usize::MAX / 2` is the "tail" sentinel, clamped to the real max at render time.
+#[derive(Debug, Clone)]
+pub struct ViewerState {
+    /// Index into the activity list (0 = main chat, then subagents, then critics).
+    pub selected: usize,
+    /// Wrapped-row offset from the top; the tail sentinel while `follow`.
+    pub scroll: usize,
+    /// Auto-scroll to the tail as the selected entry grows.
+    pub follow: bool,
+}
+
+impl Default for ViewerState {
+    fn default() -> Self {
+        Self {
+            selected: 0,
+            scroll: usize::MAX / 2,
+            follow: true,
+        }
+    }
 }
 
 /// A keystroke, decoupled from crossterm so input handling is testable.
@@ -1483,6 +1509,75 @@ impl App {
         self.fold_main_log(&lines);
     }
 
+    /// Open the in-loop activity viewer at `selected` (full-screen mode). Renders over the whole
+    /// frame using the main terminal — no nested alternate screen.
+    pub fn open_viewer(&mut self, selected: usize) {
+        let n = self.activity_len();
+        if n == 0 {
+            return;
+        }
+        self.viewer = Some(ViewerState {
+            selected: selected.min(n - 1),
+            ..ViewerState::default()
+        });
+    }
+
+    /// Feed a keystroke to the in-loop activity viewer. Returns true if the viewer consumed it (it
+    /// is open). Esc closes it. ↑↓/PgUp/PgDn scroll, ←→/Tab switch entry, g/G top/tail.
+    pub fn viewer_key(&mut self, key: KeyKind) -> bool {
+        let n = self.activity_len().max(1);
+        let Some(v) = self.viewer.as_mut() else {
+            return false;
+        };
+        match key {
+            KeyKind::Esc => self.viewer = None,
+            KeyKind::Up => {
+                v.follow = false;
+                v.scroll = v.scroll.saturating_sub(1);
+            }
+            KeyKind::Down => v.scroll = v.scroll.saturating_add(1),
+            KeyKind::PageUp => {
+                v.follow = false;
+                v.scroll = v.scroll.saturating_sub(10);
+            }
+            KeyKind::PageDown => v.scroll = v.scroll.saturating_add(10),
+            KeyKind::Home => {
+                v.follow = false;
+                v.scroll = 0;
+            }
+            KeyKind::End => {
+                v.follow = true;
+                v.scroll = usize::MAX / 2;
+            }
+            KeyKind::Right | KeyKind::Tab => {
+                v.selected = (v.selected + 1) % n;
+                v.scroll = usize::MAX / 2;
+                v.follow = true;
+            }
+            KeyKind::Left => {
+                v.selected = (v.selected + n - 1) % n;
+                v.scroll = usize::MAX / 2;
+                v.follow = true;
+            }
+            KeyKind::Char('q') => self.viewer = None,
+            KeyKind::Char('k') => {
+                v.follow = false;
+                v.scroll = v.scroll.saturating_sub(1);
+            }
+            KeyKind::Char('j') | KeyKind::Char(' ') => v.scroll = v.scroll.saturating_add(1),
+            KeyKind::Char('g') => {
+                v.follow = false;
+                v.scroll = 0;
+            }
+            KeyKind::Char('G') => {
+                v.follow = true;
+                v.scroll = usize::MAX / 2;
+            }
+            _ => {}
+        }
+        true
+    }
+
     /// Clear the full-screen transcript (`/clear`): wipe the rendered log and re-anchor at the tail.
     /// The session/transcript on disk are untouched — this only clears what's drawn.
     pub fn clear_transcript(&mut self) {
@@ -1841,6 +1936,20 @@ fn truncate(s: &str, max: usize) -> String {
 /// The inline viewport is never resized at runtime — recreating it would corrupt the scrollback.
 /// The stream area shrinks as panels grow but always keeps ≥1 row (MIN_STREAM guarantee).
 pub fn render_live(frame: &mut Frame, app: &App) {
+    // The in-loop activity viewer (full-screen mode) takes over the whole frame, rendered through
+    // the SAME terminal as the chat — no nested alternate screen, so it can't collide with it.
+    if let Some(v) = &app.viewer {
+        let views = app.activity_views();
+        let scroll = if v.follow { usize::MAX / 2 } else { v.scroll };
+        let a = frame.area();
+        frame.render_widget(
+            Paragraph::new(crate::transcript::transcript_lines(
+                &views, v.selected, scroll, a.height, a.width,
+            )),
+            a,
+        );
+        return;
+    }
     const MIN_STREAM: u16 = 1;
     // The input box grows with wrapped/multiline content (capped); the stream area absorbs the
     // change, so the inline viewport's total height is untouched (never resized at runtime).
@@ -4362,5 +4471,46 @@ mod tests {
         // /clear empties the rendered transcript.
         app.clear_transcript();
         assert_eq!(app.wrapped_transcript(40).len(), 0);
+    }
+
+    #[test]
+    fn in_loop_viewer_opens_navigates_and_closes() {
+        let mut app = App {
+            fullscreen: true,
+            ..Default::default()
+        };
+        // No activity → open is a no-op (nothing to view).
+        app.open_viewer(0);
+        assert!(app.viewer.is_none());
+
+        // Two subagents → activity list is [main, sub, sub] (len 3).
+        app.apply(crate::PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "general".into(),
+            task: "x".into(),
+            model: Some("m".into()),
+        });
+        app.apply(crate::PresenterEvent::SubagentStart {
+            id: "b".into(),
+            agent: "general".into(),
+            task: "y".into(),
+            model: Some("m".into()),
+        });
+        app.open_viewer(1);
+        assert_eq!(app.viewer.as_ref().unwrap().selected, 1);
+
+        // Right/Left switch entries (wrapping); a modal key is always consumed.
+        assert!(app.viewer_key(KeyKind::Right));
+        assert_eq!(app.viewer.as_ref().unwrap().selected, 2);
+        assert!(app.viewer_key(KeyKind::Right)); // wraps 2 → 0
+        assert_eq!(app.viewer.as_ref().unwrap().selected, 0);
+
+        // Up pauses follow; Esc closes.
+        app.viewer_key(KeyKind::Up);
+        assert!(!app.viewer.as_ref().unwrap().follow);
+        app.viewer_key(KeyKind::Esc);
+        assert!(app.viewer.is_none());
+        // Closed viewer ignores keys (not consumed).
+        assert!(!app.viewer_key(KeyKind::Down));
     }
 }

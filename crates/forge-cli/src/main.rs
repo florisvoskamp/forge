@@ -4254,6 +4254,11 @@ async fn run_chat_tui(
     let mut queued_prompts: Vec<String> = Vec::new();
 
     while !quit {
+        // While the in-loop activity viewer is open during a running turn, redraw every frame so
+        // the selected entry's transcript tails live (subagent/critic output streams in).
+        if app.viewer.is_some() && busy {
+            dirty = true;
+        }
         if dirty {
             app.busy = busy;
             tui.draw(&app);
@@ -4295,6 +4300,14 @@ async fn run_chat_tui(
                 }
                 forge_tui::InputEvent::Key(k) => k,
             };
+
+            // The in-loop activity viewer (full-screen mode) is modal while open: it owns every key
+            // (scroll / switch entry / Esc to close). Rendered through the main terminal, so there's
+            // no nested alternate screen to collide with the chat.
+            if app.viewer_key(key) {
+                dirty = true;
+                continue;
+            }
 
             // The command palette is modal while open: it owns every key. Esc dismisses it
             // (so the user isn't surprised by a quit); Ctrl-C still maps to Esc → here it just
@@ -4654,22 +4667,33 @@ async fn run_chat_tui(
                     }
                     KeyKind::Enter => {
                         let idx = app.activity_idx;
-                        tui.run_fullscreen(|| {
-                            forge_tui::run_transcript_viewer(idx, || {
-                                while let Ok(msg) = rx.try_recv() {
-                                    match msg {
-                                        UiMsg::Event(e) => app.apply(e),
-                                        UiMsg::Permission { reply, .. } => {
-                                            let _ = reply.send(false);
-                                        }
-                                        UiMsg::Question { reply, .. } => {
-                                            let _ = reply.send(forge_tui::NO_ANSWER.to_string());
+                        if app.fullscreen {
+                            // Full-screen: open the in-loop viewer (same terminal, no nested
+                            // alt-screen). The main render loop keeps draining events, so the
+                            // selected entry auto-updates while open.
+                            app.open_viewer(idx);
+                            app.activity_focused = false;
+                        } else {
+                            // Inline: the live region is tiny, so take over a separate alternate
+                            // screen for the viewer and drain events in its refresh closure.
+                            tui.run_fullscreen(|| {
+                                forge_tui::run_transcript_viewer(idx, || {
+                                    while let Ok(msg) = rx.try_recv() {
+                                        match msg {
+                                            UiMsg::Event(e) => app.apply(e),
+                                            UiMsg::Permission { reply, .. } => {
+                                                let _ = reply.send(false);
+                                            }
+                                            UiMsg::Question { reply, .. } => {
+                                                let _ =
+                                                    reply.send(forge_tui::NO_ANSWER.to_string());
+                                            }
                                         }
                                     }
-                                }
-                                app.activity_views()
-                            })
-                        })?;
+                                    app.activity_views()
+                                })
+                            })?;
+                        }
                     }
                     KeyKind::Esc => {
                         app.activity_focused = false;
