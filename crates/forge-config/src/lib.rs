@@ -92,6 +92,9 @@ pub struct Config {
     /// Interactive TUI rendering (chat). Controls inline vs. full-screen (alternate-screen) mode.
     #[serde(default)]
     pub tui: TuiConfig,
+    /// Local-LLM runtime (Ollama): which model to auto-start and whether to start it with Forge.
+    #[serde(default)]
+    pub local: LocalConfig,
 }
 
 /// When a hook fires.
@@ -356,6 +359,37 @@ impl Default for TuiConfig {
 
 fn default_tui_fullscreen() -> bool {
     true
+}
+
+/// Local-LLM runtime settings. Forge runs local models through Ollama (exposed in the mesh as
+/// `ollama::<tag>`). Off by default — nothing starts unless the user opts in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalConfig {
+    /// Start the local runtime + `model` automatically when `forge chat` launches. Default false
+    /// (no surprise multi-GB model load / background server); use `forge local start` to run it
+    /// on demand.
+    #[serde(default)]
+    pub autostart: bool,
+    /// The Ollama tag to auto-start / treat as the default local model (e.g. `gemma4:12b`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Ollama HTTP endpoint. Defaults to the local server.
+    #[serde(default = "default_local_endpoint")]
+    pub endpoint: String,
+}
+
+impl Default for LocalConfig {
+    fn default() -> Self {
+        Self {
+            autostart: false,
+            model: None,
+            endpoint: default_local_endpoint(),
+        }
+    }
+}
+
+fn default_local_endpoint() -> String {
+    "http://localhost:11434".to_string()
 }
 
 /// Git integration settings.
@@ -1084,6 +1118,7 @@ impl Default for Config {
             assay: AssayConfig::default(),
             recap: RecapConfig::default(),
             tui: TuiConfig::default(),
+            local: LocalConfig::default(),
         }
     }
 }

@@ -25,6 +25,7 @@ mod benchmarks;
 mod bridge_stats;
 mod context_windows;
 mod image_input;
+mod local;
 mod mcp_serve;
 mod remote;
 mod replay;
@@ -111,6 +112,25 @@ enum BenchCmd {
         #[arg(required = true)]
         reports: Vec<std::path::PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum LocalCmd {
+    /// Detect this machine's specs and print the recommended local models.
+    Detect,
+    /// Install a local model (pulls via Ollama, offering to install Ollama first if missing).
+    /// With no KEY, installs the recommended model for this machine.
+    Install {
+        /// Catalog key (e.g. `gemma4-12b`); omit to use the recommended pick.
+        key: Option<String>,
+    },
+    /// List local models already pulled.
+    List,
+    /// Start the local runtime (and ensure a model is available). With no KEY, uses the configured
+    /// `[local] model` or the recommended pick.
+    Start { key: Option<String> },
+    /// Show local-runtime status: Ollama installed/serving, installed models, autostart config.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -278,6 +298,11 @@ enum Command {
     Benchmarks {
         #[arg(long)]
         refresh: bool,
+    },
+    /// Manage local LLMs (Ollama): detect specs, install/run a Gemma model that fits, list/start.
+    Local {
+        #[command(subcommand)]
+        sub: Option<LocalCmd>,
     },
     /// Internal: run Forge's tool registry as an MCP server on stdio (spawned by the CLI
     /// bridge so claude/codex use Forge's tools under Forge's permission gate). Not for direct use.
@@ -790,6 +815,7 @@ async fn main() -> Result<()> {
         Command::Models { probe, all, clear } => models(probe, all, clear).await,
         Command::Mesh { prompt, json } => mesh_explain(prompt.join(" "), json).await,
         Command::Benchmarks { refresh } => benchmarks_cmd(refresh).await,
+        Command::Local { sub } => local_cmd(sub),
         Command::Auth { provider, remove } => auth(&provider, remove),
         Command::Init => init(),
         Command::Mcp { cmd } => mcp_cmd(cmd).await,
@@ -1451,6 +1477,233 @@ fn needs_onboarding(has_any_key: bool, any_bridge: bool, config_exists: bool) ->
 }
 
 /// Read one trimmed line from stdin with a prompt (no echo suppression — same as `auth`).
+/// Opt-in: if `[local] autostart` is set, ensure the configured local model's Ollama server is up
+/// before the chat starts. Best-effort and non-fatal — a failure just means the mesh won't have the
+/// local model this session.
+fn maybe_autostart_local() {
+    let cfg = forge_config::load().unwrap_or_default();
+    if !cfg.local.autostart || !local::ollama_installed() {
+        return;
+    }
+    if local::ollama_start_serve() {
+        if let Some(tag) = &cfg.local.model {
+            if !local::ollama_installed_models().iter().any(|m| m == tag) {
+                println!("⚒ local: pulling {tag} (first run)…");
+                local::ollama_pull(tag);
+            }
+            println!("⚒ local model ready: ollama::{tag}");
+        }
+    }
+}
+
+/// `forge local [subcommand]`: detect specs, install/run a local Gemma via Ollama, list, status.
+/// No subcommand → `detect` (the discovery view).
+fn local_cmd(sub: Option<LocalCmd>) -> Result<()> {
+    match sub.unwrap_or(LocalCmd::Detect) {
+        LocalCmd::Detect => {
+            print_specs_and_recommendation();
+            Ok(())
+        }
+        LocalCmd::Install { key } => local_install(key.as_deref()),
+        LocalCmd::List => {
+            if !local::ollama_installed() {
+                println!("Ollama is not installed. Run `forge local install` to set it up.");
+                return Ok(());
+            }
+            let models = local::ollama_installed_models();
+            if models.is_empty() {
+                println!("No local models pulled yet. Run `forge local install`.");
+            } else {
+                println!("Local models ({}):", models.len());
+                for m in models {
+                    println!("  • {m}");
+                }
+            }
+            Ok(())
+        }
+        LocalCmd::Start { key } => local_start(key.as_deref()),
+        LocalCmd::Status => {
+            local_status();
+            Ok(())
+        }
+    }
+}
+
+/// Print the detected specs + the ranked recommendation list.
+fn print_specs_and_recommendation() {
+    let specs = local::detect_specs();
+    let gpu = match &specs.gpu {
+        Some(g) => match g.vram_gb {
+            Some(v) => format!("{} ({v:.0} GB VRAM)", g.name),
+            None => g.name.clone(),
+        },
+        None => "none detected".to_string(),
+    };
+    println!("⚒ This machine");
+    println!(
+        "  RAM {:.0} GB · {} cores · {} · GPU: {gpu}",
+        specs.total_ram_gb, specs.cpu_cores, specs.os
+    );
+    println!(
+        "  model memory budget: ~{:.0} GB\n",
+        specs.model_memory_gb()
+    );
+    let picks = local::recommend(&specs);
+    if picks.is_empty() {
+        println!(
+            "No catalog model fits this machine's memory. The smallest is Gemma 4 E2B (~6 GB)."
+        );
+        return;
+    }
+    println!("Recommended local models (best fit first):");
+    for (i, m) in picks.iter().enumerate() {
+        let tag = if i == 0 { "  ‹recommended›" } else { "" };
+        println!(
+            "  {} {}  [{}]  ~{:.0} GB{tag}\n      {}",
+            if i == 0 { "▸" } else { " " },
+            m.label,
+            m.ollama_tag,
+            m.min_memory_gb,
+            m.blurb
+        );
+    }
+    println!("\nInstall with `forge local install` (recommended) or `forge local install <key>`.");
+}
+
+/// Ensure Ollama is installed (offering to install it), then pull the chosen (or recommended) model.
+fn local_install(key: Option<&str>) -> Result<()> {
+    let specs = local::detect_specs();
+    let model = match key {
+        Some(k) => local::model_by_key(k)
+            .with_context(|| format!("unknown model key '{k}' — see `forge local detect`"))?,
+        None => *local::recommend(&specs)
+            .first()
+            .context("no local model fits this machine (needs ≥6 GB)")?,
+    };
+
+    if !local::ollama_installed() {
+        println!("Ollama (the local-model runtime) is not installed.");
+        match local::ollama_install_command(&specs) {
+            Some((cmd, args)) => {
+                let shown = std::iter::once(cmd.to_string())
+                    .chain(args.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let yes = prompt_line(&format!("Install it now with `{shown}`? [Y/n]: "))?;
+                if yes.is_empty()
+                    || yes.eq_ignore_ascii_case("y")
+                    || yes.eq_ignore_ascii_case("yes")
+                {
+                    if !local::run_install(cmd, &args) {
+                        anyhow::bail!("Ollama install failed — install it manually from https://ollama.com/download, then re-run.");
+                    }
+                } else {
+                    println!("Skipped. Install Ollama from https://ollama.com/download, then re-run `forge local install`.");
+                    return Ok(());
+                }
+            }
+            None => {
+                println!("Install Ollama from https://ollama.com/download, then re-run `forge local install`.");
+                return Ok(());
+            }
+        }
+    }
+
+    println!("Pulling {} ({})…", model.label, model.ollama_tag);
+    if !local::ollama_pull(model.ollama_tag) {
+        anyhow::bail!(
+            "`ollama pull {}` failed. The tag may not exist in your Ollama version — check `ollama list` / upgrade Ollama, or pick another model with `forge local detect`.",
+            model.ollama_tag
+        );
+    }
+    println!(
+        "✓ {} is ready. It's available in the mesh as `ollama::{}`.",
+        model.label, model.ollama_tag
+    );
+    println!(
+        "  Start it with `forge local start {}`, or enable `[local] autostart` in config.",
+        model.key
+    );
+    Ok(())
+}
+
+/// Ensure the Ollama server is up and the chosen model is available.
+fn local_start(key: Option<&str>) -> Result<()> {
+    if !local::ollama_installed() {
+        anyhow::bail!("Ollama is not installed. Run `forge local install` first.");
+    }
+    let cfg = forge_config::load().unwrap_or_default();
+    // Choose the model: explicit key → catalog tag; else configured tag; else recommended.
+    let tag: String = match key {
+        Some(k) => local::model_by_key(k)
+            .map(|m| m.ollama_tag.to_string())
+            .with_context(|| format!("unknown model key '{k}'"))?,
+        None => cfg
+            .local
+            .model
+            .clone()
+            .or_else(|| {
+                let specs = local::detect_specs();
+                local::recommend(&specs)
+                    .first()
+                    .map(|m| m.ollama_tag.to_string())
+            })
+            .context("no model configured and none fits — run `forge local install`")?,
+    };
+    print!("Starting Ollama… ");
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    if !local::ollama_start_serve() {
+        anyhow::bail!("could not start `ollama serve` (is it already running on another port?)");
+    }
+    println!("up.");
+    if !local::ollama_installed_models().iter().any(|m| m == &tag) {
+        println!("Model {tag} not pulled yet — pulling…");
+        if !local::ollama_pull(&tag) {
+            anyhow::bail!("`ollama pull {tag}` failed.");
+        }
+    }
+    println!("✓ Local model ready: `ollama::{tag}` (mesh will route to it).");
+    Ok(())
+}
+
+/// Print local-runtime status: install, serving, models, and the autostart config.
+fn local_status() {
+    let cfg = forge_config::load().unwrap_or_default();
+    match local::ollama_version() {
+        Some(v) => println!("Ollama: installed ({v})"),
+        None => {
+            println!("Ollama: not installed — run `forge local install`");
+            return;
+        }
+    }
+    println!(
+        "Server:  {}",
+        if local::ollama_serving() {
+            "running (localhost:11434)"
+        } else {
+            "stopped — `forge local start`"
+        }
+    );
+    let models = local::ollama_installed_models();
+    println!(
+        "Models:  {}",
+        if models.is_empty() {
+            "none".to_string()
+        } else {
+            models.join(", ")
+        }
+    );
+    println!(
+        "Autostart: {}{}",
+        if cfg.local.autostart { "on" } else { "off" },
+        cfg.local
+            .model
+            .as_deref()
+            .map(|m| format!(" · model {m}"))
+            .unwrap_or_default()
+    );
+}
+
 fn prompt_line(prompt: &str) -> Result<String> {
     print!("{prompt}");
     std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -3981,6 +4234,7 @@ async fn chat(
     pin: Option<String>,
 ) -> Result<()> {
     maybe_first_run_setup(mock)?;
+    maybe_autostart_local();
     // Default to the interactive (animated) TUI on a real terminal.
     if !plain && std::io::stdout().is_terminal() {
         return run_chat_tui(mock, mode, resume_mode, fullscreen, pin).await;
