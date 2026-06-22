@@ -177,7 +177,9 @@ pub enum PresenterEvent {
     /// Structured per-critic status update for the live assay panel in the TUI.
     AssayCriticRow(forge_types::AssayCriticRow),
     /// Verification phase started — shown in the assay panel header, not in scrollback.
-    AssayVerifying { candidates: usize },
+    AssayVerifying {
+        candidates: usize,
+    },
     /// A finished Assay analysis report, for inline rendering (docs/features/analysis-mode.md).
     AssayReport(forge_types::AssayReport),
     /// The agent's task list changed (`update_tasks`); render the checklist into scrollback.
