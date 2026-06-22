@@ -1493,6 +1493,43 @@ fn leaf(path: &str, value: SettingValue) -> SettingLeaf {
     }
 }
 
+/// One-line help for a setting path, shown in the `/config` editor. `None` for paths without a
+/// curated description (they still appear and are editable — just without help text).
+pub fn setting_help(path: &str) -> Option<&'static str> {
+    Some(match path {
+        "permission_mode" => "Tool-safety posture for new sessions: default · accept-edits · bypass · plan.",
+        "mesh.credit_mode" => "Subscription conservation: normal · frugal · strict (spread work off paid plans).",
+        "mesh.daily_cap_usd" => "Hard daily spend cap (USD) across sessions; the mesh downshifts/stops near it.",
+        "mesh.weekly_cap_usd" => "Hard weekly spend cap (USD). Empty = unlimited.",
+        "mesh.monthly_cap_usd" => "Hard monthly spend cap (USD). Empty = unlimited.",
+        "mesh.classifier" => "Task-tier classifier: heuristic (instant, no call) or llm (a cheap model labels each turn).",
+        "mesh.classifier_model" => "Model the llm classifier calls — pick a $0/local one (e.g. ollama::… or a CLI bridge).",
+        "mesh.prefer_subscription" => "Prefer $0 CLI-bridge subscriptions over a metered API model on a tie.",
+        "mesh.max_output_tokens" => "Cap on tokens a model may generate per call.",
+        "mesh.architect_mode" => "Use a stronger 'architect' model to plan, a cheaper one to edit.",
+        "mesh.architect_model" => "Model used for the architect/planning pass when architect_mode is on.",
+        "mesh.editor_model" => "Model used to apply edits when architect_mode is on.",
+        "mesh.self_review" => "After a write turn, have the model review its own diff before finishing.",
+        "mesh.default_effort" => "Default reasoning effort for models that support it (low/medium/high/…).",
+        "local.autostart" => "Start the local Ollama model automatically when `forge chat` launches.",
+        "local.model" => "Ollama tag to auto-start (e.g. gemma4:12b). Set it via `forge local install`.",
+        "local.endpoint" => "Ollama HTTP endpoint (default http://localhost:11434).",
+        "tui.fullscreen" => "Full-screen TUI on the alternate screen. Off = inline in native scrollback.",
+        "recap.enabled" => "Show a one-line AI recap after each completed turn.",
+        "shell.explain_errors" => "When a shell command fails, the AI explains the likely cause + a fix.",
+        "lattice.enabled" => "Build/maintain the code-intelligence graph (`forge lattice`).",
+        "lattice.inject" => "Auto-inject relevant code into each turn before the model call.",
+        "lattice.watch" => "Reindex changed files automatically as you edit.",
+        "autofix.enabled" => "After edits, run lint/test and feed failures back so the model self-heals.",
+        "autofix.max_iterations" => "Max self-heal passes before giving up.",
+        "assay.gate_enabled" => "Run an Assay review on write turns before they finish.",
+        "assay.max_cost_usd" => "Per-run cost ceiling for the Assay critic crew.",
+        "git.coauthor" => "Install a commit hook stamping Co-Authored-By: Forge and stripping CLI co-authors.",
+        "lsp.enabled" => "Feed language-server diagnostics back into the turn after edits.",
+        _ => return None,
+    })
+}
+
 /// The config file path for a scope.
 pub fn scope_path(scope: ConfigScope) -> Result<PathBuf, ConfigError> {
     match scope {

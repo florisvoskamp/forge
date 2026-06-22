@@ -4328,16 +4328,38 @@ fn emit_text(tui: &mut forge_tui::Tui, app: &mut forge_tui::App, text: &str) {
     }
 }
 
-/// Every editable scalar setting (importance-ordered), as `/config` editor rows.
+/// Every editable setting (importance-ordered), as `/config` editor rows: API keys first (so the
+/// provider keys the old wizard owned are managed here too), then the discovered scalar settings.
 fn config_editor_rows() -> Vec<forge_tui::SettingRow> {
-    forge_config::config_leaves()
-        .into_iter()
-        .map(|l| forge_tui::SettingRow {
-            path: l.path,
-            display: l.value.display(),
-            type_tag: l.value.type_tag().to_string(),
+    // API keys (stored in the OS keyring, never in config.toml). Shown set/unset; edits route to
+    // the keyring. These lead the list because they're the first thing a new user needs.
+    let mut rows: Vec<forge_tui::SettingRow> = forge_config::known_key_providers()
+        .map(|p| forge_tui::SettingRow {
+            path: format!("key.{p}"),
+            display: if forge_config::has_api_key(p) {
+                "● set".to_string()
+            } else {
+                "○ not set".to_string()
+            },
+            type_tag: "secret".to_string(),
+            help: Some(format!(
+                "API key for {p} (stored in the OS keyring). Enter to set; empty to remove."
+            )),
+            secret: true,
         })
-        .collect()
+        .collect();
+    rows.extend(
+        forge_config::config_leaves()
+            .into_iter()
+            .map(|l| forge_tui::SettingRow {
+                path: l.path.clone(),
+                display: l.value.display(),
+                type_tag: l.value.type_tag().to_string(),
+                help: forge_config::setting_help(&l.path).map(str::to_string),
+                secret: false,
+            }),
+    );
+    rows
 }
 
 async fn run_chat_tui(
@@ -4606,12 +4628,26 @@ async fn run_chat_tui(
             if app.config_editor.open {
                 match app.config_editor.handle_key(key) {
                     forge_tui::ConfigAction::Save { path, value } => {
-                        let scope = if app.config_editor.project_scope {
-                            forge_config::ConfigScope::Project
+                        let result = if let Some(provider) = path.strip_prefix("key.") {
+                            // Secret: store/remove the API key in the OS keyring (never config.toml).
+                            if value.trim().is_empty() {
+                                forge_config::remove_api_key(provider)
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string())
+                            } else {
+                                forge_config::store_api_key(provider, value.trim())
+                                    .map_err(|e| e.to_string())
+                            }
                         } else {
-                            forge_config::ConfigScope::User
+                            let scope = if app.config_editor.project_scope {
+                                forge_config::ConfigScope::Project
+                            } else {
+                                forge_config::ConfigScope::User
+                            };
+                            forge_config::set_config_value(scope, &path, &value)
+                                .map_err(|e| e.to_string())
                         };
-                        match forge_config::set_config_value(scope, &path, &value) {
+                        match result {
                             Ok(()) => {
                                 app.config_editor.rows = config_editor_rows();
                                 app.config_editor.status = Some(format!("✓ saved {path}"));

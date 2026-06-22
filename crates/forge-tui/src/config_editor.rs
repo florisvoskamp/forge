@@ -20,13 +20,17 @@ const WARN: Color = Color::Rgb(235, 120, 110);
 const VERY_DIM: Color = Color::Rgb(80, 80, 90);
 
 /// One editable setting row (the TUI-side mirror of `forge_config::SettingLeaf`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SettingRow {
     pub path: String,
     /// Current value, rendered.
     pub display: String,
-    /// Short type tag (`bool`/`int`/`float`/`text`).
+    /// Short type tag (`bool`/`int`/`float`/`text`/`secret`).
     pub type_tag: String,
+    /// One-line help shown for the selected row.
+    pub help: Option<String>,
+    /// A secret (API key): the value is masked, edits route to the keyring not config.toml.
+    pub secret: bool,
 }
 
 /// What the I/O shell should do after a keystroke (it owns the `forge-config` writes).
@@ -153,8 +157,11 @@ impl ConfigEditor {
                 }
                 KeyKind::Enter => {
                     if let Some(r) = self.selected_row() {
-                        // Pre-fill bools with the toggled value for a one-keystroke flip.
-                        self.editing = Some(if r.type_tag == "bool" {
+                        // Secrets start empty (never prefill the masked value); bools pre-fill the
+                        // toggle for a one-keystroke flip; everything else pre-fills its value.
+                        self.editing = Some(if r.secret {
+                            String::new()
+                        } else if r.type_tag == "bool" {
                             (r.display != "true").to_string()
                         } else {
                             r.display.clone()
@@ -231,8 +238,8 @@ pub fn render_config_overlay(frame: &mut Frame, ed: &ConfigEditor) {
     ]));
     lines.push(TextLine::default());
 
-    // Body: reserve 3 header + 2 footer rows; keep the selection visible by windowing.
-    let body_h = (area.height as usize).saturating_sub(5).max(1);
+    // Body: reserve 3 header + 3 footer rows (help + status + hints); window to the selection.
+    let body_h = (area.height as usize).saturating_sub(6).max(1);
     let start = ed.selected.saturating_sub(body_h.saturating_sub(1));
     for (row, &ri) in matches.iter().enumerate().skip(start).take(body_h) {
         let r = &ed.rows[ri];
@@ -240,8 +247,15 @@ pub fn render_config_overlay(frame: &mut Frame, ed: &ConfigEditor) {
         let marker = if sel { "▸ " } else { "  " };
         let editing_here = sel && ed.editing.is_some();
         let value_span = if editing_here {
+            let buf = ed.editing.as_deref().unwrap_or("");
+            // Secrets are masked while typing.
+            let shown = if r.secret {
+                "•".repeat(buf.chars().count())
+            } else {
+                buf.to_string()
+            };
             Span::styled(
-                format!("{}▌", ed.editing.as_deref().unwrap_or("")),
+                format!("{shown}▌"),
                 Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
             )
         } else {
@@ -269,9 +283,19 @@ pub fn render_config_overlay(frame: &mut Frame, ed: &ConfigEditor) {
             value_span,
         ]));
     }
-    while lines.len() < (area.height as usize).saturating_sub(2) {
+    while lines.len() < (area.height as usize).saturating_sub(3) {
         lines.push(TextLine::default());
     }
+
+    // Help line for the selected setting (the "what does this do" the editor was missing).
+    let help = ed
+        .selected_row()
+        .and_then(|r| r.help.clone())
+        .unwrap_or_else(|| "(no description)".to_string());
+    lines.push(TextLine::from(Span::styled(
+        format!("  {}", truncate(&help, w.saturating_sub(4))),
+        Style::default().fg(USER),
+    )));
 
     // Footer: status (if any) + key hints.
     if let Some(s) = &ed.status {
@@ -311,24 +335,35 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn row(path: &str, display: &str, type_tag: &str) -> SettingRow {
+        SettingRow {
+            path: path.into(),
+            display: display.into(),
+            type_tag: type_tag.into(),
+            ..Default::default()
+        }
+    }
+
     fn rows() -> Vec<SettingRow> {
         vec![
-            SettingRow {
-                path: "tui.fullscreen".into(),
-                display: "true".into(),
-                type_tag: "bool".into(),
-            },
-            SettingRow {
-                path: "local.autostart".into(),
-                display: "false".into(),
-                type_tag: "bool".into(),
-            },
-            SettingRow {
-                path: "mesh.daily_cap_usd".into(),
-                display: "10".into(),
-                type_tag: "float".into(),
-            },
+            row("tui.fullscreen", "true", "bool"),
+            row("local.autostart", "false", "bool"),
+            row("mesh.daily_cap_usd", "10", "float"),
         ]
+    }
+
+    #[test]
+    fn secret_row_starts_empty_and_masks() {
+        let mut ed = ConfigEditor::default();
+        ed.open_with(vec![SettingRow {
+            path: "key.openai".into(),
+            display: "● set".into(),
+            type_tag: "secret".into(),
+            secret: true,
+            ..Default::default()
+        }]);
+        ed.handle_key(KeyKind::Enter); // begin editing the secret
+        assert_eq!(ed.editing.as_deref(), Some("")); // never prefilled with the value
     }
 
     #[test]
