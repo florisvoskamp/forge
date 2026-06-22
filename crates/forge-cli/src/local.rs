@@ -1,11 +1,11 @@
-//! Local-LLM management: probe the machine, recommend a Gemma model that fits, and
-//! install / run it through a local runtime. Ollama is the first (and currently only) supported
-//! runtime — already a first-class mesh provider (`ollama::<tag>`) — but [`Runtime`] is a seam so
-//! llama.cpp / LM Studio can plug in later. Backs the `forge local` commands and the setup wizard.
+//! Local-LLM management: probe the machine, recommend the strongest models that fit (across the
+//! Qwen / Llama / DeepSeek / Gemma / Phi families), and install / run them through Ollama — already
+//! a first-class mesh provider (`ollama::<tag>`). The runtime layer is factored so llama.cpp /
+//! LM Studio can plug in later. Backs the `forge local` commands and the setup wizard.
 //!
-//! Honesty note: the Ollama *tags* below are best-effort. The actual fetch defers to
-//! `ollama pull <tag>`, so if a tag isn't in the registry (e.g. an older Ollama that predates
-//! Gemma 4) the user sees Ollama's own error rather than a fabricated success.
+//! Honesty note: the Ollama *tags* below are real, well-established library tags, but the fetch
+//! still defers to `ollama pull <tag>` — so if a tag is renamed/removed (or, for the post-cutoff
+//! Gemma 4 line, needs a newer Ollama) the user sees Ollama's own error, never a fabricated success.
 
 use std::net::TcpStream;
 use std::process::Command;
@@ -103,64 +103,268 @@ fn detect_gpu(apple_silicon: bool) -> Option<GpuInfo> {
     None
 }
 
-/// A locally-runnable model in the catalog (the Gemma family, per the June 2026 releases).
+/// A locally-runnable model in the catalog. Spans several open families and sizes; `min_memory_gb`
+/// is a realistic ~Q4 runtime footprint and `quality` is a coarse capability score (0–100, coding-
+/// leaning since Forge is a dev tool) used to rank across families.
 #[derive(Debug, Clone, Copy)]
 pub struct LocalModel {
     /// Stable key used on the CLI (`forge local install <key>`).
     pub key: &'static str,
+    /// Family label (Qwen, Llama, DeepSeek, …) — used as the menu group.
+    pub family: &'static str,
     /// Human label.
     pub label: &'static str,
     /// Ollama tag, resolved against the registry at `ollama pull` time.
     pub ollama_tag: &'static str,
-    /// Parameter count in billions (effective, for MoE).
+    /// Parameter count in billions (effective/active, for MoE).
     pub params_b: f64,
-    /// Recommended minimum memory budget (GiB) to run it comfortably at ~Q4.
+    /// Recommended minimum memory budget (GiB) to run it at ~Q4 (Ollama-style: ~8 GB/7B,
+    /// ~16 GB/13B, ~32 GB/33B, ~48 GB/70B).
     pub min_memory_gb: f64,
+    /// Coarse capability score for ranking across families (higher = stronger).
+    pub quality: u8,
     pub blurb: &'static str,
 }
 
-/// The Gemma catalog (smallest → largest). Sizes track the Gemma 4 release line; `min_memory_gb`
-/// is a conservative ~Q4 estimate (≈0.7 GiB/B + runtime overhead).
+/// The local-model catalog: well-established open models across families and sizes, with their real
+/// Ollama tags. Tags still resolve against the Ollama registry at `ollama pull` time, so anything
+/// renamed/removed surfaces Ollama's own error rather than a fabricated success. Gemma 4 entries are
+/// the June-2026 line (newer than this build's knowledge — they need a recent Ollama).
 pub const CATALOG: &[LocalModel] = &[
+    // ---- ≤4 GB: tiny / mobile-class ----
+    LocalModel {
+        key: "qwen2.5-coder-3b",
+        family: "Qwen",
+        label: "Qwen2.5-Coder 3B",
+        ollama_tag: "qwen2.5-coder:3b",
+        params_b: 3.0,
+        min_memory_gb: 4.0,
+        quality: 55,
+        blurb: "Tiny coding model; fits modest laptops.",
+    },
+    LocalModel {
+        key: "llama3.2-3b",
+        family: "Llama",
+        label: "Llama 3.2 3B",
+        ollama_tag: "llama3.2:3b",
+        params_b: 3.0,
+        min_memory_gb: 4.0,
+        quality: 46,
+        blurb: "Small general model; quick chat/edits.",
+    },
     LocalModel {
         key: "gemma4-e2b",
+        family: "Gemma",
         label: "Gemma 4 E2B",
         ollama_tag: "gemma4:e2b",
         params_b: 2.0,
-        min_memory_gb: 6.0,
-        blurb: "Tiny, fast — fits modest laptops; good for quick edits/chat.",
+        min_memory_gb: 4.0,
+        quality: 42,
+        blurb: "Tiny Gemma 4; mobile-class.",
     },
     LocalModel {
         key: "gemma4-e4b",
+        family: "Gemma",
         label: "Gemma 4 E4B",
         ollama_tag: "gemma4:e4b",
         params_b: 4.0,
+        min_memory_gb: 6.0,
+        quality: 50,
+        blurb: "Small Gemma 4.",
+    },
+    // ---- 8 GB: 7–9B ----
+    LocalModel {
+        key: "qwen2.5-coder-7b",
+        family: "Qwen",
+        label: "Qwen2.5-Coder 7B",
+        ollama_tag: "qwen2.5-coder:7b",
+        params_b: 7.0,
         min_memory_gb: 8.0,
-        blurb: "Small but capable; a solid default on 16 GB machines.",
+        quality: 74,
+        blurb: "Excellent coder for its size; great 16 GB default.",
+    },
+    LocalModel {
+        key: "deepseek-r1-8b",
+        family: "DeepSeek",
+        label: "DeepSeek-R1 8B",
+        ollama_tag: "deepseek-r1:8b",
+        params_b: 8.0,
+        min_memory_gb: 8.0,
+        quality: 72,
+        blurb: "Reasoning-distilled; strong step-by-step.",
+    },
+    LocalModel {
+        key: "qwen2.5-7b",
+        family: "Qwen",
+        label: "Qwen2.5 7B",
+        ollama_tag: "qwen2.5:7b",
+        params_b: 7.0,
+        min_memory_gb: 8.0,
+        quality: 68,
+        blurb: "Solid general 7B.",
+    },
+    LocalModel {
+        key: "llama3.1-8b",
+        family: "Llama",
+        label: "Llama 3.1 8B",
+        ollama_tag: "llama3.1:8b",
+        params_b: 8.0,
+        min_memory_gb: 8.0,
+        quality: 66,
+        blurb: "Well-rounded general 8B.",
+    },
+    LocalModel {
+        key: "gemma2-9b",
+        family: "Gemma",
+        label: "Gemma 2 9B",
+        ollama_tag: "gemma2:9b",
+        params_b: 9.0,
+        min_memory_gb: 10.0,
+        quality: 64,
+        blurb: "Capable general 9B.",
+    },
+    // ---- 16 GB: 12–16B ----
+    LocalModel {
+        key: "qwen2.5-coder-14b",
+        family: "Qwen",
+        label: "Qwen2.5-Coder 14B",
+        ollama_tag: "qwen2.5-coder:14b",
+        params_b: 14.0,
+        min_memory_gb: 16.0,
+        quality: 82,
+        blurb: "Top coder in the 16 GB class.",
+    },
+    LocalModel {
+        key: "deepseek-r1-14b",
+        family: "DeepSeek",
+        label: "DeepSeek-R1 14B",
+        ollama_tag: "deepseek-r1:14b",
+        params_b: 14.0,
+        min_memory_gb: 16.0,
+        quality: 81,
+        blurb: "Strong reasoning at 14B.",
+    },
+    LocalModel {
+        key: "deepseek-coder-v2-16b",
+        family: "DeepSeek",
+        label: "DeepSeek-Coder-V2 16B (MoE)",
+        ollama_tag: "deepseek-coder-v2:16b",
+        params_b: 16.0,
+        min_memory_gb: 16.0,
+        quality: 79,
+        blurb: "MoE coder; fast for its quality.",
+    },
+    LocalModel {
+        key: "phi4-14b",
+        family: "Phi",
+        label: "Phi-4 14B",
+        ollama_tag: "phi4:14b",
+        params_b: 14.0,
+        min_memory_gb: 16.0,
+        quality: 76,
+        blurb: "Strong reasoning/coding for 14B.",
+    },
+    LocalModel {
+        key: "qwen2.5-14b",
+        family: "Qwen",
+        label: "Qwen2.5 14B",
+        ollama_tag: "qwen2.5:14b",
+        params_b: 14.0,
+        min_memory_gb: 16.0,
+        quality: 77,
+        blurb: "Strong general 14B.",
     },
     LocalModel {
         key: "gemma4-12b",
-        label: "Gemma 4 12B Unified",
+        family: "Gemma",
+        label: "Gemma 4 12B",
         ollama_tag: "gemma4:12b",
         params_b: 12.0,
         min_memory_gb: 16.0,
-        blurb: "Strong general/coding quality; the sweet spot on 16–32 GB.",
+        quality: 78,
+        blurb: "Gemma 4 sweet spot (recent Ollama needed).",
+    },
+    // ---- 32 GB: 27–34B ----
+    LocalModel {
+        key: "qwen2.5-coder-32b",
+        family: "Qwen",
+        label: "Qwen2.5-Coder 32B",
+        ollama_tag: "qwen2.5-coder:32b",
+        params_b: 32.0,
+        min_memory_gb: 32.0,
+        quality: 89,
+        blurb: "Best local coder short of 70B.",
     },
     LocalModel {
-        key: "gemma4-26b-a4b",
-        label: "Gemma 4 26B A4B (MoE)",
-        ollama_tag: "gemma4:26b-a4b",
-        params_b: 26.0,
+        key: "deepseek-r1-32b",
+        family: "DeepSeek",
+        label: "DeepSeek-R1 32B",
+        ollama_tag: "deepseek-r1:32b",
+        params_b: 32.0,
         min_memory_gb: 32.0,
-        blurb: "Mixture-of-experts: 26B weights, ~4B active — fast for its quality.",
+        quality: 88,
+        blurb: "Excellent reasoning at 32B.",
+    },
+    LocalModel {
+        key: "qwen2.5-32b",
+        family: "Qwen",
+        label: "Qwen2.5 32B",
+        ollama_tag: "qwen2.5:32b",
+        params_b: 32.0,
+        min_memory_gb: 32.0,
+        quality: 85,
+        blurb: "Strong general 32B.",
+    },
+    LocalModel {
+        key: "gemma2-27b",
+        family: "Gemma",
+        label: "Gemma 2 27B",
+        ollama_tag: "gemma2:27b",
+        params_b: 27.0,
+        min_memory_gb: 28.0,
+        quality: 80,
+        blurb: "Capable general 27B.",
     },
     LocalModel {
         key: "gemma4-31b",
+        family: "Gemma",
         label: "Gemma 4 31B",
         ollama_tag: "gemma4:31b",
         params_b: 31.0,
         min_memory_gb: 32.0,
-        blurb: "Highest quality in the family; wants 32 GB+ / a big GPU.",
+        quality: 86,
+        blurb: "Top Gemma 4 (recent Ollama needed).",
+    },
+    // ---- 48 GB+: 70B ----
+    LocalModel {
+        key: "deepseek-r1-70b",
+        family: "DeepSeek",
+        label: "DeepSeek-R1 70B",
+        ollama_tag: "deepseek-r1:70b",
+        params_b: 70.0,
+        min_memory_gb: 48.0,
+        quality: 92,
+        blurb: "Frontier-class reasoning; big rig only.",
+    },
+    LocalModel {
+        key: "llama3.3-70b",
+        family: "Llama",
+        label: "Llama 3.3 70B",
+        ollama_tag: "llama3.3:70b",
+        params_b: 70.0,
+        min_memory_gb: 48.0,
+        quality: 90,
+        blurb: "Top general open model; big rig only.",
+    },
+    LocalModel {
+        key: "qwen2.5-72b",
+        family: "Qwen",
+        label: "Qwen2.5 72B",
+        ollama_tag: "qwen2.5:72b",
+        params_b: 72.0,
+        min_memory_gb: 48.0,
+        quality: 90,
+        blurb: "Frontier-class general; big rig only.",
     },
 ];
 
@@ -169,15 +373,20 @@ pub fn model_by_key(key: &str) -> Option<&'static LocalModel> {
     CATALOG.iter().find(|m| m.key == key)
 }
 
-/// Rank the catalog for these specs: every model whose memory budget fits, largest first. The first
-/// entry is the recommended pick. Empty only on a machine too small for even the E2B model.
+/// Rank the catalog for these specs: EVERY model whose memory budget fits, highest capability first
+/// (ties broken by params). The first entry is the recommended pick. Empty only on a machine too
+/// small for even the tiniest model.
 pub fn recommend(specs: &SystemSpecs) -> Vec<&'static LocalModel> {
     let budget = specs.model_memory_gb();
     let mut fits: Vec<&LocalModel> = CATALOG
         .iter()
         .filter(|m| m.min_memory_gb <= budget)
         .collect();
-    fits.sort_by(|a, b| b.params_b.partial_cmp(&a.params_b).unwrap());
+    fits.sort_by(|a, b| {
+        b.quality
+            .cmp(&a.quality)
+            .then(b.params_b.partial_cmp(&a.params_b).unwrap())
+    });
     fits
 }
 
@@ -344,18 +553,28 @@ mod tests {
     }
 
     #[test]
-    fn recommend_picks_largest_that_fits_ram() {
-        // 16 GB → up to the 12B, not the 31B; biggest-fitting is first.
+    fn recommend_returns_all_that_fit_ranked_by_capability() {
+        // 16 GB → spans several families/sizes, all within budget, highest-quality first, and
+        // ordered (no lower-quality model ahead of a higher one).
         let r = recommend(&specs(16.0, None, false));
-        assert_eq!(r.first().unwrap().key, "gemma4-12b");
+        assert!(r.len() >= 8, "broad catalog, not just Gemma: {}", r.len());
         assert!(r.iter().all(|m| m.min_memory_gb <= 16.0));
-        assert!(!r.iter().any(|m| m.key == "gemma4-31b"));
+        assert!(
+            r.windows(2).all(|w| w[0].quality >= w[1].quality),
+            "ranked best-first"
+        );
+        // Multiple families are represented (not Gemma-only).
+        let families: std::collections::HashSet<_> = r.iter().map(|m| m.family).collect();
+        assert!(families.len() >= 3, "families: {families:?}");
+        // The 32B+ models do not fit a 16 GB budget.
+        assert!(!r.iter().any(|m| m.min_memory_gb > 16.0));
     }
 
     #[test]
-    fn tiny_machine_still_gets_the_smallest() {
+    fn tiny_machine_still_gets_small_models() {
         let r = recommend(&specs(6.0, None, false));
-        assert_eq!(r.last().unwrap().key, "gemma4-e2b");
+        assert!(!r.is_empty());
+        assert!(r.iter().all(|m| m.min_memory_gb <= 6.0));
     }
 
     #[test]
@@ -365,23 +584,25 @@ mod tests {
 
     #[test]
     fn discrete_gpu_vram_is_the_budget_not_system_ram() {
-        // 8 GB RAM but a 24 GB GPU → sizing uses the 24 GB VRAM, so the 12B fits (it wouldn't on
-        // 8 GB RAM alone, which would cap at the E4B).
+        // 8 GB RAM but a 24 GB GPU → sizing uses VRAM, so 16 GB-class models fit (they wouldn't on
+        // 8 GB RAM alone). Best fitting is a 14B-class model, not a 32B (needs 32).
         let gpu = Some(GpuInfo {
             name: "RTX 4090".into(),
             vram_gb: Some(24.0),
         });
         let r = recommend(&specs(8.0, gpu, false));
-        assert_eq!(r.first().unwrap().key, "gemma4-12b");
-        // And a 48 GB card fits the largest.
+        assert!(r
+            .iter()
+            .any(|m| (m.min_memory_gb - 16.0).abs() < f64::EPSILON));
+        assert!(!r.iter().any(|m| m.min_memory_gb > 24.0));
+        // A 48 GB card fits the 70B tier.
         let big = Some(GpuInfo {
             name: "A6000".into(),
             vram_gb: Some(48.0),
         });
-        assert_eq!(
-            recommend(&specs(8.0, big, false)).first().unwrap().key,
-            "gemma4-31b"
-        );
+        assert!(recommend(&specs(8.0, big, false))
+            .iter()
+            .any(|m| m.params_b >= 70.0));
     }
 
     #[test]

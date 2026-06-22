@@ -1649,19 +1649,18 @@ fn print_specs_and_recommendation() {
     );
     let picks = local::recommend(&specs);
     if picks.is_empty() {
-        println!(
-            "No catalog model fits this machine's memory. The smallest is Gemma 4 E2B (~6 GB)."
-        );
+        println!("No catalog model fits this machine's memory (the smallest needs ~4 GB).");
         return;
     }
-    println!("Recommended local models (best fit first):");
+    println!("Models that fit, best capability first (across families):");
     for (i, m) in picks.iter().enumerate() {
         let tag = if i == 0 { "  ‹recommended›" } else { "" };
         println!(
-            "  {} {}  [{}]  ~{:.0} GB{tag}\n      {}",
+            "  {} {:<26} [{}]  {} · ~{:.0} GB{tag}\n      {}",
             if i == 0 { "▸" } else { " " },
             m.label,
             m.ollama_tag,
+            m.family,
             m.min_memory_gb,
             m.blurb
         );
