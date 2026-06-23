@@ -350,18 +350,29 @@ pub struct TuiConfig {
     /// flags on `forge chat` override this per-invocation.
     #[serde(default = "default_tui_fullscreen")]
     pub fullscreen: bool,
+    /// Capture the mouse in full-screen mode so the wheel scrolls the transcript. Default: false.
+    /// Capturing the mouse disables the terminal's native click-drag text selection (you'd have to
+    /// hold Shift to select), which most users hit first — so it's opt-in. With it off, scroll with
+    /// PgUp/PgDn/Home/End and select/copy text normally. No effect in inline mode.
+    #[serde(default = "default_tui_mouse_capture")]
+    pub mouse_capture: bool,
 }
 
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
             fullscreen: default_tui_fullscreen(),
+            mouse_capture: default_tui_mouse_capture(),
         }
     }
 }
 
 fn default_tui_fullscreen() -> bool {
     true
+}
+
+fn default_tui_mouse_capture() -> bool {
+    false
 }
 
 /// Local-LLM runtime settings. Forge runs local models through Ollama (exposed in the mesh as
@@ -1447,6 +1458,7 @@ const PRIORITY_PREFIXES: &[&str] = &[
     "local.autostart",
     "local.model",
     "tui.fullscreen",
+    "tui.mouse_capture",
     "recap.enabled",
     "mesh",
     "local",
@@ -1547,6 +1559,7 @@ pub fn setting_group_and_label(path: &str) -> (String, String) {
         "local.model" => Some(("Local LLM", "Model (Ollama tag)")),
         "local.endpoint" => Some(("Local LLM", "Ollama endpoint")),
         "tui.fullscreen" => Some(("Interface", "Full-screen TUI")),
+        "tui.mouse_capture" => Some(("Interface", "Mouse wheel scroll (disables text selection)")),
         "recap.enabled" => Some(("Interface", "Per-turn recap")),
         "update.check" => Some(("Interface", "Check for updates")),
         "shell.explain_errors" => Some(("Shell", "Explain failed commands")),
@@ -1741,6 +1754,7 @@ pub fn setting_help(path: &str) -> Option<&'static str> {
         "local.model" => "Ollama tag to auto-start (e.g. gemma4:12b). Set it via `forge local install`.",
         "local.endpoint" => "Ollama HTTP endpoint (default http://localhost:11434).",
         "tui.fullscreen" => "Full-screen TUI on the alternate screen. Off = inline in native scrollback.",
+        "tui.mouse_capture" => "Capture the mouse so the wheel scrolls the transcript (full-screen). On = native click-drag text selection is disabled (hold Shift to select). Off (default) = scroll with PgUp/PgDn, select text normally.",
         "recap.enabled" => "Show a one-line AI recap after each completed turn.",
         "update.check" => "Check GitHub for a newer Forge release on startup (throttled to once a day).",
         "shell.explain_errors" => "When a shell command fails, the AI explains the likely cause + a fix.",

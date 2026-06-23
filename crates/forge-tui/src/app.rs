@@ -352,6 +352,21 @@ pub struct App {
     /// half of the blink). Inverted sense so `Default` (false) shows the solid block. Toggled by
     /// the render loop ~every 530ms while focused.
     pub cursor_hidden: bool,
+    /// Monotonic revision of [`main_log`], bumped on every append/clear. Keys the wrap cache so a
+    /// fold that *replaces* lines at the [`MAIN_LOG_MAX`] cap (len unchanged) still invalidates it.
+    main_log_rev: u64,
+    /// Memoized wrap of [`main_log`] for the full-screen transcript. Re-wrapping the whole log
+    /// char-by-char every frame is O(transcript) and was the full-screen input/scroll lag on long
+    /// conversations; this caches it so a streaming frame only re-wraps the one in-flight edge line.
+    wrap_cache: std::cell::RefCell<WrapCache>,
+}
+
+/// Cached result of wrapping [`App::main_log`] to a width. Valid while `(width, rev)` are unchanged.
+#[derive(Debug, Clone, Default)]
+struct WrapCache {
+    width: u16,
+    rev: u64,
+    rows: Vec<TextLine<'static>>,
 }
 
 /// How many recent scrollback lines the remote snapshot keeps (a phone screen shows ~6–8).
@@ -1697,6 +1712,7 @@ impl App {
     /// untouched — this only resets what's drawn (and what a snapshot would capture).
     pub fn clear_transcript(&mut self) {
         self.main_log.clear();
+        self.main_log_rev += 1;
         self.subagents.clear();
         self.assay_critics.clear();
         self.assay_verifying = None;
@@ -1710,7 +1726,7 @@ impl App {
     /// Wrapped-row metrics for the full-screen transcript: total rows at the given width, and the
     /// max scroll offset given a visible body height. Used by the I/O shell to clamp paging.
     pub fn transcript_metrics(&self, width: u16, body_h: u16) -> (usize, usize) {
-        let total = self.wrapped_transcript(width).len();
+        let total = self.transcript_total_rows(width);
         let max_scroll = total.saturating_sub(body_h.max(1) as usize);
         (total, max_scroll)
     }
@@ -1741,26 +1757,49 @@ impl App {
         self.transcript_scroll = usize::MAX / 2;
     }
 
-    /// The full-screen transcript body: finalized `main_log` plus the in-flight reply edge, each
-    /// wrapped to `width`. Pure; the wrap mirrors the activity viewer's so scroll math is exact.
-    fn wrapped_transcript(&self, width: u16) -> Vec<TextLine<'static>> {
-        let mut lines = self.main_log.clone();
-        if self.streaming_active {
-            lines.push(TextLine::from(vec![
-                Span::raw(format!("  {}", self.streaming)),
-                Span::styled("▌", Style::default().fg(ORANGE)),
-            ]));
+    /// Refresh the wrap cache for `width` if `main_log` or the width changed. Re-wrapping the whole
+    /// log every frame was O(transcript) and showed up as input/scroll lag on long full-screen
+    /// conversations; the cache makes a streaming frame re-wrap only the one in-flight edge line.
+    fn ensure_wrapped_main(&self, width: u16) {
+        let mut c = self.wrap_cache.borrow_mut();
+        if c.width != width || c.rev != self.main_log_rev {
+            c.rows =
+                crate::transcript::wrap_lines(&self.main_log, width.saturating_sub(1) as usize);
+            c.width = width;
+            c.rev = self.main_log_rev;
         }
-        crate::transcript::wrap_lines(&lines, width.saturating_sub(1) as usize)
+    }
+
+    /// The in-flight reply edge, wrapped to `width` (empty when not streaming). Cheap — one logical
+    /// line — so it's recomputed each frame rather than cached, while the bulk log stays memoized.
+    fn streaming_edge(&self, width: u16) -> Vec<TextLine<'static>> {
+        if !self.streaming_active {
+            return Vec::new();
+        }
+        let line = TextLine::from(vec![
+            Span::raw(format!("  {}", self.streaming)),
+            Span::styled("▌", Style::default().fg(ORANGE)),
+        ]);
+        crate::transcript::wrap_lines(&[line], width.saturating_sub(1) as usize)
+    }
+
+    /// Total wrapped rows of the full-screen transcript (memoized log + the streaming edge).
+    fn transcript_total_rows(&self, width: u16) -> usize {
+        self.ensure_wrapped_main(width);
+        self.wrap_cache.borrow().rows.len() + self.streaming_edge(width).len()
     }
 
     /// Append flushed lines to the bounded main-chat log used by the activity viewer.
     fn fold_main_log(&mut self, lines: &[TextLine<'static>]) {
+        if lines.is_empty() {
+            return;
+        }
         self.main_log.extend(lines.iter().cloned());
         if self.main_log.len() > MAIN_LOG_MAX {
             let drop = self.main_log.len() - MAIN_LOG_MAX;
             self.main_log.drain(0..drop);
         }
+        self.main_log_rev += 1;
     }
 
     fn push_remote_transcript_line(&mut self, line: &TextLine<'static>) {
@@ -2427,15 +2466,26 @@ fn render_transcript_area(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let body_h = area.height as usize;
-    let wrapped = app.wrapped_transcript(area.width);
-    let total = wrapped.len();
+    // Memoized: only re-wraps the bulk log when it changed; the streaming edge is the cheap part.
+    app.ensure_wrapped_main(area.width);
+    let cache = app.wrap_cache.borrow();
+    let edge = app.streaming_edge(area.width);
+    let total = cache.rows.len() + edge.len();
     let max_scroll = total.saturating_sub(body_h);
     let scroll = if app.transcript_follow {
         max_scroll
     } else {
         app.transcript_scroll.min(max_scroll)
     };
-    let lines: Vec<TextLine> = wrapped.into_iter().skip(scroll).take(body_h).collect();
+    // Clone only the visible window (~body_h rows), not the whole transcript, each frame.
+    let mut lines: Vec<TextLine> = Vec::with_capacity(body_h.min(total.saturating_sub(scroll)));
+    for i in scroll..(scroll + body_h).min(total) {
+        if i < cache.rows.len() {
+            lines.push(cache.rows[i].clone());
+        } else {
+            lines.push(edge[i - cache.rows.len()].clone());
+        }
+    }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -4731,7 +4781,38 @@ mod tests {
         assert!(!text.contains("line 0 "), "head scrolled off");
         // /clear empties the rendered transcript.
         app.clear_transcript();
-        assert_eq!(app.wrapped_transcript(40).len(), 0);
+        assert_eq!(app.transcript_total_rows(40), 0);
+    }
+
+    #[test]
+    fn wrap_cache_invalidates_on_append_and_at_the_cap() {
+        let mut app = App {
+            fullscreen: true,
+            ..Default::default()
+        };
+        app.push_scrollback(vec![TextLine::from("one")]);
+        assert_eq!(app.transcript_total_rows(40), 1);
+        // Appending more must invalidate the memoized wrap (not serve a stale 1-row count).
+        app.push_scrollback(vec![TextLine::from("two"), TextLine::from("three")]);
+        assert_eq!(app.transcript_total_rows(40), 3);
+        // At the MAIN_LOG_MAX cap the len stays constant while lines are replaced — the rev-based
+        // key (not len) must still invalidate, so the newest line is reflected.
+        for i in 0..MAIN_LOG_MAX + 50 {
+            app.push_scrollback(vec![TextLine::from(format!("fill {i}"))]);
+        }
+        let _ = app.transcript_total_rows(40); // prime the cache at the cap
+        app.push_scrollback(vec![TextLine::from("NEWEST")]);
+        app.ensure_wrapped_main(40);
+        let cache = app.wrap_cache.borrow();
+        let last: String = cache
+            .rows
+            .last()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(last.contains("NEWEST"), "cap append reflected: {last:?}");
     }
 
     #[test]
