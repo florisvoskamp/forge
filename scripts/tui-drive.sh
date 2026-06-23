@@ -68,7 +68,10 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   [[ -z "${line// }" || "${line:0:1}" == "#" ]] && continue
   cmd="${line%% *}"; arg="${line#"$cmd"}"; arg="${arg# }"
   case "$cmd" in
-    send) tmux send-keys -t "$SESSION" "$arg" Enter ;;
+    # Type the text, pause, THEN Enter as a separate keystroke. Sending "text Enter" in one call
+    # can insert a newline instead of submitting when the slash-command palette is open (a `/cmd`
+    # line), so the two are split with a beat between them.
+    send) tmux send-keys -t "$SESSION" "$arg"; sleep 0.4; tmux send-keys -t "$SESSION" Enter ;;
     type) tmux send-keys -t "$SESSION" "$arg" ;;
     key)  tmux send-keys -t "$SESSION" "$arg" ;;
     sleep) sleep "$(awk "BEGIN{print $arg/1000}")" ;;
