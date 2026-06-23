@@ -40,7 +40,7 @@ case "$os" in
       x86_64) target="x86_64-apple-darwin" ;;
       *) err "unsupported macOS arch: $arch" ;;
     esac ;;
-  *) err "unsupported OS: $os (Windows: download the .zip from the Releases page)" ;;
+  *) err "unsupported OS: $os (Windows: run install.ps1 in PowerShell — irm https://raw.githubusercontent.com/$REPO/main/install.ps1 | iex)" ;;
 esac
 
 version="${FORGE_VERSION:-}"

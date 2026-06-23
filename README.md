@@ -65,6 +65,17 @@ SHA-256), and installs `forge` to `~/.local/bin`. Override with `FORGE_VERSION`
 (a tag) or `FORGE_INSTALL_DIR`. Linux x86-64 and macOS (Apple Silicon + Intel)
 are supported; on other arches it falls back to building from source.
 
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/florisvoskamp/forge/main/install.ps1 | iex
+```
+
+Downloads the x86-64 release binary (verifying its SHA-256), installs `forge.exe`
+to `%LOCALAPPDATA%\Programs\forge`, and adds it to your user `PATH`. Override with
+`$env:FORGE_VERSION` or `$env:FORGE_INSTALL_DIR`. After install, `forge update`
+keeps it current.
+
 ### Homebrew
 
 ```bash

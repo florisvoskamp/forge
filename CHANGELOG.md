@@ -7,6 +7,9 @@ All notable changes to Forge are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Windows PowerShell installer (`install.ps1`): `irm …/install.ps1 | iex` downloads the x86-64
+  release binary (SHA-256 verified), installs `forge.exe` to `%LOCALAPPDATA%\Programs\forge`, and
+  adds it to the user `PATH`. `install.sh` now points Windows users to it.
 - Anchored-block fuzzy tier for `edit_file` / `multi_edit`: when an `old` block's interior was
   paraphrased but its first/last lines match, the unique span between those anchors is replaced —
   guarded by uniqueness + a disproportionate-match rejection so it can't silently eat the wrong
