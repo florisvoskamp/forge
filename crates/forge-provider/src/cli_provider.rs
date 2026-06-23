@@ -69,7 +69,7 @@ impl CliKind {
     /// bridge that's present is treated as always-available — it doesn't rate-limit like the free
     /// API tiers — so the mesh can fall back to it when metered providers are throttled.
     pub fn available(self) -> bool {
-        binary_on_path(self.default_binary())
+        resolve_on_path(self.default_binary()).is_some()
     }
 
     /// The bare Forge model id for this bridge (`claude-cli::` / `codex-cli::`), which resolves to
@@ -121,11 +121,55 @@ impl CliKind {
     }
 }
 
-/// Whether `bin` resolves to a file on `PATH` (a lightweight `which`, no spawning).
-fn binary_on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
-        .unwrap_or(false)
+/// Resolve `bin` to an executable file on `PATH` (a lightweight `which`, no spawning). Windows-aware:
+/// there it also tries the `.exe`/`.cmd`/`.bat` suffixes, because the official CLIs are installed by
+/// npm as `.cmd` shims — a bare-name lookup (`claude`) misses `claude.cmd` and reports the bridge as
+/// absent. A `bin` that already contains a path separator is checked directly (still trying the
+/// Windows suffixes) instead of via `PATH`. Returns the matched path, or `None`.
+fn resolve_on_path(bin: &str) -> Option<std::path::PathBuf> {
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    let try_base = |base: &std::path::Path| -> Option<std::path::PathBuf> {
+        exts.iter().find_map(|e| {
+            let cand = if e.is_empty() {
+                base.to_path_buf()
+            } else {
+                let mut s = base.as_os_str().to_owned();
+                s.push(e);
+                std::path::PathBuf::from(s)
+            };
+            cand.is_file().then_some(cand)
+        })
+    };
+    let p = std::path::Path::new(bin);
+    if p.components().count() > 1 {
+        return try_base(p);
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|dir| try_base(&dir.join(bin)))
+}
+
+/// Build the base [`Command`] to launch a bridge CLI named/located at `binary`. On Windows the CLIs
+/// are commonly `.cmd` shims (how npm installs them), which `CreateProcess` cannot launch directly —
+/// those are run through `cmd /C`. A real `.exe`, or any Unix binary, launches directly. This is the
+/// difference between the bridge working and failing to start on Windows.
+fn bridge_command(binary: &str) -> Command {
+    #[cfg(windows)]
+    if let Some(p) = resolve_on_path(binary) {
+        let is_script = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+        if is_script {
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/C").arg(&p);
+            return cmd;
+        }
+    }
+    Command::new(binary)
 }
 
 /// Forge model ids for every CLI bridge whose CLI is installed — the always-available
@@ -929,7 +973,7 @@ impl Provider for CliProvider {
             None
         };
 
-        let mut cmd = Command::new(&self.binary);
+        let mut cmd = bridge_command(&self.binary);
         cmd.args(&args)
             // The prompt is written to stdin (not argv) to avoid `ARG_MAX` on big transcripts.
             .stdin(Stdio::piped())
@@ -1264,11 +1308,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn binary_on_path_detects_present_and_absent() {
+    fn resolve_on_path_detects_present_and_absent() {
         // A ubiquitous binary resolves; a nonsense one does not. (PATH-based, no spawning.)
-        let real = if cfg!(windows) { "cmd.exe" } else { "sh" };
-        assert!(binary_on_path(real), "{real} should be on PATH");
-        assert!(!binary_on_path("forge-definitely-not-a-real-binary-zzz"));
+        // On Windows `cmd` resolves only because the resolver tries the `.exe` suffix.
+        let real = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(resolve_on_path(real).is_some(), "{real} should be on PATH");
+        assert!(resolve_on_path("forge-definitely-not-a-real-binary-zzz").is_none());
+    }
+
+    #[test]
+    fn resolve_on_path_resolves_an_explicit_file() {
+        let dir = std::env::temp_dir().join(format!("forge-resolve-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("marker.txt");
+        std::fs::write(&f, b"x").unwrap();
+        assert_eq!(
+            resolve_on_path(f.to_str().unwrap()).as_deref(),
+            Some(f.as_path())
+        );
+        assert!(resolve_on_path(dir.join("nope.txt").to_str().unwrap()).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bridge_command_wraps_cmd_shims_but_not_exes() {
+        let dir = std::env::temp_dir().join(format!("forge-bridge-cmd-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let shim = dir.join("fakeclaude.cmd");
+        std::fs::write(&shim, b"@echo off\n").unwrap();
+        // A `.cmd` shim is launched through `cmd /C`, not directly.
+        let cmd = bridge_command(shim.to_str().unwrap());
+        assert_eq!(cmd.as_std().get_program(), std::ffi::OsStr::new("cmd"));
+        // A non-script path launches directly.
+        let exe = dir.join("faketool.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let direct = bridge_command(exe.to_str().unwrap());
+        assert_eq!(direct.as_std().get_program(), exe.as_os_str());
     }
 
     #[test]
