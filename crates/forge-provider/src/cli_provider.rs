@@ -959,18 +959,18 @@ impl Provider for CliProvider {
             .unwrap_or_else(|| "forge".to_string());
         let args = build_args(self.kind, bare_model(model), self.harness, &forge_exe);
 
-        // Harness turns can spawn subagents inside `forge mcp-serve`; give it an out-of-band
-        // JSONL sink to report their lifecycle so we can surface them in the TUI (Phase 3c).
-        let sink_path: Option<std::path::PathBuf> = if self.harness {
+        // A bridge turn (interactive OR harness) runs Forge's own tools inside `forge mcp-serve`, a
+        // separate process. Give it an out-of-band JSONL sink so that process can report `update_tasks`
+        // and any spawned-subagent lifecycle back to us — without it those events have nowhere to go
+        // and the sticky task / subagent panels never update during a bridge chat. (Previously this
+        // was gated to harness mode, so interactive bridge turns showed no live task list at all.)
+        let sink_path: Option<std::path::PathBuf> = {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let p = std::env::temp_dir()
                 .join(format!("forge-subagents-{}-{n}.jsonl", std::process::id()));
             // Create it empty so the tailer can open it immediately.
-            let _ = std::fs::File::create(&p);
-            Some(p)
-        } else {
-            None
+            std::fs::File::create(&p).ok().map(|_| p)
         };
 
         let mut cmd = bridge_command(&self.binary);
@@ -1013,8 +1013,8 @@ impl Provider for CliProvider {
         let stderr = child.stderr.take().expect("piped stderr");
         let err_task = tokio::spawn(read_to_cap(stderr));
 
-        // Tail the subagent sink concurrently (only in harness mode). Events arrive while the
-        // CLI is silent waiting on the spawn_agents tool result, so they must be drained live.
+        // Tail the sink concurrently so task / subagent events surface live. They arrive while the
+        // CLI is silent (mid-tool, or waiting on a spawn_agents result), so they must be drained live.
         let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
         let tailer = match &sink_path {
             Some(p) => Some(tokio::spawn(tail_subagent_sink(p.clone(), sub_tx))),

@@ -28,6 +28,20 @@ All notable changes to Forge are documented here. The format follows
   templates, and this changelog.
 
 ### Fixed
+- Context gauge no longer reads a bogus, ever-climbing percentage (e.g. "337% — auto-compact
+  imminent") on a subscription CLI bridge. `claude-cli`/`codex-cli` report *cumulative* internal
+  token usage across their own tool loop, not the size of the request Forge sent, so the gauge now
+  uses Forge's transcript estimate for bridge turns and the provider's real input count for direct
+  API models. This also stops the phantom auto-compact banner (no real compaction was ever needed).
+- The sticky task list (`update_tasks`) and spawned-subagent panels now appear during an interactive
+  CLI-bridge turn. The out-of-band event sink that carries those updates from `forge mcp-serve` was
+  only created in benchmark/harness mode, so a normal `forge chat` on `claude-cli`/`codex-cli` showed
+  no live tasks at all; it is now created and tailed for every bridge turn. A post-turn store reload
+  also no longer blanks a task list that was already shown.
+- `forge lattice` no longer indexes nested git repositories (vendored deps, submodules, or scratch
+  clones such as SWE-bench workdirs under the project root). Their symbols were swamping `impact`/
+  `query` with unrelated hits (a generic `Command` matching across a cloned `django/` tree); the
+  walker now skips any subdirectory that is its own git repo.
 - `forge bench swe` no longer fails with `os error 2` when `--workdir` is relative (the default):
   the per-instance clone was double-nesting the path. The workdir is now absolutized first.
 - Local Ollama models that emit Hermes/Qwen-style `<tool_call>` XML (e.g. `qwen3-coder`) are now
