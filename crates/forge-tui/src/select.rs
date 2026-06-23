@@ -63,6 +63,119 @@ pub fn select_multi(title: &str, items: &[SelectItem]) -> io::Result<Option<Vec<
     result
 }
 
+/// Run an animated single-select menu (same look as [`select_multi`], no checkboxes). Returns the
+/// chosen index, or `None` on cancel (Esc / `q` / Ctrl-C). Restores the terminal on every path.
+pub fn select_one(title: &str, items: &[SelectItem]) -> io::Result<Option<usize>> {
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let mut stdout = io::stdout();
+    enable_raw_mode()?;
+    stdout.execute(EnterAlternateScreen)?;
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Fullscreen,
+        },
+    )?;
+    let mut cursor = 0usize;
+    let mut tick = 0u64;
+    let result = loop {
+        terminal.draw(|f| draw_single(f, title, items, cursor, tick))?;
+        if event::poll(Duration::from_millis(80))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => break Ok(None),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break Ok(None)
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        cursor = cursor.checked_sub(1).unwrap_or(items.len() - 1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => cursor = (cursor + 1) % items.len(),
+                    KeyCode::Enter => break Ok(Some(cursor)),
+                    _ => {}
+                }
+            }
+        }
+        tick = tick.wrapping_add(1);
+    };
+    disable_raw_mode().ok();
+    terminal.backend_mut().execute(LeaveAlternateScreen).ok();
+    terminal.show_cursor().ok();
+    result
+}
+
+fn draw_single(
+    f: &mut ratatui::Frame,
+    title: &str,
+    items: &[SelectItem],
+    cursor: usize,
+    tick: u64,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(f.area());
+    let pulse = if (tick / 6) % 2 == 0 { ORANGE } else { DIM };
+    let header = Line::from(vec![
+        Span::styled("⚒ ", Style::default().fg(pulse)),
+        Span::styled(
+            title.to_string(),
+            Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(header), chunks[0]);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let on = i == cursor;
+        let caret = if on {
+            if (tick / 4) % 2 == 0 {
+                "▸ "
+            } else {
+                "▹ "
+            }
+        } else {
+            "  "
+        };
+        let label_style = if on {
+            Style::default().fg(FG).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(caret, Style::default().fg(ORANGE)),
+            Span::styled(format!("{:<26}", item.label), label_style),
+            Span::styled(item.hint.clone(), Style::default().fg(DIM)),
+        ]));
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(DIM)),
+        ),
+        chunks[1],
+    );
+    let footer = Line::from(vec![
+        Span::styled("↑/↓", Style::default().fg(ORANGE)),
+        Span::styled(" move   ", Style::default().fg(DIM)),
+        Span::styled("enter", Style::default().fg(OKGREEN)),
+        Span::styled(" select   ", Style::default().fg(DIM)),
+        Span::styled("esc", Style::default().fg(Color::Rgb(240, 110, 110))),
+        Span::styled(" cancel", Style::default().fg(DIM)),
+    ]);
+    f.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
 struct State {
     cursor: usize,
     checked: Vec<bool>,

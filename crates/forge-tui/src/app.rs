@@ -2102,12 +2102,35 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     ])
     .split(frame.area());
 
-    // areas[0]: the main region. A modal overlay (palette / picker) takes it when open; otherwise
-    // it's the scrollable transcript in full-screen mode, or just the in-flight reply edge inline.
-    if app.palette.open {
-        render_palette(frame, areas[0], app);
-    } else if app.at_picker.open {
-        render_at_path_picker(frame, areas[0], app);
+    // areas[0]: the main region. The slash-command palette and @path picker are *completion popups*
+    // — in full-screen they show as a small bottom-anchored list with the transcript still visible
+    // above (not the whole screen). The session picker stays a full modal. Otherwise areas[0] is the
+    // transcript (full-screen) or the in-flight reply edge (inline).
+    const POPUP_MAX: u16 = 10;
+    if app.palette.open || app.at_picker.open {
+        let (top, popup) = if app.fullscreen && areas[0].height > POPUP_MAX + 1 {
+            let popup_h = POPUP_MAX;
+            let top = Rect {
+                height: areas[0].height - popup_h,
+                ..areas[0]
+            };
+            let popup = Rect {
+                y: areas[0].y + areas[0].height - popup_h,
+                height: popup_h,
+                ..areas[0]
+            };
+            (Some(top), popup)
+        } else {
+            (None, areas[0])
+        };
+        if let Some(top) = top {
+            render_transcript_area(frame, top, app);
+        }
+        if app.palette.open {
+            render_palette(frame, popup, app);
+        } else {
+            render_at_path_picker(frame, popup, app);
+        }
     } else if app.picker.open {
         render_picker(frame, areas[0], app);
     } else if app.fullscreen {

@@ -317,8 +317,10 @@ enum Command {
         #[arg(long)]
         remove: bool,
     },
-    /// Interactive first-run setup: enable providers (enter API keys) and declare which
-    /// subscription plan backs each installed CLI bridge, so the mesh knows your usage headroom.
+    /// Guided first-run setup: enable providers (enter API keys), declare which subscription plan
+    /// backs each installed CLI bridge, and optionally install a local LLM that fits this machine.
+    Setup,
+    /// Alias for `setup` (kept for muscle memory) — runs the same guided setup.
     Init,
     /// Connect to the configured MCP servers and show their status (or one server's tools, or
     /// import a Claude-Code `.mcp.json`).
@@ -815,9 +817,9 @@ async fn main() -> Result<()> {
         Command::Models { probe, all, clear } => models(probe, all, clear).await,
         Command::Mesh { prompt, json } => mesh_explain(prompt.join(" "), json).await,
         Command::Benchmarks { refresh } => benchmarks_cmd(refresh).await,
-        Command::Local { sub } => local_cmd(sub),
+        Command::Local { sub } => local_cmd(sub).await,
         Command::Auth { provider, remove } => auth(&provider, remove),
-        Command::Init => init(),
+        Command::Setup | Command::Init => setup(),
         Command::Mcp { cmd } => mcp_cmd(cmd).await,
         Command::McpServe => mcp_serve::run().await,
         Command::Lattice { op } => lattice_cmd(op).await,
@@ -1496,12 +1498,122 @@ fn maybe_autostart_local() {
     }
 }
 
-/// `forge local [subcommand]`: detect specs, install/run a local Gemma via Ollama, list, status.
-/// No subcommand → `detect` (the discovery view).
-fn local_cmd(sub: Option<LocalCmd>) -> Result<()> {
-    match sub.unwrap_or(LocalCmd::Detect) {
+/// The animated `forge local` menu (no-arg on a terminal): pick a model to install/start, or view
+/// status. Loops until the user closes it; each action prints, then waits for Enter before the
+/// menu redraws (it owns its own alternate screen).
+async fn local_menu() -> Result<()> {
+    enum Act {
+        Model(String),
+        Status,
+        Close,
+    }
+    let scores = local_bench_scores().await;
+    loop {
+        let specs = local::detect_specs();
+        let cands = local::discover_ranked(&specs, scores.as_ref()).await;
+        let installed = if local::ollama_installed() {
+            local::ollama_installed_models()
+        } else {
+            Vec::new()
+        };
+        let mut items: Vec<forge_tui::SelectItem> = Vec::new();
+        let mut acts: Vec<Act> = Vec::new();
+        for c in &cands {
+            let have = installed.iter().any(|t| t == &c.ollama_tag);
+            let bench = if c.benchmarked {
+                format!("AA {:.0}", c.score)
+            } else {
+                "—".to_string()
+            };
+            items.push(forge_tui::SelectItem {
+                label: c.label.clone(),
+                hint: format!(
+                    "{} · ~{:.0} GB · bench {bench}{}",
+                    c.ollama_tag,
+                    c.min_memory_gb,
+                    if have {
+                        " · installed → start"
+                    } else {
+                        " → install"
+                    }
+                ),
+                preselected: false,
+            });
+            acts.push(Act::Model(c.ollama_tag.clone()));
+        }
+        items.push(forge_tui::SelectItem {
+            label: "Status".into(),
+            hint: "runtime + installed models + autostart".into(),
+            preselected: false,
+        });
+        acts.push(Act::Status);
+        items.push(forge_tui::SelectItem {
+            label: "Close".into(),
+            hint: String::new(),
+            preselected: false,
+        });
+        acts.push(Act::Close);
+
+        let title = format!(
+            "forge local — {:.0} GB usable · {} · GPU: {} · ranked by Artificial Analysis",
+            specs.model_memory_gb(),
+            specs.os,
+            specs
+                .gpu
+                .as_ref()
+                .map(|g| g.name.as_str())
+                .unwrap_or("none")
+        );
+        let Some(idx) = forge_tui::select_one(&title, &items)? else {
+            return Ok(());
+        };
+        match &acts[idx] {
+            Act::Close => return Ok(()),
+            Act::Status => {
+                local_status();
+                let _ = prompt_line("\n  press Enter to continue…");
+            }
+            Act::Model(tag) => {
+                let have = local::ollama_installed_models().iter().any(|t| t == tag);
+                let res = if have {
+                    local_start(Some(tag))
+                } else {
+                    local_install(Some(tag))
+                };
+                if let Err(e) = res {
+                    println!("⚠ {e}");
+                }
+                let _ = prompt_line("\n  press Enter to continue…");
+            }
+        }
+    }
+}
+
+/// Artificial Analysis benchmark scores for ranking local models (cache-first; `None` if disabled
+/// or unavailable). Seeds the coverage check with the static catalog's tags.
+async fn local_bench_scores() -> Option<forge_mesh::BenchmarkScores> {
+    let cfg = forge_config::load().unwrap_or_default();
+    let ids: Vec<String> = local::CATALOG
+        .iter()
+        .map(|m| format!("ollama::{}", m.ollama_tag))
+        .collect();
+    benchmarks::ensure(&cfg, &ids, false).await
+}
+
+/// `forge local [subcommand]`: detect specs, install/run a local model via Ollama, list, status.
+/// No subcommand on a terminal → the animated interactive menu; otherwise (piped) → `detect`.
+async fn local_cmd(sub: Option<LocalCmd>) -> Result<()> {
+    let Some(sub) = sub else {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+            return local_menu().await;
+        }
+        print_specs_and_recommendation().await;
+        return Ok(());
+    };
+    match sub {
         LocalCmd::Detect => {
-            print_specs_and_recommendation();
+            print_specs_and_recommendation().await;
             Ok(())
         }
         LocalCmd::Install { key } => local_install(key.as_deref()),
@@ -1530,7 +1642,7 @@ fn local_cmd(sub: Option<LocalCmd>) -> Result<()> {
 }
 
 /// Print the detected specs + the ranked recommendation list.
-fn print_specs_and_recommendation() {
+async fn print_specs_and_recommendation() {
     let specs = local::detect_specs();
     let gpu = match &specs.gpu {
         Some(g) => match g.vram_gb {
@@ -1548,37 +1660,61 @@ fn print_specs_and_recommendation() {
         "  model memory budget: ~{:.0} GB\n",
         specs.model_memory_gb()
     );
-    let picks = local::recommend(&specs);
-    if picks.is_empty() {
-        println!(
-            "No catalog model fits this machine's memory. The smallest is Gemma 4 E2B (~6 GB)."
-        );
+
+    let scores = local_bench_scores().await;
+    let cands = local::discover_ranked(&specs, scores.as_ref()).await;
+    if cands.is_empty() {
+        println!("No model fits this machine's memory (the smallest needs ~4 GB).");
         return;
     }
-    println!("Recommended local models (best fit first):");
-    for (i, m) in picks.iter().enumerate() {
-        let tag = if i == 0 { "  ‹recommended›" } else { "" };
+    let benched = cands.iter().filter(|c| c.benchmarked).count();
+    println!(
+        "Models that fit, ranked by Artificial Analysis benchmark score ({benched}/{} rated):",
+        cands.len()
+    );
+    for (i, c) in cands.iter().enumerate() {
+        let rec = if i == 0 { "  ‹recommended›" } else { "" };
+        let bench = if c.benchmarked {
+            format!("AA {:.0}", c.score)
+        } else {
+            "unrated".to_string()
+        };
         println!(
-            "  {} {}  [{}]  ~{:.0} GB{tag}\n      {}",
+            "  {} {:<26} [{}]  {} · ~{:.0} GB · {bench}{rec}",
             if i == 0 { "▸" } else { " " },
-            m.label,
-            m.ollama_tag,
-            m.min_memory_gb,
-            m.blurb
+            c.label,
+            c.ollama_tag,
+            c.family,
+            c.min_memory_gb,
         );
+        if !c.blurb.is_empty() {
+            println!("      {}", c.blurb);
+        }
     }
-    println!("\nInstall with `forge local install` (recommended) or `forge local install <key>`.");
+    println!(
+        "\nInstall with `forge local install` (recommended) or `forge local install <tag-or-key>`."
+    );
 }
 
-/// Ensure Ollama is installed (offering to install it), then pull the chosen (or recommended) model.
-fn local_install(key: Option<&str>) -> Result<()> {
+/// Ensure Ollama is installed (offering to install it), then pull the chosen (or recommended)
+/// model. `name` is a raw Ollama tag (`qwen2.5-coder:14b`), a catalog key (`qwen2.5-coder-14b`),
+/// or `None` for the recommended pick.
+fn local_install(name: Option<&str>) -> Result<()> {
     let specs = local::detect_specs();
-    let model = match key {
-        Some(k) => local::model_by_key(k)
-            .with_context(|| format!("unknown model key '{k}' — see `forge local detect`"))?,
-        None => *local::recommend(&specs)
-            .first()
-            .context("no local model fits this machine (needs ≥6 GB)")?,
+    // Resolve to (display label, ollama tag).
+    let (label, tag): (String, String) = match name {
+        Some(n) if n.contains(':') => (n.to_string(), n.to_string()), // raw tag
+        Some(k) => {
+            let m = local::model_by_key(k)
+                .with_context(|| format!("unknown model '{k}' — see `forge local detect`"))?;
+            (m.label.to_string(), m.ollama_tag.to_string())
+        }
+        None => {
+            let m = *local::recommend(&specs)
+                .first()
+                .context("no local model fits this machine (needs ≥4 GB)")?;
+            (m.label.to_string(), m.ollama_tag.to_string())
+        }
     };
 
     if !local::ollama_installed() {
@@ -1609,21 +1745,14 @@ fn local_install(key: Option<&str>) -> Result<()> {
         }
     }
 
-    println!("Pulling {} ({})…", model.label, model.ollama_tag);
-    if !local::ollama_pull(model.ollama_tag) {
+    println!("Pulling {label} ({tag})…");
+    if !local::ollama_pull(&tag) {
         anyhow::bail!(
-            "`ollama pull {}` failed. The tag may not exist in your Ollama version — check `ollama list` / upgrade Ollama, or pick another model with `forge local detect`.",
-            model.ollama_tag
+            "`ollama pull {tag}` failed. The tag may not exist in your Ollama version — check `ollama list` / upgrade Ollama, or pick another model with `forge local detect`."
         );
     }
-    println!(
-        "✓ {} is ready. It's available in the mesh as `ollama::{}`.",
-        model.label, model.ollama_tag
-    );
-    println!(
-        "  Start it with `forge local start {}`, or enable `[local] autostart` in config.",
-        model.key
-    );
+    println!("✓ {label} is ready. It's available in the mesh as `ollama::{tag}`.");
+    println!("  Start it with `forge local start {tag}`, or enable `[local] autostart` in config.");
     Ok(())
 }
 
@@ -1633,11 +1762,12 @@ fn local_start(key: Option<&str>) -> Result<()> {
         anyhow::bail!("Ollama is not installed. Run `forge local install` first.");
     }
     let cfg = forge_config::load().unwrap_or_default();
-    // Choose the model: explicit key → catalog tag; else configured tag; else recommended.
+    // Choose the model: raw tag as-is; catalog key → its tag; else configured tag; else recommended.
     let tag: String = match key {
+        Some(n) if n.contains(':') => n.to_string(),
         Some(k) => local::model_by_key(k)
             .map(|m| m.ollama_tag.to_string())
-            .with_context(|| format!("unknown model key '{k}'"))?,
+            .with_context(|| format!("unknown model '{k}'"))?,
         None => cfg
             .local
             .model
@@ -1739,6 +1869,60 @@ fn init() -> Result<()> {
     );
     println!("  The mesh routes across these by task tier + cost. Try `forge models`.");
     Ok(())
+}
+
+/// `forge setup`: the full guided flow — the provider/plan wizard ([`init`]), then an optional
+/// local-LLM step. Used by `forge setup`, `forge init`, and the first-run prompt.
+fn setup() -> Result<()> {
+    init()?;
+    offer_local_setup();
+    Ok(())
+}
+
+/// Interactive local-LLM step of `forge setup`: detect the machine, recommend a Gemma model that
+/// fits, and offer to install it (and auto-start it). Best-effort — any failure prints and the
+/// flow continues. Skipped on a machine too small for the smallest model.
+fn offer_local_setup() {
+    let specs = local::detect_specs();
+    let picks = local::recommend(&specs);
+    let Some(&rec) = picks.first() else {
+        return; // nothing fits — don't pester the user
+    };
+    println!("\n⚒ Local LLM (optional)");
+    println!(
+        "  This machine (~{:.0} GB usable) can run {} [{}].",
+        specs.model_memory_gb(),
+        rec.label,
+        rec.ollama_tag
+    );
+    let ans = match prompt_line("  Install it now via Ollama? [Y/n]: ") {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    if !(ans.is_empty() || ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")) {
+        println!("  Skipped. Run `forge local install` anytime.");
+        return;
+    }
+    if let Err(e) = local_install(Some(rec.key)) {
+        println!("  ⚠ {e}");
+        return;
+    }
+    // Offer auto-start so the model is ready whenever Forge runs.
+    if let Ok(a) = prompt_line("  Auto-start this model when Forge runs? [y/N]: ") {
+        if a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes") {
+            let _ = forge_config::set_config_value(
+                forge_config::ConfigScope::User,
+                "local.autostart",
+                "true",
+            );
+            let _ = forge_config::set_config_value(
+                forge_config::ConfigScope::User,
+                "local.model",
+                rec.ollama_tag,
+            );
+            println!("  ✓ Auto-start enabled ({}).", rec.ollama_tag);
+        }
+    }
 }
 
 /// Build the config-wizard inputs from what Forge knows: key-based model providers, search-API
@@ -4187,13 +4371,13 @@ fn maybe_first_run_setup(mock: bool) -> Result<()> {
         return Ok(());
     }
     println!("⚒ Welcome to Forge — no providers are configured yet.");
-    let yes = prompt_line("Run interactive setup now? [Y/n]: ")?;
+    let yes = prompt_line("Run guided setup now? [Y/n]: ")?;
     if yes.is_empty() || yes.eq_ignore_ascii_case("y") || yes.eq_ignore_ascii_case("yes") {
-        init()?;
+        setup()?;
     } else {
-        // Mark onboarded so we don't ask again; the user can re-run `forge init` anytime.
+        // Mark onboarded so we don't ask again; the user can re-run `forge setup` anytime.
         let _ = forge_config::write_subscriptions(&std::collections::HashMap::new());
-        println!("Skipped. Run `forge init` anytime, or `forge auth <provider>` to add a key.");
+        println!("Skipped. Run `forge setup` anytime, or `forge auth <provider>` to add a key.");
     }
     Ok(())
 }
@@ -4328,16 +4512,51 @@ fn emit_text(tui: &mut forge_tui::Tui, app: &mut forge_tui::App, text: &str) {
     }
 }
 
-/// Every editable scalar setting (importance-ordered), as `/config` editor rows.
+/// Every editable setting as `/config` editor rows, grouped: "Providers & Keys" (API keys, keyring)
+/// first, then the discovered scalar settings (friendly labels, control kind, default, source).
 fn config_editor_rows() -> Vec<forge_tui::SettingRow> {
-    forge_config::config_leaves()
-        .into_iter()
-        .map(|l| forge_tui::SettingRow {
-            path: l.path,
-            display: l.value.display(),
-            type_tag: l.value.type_tag().to_string(),
+    let mut rows: Vec<forge_tui::SettingRow> = forge_config::known_key_providers()
+        .map(|p| forge_tui::SettingRow {
+            path: format!("key.{p}"),
+            group: "Providers & Keys".to_string(),
+            label: format!("{} API key", provider_label(p)),
+            help: Some(format!(
+                "API key for {p}, stored in the OS keyring. Enter to set; empty to remove."
+            )),
+            kind: forge_tui::RowKind::Secret,
+            value: if forge_config::has_api_key(p) {
+                "● set".to_string()
+            } else {
+                "○ not set".to_string()
+            },
+            default: String::new(),
+            modified: forge_config::has_api_key(p),
+            source: "keyring".to_string(),
         })
-        .collect()
+        .collect();
+    rows.extend(forge_config::config_descriptors().into_iter().map(|d| {
+        let kind = match d.kind {
+            forge_config::SettingKind::Bool => forge_tui::RowKind::Bool,
+            forge_config::SettingKind::Int => forge_tui::RowKind::Int,
+            forge_config::SettingKind::Float => forge_tui::RowKind::Float,
+            forge_config::SettingKind::Text => forge_tui::RowKind::Text,
+            forge_config::SettingKind::Enum(opts) => {
+                forge_tui::RowKind::Enum(opts.into_iter().map(str::to_string).collect())
+            }
+        };
+        forge_tui::SettingRow {
+            path: d.path,
+            group: d.group,
+            label: d.label,
+            help: d.help,
+            kind,
+            value: d.value.display(),
+            default: d.default.display(),
+            modified: d.modified,
+            source: d.source.to_string(),
+        }
+    }));
+    rows
 }
 
 async fn run_chat_tui(
@@ -4606,15 +4825,44 @@ async fn run_chat_tui(
             if app.config_editor.open {
                 match app.config_editor.handle_key(key) {
                     forge_tui::ConfigAction::Save { path, value } => {
+                        let result = if let Some(provider) = path.strip_prefix("key.") {
+                            // Secret: store/remove the API key in the OS keyring (never config.toml).
+                            if value.trim().is_empty() {
+                                forge_config::remove_api_key(provider)
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string())
+                            } else {
+                                forge_config::store_api_key(provider, value.trim())
+                                    .map_err(|e| e.to_string())
+                            }
+                        } else {
+                            let scope = if app.config_editor.project_scope {
+                                forge_config::ConfigScope::Project
+                            } else {
+                                forge_config::ConfigScope::User
+                            };
+                            forge_config::set_config_value(scope, &path, &value)
+                                .map_err(|e| e.to_string())
+                        };
+                        match result {
+                            Ok(()) => {
+                                app.config_editor.rows = config_editor_rows();
+                                app.config_editor.status = Some(format!("✓ saved {path}"));
+                            }
+                            Err(e) => app.config_editor.status = Some(format!("✗ {e}")),
+                        }
+                    }
+                    forge_tui::ConfigAction::Reset { path } => {
                         let scope = if app.config_editor.project_scope {
                             forge_config::ConfigScope::Project
                         } else {
                             forge_config::ConfigScope::User
                         };
-                        match forge_config::set_config_value(scope, &path, &value) {
+                        match forge_config::reset_config_value(scope, &path) {
                             Ok(()) => {
                                 app.config_editor.rows = config_editor_rows();
-                                app.config_editor.status = Some(format!("✓ saved {path}"));
+                                app.config_editor.status =
+                                    Some(format!("✓ reset {path} to default"));
                             }
                             Err(e) => app.config_editor.status = Some(format!("✗ {e}")),
                         }

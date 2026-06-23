@@ -52,13 +52,13 @@ pub use commands::{
     CommandAction, Palette, PaletteEntry, Picker, PickerKind, PickerRow, RemoteMode, SlashToken,
     COMMANDS,
 };
-pub use config_editor::{ConfigAction, ConfigEditor, SettingRow};
+pub use config_editor::{ConfigAction, ConfigEditor, RowKind, SettingRow};
 pub use driver::{ChannelPresenter, InputEvent, Tui, UiMsg};
 pub use init_wizard::{BridgeItem, ProviderItem, WizardInput, WizardOutcome};
 /// A styled scrollback line, re-exported so binaries can route out-of-band output to the right
 /// sink (native scrollback inline, or the transcript log full-screen) without depending on ratatui.
 pub use ratatui::text::Line as ScrollbackLine;
-pub use select::{select_multi, SelectItem};
+pub use select::{select_multi, select_one, SelectItem};
 pub use transcript::{run_transcript_viewer, transcript_lines};
 pub use tui::TuiPresenter;
 
