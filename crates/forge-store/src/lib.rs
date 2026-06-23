@@ -1573,6 +1573,35 @@ impl Store {
         }
     }
 
+    /// Delete every indexed file under `repo_root` whose `rel_path` is NOT in `keep` — and, via
+    /// `ON DELETE CASCADE`, all of its symbols/edges/refs. Called after a full `update` walk to
+    /// purge files that were removed or are now skipped (deleted files, nested git repos / vendored
+    /// trees), so stale symbols don't linger in queries or bloat the store. Returns the count pruned.
+    pub fn prune_lattice_files_except(
+        &self,
+        repo_root: &str,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let stale: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT id, rel_path FROM lattice_file WHERE repo_root = ?1")?;
+            let rows = stmt.query_map([repo_root], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.filter_map(|r| r.ok())
+                .filter(|(_, rel)| !keep.contains(rel))
+                .map(|(id, _)| id)
+                .collect()
+        };
+        for id in &stale {
+            tx.execute("DELETE FROM lattice_file WHERE id = ?1", (id,))?;
+        }
+        tx.commit()?;
+        Ok(stale.len())
+    }
+
     /// The `rel_path` of an indexed file by its id (for rendering a node's location).
     pub fn lattice_file_path(&self, file_id: &str) -> Result<Option<String>> {
         let conn = self.lock()?;

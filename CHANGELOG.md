@@ -34,6 +34,17 @@ All notable changes to Forge are documented here. The format follows
   templates, and this changelog.
 
 ### Fixed
+- `forge lattice update` now PRUNES files that vanished from the walk — deleted files and, crucially,
+  ones now under a skipped/nested-git/vendored tree. Previously the nested-git skip stopped *new*
+  indexing but left already-indexed vendored symbols (e.g. a SWE-bench `django/` clone) in the graph,
+  so `impact`/`query` stayed swamped with unrelated hits and the store ballooned. Re-running update
+  purges them (symbols/edges/refs cascade-deleted).
+- The CLI bridge (`forge mcp-serve`) now uses the SAME global session store as the parent instead of
+  a relative `.forge/forge.db`. The divergent path created spurious empty sessions and meant a bridge
+  turn's `update_tasks` was written to a different database than the parent's post-turn reload read —
+  so bridge task updates didn't round-trip.
+- Chat input is more responsive: the event loop now paces adaptively, looping back quickly while you
+  type or navigate the palette/picker/approve prompts instead of always waiting a full frame.
 - Context gauge no longer reads a bogus, ever-climbing percentage (e.g. "337% — auto-compact
   imminent") on a subscription CLI bridge. `claude-cli`/`codex-cli` report *cumulative* internal
   token usage across their own tool loop, not the size of the request Forge sent, so the gauge now

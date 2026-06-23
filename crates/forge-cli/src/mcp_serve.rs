@@ -484,7 +484,11 @@ pub async fn run() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let subagents = if config.mesh.subagents.enabled && depth < config.mesh.subagents.max_depth {
-        let store = Arc::new(Store::open(std::path::Path::new(".forge/forge.db"))?);
+        // Same global store the parent uses — NOT a relative `.forge/forge.db`, which is a DIFFERENT
+        // file (the parent's store lives in the per-user data dir). The divergence created spurious
+        // empty sessions and broke the bridge task round-trip (the parent reloaded tasks from the
+        // global db but mcp-serve wrote them to the project-local one).
+        let store = Arc::new(crate::open_store()?);
         let (provider, router) = crate::build_provider_and_router(&config, false, None, None);
         let parent_id = store.create_session(".", &format!("{:?}", config.permission_mode))?;
         let agents = Arc::new(forge_config::load_agents(std::path::Path::new(
@@ -515,10 +519,11 @@ pub async fn run() -> Result<()> {
         None
     };
 
-    // Reuse the subagent store if present, else open the project store for task persistence.
+    // Reuse the subagent store if present, else open the SAME global store the parent uses, so the
+    // bridge turn's `update_tasks` persists where the parent's post-turn reload reads it.
     let tasks_store = match &subagents {
         Some(s) => Arc::clone(&s.ctx.store),
-        None => Arc::new(Store::open(std::path::Path::new(".forge/forge.db"))?),
+        None => Arc::new(crate::open_store()?),
     };
     // Connect the external MCP servers in THIS process so the bridge model can drive them — the
     // bridge's whole tool surface is this server. Skipped (None) when none are configured.

@@ -2005,7 +2005,7 @@ fn apply_wizard_outcome(outcome: &forge_tui::WizardOutcome) -> Result<std::path:
     Ok(path)
 }
 
-fn open_store() -> Result<Store> {
+pub(crate) fn open_store() -> Result<Store> {
     // The store lives in a stable per-user data dir so usage/budget and session history persist
     // across restarts and don't reset when `forge` is launched from a different directory (the
     // budget is global per FR-5). Fall back to the legacy cwd-local path only if no data dir
@@ -6089,7 +6089,12 @@ async fn run_chat_tui(
                 dirty = true;
             }
         }
-        tokio::time::sleep(Duration::from_millis(16)).await;
+        // Adaptive frame pacing. When the user is actively interacting (a key/paste was handled
+        // this iteration) and no turn is streaming, loop back quickly so typing/selection in the
+        // palette, picker, and approve prompts feels immediate instead of capped at ~60fps. Idle or
+        // mid-stream → a full ~16ms frame keeps CPU low and the spinner smooth.
+        let snappy = dirty && !busy;
+        tokio::time::sleep(Duration::from_millis(if snappy { 3 } else { 16 })).await;
     }
     {
         let (hooks, sid) = {

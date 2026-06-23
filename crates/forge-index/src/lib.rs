@@ -46,6 +46,9 @@ pub struct UpdateStats {
     pub files_indexed: usize,
     pub files_skipped: usize,
     pub symbols: usize,
+    /// Files removed from the index this run because they vanished from the walk (deleted, or now
+    /// under a skipped/nested-git/vendored dir). Their symbols/edges/refs are cascade-deleted.
+    pub files_pruned: usize,
 }
 
 /// A symbol returned from a query.
@@ -122,6 +125,9 @@ impl Lattice {
     /// hash is unchanged since the last run are skipped without re-parsing.
     pub fn update(&self) -> Result<UpdateStats, LatticeError> {
         let mut stats = UpdateStats::default();
+        // Every rel-path we index this run; anything in the store but NOT here is stale (removed or
+        // now-skipped, e.g. a vendored/nested-git tree) and gets pruned at the end.
+        let mut seen: HashSet<String> = HashSet::new();
         let root = Path::new(&self.repo_root).to_path_buf();
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {
@@ -147,11 +153,17 @@ impl Lattice {
                     }
                     stack.push(path);
                 } else if lang_for_path(&name).is_some() {
+                    seen.insert(self.rel_path(&path));
                     self.index_file(&path, &mut stats)?;
                 }
             }
         }
-        if stats.files_indexed > 0 {
+        // Purge files that vanished from the walk (deleted, or now under a skipped/nested-git dir).
+        stats.files_pruned = self
+            .store
+            .prune_lattice_files_except(&self.repo_root, &seen)
+            .unwrap_or(0);
+        if stats.files_indexed > 0 || stats.files_pruned > 0 {
             // Recompute PageRank whenever the graph changed. Best-effort: a failure here is
             // non-fatal — retrieval simply uses the previous (or zero) scores.
             let _ = self.recompute_pagerank();
@@ -831,6 +843,33 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].rel_path, "src/lib.rs");
         assert!(lat.query("should_not_index", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_prunes_files_that_vanished_from_the_walk() {
+        let t = Tmp::new();
+        t.write("src/keep.rs", "pub fn kept_symbol() {}\n");
+        t.write("src/gone.rs", "pub fn doomed_symbol() {}\n");
+        let lat = lattice(&t.root);
+
+        let first = lat.update().unwrap();
+        assert_eq!(first.files_indexed, 2);
+        assert_eq!(first.files_pruned, 0);
+        assert_eq!(lat.query("doomed_symbol", 10).unwrap().len(), 1);
+
+        // Remove one file from disk, re-index: it (and its symbols) must be purged.
+        std::fs::remove_file(t.root.join("src/gone.rs")).unwrap();
+        let second = lat.update().unwrap();
+        assert_eq!(second.files_pruned, 1, "the removed file is pruned");
+        assert!(
+            lat.query("doomed_symbol", 10).unwrap().is_empty(),
+            "pruned file's symbols are gone from queries"
+        );
+        assert_eq!(
+            lat.query("kept_symbol", 10).unwrap().len(),
+            1,
+            "kept file survives"
+        );
     }
 
     #[test]
