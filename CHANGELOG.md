@@ -26,6 +26,10 @@ All notable changes to Forge are documented here. The format follows
 - Local Ollama models that emit Hermes/Qwen-style `<tool_call>` XML (e.g. `qwen3-coder`) are now
   driven correctly: `ollama::` is routed through Ollama's OpenAI-compatible `/v1` endpoint, which
   parses those into structured tool calls instead of leaking them as text and dead-ending the turn.
+- **Windows**: the Claude Code / Codex CLI bridges and stdio MCP servers now launch correctly.
+  Detection and spawning are PATH-resolved with the `.exe`/`.cmd`/`.bat` suffixes, and `.cmd`/`.bat`
+  shims (how npm installs `claude`, `codex`, `npx`, and node-based MCP servers like `caveman-shrink`)
+  are run through `cmd /C`. Previously these failed to detect or spawn ("program not found").
 
 ## [0.2.0] - 2026-06-23
 
