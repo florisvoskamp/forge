@@ -15,8 +15,12 @@ All notable changes to Forge are documented here. The format follows
   prioritized backlog of techniques to port.
 - `forge doctor` — diagnose your setup (providers/keys, CLI bridges, Ollama, MCP, config, git,
   terminal) with actionable fixes.
-- Startup update check — a throttled notice when a newer release is available (disable with
-  `[update] check = false` or `FORGE_NO_UPDATE_CHECK=1`).
+- `forge update` — self-update to the latest release. A standalone binary install (curl/zip) is
+  downloaded and swapped in place; Homebrew/cargo installs print the correct upgrade command instead
+  of clobbering a package-managed file. `forge update --check` reports without changing anything.
+- Startup update check now offers to update: on an interactive terminal it prompts "update now?" and
+  runs `forge update` on yes; otherwise it prints the notice (disable with `[update] check = false`
+  or `FORGE_NO_UPDATE_CHECK=1`). Never prompts in headless runs, pipes, or the `mcp-serve` bridge.
 - Community infrastructure: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, issue
   templates, and this changelog.
 

@@ -30,6 +30,7 @@ mod local;
 mod mcp_serve;
 mod remote;
 mod replay;
+mod update;
 mod update_check;
 
 /// Env var carrying the current subagent nesting depth across the process boundary (forge →
@@ -309,6 +310,13 @@ enum Command {
     /// Diagnose your setup — config, providers/keys, CLI bridges, Ollama, git, terminal — with
     /// actionable fixes. Paste its output into bug reports. Exits non-zero if anything is broken.
     Doctor,
+    /// Update Forge to the latest release. A standalone binary install (curl/zip) is replaced in
+    /// place; Homebrew/cargo installs print the right upgrade command. `--check` only reports.
+    Update {
+        /// Only check whether a newer release exists; download/replace nothing.
+        #[arg(long)]
+        check: bool,
+    },
     /// Internal: run Forge's tool registry as an MCP server on stdio (spawned by the CLI
     /// bridge so claude/codex use Forge's tools under Forge's permission gate). Not for direct use.
     #[command(hide = true)]
@@ -830,6 +838,9 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Update { check } => tokio::task::spawn_blocking(move || update::run(check))
+            .await
+            .context("update task")?,
         Command::Auth { provider, remove } => auth(&provider, remove),
         Command::Setup | Command::Init => setup(),
         Command::Mcp { cmd } => mcp_cmd(cmd).await,

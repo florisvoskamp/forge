@@ -20,13 +20,34 @@ pub async fn maybe_notify(config: &forge_config::Config) {
         return;
     }
     touch_throttle(); // record the attempt now, so a hang/offline run doesn't retry every launch
-    if let Some(latest) = fetch_latest_tag().await {
-        if is_newer(&latest, CURRENT) {
-            println!(
-                "⚒ Forge {latest} is available (you have {CURRENT}).\n  Update: re-run the install script, `brew upgrade forge`, or grab it from\n  https://github.com/{REPO}/releases/latest"
-            );
+    let Some(latest) = fetch_latest_tag().await else {
+        return;
+    };
+    if !is_newer(&latest, CURRENT) {
+        return;
+    }
+    // On an interactive terminal, offer to update right now; otherwise just print the notice. The
+    // TTY gate keeps headless runs, pipes, and the `mcp-serve` bridge from ever blocking on input.
+    use std::io::{IsTerminal, Write};
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        print!("⚒ Forge {latest} is available (you have {CURRENT}). Update now? [y/N] ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok()
+            && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+        {
+            // self_update is blocking — run it off the async runtime so we don't stall the reactor.
+            match tokio::task::spawn_blocking(|| crate::update::run(false)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("update failed: {e:#}"),
+                Err(e) => eprintln!("update task panicked: {e}"),
+            }
+            return;
         }
     }
+    println!(
+        "⚒ Forge {latest} is available (you have {CURRENT}).\n  Update: run `forge update`, `brew upgrade forge`, or grab it from\n  https://github.com/{REPO}/releases/latest"
+    );
 }
 
 fn throttle_path() -> Option<std::path::PathBuf> {
@@ -81,7 +102,7 @@ async fn fetch_latest_tag() -> Option<String> {
 
 /// Whether `tag` (e.g. "v0.4.0") is a newer SemVer than `current` ("0.3.0"). Lenient: a malformed
 /// tag is treated as not-newer (so we never nag on garbage).
-fn is_newer(tag: &str, current: &str) -> bool {
+pub(crate) fn is_newer(tag: &str, current: &str) -> bool {
     match (parse_semver(tag), parse_semver(current)) {
         (Some(a), Some(b)) => a > b,
         _ => false,
