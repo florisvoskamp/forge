@@ -1,0 +1,10 @@
+# A normal (non-plan) turn that tracks tasks renders the sticky task panel mid-turn.
+# Run: scripts/tui-drive.sh scripts/tui-scripts/task-panel.txt
+sleep 500
+send refactor this with a task list to track progress
+sleep 4000
+capture task-panel
+expect tasks
+expect Scan the codebase
+reject 337%
+send /quit

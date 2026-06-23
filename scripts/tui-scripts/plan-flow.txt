@@ -1,0 +1,18 @@
+# Full planning flow: /plan renders a card + seeds the task panel, approve builds in Auto-edit.
+# Run: scripts/tui-drive.sh scripts/tui-scripts/plan-flow.txt
+sleep 500
+expect message
+send /plan split main.rs into modules
+sleep 4000
+capture plan-card
+expect ⬡ PLAN
+expect Extract clap structs
+expect Build this plan?
+expect 3 tasks
+send 1
+sleep 4000
+capture after-approve
+expect plan approved
+expect Auto-edit
+reject 337%
+send /quit

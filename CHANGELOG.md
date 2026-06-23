@@ -7,6 +7,12 @@ All notable changes to Forge are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `scripts/tui-drive.sh` — drive `forge chat` in a real full-screen TUI inside tmux, send a
+  scripted key sequence, and capture/assert on the rendered screen (the alt-screen grid, which a raw
+  PTY byte-stream can't show). The `--mock` provider is now plan- and task-aware, so `/plan …`
+  renders a real plan card + seeds the task panel and a task-tracking prompt renders the sticky task
+  panel — reproducing the full-screen panels offline (no API/bridge). Sample scripts under
+  `scripts/tui-scripts/`.
 - Interactive plan mode: `/plan` now has the agent call a `present_plan` tool that renders a
   bordered, animated **plan card** (title + numbered steps + notes) instead of loose prose. You
   approve it interactively — approving switches to Auto-edit and **auto-builds** the plan, typing
@@ -47,10 +53,12 @@ All notable changes to Forge are documented here. The format follows
   character-by-character in full every frame (~60×/sec while streaming), which is O(transcript) and
   showed up as input/scroll lag once the log grew. The wrap is now memoized (re-wrapped only when the
   log or width changes) and each frame clones just the visible window, not the whole transcript.
-- Text selection works again in full-screen mode. Mouse capture (added for wheel-scroll) disabled
-  the terminal's native click-drag selection. It's now **opt-in** (`[tui] mouse_capture`, default
-  off): by default you select/copy text normally and scroll with PgUp/PgDn/Home/End; enable it to
-  get wheel scroll back (at the cost of needing Shift to select).
+- Full-screen mouse wheel scroll and native text selection now BOTH work. The wheel-scroll support
+  used crossterm's full mouse capture, which turns on motion tracking and disables the terminal's
+  native click-drag selection. Forge now enables only **minimal** mouse reporting (button + wheel,
+  no motion tracking), so the wheel scrolls the transcript while drag-to-select keeps working.
+  Configurable via `[tui] mouse_capture` (default on); set false to disable mouse reporting entirely
+  and scroll with PgUp/PgDn/Home/End.
 - Plan mode now works on CLI bridges: the harness tool-preamble names `mcp__forge__present_plan`
   (and notes that hosts like codex load MCP tools lazily and won't pre-list them). codex 0.141 only
   surfaces a subset of MCP tools up front, so a bridged model told to "present a plan" couldn't find

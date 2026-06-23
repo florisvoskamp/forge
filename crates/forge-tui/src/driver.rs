@@ -9,8 +9,7 @@ use std::time::Duration;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    EnableFocusChange, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,6 +22,28 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::app::{self, App, KeyKind, LIVE_H};
 use crate::{Presenter, PresenterEvent};
+
+/// Enable **minimal** mouse reporting: button + wheel (`?1000h`) with SGR encoding (`?1006h`), but
+/// deliberately NOT motion tracking (`?1002h`/`?1003h`). The wheel reaches us as scroll events while
+/// drag-motion is left to the terminal, so the terminal's native click-drag text selection keeps
+/// working. (crossterm's `EnableMouseCapture` turns motion tracking on, which disables selection.)
+const ENABLE_WHEEL_MOUSE: &str = "\x1b[?1000h\x1b[?1006h";
+/// Undo [`ENABLE_WHEEL_MOUSE`].
+const DISABLE_WHEEL_MOUSE: &str = "\x1b[?1000l\x1b[?1006l";
+
+fn enable_wheel_mouse() -> io::Result<()> {
+    use std::io::Write;
+    let mut out = io::stdout();
+    write!(out, "{ENABLE_WHEEL_MOUSE}")?;
+    out.flush()
+}
+
+fn disable_wheel_mouse() {
+    use std::io::Write;
+    let mut out = io::stdout();
+    let _ = write!(out, "{DISABLE_WHEEL_MOUSE}");
+    let _ = out.flush();
+}
 
 /// An input event from the terminal — either a keystroke or a bracketed paste.
 pub enum InputEvent {
@@ -175,13 +196,14 @@ impl Tui {
         install_panic_restore();
         enable_raw_mode()?;
         crossterm::execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
-        // Mouse capture only matters in full-screen mode (it routes the wheel to us as scroll
-        // events). It's opt-in because capturing the mouse disables native click-drag selection.
+        // Mouse reporting only matters in full-screen mode (it routes the wheel to us as scroll
+        // events). We use minimal button+wheel reporting (no motion tracking), so native text
+        // selection still works; can be turned off entirely via `[tui] mouse_capture`.
         let mouse_capture = mouse_capture && fullscreen;
         if fullscreen {
             crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
             if mouse_capture {
-                crossterm::execute!(io::stdout(), EnableMouseCapture)?;
+                enable_wheel_mouse()?;
             }
             IN_ALT_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -333,7 +355,7 @@ impl Tui {
         if self.fullscreen {
             crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
             if self.mouse_capture {
-                crossterm::execute!(io::stdout(), EnableMouseCapture)?;
+                enable_wheel_mouse()?;
             }
         }
         let backend = CrosstermBackend::new(io::stdout());
@@ -363,7 +385,7 @@ impl Drop for Tui {
         if self.fullscreen {
             IN_ALT_SCREEN.store(false, std::sync::atomic::Ordering::Relaxed);
             if self.mouse_capture {
-                let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
+                disable_wheel_mouse();
             }
             let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
         }
