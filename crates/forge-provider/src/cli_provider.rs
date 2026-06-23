@@ -372,9 +372,12 @@ agent. For ANY web access — searching the web or opening a URL — you MUST us
 built-in, native, or provider web-search/browsing capability. Likewise route all file and \
 shell actions through the `mcp__forge__*` tools.\n\n\
 Tool names: every Forge tool is exposed by the `forge` MCP server and is PREFIXED `mcp__forge__`. \
-So the task-list tool is `mcp__forge__update_tasks`, subagents are `mcp__forge__spawn_agents`, \
-skills are `mcp__forge__use_skill`, plus `mcp__forge__read_file`/`write_file`/`edit_file`/\
-`list_dir`/`search`/`shell`. When a task or instruction refers to a tool by its bare name (e.g. \
+So the task-list tool is `mcp__forge__update_tasks`, the plan-presentation tool (used in planning \
+mode) is `mcp__forge__present_plan`, subagents are `mcp__forge__spawn_agents`, skills are \
+`mcp__forge__use_skill`, plus `mcp__forge__read_file`/`write_file`/`edit_file`/`list_dir`/`search`/\
+`shell`. Some hosts (e.g. codex) load MCP tools lazily and won't pre-list every one — these tools \
+ARE available; call them by their exact prefixed name even if you don't see them enumerated. When \
+a task or instruction refers to a tool by its bare name (e.g. \"present a plan\", \
 \"use the update_tasks tool\", \"record tasks\", \"spawn 2 subagents\"), it means the matching \
 `mcp__forge__*` tool — these ARE in your toolset; call them by the prefixed name. Never say a \
 tool is unavailable without first checking for its `mcp__forge__`-prefixed form.\n\n\

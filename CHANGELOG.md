@@ -34,6 +34,11 @@ All notable changes to Forge are documented here. The format follows
   templates, and this changelog.
 
 ### Fixed
+- Plan mode now works on CLI bridges: the harness tool-preamble names `mcp__forge__present_plan`
+  (and notes that hosts like codex load MCP tools lazily and won't pre-list them). codex 0.141 only
+  surfaces a subset of MCP tools up front, so a bridged model told to "present a plan" couldn't find
+  `present_plan` and fell back to its read-only shell — the plan never rendered. Verified end-to-end
+  against codex 0.141: a bare-name "present a plan" instruction now resolves and calls the tool.
 - `forge lattice update` now PRUNES files that vanished from the walk — deleted files and, crucially,
   ones now under a skipped/nested-git/vendored tree. Previously the nested-git skip stopped *new*
   indexing but left already-indexed vendored symbols (e.g. a SWE-bench `django/` clone) in the graph,
