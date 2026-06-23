@@ -4432,18 +4432,14 @@ async fn claude_quota_is_stale(
         .is_none_or(|a| a > max_age)
 }
 
-/// Copy mouse-selected transcript text to the OS clipboard (best-effort), noting the result in the
-/// TUI. The TUI process stays alive to own the X11/Wayland selection, so the paste survives.
-fn copy_to_clipboard(text: &str, app: &mut forge_tui::App) {
-    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
-        Ok(()) => {
-            let n = text.chars().count();
-            app.note(&format!(
-                "📋 copied {n} char{}",
-                if n == 1 { "" } else { "s" }
-            ));
-        }
-        Err(_) => app.note("⚠ clipboard unavailable"),
+/// Copy mouse-selected transcript text to the OS clipboard. SILENT and best-effort — no scrollback
+/// note (it would spam the chat) and no terminal output (any stray write corrupts the alt-screen).
+/// Reuses a single long-lived `Clipboard`: creating one per copy makes arboard's X11 backend
+/// relinquish the selection immediately ("clipboard dropped") and log to the terminal, which
+/// wrecked the TUI layout. One instance keeps the selection-serving thread alive and quiet.
+fn copy_selection(clipboard: &mut Option<arboard::Clipboard>, text: &str) {
+    if let Some(cb) = clipboard.as_mut() {
+        let _ = cb.set_text(text.to_owned());
     }
 }
 
@@ -4787,6 +4783,9 @@ async fn run_chat_tui(
     // Prompts typed while a turn is running, queued to run one-per-turn after it finishes
     // (like Claude Code / aider). Drained in the done-handler below; cleared on interrupt.
     let mut queued_prompts: Vec<String> = Vec::new();
+    // One long-lived clipboard for mouse-selection copies (see `copy_selection`). Created once so
+    // arboard keeps the X11/Wayland selection alive and never logs a "dropped" warning to the TUI.
+    let mut clipboard: Option<arboard::Clipboard> = arboard::Clipboard::new().ok();
 
     while !quit {
         // While the in-loop activity viewer is open during a running turn, redraw every frame so
@@ -4870,7 +4869,7 @@ async fn run_chat_tui(
                             MouseKind::Drag => app.selection_extend(col, row),
                             MouseKind::Up => {
                                 if let Some(text) = app.selection_text() {
-                                    copy_to_clipboard(&text, &mut app);
+                                    copy_selection(&mut clipboard, &text);
                                 }
                             }
                         }

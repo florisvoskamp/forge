@@ -8,6 +8,8 @@ use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
+use ignore::WalkBuilder;
+
 use forge_store::{
     LatticeEdgeRow, LatticeFileRow, LatticeNodeRow, LatticeRefRow, Store, StoreError,
 };
@@ -129,33 +131,47 @@ impl Lattice {
         // now-skipped, e.g. a vendored/nested-git tree) and gets pruned at the end.
         let mut seen: HashSet<String> = HashSet::new();
         let root = Path::new(&self.repo_root).to_path_buf();
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if path.is_dir() {
-                    if is_skippable_dir(&name) {
-                        continue;
-                    }
-                    // Skip nested git repositories — vendored deps, submodules, or scratch clones
-                    // (e.g. SWE-bench workdirs) checked out under the project root. Indexing them
-                    // swamps `impact`/`query` with unrelated hits, like a generic `Command` matching
-                    // across a cloned django/ tree. The root itself is never checked here (only its
-                    // descendants), so the project's own repo is always indexed.
-                    if path.join(".git").exists() {
-                        continue;
-                    }
-                    stack.push(path);
-                } else if lang_for_path(&name).is_some() {
-                    seen.insert(self.rel_path(&path));
-                    self.index_file(&path, &mut stats)?;
+        // Walk with ripgrep's `ignore` crate so the index honors `.gitignore`/`.ignore`/global
+        // excludes and skips `.git` — without it the walker indexed gitignored trees like
+        // `.forge/bench/repos/<astropy|django>/…` and `target/`, swamping `impact`/`query` with
+        // hundreds of name-collision hits from unrelated code. `filter_entry` keeps two extra
+        // guards: a hardcoded skip list (for projects that don't gitignore `target`/`node_modules`)
+        // and a nested-git-repo skip (vendored deps / scratch clones that AREN'T gitignored).
+        let walker = WalkBuilder::new(&root)
+            .hidden(false) // don't blanket-skip dotfiles; gitignore + the guards below decide
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .require_git(false) // honor .gitignore even when the dir isn't a git checkout
+            .parents(true)
+            .filter_entry(|e| {
+                if e.depth() == 0 {
+                    return true; // never filter the root itself
                 }
+                if e.file_type().is_some_and(|t| t.is_dir()) {
+                    let name = e.file_name().to_string_lossy();
+                    if is_skippable_dir(&name) {
+                        return false;
+                    }
+                    if e.path().join(".git").exists() {
+                        return false; // nested repo (submodule / vendored clone / scratch checkout)
+                    }
+                }
+                true
+            })
+            .build();
+        for entry in walker.flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            if lang_for_path(&name).is_some() {
+                seen.insert(self.rel_path(path));
+                self.index_file(path, &mut stats)?;
             }
         }
         // Purge files that vanished from the walk (deleted, or now under a skipped/nested-git dir).
@@ -163,6 +179,23 @@ impl Lattice {
             .store
             .prune_lattice_files_except(&self.repo_root, &seen)
             .unwrap_or(0);
+        // Also drop ORPHAN roots from the global store. Two cases:
+        //  - dead: the root's directory no longer exists (e.g. a deleted `/tmp/swe-*/django` clone).
+        //  - nested: the root sits UNDER the one we just walked. This walk (gitignore-aware) is
+        //    authoritative for everything beneath `self.repo_root`, so a separate sub-root is stale
+        //    scratch — e.g. SWE-bench clones at `.forge/bench/repos/<astropy>` that earlier runs
+        //    indexed as their own roots. They're gitignored here, so they'd never re-index; purge.
+        let nested_prefix = format!("{}{}", self.repo_root, std::path::MAIN_SEPARATOR);
+        if let Ok(roots) = self.store.lattice_repo_roots() {
+            for root in roots {
+                if root == self.repo_root {
+                    continue;
+                }
+                if !Path::new(&root).is_dir() || root.starts_with(&nested_prefix) {
+                    stats.files_pruned += self.store.prune_lattice_repo(&root).unwrap_or(0);
+                }
+            }
+        }
         if stats.files_indexed > 0 || stats.files_pruned > 0 {
             // Recompute PageRank whenever the graph changed. Best-effort: a failure here is
             // non-fatal — retrieval simply uses the previous (or zero) scores.
@@ -379,7 +412,9 @@ impl Lattice {
 
     /// Symbols whose name matches `query` (case-insensitive), best-first.
     pub fn query(&self, query: &str, limit: usize) -> Result<Vec<NodeHit>, LatticeError> {
-        let rows = self.store.lattice_nodes_by_name(query, limit)?;
+        let rows = self
+            .store
+            .lattice_nodes_by_name(&self.repo_root, query, limit)?;
         self.rows_to_hits(rows)
     }
 
@@ -479,7 +514,11 @@ impl Lattice {
 
     /// Reverse-dependency closure: who references `symbol`, transitively, up to `max_depth` hops.
     pub fn impact(&self, symbol: &str, max_depth: usize) -> Result<BlastRadius, LatticeError> {
-        let roots = self.rows_to_hits(self.store.lattice_nodes_by_name(symbol, 32)?)?;
+        let roots = self.rows_to_hits(self.store.lattice_nodes_by_name(
+            &self.repo_root,
+            symbol,
+            32,
+        )?)?;
         let roots: Vec<NodeHit> = roots.into_iter().filter(|h| h.name == symbol).collect();
 
         let mut seen: HashSet<String> = HashSet::from([symbol.to_string()]);
@@ -490,7 +529,11 @@ impl Lattice {
         for _ in 0..max_depth.max(1) {
             let mut next = Vec::new();
             for name in &frontier {
-                for hit in self.rows_to_hits(self.store.lattice_callers_by_name(name, 200)?)? {
+                for hit in self.rows_to_hits(self.store.lattice_callers_by_name(
+                    &self.repo_root,
+                    name,
+                    200,
+                )?)? {
                     if seen.insert(hit.name.clone()) {
                         next.push(hit.name.clone());
                     }
@@ -542,7 +585,7 @@ impl Lattice {
                 continue;
             }
             let last = chain.last().unwrap();
-            for callee in self.store.lattice_callees_of_name(last)? {
+            for callee in self.store.lattice_callees_of_name(&self.repo_root, last)? {
                 if callee == b {
                     let mut found = chain.clone();
                     found.push(callee);
@@ -897,6 +940,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn update_respects_gitignore() {
+        let t = Tmp::new();
+        t.write("src/lib.rs", "pub fn kept_symbol() {}\n");
+        // A gitignored tree (e.g. Forge's own `.forge/bench/repos/<astropy>` clone): even though it
+        // is a plain dir (no nested .git), `.gitignore` must keep it out of the index.
+        t.write(".gitignore", "ignored_tree/\n");
+        t.write("ignored_tree/junk.rs", "pub fn ignored_symbol() {}\n");
+        let lat = lattice(&t.root);
+
+        let stats = lat.update().unwrap();
+        assert_eq!(stats.files_indexed, 1, "only the non-ignored src/ file");
+        assert_eq!(lat.query("kept_symbol", 10).unwrap().len(), 1);
+        assert!(
+            lat.query("ignored_symbol", 10).unwrap().is_empty(),
+            "gitignored symbols must be excluded"
+        );
+    }
+
+    #[test]
+    fn impact_is_scoped_to_its_own_repo_root() {
+        // Two repos sharing ONE global store, each with an identically named symbol + caller. An
+        // unscoped `impact` would cross-contaminate (the bug behind a refactor check reporting
+        // django/astropy and other-crate hits); scoping to the Lattice's repo_root must not.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let a = Tmp::new();
+        a.write(
+            "src/a.rs",
+            "pub fn dup() {}\npub fn caller_a() { dup(); }\n",
+        );
+        let b = Tmp::new();
+        b.write(
+            "src/b.rs",
+            "pub fn dup() {}\npub fn caller_b() { dup(); }\n",
+        );
+        let lat_a = Lattice::new(Arc::clone(&store), &a.root);
+        let lat_b = Lattice::new(Arc::clone(&store), &b.root);
+        lat_a.update().unwrap();
+        lat_b.update().unwrap();
+
+        let blast = lat_a.impact("dup", 3).unwrap();
+        let dependents: Vec<&str> = blast.dependents.iter().map(|h| h.name.as_str()).collect();
+        assert!(dependents.contains(&"caller_a"), "own-repo caller found");
+        assert!(
+            !dependents.contains(&"caller_b"),
+            "must NOT see the other repo's caller: {dependents:?}"
+        );
+    }
+
     struct FakeEmbedder;
     #[async_trait::async_trait]
     impl Embedder for FakeEmbedder {
@@ -990,7 +1082,11 @@ mod tests {
         lat.update().unwrap();
 
         // Assign distinct unit vectors per node, then query near `beta`'s.
-        for n in store.lattice_nodes_by_name("", 100).unwrap() {
+        let root = std::fs::canonicalize(&t.root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        for n in store.lattice_nodes_by_name(&root, "", 100).unwrap() {
             let v = match n.name.as_str() {
                 "alpha" => [1.0, 0.0, 0.0],
                 "beta" => [0.0, 1.0, 0.0],
@@ -1163,7 +1259,13 @@ pub fn caller_c() { hub(); }
         lat.update().unwrap();
 
         // Find the two `parse_target` nodes and assign distinct pagerank scores directly.
-        let nodes = store.lattice_nodes_by_name("parse_target", 10).unwrap();
+        let root = std::fs::canonicalize(&t.root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let nodes = store
+            .lattice_nodes_by_name(&root, "parse_target", 10)
+            .unwrap();
         assert_eq!(
             nodes.len(),
             2,

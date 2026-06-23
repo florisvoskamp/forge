@@ -1483,35 +1483,50 @@ impl Store {
 
     /// Distinct definitions that reference `name` — the direct callers/dependents of a symbol
     /// (one hop of `impact`). Resolves the name-keyed `lattice_ref` rows back to their src nodes.
-    pub fn lattice_callers_by_name(&self, name: &str, limit: usize) -> Result<Vec<LatticeNodeRow>> {
+    pub fn lattice_callers_by_name(
+        &self,
+        repo_root: &str,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<LatticeNodeRow>> {
         let conn = self.lock()?;
+        // Scoped to `repo_root`: the store is global (one DB across every project + bench clone), so
+        // an unscoped name match returns cross-repo collisions (a `Command` in a vendored django/ or
+        // another crate). The caller's Lattice is bound to one repo_root; only its rows are relevant.
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.file_id, n.kind, n.name, n.qualname, n.signature,
                     n.span_start, n.span_end, n.line_start, n.pagerank
              FROM lattice_ref r
              JOIN lattice_node n ON n.id = r.src_id
-             WHERE r.name = ?1 AND n.name <> ?1
+             JOIN lattice_file f ON f.id = n.file_id
+             WHERE r.name = ?1 AND n.name <> ?1 AND f.repo_root = ?2
              ORDER BY n.name
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![name, limit as i64], lattice_node_from_row)?
+            .query_map(
+                rusqlite::params![name, repo_root, limit as i64],
+                lattice_node_from_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     /// Distinct identifier names referenced *by* definitions named `name` — one forward hop for
     /// `path` BFS (what the symbol calls/uses).
-    pub fn lattice_callees_of_name(&self, name: &str) -> Result<Vec<String>> {
+    pub fn lattice_callees_of_name(&self, repo_root: &str, name: &str) -> Result<Vec<String>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT r.name
              FROM lattice_ref r
              JOIN lattice_node n ON n.id = r.src_id
-             WHERE n.name = ?1 AND r.name <> ?1",
+             JOIN lattice_file f ON f.id = n.file_id
+             WHERE n.name = ?1 AND r.name <> ?1 AND f.repo_root = ?2",
         )?;
         let rows = stmt
-            .query_map([name], |r| r.get::<_, String>(0))?
+            .query_map(rusqlite::params![name, repo_root], |r| {
+                r.get::<_, String>(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1524,7 +1539,12 @@ impl Store {
 
     /// Symbols whose name contains `query` (case-insensitive), best-first: exact name, then
     /// prefix, then substring; capped at `limit`.
-    pub fn lattice_nodes_by_name(&self, query: &str, limit: usize) -> Result<Vec<LatticeNodeRow>> {
+    pub fn lattice_nodes_by_name(
+        &self,
+        repo_root: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<LatticeNodeRow>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT n.id, n.file_id, n.kind, n.name, n.qualname, n.signature,
@@ -1535,12 +1555,13 @@ impl Store {
                         ELSE 2
                     END AS rank
              FROM lattice_node n
-             WHERE lower(n.name) LIKE '%' || lower(?1) || '%'
+             JOIN lattice_file f ON f.id = n.file_id
+             WHERE lower(n.name) LIKE '%' || lower(?1) || '%' AND f.repo_root = ?3
              ORDER BY rank, length(n.name), n.name
              LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![query, limit as i64], |r| {
+            .query_map(rusqlite::params![query, limit as i64, repo_root], |r| {
                 Ok(LatticeNodeRow {
                     id: r.get(0)?,
                     file_id: r.get(1)?,
@@ -1600,6 +1621,25 @@ impl Store {
         }
         tx.commit()?;
         Ok(stale.len())
+    }
+
+    /// Every distinct `repo_root` with indexed files. The store is global (shared across projects
+    /// and bench clones), so this surfaces orphan roots — e.g. a deleted `/tmp/swe-*/django` scratch
+    /// checkout — that `update` can prune.
+    pub fn lattice_repo_roots(&self) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT DISTINCT repo_root FROM lattice_file")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Delete every indexed file under `repo_root` (cascading to its symbols/edges/refs). Used to
+    /// drop an orphan root whose directory no longer exists on disk. Returns the count removed.
+    pub fn prune_lattice_repo(&self, repo_root: &str) -> Result<usize> {
+        let conn = self.lock()?;
+        Ok(conn.execute("DELETE FROM lattice_file WHERE repo_root = ?1", [repo_root])?)
     }
 
     /// The `rel_path` of an indexed file by its id (for rendering a node's location).

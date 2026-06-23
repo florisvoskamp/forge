@@ -48,6 +48,23 @@ All notable changes to Forge are documented here. The format follows
   templates, and this changelog.
 
 ### Fixed
+- `forge lattice` now honors `.gitignore`/`.ignore` (via ripgrep's `ignore` walker) instead of a raw
+  directory walk, so it no longer indexes gitignored trees — most importantly Forge's own
+  `.forge/bench/repos/<astropy|django>/…` SWE-bench clones and `target/`. Those swamped `impact`/
+  `query` with hundreds of name-collision hits from unrelated code (e.g. `impact Command` → "323
+  sites" across django/astropy), which is why a `/plan` refactor on the codex bridge kept *stopping*:
+  the agent dutifully halted on the prompt's "stop if anything outside the crate references this"
+  rule when impact reported that vendored noise.
+- Lattice queries (`impact`/`query`/`path`) are now scoped to the current repo root. The store is
+  global (one DB across every project and bench clone), so an unscoped name match cross-contaminated
+  across repos; impact for the project no longer returns symbols from a different checkout.
+- `forge lattice update` prunes orphan roots from the global index: a root whose directory is gone
+  (deleted scratch clone), or one nested under the root being indexed (stale sub-root, e.g. an old
+  bench clone) — reclaiming a badly bloated index (here 101k → 3k nodes).
+- Mouse-selection copy no longer spams the chat or breaks the TUI. It's silent now (no `📋 copied`
+  scrollback note), and reuses one long-lived clipboard handle — creating one per copy made arboard's
+  X11 backend relinquish the selection immediately ("clipboard dropped") and write to the terminal,
+  which corrupted the full-screen layout.
 - **The plan card and task list now actually appear on the codex bridge.** codex hands its stdio
   MCP servers a *curated* environment (only `PATH`/`HOME`/`LANG`/… survive — verified live), so the
   `FORGE_SUBAGENT_SINK` and checkpoint-context env that the parent sets for `forge mcp-serve` never
