@@ -4641,6 +4641,30 @@ mod tests {
     }
 
     #[test]
+    fn turn_timer_does_not_hide_the_compaction_band() {
+        // The turn timer/token segment lives in the statusline; the compaction band is its own row.
+        // Both must show at once (the regression report was "the timer hides compaction").
+        let mut app = App {
+            session_in: 100,
+            session_out: 50,
+            ..Default::default()
+        };
+        app.on_turn_start();
+        app.busy = true;
+        app.turn_elapsed_secs = 5;
+        app.compaction = Some(CompactionState {
+            start_tick: 0,
+            auto: false,
+        });
+        let s = screen_wh(&app, 120, LIVE_H);
+        assert!(
+            s.contains("compacting"),
+            "compaction band still visible: {s}"
+        );
+        assert!(s.contains("⧖ 5s"), "turn timer also visible: {s}");
+    }
+
+    #[test]
     fn fmt_dur_is_compact_across_scales() {
         assert_eq!(fmt_dur(0), "0s");
         assert_eq!(fmt_dur(45), "45s");
