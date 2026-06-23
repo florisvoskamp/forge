@@ -2089,6 +2089,12 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         let mut empty_nudges = 0usize;
         let mut last_tool_sig: Option<u64> = None;
         let mut repeat_count = 0usize;
+        // `continue_nudges`: bounded retries when the model signs off with text but tracked tasks
+        // are still unfinished (narrate-then-stall) — drive it to completion instead of ending the
+        // turn mid-task. `doom_nudged`: the doom-loop fires a "change approach" nudge BEFORE it
+        // ever hard-stops, so a repeated call doesn't kill an otherwise-recoverable turn.
+        let mut continue_nudges = 0usize;
+        let mut doom_nudged = false;
 
         for step in 0..max_steps {
             // Stream the reply, with transparent failover for this step's completion.
@@ -2350,6 +2356,37 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                         "model returned an empty response (no text, no tool call) — stopping the turn"
                             .to_string(),
                     ));
+                } else {
+                    // Non-empty text, no tool call — usually the real final answer. But a weaker
+                    // model often narrates its NEXT action ("now I'll edit X") without calling the
+                    // tool, or signs off with tasks still open. If the tracked task list still has
+                    // unfinished items, this is a premature stall: drive it onward (bounded) so the
+                    // harness completes the work with ANY model instead of ending the turn mid-task.
+                    let unfinished = self
+                        .tasks
+                        .iter()
+                        .filter(|t| !matches!(t.status, forge_types::TodoStatus::Done))
+                        .count();
+                    const MAX_CONTINUE_NUDGES: usize = 4;
+                    if unfinished > 0 && continue_nudges < MAX_CONTINUE_NUDGES {
+                        continue_nudges += 1;
+                        self.presenter.emit(PresenterEvent::Warning(format!(
+                            "model stopped with {unfinished} task(s) unfinished — continuing it ({continue_nudges}/{MAX_CONTINUE_NUDGES})"
+                        )));
+                        let nudge = "You ended your reply, but tasks on your list are NOT yet \
+                                     Done. The turn is not over — do not stop. Continue now: call \
+                                     the next tool to make progress on the remaining work. Only \
+                                     finish once every task is resolved; if one is genuinely \
+                                     complete or impossible, mark it Done via update_tasks and say \
+                                     why. Do not reply again without either calling a tool or \
+                                     marking a task Done.";
+                        let nseq = self.next_seq();
+                        let _ = self
+                            .store
+                            .add_message(&self.id, nseq, Role::System, nudge, None);
+                        self.transcript.push(Message::system(nudge));
+                        continue;
+                    }
                 }
                 final_text = resp.content;
                 hit_step_cap = false;
@@ -2369,12 +2406,35 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                 last_tool_sig = Some(sig);
             }
             if repeat_count + 1 >= DOOM_LOOP_THRESHOLD {
-                self.presenter.emit(PresenterEvent::Warning(format!(
-                    "the model repeated the same tool call {DOOM_LOOP_THRESHOLD}× — stopping to \
-                     avoid a loop"
-                )));
-                hit_step_cap = false;
-                break;
+                if !doom_nudged {
+                    // First time: don't kill the turn. Tell it the identical call won't change
+                    // anything and to switch approach — a weaker model usually breaks out of the
+                    // rut. Queue the nudge so it lands AFTER this step's tool results (valid message
+                    // ordering); fall through to execute, then re-check next step.
+                    doom_nudged = true;
+                    self.presenter.emit(PresenterEvent::Warning(
+                        "model repeated the same tool call — nudging it to change approach before \
+                         stopping"
+                            .to_string(),
+                    ));
+                    self.pending_hints.push(
+                        "You've now called the same tool with the same arguments several times — \
+                         the result will not change. Stop repeating it and take a DIFFERENT \
+                         approach (another tool, different arguments, or a different file). If the \
+                         task is genuinely complete, say so plainly or mark it Done with \
+                         update_tasks. Do not issue that identical call again."
+                            .to_string(),
+                    );
+                } else {
+                    // Still looping after the nudge → truly stuck; halt with a clear message.
+                    self.presenter.emit(PresenterEvent::Warning(
+                        "the model kept repeating the same tool call after a nudge — stopping to \
+                         avoid a loop"
+                            .to_string(),
+                    ));
+                    hit_step_cap = false;
+                    break;
+                }
             }
 
             // Fast path: when the model batched several independent side-effect-free calls (and no
@@ -4840,6 +4900,105 @@ mod tests {
             .iter()
             .any(|e| matches!(e, PresenterEvent::Tasks(t) if t.len() == 2));
         assert!(emitted, "a Tasks event was emitted for the TUI");
+    }
+
+    /// Stalls on the 2nd call (text, no tool call) while a task is still in_progress, then — once
+    /// the harness nudges it to continue — marks the task Done and finishes.
+    struct StallThenFinishProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for StallThenFinishProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            use std::sync::atomic::Ordering;
+            let usage = Usage::default();
+            let task = |status: &str| {
+                vec![ToolCall {
+                    id: new_id(),
+                    name: "update_tasks".into(),
+                    args: serde_json::json!({"tasks": [{"title": "do the thing", "status": status}]}),
+                }]
+            };
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let resp = match n {
+                0 => ModelResponse {
+                    content: "starting".into(),
+                    tool_calls: task("in_progress"),
+                    usage,
+                    quotas: Vec::new(),
+                },
+                // Premature stall: narrates, no tool call, task still unfinished. The harness must
+                // NOT accept this as the final answer — it should nudge and drive on.
+                1 => ModelResponse {
+                    content: "I'll keep going on this.".into(),
+                    tool_calls: vec![],
+                    usage,
+                    quotas: Vec::new(),
+                },
+                2 => ModelResponse {
+                    content: "finishing".into(),
+                    tool_calls: task("done"),
+                    usage,
+                    quotas: Vec::new(),
+                },
+                _ => ModelResponse {
+                    content: "all done".into(),
+                    tool_calls: vec![],
+                    usage,
+                    quotas: Vec::new(),
+                },
+            };
+            Ok(resp)
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_drives_on_when_model_stalls_with_unfinished_tasks() {
+        use forge_types::TodoStatus;
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(StallThenFinishProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        let answer = session.run_turn("do the thing").await.unwrap();
+
+        // The turn did NOT end at the stall — it continued until the task was Done.
+        assert_eq!(
+            answer, "all done",
+            "drove past the premature text-only stall"
+        );
+        assert_eq!(session.tasks().len(), 1);
+        assert_eq!(session.tasks()[0].status, TodoStatus::Done);
+        // A continue-nudge was surfaced.
+        let nudged = events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, PresenterEvent::Warning(w) if w.contains("unfinished")));
+        assert!(
+            nudged,
+            "emitted a continue-nudge warning for the unfinished task"
+        );
     }
 
     #[test]

@@ -53,6 +53,13 @@ All notable changes to Forge are documented here. The format follows
   templates, and this changelog.
 
 ### Fixed
+- The agent loop no longer ends a turn mid-task when a (often weaker/free) model narrates its next
+  step without calling the tool, or signs off with tasks still open. If the tracked task list has
+  unfinished items when the model stops with plain text, Forge nudges it to continue (up to 4×)
+  instead of accepting the stall as the final answer — driving any model to finish the work. The
+  doom-loop guard also now fires a "change approach" nudge *before* it hard-stops, so a single
+  repeated call no longer kills an otherwise-recoverable turn; it only halts if the model keeps
+  repeating after the nudge.
 - The CLI bridge (claude/codex) now gates on Forge's **live** temper, not the stale on-disk config
   mode — so switching Plan→Auto-edit (e.g. approving a plan) actually lets the bridged model write.
   `forge mcp-serve` runs as a fresh process per turn and loaded `permission_mode` from the config
