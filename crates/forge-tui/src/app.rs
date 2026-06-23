@@ -1934,6 +1934,54 @@ fn body_line(text: &str) -> TextLine<'static> {
     TextLine::from(format!("  {text}"))
 }
 
+/// Greedy word-wrap to `width` display columns (approximated by char count, matching the rest of
+/// this module). Words longer than `width` are hard-split so a single long token can't overflow.
+/// Always returns at least one (possibly empty) line.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split_whitespace() {
+        let ww = word.chars().count();
+        if ww > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            cur = chunk;
+            cur_w = cur.chars().count();
+            continue;
+        }
+        let add = if cur.is_empty() { ww } else { ww + 1 };
+        if cur_w + add > width {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+            cur_w = ww;
+        } else {
+            if !cur.is_empty() {
+                cur.push(' ');
+                cur_w += 1;
+            }
+            cur.push_str(word);
+            cur_w += ww;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// Render a proposed plan (the `present_plan` tool) as a styled card flushed to scrollback: an
 /// orange frame + "⬡ PLAN" title, cyan step numbers with a green ❯ marker, dim per-step detail,
 /// an optional yellow notes line, and a dim footer hinting the interactive approve prompt that
@@ -1942,33 +1990,44 @@ fn plan_card_lines(plan: &forge_types::PlanProposal) -> Vec<TextLine<'static>> {
     let frame = Style::default().fg(ORANGE);
     let title = plan.title.trim().to_string();
 
-    // Build each inner row's spans alongside its visible width, so the frame fits the widest.
-    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut widths: Vec<usize> = Vec::new();
+    // Each logical row is a fixed prefix (number/marker/indent) plus a wrappable text payload.
+    // The payload is word-wrapped to the inner width so long step titles/details stay inside the
+    // frame instead of overflowing the right border.
+    struct Row {
+        prefix: Vec<Span<'static>>,
+        prefix_w: usize,
+        text: String,
+        text_style: Style,
+    }
+    let mut rows: Vec<Row> = Vec::new();
 
     let head_tag = "⬡ PLAN  ";
-    rows.push(vec![
-        Span::styled(head_tag, Style::default().fg(ORANGE).bold()),
-        Span::styled(title.clone(), Style::default().fg(ORANGE).bold()),
-    ]);
-    widths.push(head_tag.chars().count() + title.chars().count());
+    rows.push(Row {
+        prefix: vec![Span::styled(head_tag, Style::default().fg(ORANGE).bold())],
+        prefix_w: head_tag.chars().count(),
+        text: title.clone(),
+        text_style: Style::default().fg(ORANGE).bold(),
+    });
 
     for (i, step) in plan.steps.iter().enumerate() {
         let n = format!("{:>2} ", i + 1);
-        let t = step.title.trim().to_string();
-        widths.push(n.chars().count() + 2 + t.chars().count());
-        rows.push(vec![
-            Span::styled(n, Style::default().fg(TOOLCYAN).bold()),
-            Span::styled("❯ ", Style::default().fg(OKGREEN)),
-            Span::raw(t),
-        ]);
+        rows.push(Row {
+            prefix: vec![
+                Span::styled(n.clone(), Style::default().fg(TOOLCYAN).bold()),
+                Span::styled("❯ ", Style::default().fg(OKGREEN)),
+            ],
+            prefix_w: n.chars().count() + 2,
+            text: step.title.trim().to_string(),
+            text_style: Style::default(),
+        });
         let d = step.detail.trim();
         if !d.is_empty() {
-            widths.push(5 + d.chars().count());
-            rows.push(vec![
-                Span::raw("     "),
-                Span::styled(d.to_string(), Style::default().fg(DIM)),
-            ]);
+            rows.push(Row {
+                prefix: vec![Span::raw("     ")],
+                prefix_w: 5,
+                text: d.to_string(),
+                text_style: Style::default().fg(DIM),
+            });
         }
     }
     if let Some(notes) = plan
@@ -1977,14 +2036,20 @@ fn plan_card_lines(plan: &forge_types::PlanProposal) -> Vec<TextLine<'static>> {
         .map(str::trim)
         .filter(|n| !n.is_empty())
     {
-        widths.push(2 + notes.chars().count());
-        rows.push(vec![Span::styled(
-            format!("⚠ {notes}"),
-            Style::default().fg(WARNYEL),
-        )]);
+        rows.push(Row {
+            prefix: vec![Span::styled("⚠ ", Style::default().fg(WARNYEL))],
+            prefix_w: 2,
+            text: notes.to_string(),
+            text_style: Style::default().fg(WARNYEL),
+        });
     }
 
-    let inner = widths.iter().copied().max().unwrap_or(20).clamp(24, 72);
+    let inner = rows
+        .iter()
+        .map(|r| r.prefix_w + r.text.chars().count())
+        .max()
+        .unwrap_or(20)
+        .clamp(24, 72);
     let rule = |l: &str, r: &str| {
         TextLine::from(Span::styled(
             format!("  {l}{}{r}", "─".repeat(inner + 2)),
@@ -1993,12 +2058,21 @@ fn plan_card_lines(plan: &forge_types::PlanProposal) -> Vec<TextLine<'static>> {
     };
 
     let mut out = vec![rule("╭", "╮")];
-    for (idx, (r, w)) in rows.iter().zip(widths.iter()).enumerate() {
-        let pad = inner.saturating_sub((*w).min(inner));
-        let mut spans = vec![Span::styled("  │ ", frame)];
-        spans.extend(r.iter().cloned());
-        spans.push(Span::styled(format!("{} │", " ".repeat(pad)), frame));
-        out.push(TextLine::from(spans));
+    for (idx, row) in rows.iter().enumerate() {
+        let avail = inner.saturating_sub(row.prefix_w).max(1);
+        for (li, chunk) in wrap_words(&row.text, avail).iter().enumerate() {
+            let mut spans = vec![Span::styled("  │ ", frame)];
+            if li == 0 {
+                spans.extend(row.prefix.iter().cloned());
+            } else {
+                spans.push(Span::raw(" ".repeat(row.prefix_w)));
+            }
+            let cw = chunk.chars().count();
+            spans.push(Span::styled(chunk.clone(), row.text_style));
+            let pad = inner.saturating_sub(row.prefix_w + cw);
+            spans.push(Span::styled(format!("{} │", " ".repeat(pad)), frame));
+            out.push(TextLine::from(spans));
+        }
         if idx == 0 {
             out.push(rule("├", "┤")); // separate the title from the steps
         }
@@ -4664,6 +4738,34 @@ mod tests {
         );
         assert!(text.contains('╭') && text.contains('╰'), "has a frame");
         assert!(text.contains("approve to build"), "footer hint present");
+    }
+
+    #[test]
+    fn plan_card_wraps_long_text_within_the_frame() {
+        let long = "Move every clap struct and enum out of main.rs into cli/args.rs without \
+                    changing any field, variant, attribute, or doc comment so the parsed CLI \
+                    surface stays byte-for-byte identical across the whole refactor";
+        let plan = forge_types::PlanProposal {
+            title: "Refactor".into(),
+            steps: vec![forge_types::PlanStep {
+                title: long.into(),
+                detail: long.into(),
+            }],
+            notes: Some(long.into()),
+        };
+        let lines: Vec<String> = plan_card_lines(&plan)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect();
+        // Every framed row (starts with the left border) must end at the right border and all
+        // share the same visible width — i.e. nothing overflowed past the box.
+        let framed: Vec<&String> = lines.iter().filter(|l| l.starts_with("  │")).collect();
+        assert!(framed.len() > 3, "long text wrapped to multiple rows");
+        let w = framed[0].chars().count();
+        for l in &framed {
+            assert!(l.ends_with('│'), "row stays inside the right border: {l:?}");
+            assert_eq!(l.chars().count(), w, "all framed rows equal width: {l:?}");
+        }
     }
 
     #[test]

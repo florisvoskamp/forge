@@ -98,6 +98,7 @@ impl Provider for MockProvider {
                             {"title": "Extract clap structs to cli/args.rs", "detail": "Move Command/BenchCmd/… verbatim"},
                             {"title": "Extract dispatch to cli/dispatch.rs", "detail": "Top-level match on Command"},
                             {"title": "One file per subcommand handler", "detail": "cli/commands/<name>.rs"},
+                            {"title": "Move every clap struct and enum out of main.rs into cli/args.rs without changing any field, variant, attribute, or doc comment", "detail": "Keep the parsed CLI surface byte-for-byte identical across the whole refactor so no command, flag, or help string shifts position."},
                         ],
                         "notes": "Pure mechanical move; cargo build after each step.",
                     }),

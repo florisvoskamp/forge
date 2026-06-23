@@ -1358,6 +1358,13 @@ async fn lattice_cmd(op: LatticeOp) -> Result<()> {
                 for d in &blast.dependents {
                     println!("  ← {:<8} {} {}:{}", d.kind, d.name, d.rel_path, d.line);
                 }
+                println!(
+                    "  ⓘ name-based: matches ANY symbol named '{symbol}' ({} definition(s) carry \
+                     this name). References to a same-named item in an unrelated module/crate are \
+                     included — confirm a hit is the right definition (grep/read it) before \
+                     treating a cross-module reference as a real blocker.",
+                    blast.roots.len()
+                );
             }
         }
         LatticeOp::Path { from, to } => {

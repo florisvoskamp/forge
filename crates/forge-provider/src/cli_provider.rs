@@ -403,6 +403,14 @@ agent. For ANY web access — searching the web or opening a URL — you MUST us
 `mcp__forge__web_search` and `mcp__forge__web_fetch` tools exposed over MCP. Do NOT use any \
 built-in, native, or provider web-search/browsing capability. Likewise route all file and \
 shell actions through the `mcp__forge__*` tools.\n\n\
+Writing files: your OWN shell may be sandboxed read-only and your approval policy may read \
+`never` — this is BY DESIGN and is NOT an error or a block. File changes do not go through your \
+shell; they go through the Forge MCP tools (`mcp__forge__write_file`, `edit_file`, `multi_edit`, \
+`apply_patch`, `delete_file`), which run OUTSIDE that sandbox in the Forge process and CAN modify \
+the workspace. So: do NOT probe writability (`test -w`, `touch` probes), do NOT inspect the \
+sandbox or approval mode, and NEVER stop, refuse, or report a build as impossible because the \
+filesystem looks read-only or approvals are disabled. To make an edit, just call the matching \
+`mcp__forge__` write tool — it will succeed.\n\n\
 Tool names: every Forge tool is exposed by the `forge` MCP server and is PREFIXED `mcp__forge__`. \
 So the task-list tool is `mcp__forge__update_tasks`, the plan-presentation tool (used in planning \
 mode) is `mcp__forge__present_plan`, subagents are `mcp__forge__spawn_agents`, skills are \

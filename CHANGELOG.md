@@ -48,6 +48,23 @@ All notable changes to Forge are documented here. The format follows
   templates, and this changelog.
 
 ### Fixed
+- The codex bridge no longer stalls a plan build claiming it has "no write permissions." codex's
+  own shell is sandboxed read-only **by design** (every write is meant to go through Forge's gated
+  `mcp__forge__*` tools, which run outside that sandbox), but codex would run `test -w .`, see the
+  read-only sandbox + `approval_policy=never`, and quit without ever trying the MCP write tools. The
+  harness preamble now states plainly that the read-only shell is expected, that file changes go
+  through `mcp__forge__write_file`/`edit_file`/… , and that it must never probe writability or refuse
+  a build over it. Verified live (codex 0.141): an implementation turn now calls `write_file` instead
+  of bailing.
+- `forge lattice impact` output now flags that it is **name-based**: it appends how many definitions
+  share the queried name and warns that same-named symbols in unrelated modules/crates are included,
+  so a hit must be confirmed before it's treated as a cross-module blocker. A planning agent (notably
+  on the codex bridge) was taking impact's same-name collisions at face value — `impact run` reports
+  21 definitions across the workspace — and hard-stopping a refactor plan on phantom external
+  references instead of presenting it.
+- The `present_plan` plan card now word-wraps long step titles, details, and notes to the frame width
+  instead of overflowing the right border and mangling the box. Each wrapped continuation line is
+  indented under its step and padded so every row meets the border at the same column.
 - `forge lattice` now honors `.gitignore`/`.ignore` (via ripgrep's `ignore` walker) instead of a raw
   directory walk, so it no longer indexes gitignored trees — most importantly Forge's own
   `.forge/bench/repos/<astropy|django>/…` SWE-bench clones and `target/`. Those swamped `impact`/
