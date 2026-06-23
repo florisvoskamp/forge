@@ -817,7 +817,7 @@ async fn main() -> Result<()> {
         Command::Models { probe, all, clear } => models(probe, all, clear).await,
         Command::Mesh { prompt, json } => mesh_explain(prompt.join(" "), json).await,
         Command::Benchmarks { refresh } => benchmarks_cmd(refresh).await,
-        Command::Local { sub } => local_cmd(sub),
+        Command::Local { sub } => local_cmd(sub).await,
         Command::Auth { provider, remove } => auth(&provider, remove),
         Command::Setup | Command::Init => setup(),
         Command::Mcp { cmd } => mcp_cmd(cmd).await,
@@ -1501,15 +1501,16 @@ fn maybe_autostart_local() {
 /// The animated `forge local` menu (no-arg on a terminal): pick a model to install/start, or view
 /// status. Loops until the user closes it; each action prints, then waits for Enter before the
 /// menu redraws (it owns its own alternate screen).
-fn local_menu() -> Result<()> {
+async fn local_menu() -> Result<()> {
     enum Act {
-        Model(&'static str),
+        Model(String),
         Status,
         Close,
     }
+    let scores = local_bench_scores().await;
     loop {
         let specs = local::detect_specs();
-        let picks = local::recommend(&specs);
+        let cands = local::discover_ranked(&specs, scores.as_ref()).await;
         let installed = if local::ollama_installed() {
             local::ollama_installed_models()
         } else {
@@ -1517,14 +1518,19 @@ fn local_menu() -> Result<()> {
         };
         let mut items: Vec<forge_tui::SelectItem> = Vec::new();
         let mut acts: Vec<Act> = Vec::new();
-        for m in &picks {
-            let have = installed.iter().any(|t| t == m.ollama_tag);
+        for c in &cands {
+            let have = installed.iter().any(|t| t == &c.ollama_tag);
+            let bench = if c.benchmarked {
+                format!("AA {:.0}", c.score)
+            } else {
+                "—".to_string()
+            };
             items.push(forge_tui::SelectItem {
-                label: m.label.to_string(),
+                label: c.label.clone(),
                 hint: format!(
-                    "{} · ~{:.0} GB{}",
-                    m.ollama_tag,
-                    m.min_memory_gb,
+                    "{} · ~{:.0} GB · bench {bench}{}",
+                    c.ollama_tag,
+                    c.min_memory_gb,
                     if have {
                         " · installed → start"
                     } else {
@@ -1533,7 +1539,7 @@ fn local_menu() -> Result<()> {
                 ),
                 preselected: false,
             });
-            acts.push(Act::Model(m.key));
+            acts.push(Act::Model(c.ollama_tag.clone()));
         }
         items.push(forge_tui::SelectItem {
             label: "Status".into(),
@@ -1549,7 +1555,7 @@ fn local_menu() -> Result<()> {
         acts.push(Act::Close);
 
         let title = format!(
-            "forge local — {:.0} GB usable · {} · GPU: {}",
+            "forge local — {:.0} GB usable · {} · GPU: {} · ranked by Artificial Analysis",
             specs.model_memory_gb(),
             specs.os,
             specs
@@ -1561,22 +1567,18 @@ fn local_menu() -> Result<()> {
         let Some(idx) = forge_tui::select_one(&title, &items)? else {
             return Ok(());
         };
-        match acts[idx] {
+        match &acts[idx] {
             Act::Close => return Ok(()),
             Act::Status => {
                 local_status();
                 let _ = prompt_line("\n  press Enter to continue…");
             }
-            Act::Model(key) => {
-                let installed_now = local::model_by_key(key).is_some_and(|m| {
-                    local::ollama_installed_models()
-                        .iter()
-                        .any(|t| t == m.ollama_tag)
-                });
-                let res = if installed_now {
-                    local_start(Some(key))
+            Act::Model(tag) => {
+                let have = local::ollama_installed_models().iter().any(|t| t == tag);
+                let res = if have {
+                    local_start(Some(tag))
                 } else {
-                    local_install(Some(key))
+                    local_install(Some(tag))
                 };
                 if let Err(e) = res {
                     println!("⚠ {e}");
@@ -1587,20 +1589,31 @@ fn local_menu() -> Result<()> {
     }
 }
 
-/// `forge local [subcommand]`: detect specs, install/run a local Gemma via Ollama, list, status.
+/// Artificial Analysis benchmark scores for ranking local models (cache-first; `None` if disabled
+/// or unavailable). Seeds the coverage check with the static catalog's tags.
+async fn local_bench_scores() -> Option<forge_mesh::BenchmarkScores> {
+    let cfg = forge_config::load().unwrap_or_default();
+    let ids: Vec<String> = local::CATALOG
+        .iter()
+        .map(|m| format!("ollama::{}", m.ollama_tag))
+        .collect();
+    benchmarks::ensure(&cfg, &ids, false).await
+}
+
+/// `forge local [subcommand]`: detect specs, install/run a local model via Ollama, list, status.
 /// No subcommand on a terminal → the animated interactive menu; otherwise (piped) → `detect`.
-fn local_cmd(sub: Option<LocalCmd>) -> Result<()> {
+async fn local_cmd(sub: Option<LocalCmd>) -> Result<()> {
     let Some(sub) = sub else {
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
-            return local_menu();
+            return local_menu().await;
         }
-        print_specs_and_recommendation();
+        print_specs_and_recommendation().await;
         return Ok(());
     };
     match sub {
         LocalCmd::Detect => {
-            print_specs_and_recommendation();
+            print_specs_and_recommendation().await;
             Ok(())
         }
         LocalCmd::Install { key } => local_install(key.as_deref()),
@@ -1629,7 +1642,7 @@ fn local_cmd(sub: Option<LocalCmd>) -> Result<()> {
 }
 
 /// Print the detected specs + the ranked recommendation list.
-fn print_specs_and_recommendation() {
+async fn print_specs_and_recommendation() {
     let specs = local::detect_specs();
     let gpu = match &specs.gpu {
         Some(g) => match g.vram_gb {
@@ -1647,36 +1660,61 @@ fn print_specs_and_recommendation() {
         "  model memory budget: ~{:.0} GB\n",
         specs.model_memory_gb()
     );
-    let picks = local::recommend(&specs);
-    if picks.is_empty() {
-        println!("No catalog model fits this machine's memory (the smallest needs ~4 GB).");
+
+    let scores = local_bench_scores().await;
+    let cands = local::discover_ranked(&specs, scores.as_ref()).await;
+    if cands.is_empty() {
+        println!("No model fits this machine's memory (the smallest needs ~4 GB).");
         return;
     }
-    println!("Models that fit, best capability first (across families):");
-    for (i, m) in picks.iter().enumerate() {
-        let tag = if i == 0 { "  ‹recommended›" } else { "" };
+    let benched = cands.iter().filter(|c| c.benchmarked).count();
+    println!(
+        "Models that fit, ranked by Artificial Analysis benchmark score ({benched}/{} rated):",
+        cands.len()
+    );
+    for (i, c) in cands.iter().enumerate() {
+        let rec = if i == 0 { "  ‹recommended›" } else { "" };
+        let bench = if c.benchmarked {
+            format!("AA {:.0}", c.score)
+        } else {
+            "unrated".to_string()
+        };
         println!(
-            "  {} {:<26} [{}]  {} · ~{:.0} GB{tag}\n      {}",
+            "  {} {:<26} [{}]  {} · ~{:.0} GB · {bench}{rec}",
             if i == 0 { "▸" } else { " " },
-            m.label,
-            m.ollama_tag,
-            m.family,
-            m.min_memory_gb,
-            m.blurb
+            c.label,
+            c.ollama_tag,
+            c.family,
+            c.min_memory_gb,
         );
+        if !c.blurb.is_empty() {
+            println!("      {}", c.blurb);
+        }
     }
-    println!("\nInstall with `forge local install` (recommended) or `forge local install <key>`.");
+    println!(
+        "\nInstall with `forge local install` (recommended) or `forge local install <tag-or-key>`."
+    );
 }
 
-/// Ensure Ollama is installed (offering to install it), then pull the chosen (or recommended) model.
-fn local_install(key: Option<&str>) -> Result<()> {
+/// Ensure Ollama is installed (offering to install it), then pull the chosen (or recommended)
+/// model. `name` is a raw Ollama tag (`qwen2.5-coder:14b`), a catalog key (`qwen2.5-coder-14b`),
+/// or `None` for the recommended pick.
+fn local_install(name: Option<&str>) -> Result<()> {
     let specs = local::detect_specs();
-    let model = match key {
-        Some(k) => local::model_by_key(k)
-            .with_context(|| format!("unknown model key '{k}' — see `forge local detect`"))?,
-        None => *local::recommend(&specs)
-            .first()
-            .context("no local model fits this machine (needs ≥6 GB)")?,
+    // Resolve to (display label, ollama tag).
+    let (label, tag): (String, String) = match name {
+        Some(n) if n.contains(':') => (n.to_string(), n.to_string()), // raw tag
+        Some(k) => {
+            let m = local::model_by_key(k)
+                .with_context(|| format!("unknown model '{k}' — see `forge local detect`"))?;
+            (m.label.to_string(), m.ollama_tag.to_string())
+        }
+        None => {
+            let m = *local::recommend(&specs)
+                .first()
+                .context("no local model fits this machine (needs ≥4 GB)")?;
+            (m.label.to_string(), m.ollama_tag.to_string())
+        }
     };
 
     if !local::ollama_installed() {
@@ -1707,21 +1745,14 @@ fn local_install(key: Option<&str>) -> Result<()> {
         }
     }
 
-    println!("Pulling {} ({})…", model.label, model.ollama_tag);
-    if !local::ollama_pull(model.ollama_tag) {
+    println!("Pulling {label} ({tag})…");
+    if !local::ollama_pull(&tag) {
         anyhow::bail!(
-            "`ollama pull {}` failed. The tag may not exist in your Ollama version — check `ollama list` / upgrade Ollama, or pick another model with `forge local detect`.",
-            model.ollama_tag
+            "`ollama pull {tag}` failed. The tag may not exist in your Ollama version — check `ollama list` / upgrade Ollama, or pick another model with `forge local detect`."
         );
     }
-    println!(
-        "✓ {} is ready. It's available in the mesh as `ollama::{}`.",
-        model.label, model.ollama_tag
-    );
-    println!(
-        "  Start it with `forge local start {}`, or enable `[local] autostart` in config.",
-        model.key
-    );
+    println!("✓ {label} is ready. It's available in the mesh as `ollama::{tag}`.");
+    println!("  Start it with `forge local start {tag}`, or enable `[local] autostart` in config.");
     Ok(())
 }
 
@@ -1731,11 +1762,12 @@ fn local_start(key: Option<&str>) -> Result<()> {
         anyhow::bail!("Ollama is not installed. Run `forge local install` first.");
     }
     let cfg = forge_config::load().unwrap_or_default();
-    // Choose the model: explicit key → catalog tag; else configured tag; else recommended.
+    // Choose the model: raw tag as-is; catalog key → its tag; else configured tag; else recommended.
     let tag: String = match key {
+        Some(n) if n.contains(':') => n.to_string(),
         Some(k) => local::model_by_key(k)
             .map(|m| m.ollama_tag.to_string())
-            .with_context(|| format!("unknown model key '{k}'"))?,
+            .with_context(|| format!("unknown model '{k}'"))?,
         None => cfg
             .local
             .model

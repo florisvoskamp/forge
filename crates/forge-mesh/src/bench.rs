@@ -74,6 +74,17 @@ impl BenchmarkScores {
         }
     }
 
+    /// The score for a Forge id using ONLY an exact token-set match — no fuzzy family fallback.
+    /// For precisely-named ids (e.g. local Ollama tags `ollama::qwen2.5-coder:14b`) this avoids the
+    /// fallback cross-matching different sizes/families that merely share a word like "coder".
+    pub fn exact_score_for(&self, id: &str) -> Option<BenchScore> {
+        let want = id_tokens(id);
+        if want.is_empty() {
+            return None;
+        }
+        self.by_canon.get(&canon(&want)).copied()
+    }
+
     /// The score for a Forge `provider::model` id, or `None` if no confident match exists.
     pub fn score_for(&self, id: &str) -> Option<BenchScore> {
         if self.entries.is_empty() {
@@ -277,6 +288,17 @@ mod tests {
         );
         let fable = b.score_for("anthropic::claude-fable-5").unwrap();
         assert_eq!(fable.intelligence, 59.9);
+    }
+
+    #[test]
+    fn exact_score_for_does_not_cross_match_on_a_shared_role_word() {
+        // "deepseek-coder-v2:16b" shares "coder" with "Qwen2.5-Coder 14B"; the fuzzy path would
+        // match, but the exact path (for precise local tags) must not.
+        let mut b = BenchmarkScores::new();
+        b.insert("Qwen2.5-Coder 14B", 70.0, 82.0);
+        assert!(b.exact_score_for("ollama::qwen2.5-coder:14b").is_some());
+        assert!(b.exact_score_for("ollama::deepseek-coder-v2:16b").is_none());
+        assert!(b.exact_score_for("ollama::qwen2.5-coder:7b").is_none()); // different size
     }
 
     #[test]

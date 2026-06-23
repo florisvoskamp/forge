@@ -391,6 +391,252 @@ pub fn recommend(specs: &SystemSpecs) -> Vec<&'static LocalModel> {
 }
 
 // ----------------------------------------------------------------------------------------------
+// Live discovery + benchmark ranking. The static CATALOG above is the offline floor; when online we
+// also pull the current model list from Ollama's library so brand-new models appear, and we rank
+// everything by REAL Artificial Analysis benchmark scores (reusing forge-mesh's BenchmarkScores),
+// falling back to size only when a model has no measured score.
+// ----------------------------------------------------------------------------------------------
+
+use forge_mesh::BenchmarkScores;
+
+/// An owned, ranked install candidate — from the static catalog and/or live discovery.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub family: String,
+    pub label: String,
+    pub ollama_tag: String,
+    pub params_b: f64,
+    pub min_memory_gb: f64,
+    /// Ranking score (higher = better). From Artificial Analysis when `benchmarked`, else a
+    /// size-derived proxy.
+    pub score: f64,
+    /// True when `score` is a measured Artificial Analysis index (not a size guess).
+    pub benchmarked: bool,
+    pub blurb: String,
+}
+
+/// Memory floor (~Q4 runtime, Ollama-style) for a parameter count.
+pub fn mem_floor(params_b: f64) -> f64 {
+    match params_b {
+        p if p <= 2.0 => 4.0,
+        p if p <= 4.0 => 6.0,
+        p if p <= 9.0 => 8.0,
+        p if p <= 16.0 => 16.0,
+        p if p <= 34.0 => 32.0,
+        _ => 48.0,
+    }
+}
+
+/// Parse a billions-of-params count from an Ollama size tag: `7b`, `1.5b`, `32b`, `e4b` (Gemma), …
+pub fn params_from_size(size: &str) -> Option<f64> {
+    let s = size.trim().to_lowercase();
+    let s = s.strip_suffix('b')?;
+    let s = s.strip_prefix('e').unwrap_or(s); // Gemma e2b/e4b
+    let n: f64 = s.parse().ok()?;
+    (n > 0.0 && n < 2000.0).then_some(n)
+}
+
+/// Parse the Ollama library HTML into `(slug, [size-tag])` cards — best-effort, structure-tolerant:
+/// every `/library/<slug>` link, with the size badges (`7b`, `1.5b`, `e4b`, …) found in the slice
+/// up to the next library link. Pure → unit-tested; an empty result makes the caller fall back to
+/// the static catalog.
+pub fn parse_library(html: &str) -> Vec<(String, Vec<String>)> {
+    const MARK: &str = "/library/";
+    let bytes = html.as_bytes();
+    // Byte offsets of each "/library/<slug>" occurrence.
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = html[from..].find(MARK) {
+        let start = from + rel + MARK.len();
+        let slug: String = html[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.' || *c == '_')
+            .collect();
+        from = start;
+        // Skip nested links like "/library/<slug>/blobs" and tag anchors.
+        if !slug.is_empty() && !slug.contains('/') {
+            hits.push((start, slug));
+        }
+        if hits.len() > 200 {
+            break;
+        }
+    }
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..hits.len() {
+        let (pos, slug) = &hits[i];
+        if !seen.insert(slug.clone()) {
+            continue;
+        }
+        let end = hits.get(i + 1).map(|(p, _)| *p).unwrap_or(bytes.len());
+        let card = &html[*pos..end.min(html.len())];
+        let sizes = size_tokens(card);
+        if !sizes.is_empty() {
+            out.push((slug.clone(), sizes));
+        }
+    }
+    out
+}
+
+/// Extract size badges (`7b`, `1.5b`, `32b`, `e4b`) from a chunk of HTML/text.
+fn size_tokens(s: &str) -> Vec<String> {
+    let lower = s.to_lowercase();
+    let chars: Vec<char> = lower.chars().collect();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < chars.len() {
+        // A size token starts at a word boundary with an optional 'e', digits, optional '.digits', 'b'.
+        let prev_alnum = i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '.');
+        if !prev_alnum {
+            let mut j = i;
+            if chars[j] == 'e' && j + 1 < chars.len() && chars[j + 1].is_ascii_digit() {
+                j += 1;
+            }
+            let num_start = j;
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                j += 1;
+            }
+            if j > num_start && j < chars.len() && chars[j] == 'b' {
+                let after = j + 1;
+                let boundary = after >= chars.len() || !chars[after].is_ascii_alphanumeric();
+                let tok: String = chars[i..=j].iter().collect();
+                if boundary && params_from_size(&tok).is_some() && seen.insert(tok.clone()) {
+                    out.push(tok);
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Capitalise a slug's leading segment for a family label ("qwen2.5-coder" → "Qwen2.5-coder").
+fn family_of(slug: &str) -> String {
+    let base = slug.split(['-', ':']).next().unwrap_or(slug);
+    let mut cs = base.chars();
+    match cs.next() {
+        Some(c) => c.to_uppercase().chain(cs).collect(),
+        None => slug.to_string(),
+    }
+}
+
+/// Fetch + parse the Ollama library (best-effort; `None` on any network/parse failure).
+async fn fetch_library() -> Option<Vec<(String, Vec<String>)>> {
+    let body = reqwest::Client::new()
+        .get("https://ollama.com/library?sort=newest")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let parsed = parse_library(&body);
+    (!parsed.is_empty()).then_some(parsed)
+}
+
+/// The static catalog as owned candidates (the offline floor).
+fn static_candidates() -> Vec<Candidate> {
+    CATALOG
+        .iter()
+        .map(|m| Candidate {
+            family: m.family.to_string(),
+            label: m.label.to_string(),
+            ollama_tag: m.ollama_tag.to_string(),
+            params_b: m.params_b,
+            min_memory_gb: m.min_memory_gb,
+            score: m.quality as f64,
+            benchmarked: false,
+            blurb: m.blurb.to_string(),
+        })
+        .collect()
+}
+
+/// Live-discovered library models as candidates (size-derived score until benchmarks attach).
+fn live_candidates(lib: &[(String, Vec<String>)]) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for (slug, sizes) in lib {
+        for size in sizes {
+            let Some(params) = params_from_size(size) else {
+                continue;
+            };
+            out.push(Candidate {
+                family: family_of(slug),
+                label: format!("{slug}:{size}"),
+                ollama_tag: format!("{slug}:{size}"),
+                params_b: params,
+                min_memory_gb: mem_floor(params),
+                score: params, // provisional until AA attaches
+                benchmarked: false,
+                blurb: String::new(),
+            });
+        }
+    }
+    out
+}
+
+/// Build the ranked candidate list for these specs: static catalog ∪ live discovery (deduped by
+/// tag, static's curated labels win), filtered to what fits the memory budget, scored by Artificial
+/// Analysis (coding-leaning) where available — else size — and sorted best-first.
+pub fn rank_candidates(
+    live: Option<Vec<(String, Vec<String>)>>,
+    specs: &SystemSpecs,
+    scores: Option<&BenchmarkScores>,
+) -> Vec<Candidate> {
+    let mut cands = static_candidates();
+    if let Some(lib) = &live {
+        cands.extend(live_candidates(lib));
+    }
+    // Dedup by tag, keeping the first (static curated entry beats a bare live one).
+    let mut seen = std::collections::HashSet::new();
+    cands.retain(|c| seen.insert(c.ollama_tag.clone()));
+
+    let budget = specs.model_memory_gb();
+    cands.retain(|c| c.min_memory_gb <= budget);
+
+    // Attach real benchmark scores where Artificial Analysis has them. EXACT match only — local
+    // tags are precise (family+size), so fuzzy fallback would mis-attribute scores across sizes
+    // and families (e.g. deepseek-coder ← a qwen-coder row).
+    for c in &mut cands {
+        if let Some(s) =
+            scores.and_then(|b| b.exact_score_for(&format!("ollama::{}", c.ollama_tag)))
+        {
+            c.score = s.coding.max(s.intelligence);
+            c.benchmarked = true;
+        }
+    }
+    // Benchmarked models rank above size-guessed ones; within each, by score then size.
+    cands.sort_by(|a, b| {
+        b.benchmarked
+            .cmp(&a.benchmarked)
+            .then(
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(
+                b.params_b
+                    .partial_cmp(&a.params_b)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+    cands
+}
+
+/// Discover + rank installable models for this machine: live Ollama library when reachable (so new
+/// models appear), else the static catalog — both benchmark-ranked via `scores`.
+pub async fn discover_ranked(
+    specs: &SystemSpecs,
+    scores: Option<&BenchmarkScores>,
+) -> Vec<Candidate> {
+    let live = fetch_library().await;
+    rank_candidates(live, specs, scores)
+}
+
+// ----------------------------------------------------------------------------------------------
 // Ollama runtime (the first `Runtime`). All ops shell out to the `ollama` binary or probe its HTTP
 // port; nothing here is on the hot path, so synchronous std::process is fine.
 // ----------------------------------------------------------------------------------------------
@@ -628,5 +874,65 @@ mod tests {
         let (cmd, args) = ollama_install_command(&specs(16.0, None, false)).unwrap();
         assert_eq!(cmd, "sh");
         assert!(args.last().unwrap().contains("ollama.com/install.sh"));
+    }
+
+    #[test]
+    fn params_and_mem_floor() {
+        assert_eq!(params_from_size("7b"), Some(7.0));
+        assert_eq!(params_from_size("1.5b"), Some(1.5));
+        assert_eq!(params_from_size("32b"), Some(32.0));
+        assert_eq!(params_from_size("e4b"), Some(4.0)); // Gemma
+        assert_eq!(params_from_size("latest"), None);
+        assert_eq!(mem_floor(7.0), 8.0);
+        assert_eq!(mem_floor(14.0), 16.0);
+        assert_eq!(mem_floor(70.0), 48.0);
+    }
+
+    #[test]
+    fn parse_library_extracts_slugs_and_sizes() {
+        // Representative of Ollama's library markup: a model link then its size badges.
+        let html = r#"
+            <a href="/library/qwen3"><span>0.6b</span><span>8b</span><span>32b</span></a>
+            <a href="/library/llama4"><div>16b</div><div>128b</div></a>
+            <a href="/library/qwen3/tags">ignored nested</a>
+        "#;
+        let lib = parse_library(html);
+        let qwen = lib.iter().find(|(s, _)| s == "qwen3").unwrap();
+        assert_eq!(qwen.1, vec!["0.6b", "8b", "32b"]);
+        assert!(lib.iter().any(|(s, _)| s == "llama4"));
+        // No duplicate slug from the nested /tags link.
+        assert_eq!(lib.iter().filter(|(s, _)| s == "qwen3").count(), 1);
+    }
+
+    #[test]
+    fn rank_uses_benchmarks_filters_budget_and_includes_live() {
+        // Real-ish AA rows: exact per-size names (the common case) so each maps to its own score.
+        let mut scores = BenchmarkScores::new();
+        scores.insert("Qwen2.5-Coder 14B", 70.0, 82.0); // highest coding
+        scores.insert("Qwen3 8B", 55.0, 60.0); // a brand-new live model AA already rated
+        let live = vec![
+            // qwen3 is NOT in the static catalog → must still surface from live discovery.
+            (
+                "qwen3".to_string(),
+                vec!["8b".to_string(), "32b".to_string()],
+            ),
+        ];
+        let specs = specs(16.0, None, false); // budget 16 → 32b (needs 32) excluded
+        let ranked = rank_candidates(Some(live), &specs, Some(&scores));
+
+        assert!(
+            ranked.iter().all(|c| c.min_memory_gb <= 16.0),
+            "budget filtered"
+        );
+        assert!(
+            !ranked.iter().any(|c| c.ollama_tag == "qwen3:32b"),
+            "32b doesn't fit"
+        );
+        // The highest measured coding score ranks first; it's flagged benchmarked.
+        assert_eq!(ranked[0].ollama_tag, "qwen2.5-coder:14b");
+        assert!(ranked[0].benchmarked);
+        // The live-discovered new model is present (and benchmarked, since AA had it).
+        let q3 = ranked.iter().find(|c| c.ollama_tag == "qwen3:8b").unwrap();
+        assert!(q3.benchmarked);
     }
 }
