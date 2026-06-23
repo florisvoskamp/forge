@@ -6,6 +6,8 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-24
+
 ### Added
 - Turn timer + token counter in the statusline (like Claude Code / Codex). While a turn runs, the
   spinner shows `⟳ working` and row 2 shows a single `⧖ 12s ↑in ↓out` segment for this turn — elapsed
@@ -213,6 +215,7 @@ Initial public release: Model Mesh routing, multi-provider support, cost/budget 
 inline TUI, session persistence + checkpoints, permission broker, subagents, Assay analysis,
 Lattice code intelligence, MCP client, web tools, hooks, skills/commands, and more.
 
-[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/florisvoskamp/forge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/florisvoskamp/forge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/florisvoskamp/forge/releases/tag/v0.1.0
