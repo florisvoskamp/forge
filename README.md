@@ -256,13 +256,17 @@ Runs automatically on first launch when nothing is configured.
 ### `forge local`
 
 Run local LLMs via [Ollama](https://ollama.com) (also a first-class mesh provider, `ollama::<tag>`).
+`forge local` detects your hardware (RAM / VRAM), discovers the **current** model list from Ollama's
+library at runtime (so newly-released models appear automatically), and ranks everything that fits by
+**real Artificial Analysis benchmark scores** — falling back to a built-in multi-family catalog
+offline. Models AA hasn't rated are shown "unrated" and ranked by size, never given a borrowed score.
 
 ```bash
-forge local              # animated menu (install / start / status)
-forge local detect       # show your specs + recommended Gemma models
-forge local install      # install the recommended model (installs Ollama if missing)
-forge local install gemma4-12b   # install a specific catalog model
-forge local start [key]  # ensure the runtime + model are up
+forge local              # animated menu, benchmark-ranked (install / start / status)
+forge local detect       # specs + every model that fits, ranked by benchmark score
+forge local install      # install the top-ranked model (installs Ollama if missing)
+forge local install qwen2.5-coder:14b   # install a specific tag (or catalog key)
+forge local start [tag]  # ensure the runtime + model are up
 forge local list         # models already pulled
 forge local status       # runtime, models, autostart config
 ```
