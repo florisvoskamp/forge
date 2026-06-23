@@ -7,6 +7,12 @@ All notable changes to Forge are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Interactive plan mode: `/plan` now has the agent call a `present_plan` tool that renders a
+  bordered, animated **plan card** (title + numbered steps + notes) instead of loose prose. You
+  approve it interactively — approving switches to Auto-edit and **auto-builds** the plan, typing
+  changes revises it, cancelling keeps you in planning. The plan's steps seed the live task list so
+  build progress is visible, and every draft/revision is saved to `.forge/plans/`. Works on direct
+  API models and the claude/codex bridges alike.
 - Windows PowerShell installer (`install.ps1`): `irm …/install.ps1 | iex` downloads the x86-64
   release binary (SHA-256 verified), installs `forge.exe` to `%LOCALAPPDATA%\Programs\forge`, and
   adds it to the user `PATH`. `install.sh` now points Windows users to it.

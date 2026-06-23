@@ -1225,6 +1225,10 @@ fn parse_sink_line(line: &str) -> Option<StreamEvent> {
             let tasks = serde_json::from_value(v.get("tasks")?.clone()).ok()?;
             Some(StreamEvent::Tasks(tasks))
         }
+        "plan" => {
+            let plan = serde_json::from_value(v.get("plan")?.clone()).ok()?;
+            Some(StreamEvent::Plan(plan))
+        }
         _ => None,
     }
 }

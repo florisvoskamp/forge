@@ -638,6 +638,26 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
+/// One step of a proposed plan (the `present_plan` tool). `detail` is an optional one-line
+/// elaboration shown dimmed under the step title in the plan card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub title: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// A plan the agent proposes for review in planning mode (the `present_plan` tool): a titled,
+/// ordered list of steps plus optional notes (risks/assumptions). Rendered as an interactive card;
+/// on approval its steps seed the live task list and execution begins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanProposal {
+    pub title: String,
+    pub steps: Vec<PlanStep>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {

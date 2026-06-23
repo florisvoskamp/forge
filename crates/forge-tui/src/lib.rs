@@ -233,6 +233,12 @@ pub enum PresenterEvent {
         before: usize,
         after: usize,
     },
+    /// The agent proposed a plan (`present_plan`) in planning mode. The TUI renders the plan card;
+    /// the interactive approve/revise/cancel prompt follows as a normal [`Presenter::ask`].
+    PlanProposed(forge_types::PlanProposal),
+    /// The operating temper (permission mode) changed mid-turn — e.g. plan approval flipped the
+    /// session into Auto-edit to build. Updates the statusline label live.
+    Temper(String),
 }
 
 /// A rendering + interaction surface. Implementors decide how to display events and how
@@ -424,6 +430,25 @@ impl Presenter for HeadlessPresenter {
             PresenterEvent::CompactionFinished { before, after } => {
                 println!("  ⟳ compacted {before} → {after} messages");
             }
+            PresenterEvent::PlanProposed(plan) => {
+                println!("  ⬡ PLAN  {}", plan.title.trim());
+                for (i, step) in plan.steps.iter().enumerate() {
+                    println!("    {:>2}. {}", i + 1, step.title.trim());
+                    let d = step.detail.trim();
+                    if !d.is_empty() {
+                        println!("        {d}");
+                    }
+                }
+                if let Some(n) = plan
+                    .notes
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                {
+                    println!("    ⚠ {n}");
+                }
+            }
+            PresenterEvent::Temper(_) => {}
         }
     }
 

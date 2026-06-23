@@ -6672,13 +6672,17 @@ tight and accurate; omit anything you could not verify."
                 s.set_temper(forge_types::PermissionMode::Plan).label()
             };
             app.set_temper(label);
-            app.note("🗺 planning mode — read-only. I'll propose a plan; approve it with /execute.");
+            app.note(
+                "🗺 planning mode — read-only. I'll investigate, then present a plan to approve.",
+            );
             return Ok(DispatchOutcome::RunTurn {
                 prompt: format!(
-                    "Investigate the codebase as needed and produce a concrete, ordered, \
+                    "Investigate the codebase as needed, then produce a concrete, ordered, \
 step-by-step plan to accomplish the task below. Do NOT make any edits or run state-changing \
-commands — this is planning only. Present the plan clearly for review; the user approves it with \
-/execute.\n\nTask: {task}"
+commands — this is planning only. When the plan is ready, call the `present_plan` tool with a \
+short title and the ordered steps (each a title + optional one-line detail, plus any notes) so the \
+user can review and approve it interactively. Do not just describe the plan in prose — present it \
+with the tool.\n\nTask: {task}"
                 ),
                 guidance: Vec::new(),
                 tier: Some(forge_types::TaskTier::Complex),

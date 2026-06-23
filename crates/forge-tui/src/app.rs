@@ -991,6 +991,10 @@ impl App {
                 // The band clears; the core also emits a "compacted N → M" warning into scrollback.
                 self.compaction = None;
             }
+            PresenterEvent::PlanProposed(plan) => {
+                self.flush.extend(plan_card_lines(&plan));
+            }
+            PresenterEvent::Temper(label) => self.temper = label,
         }
     }
 
@@ -1782,6 +1786,84 @@ fn header_line(label: &str, color: Color) -> TextLine<'static> {
 
 fn body_line(text: &str) -> TextLine<'static> {
     TextLine::from(format!("  {text}"))
+}
+
+/// Render a proposed plan (the `present_plan` tool) as a styled card flushed to scrollback: an
+/// orange frame + "⬡ PLAN" title, cyan step numbers with a green ❯ marker, dim per-step detail,
+/// an optional yellow notes line, and a dim footer hinting the interactive approve prompt that
+/// follows. The frame is sized to the widest row (clamped) so it stays tidy at any plan length.
+fn plan_card_lines(plan: &forge_types::PlanProposal) -> Vec<TextLine<'static>> {
+    let frame = Style::default().fg(ORANGE);
+    let title = plan.title.trim().to_string();
+
+    // Build each inner row's spans alongside its visible width, so the frame fits the widest.
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut widths: Vec<usize> = Vec::new();
+
+    let head_tag = "⬡ PLAN  ";
+    rows.push(vec![
+        Span::styled(head_tag, Style::default().fg(ORANGE).bold()),
+        Span::styled(title.clone(), Style::default().fg(ORANGE).bold()),
+    ]);
+    widths.push(head_tag.chars().count() + title.chars().count());
+
+    for (i, step) in plan.steps.iter().enumerate() {
+        let n = format!("{:>2} ", i + 1);
+        let t = step.title.trim().to_string();
+        widths.push(n.chars().count() + 2 + t.chars().count());
+        rows.push(vec![
+            Span::styled(n, Style::default().fg(TOOLCYAN).bold()),
+            Span::styled("❯ ", Style::default().fg(OKGREEN)),
+            Span::raw(t),
+        ]);
+        let d = step.detail.trim();
+        if !d.is_empty() {
+            widths.push(5 + d.chars().count());
+            rows.push(vec![
+                Span::raw("     "),
+                Span::styled(d.to_string(), Style::default().fg(DIM)),
+            ]);
+        }
+    }
+    if let Some(notes) = plan
+        .notes
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        widths.push(2 + notes.chars().count());
+        rows.push(vec![Span::styled(
+            format!("⚠ {notes}"),
+            Style::default().fg(WARNYEL),
+        )]);
+    }
+
+    let inner = widths.iter().copied().max().unwrap_or(20).clamp(24, 72);
+    let rule = |l: &str, r: &str| {
+        TextLine::from(Span::styled(
+            format!("  {l}{}{r}", "─".repeat(inner + 2)),
+            frame,
+        ))
+    };
+
+    let mut out = vec![rule("╭", "╮")];
+    for (idx, (r, w)) in rows.iter().zip(widths.iter()).enumerate() {
+        let pad = inner.saturating_sub((*w).min(inner));
+        let mut spans = vec![Span::styled("  │ ", frame)];
+        spans.extend(r.iter().cloned());
+        spans.push(Span::styled(format!("{} │", " ".repeat(pad)), frame));
+        out.push(TextLine::from(spans));
+        if idx == 0 {
+            out.push(rule("├", "┤")); // separate the title from the steps
+        }
+    }
+    out.push(rule("╰", "╯"));
+    out.push(TextLine::from(Span::styled(
+        "    ▸ approve to build · or type your changes to revise",
+        Style::default().fg(DIM),
+    )));
+    out.push(TextLine::default());
+    out
 }
 
 /// One renderable item of a resumed session's transcript. Built by the core from the rehydrated
@@ -4339,6 +4421,44 @@ mod tests {
             !screen(&app).contains("tasks ("),
             "panel collapses when the list empties"
         );
+    }
+
+    #[test]
+    fn plan_card_renders_title_steps_and_frame() {
+        let plan = forge_types::PlanProposal {
+            title: "Refactor main.rs".into(),
+            steps: vec![
+                forge_types::PlanStep {
+                    title: "Extract clap defs".into(),
+                    detail: "into cli/args.rs".into(),
+                },
+                forge_types::PlanStep {
+                    title: "Split dispatch".into(),
+                    detail: String::new(),
+                },
+            ],
+            notes: Some("keep the CLI surface identical".into()),
+        };
+        let text = plan_card_lines(&plan)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("⬡ PLAN"), "has the plan tag: {text}");
+        assert!(text.contains("Refactor main.rs"), "has the title");
+        assert!(text.contains("Extract clap defs") && text.contains("Split dispatch"));
+        assert!(text.contains("into cli/args.rs"), "shows step detail");
+        assert!(
+            text.contains("keep the CLI surface identical"),
+            "shows notes"
+        );
+        assert!(text.contains('╭') && text.contains('╰'), "has a frame");
+        assert!(text.contains("approve to build"), "footer hint present");
     }
 
     #[test]

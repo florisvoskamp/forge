@@ -415,6 +415,9 @@ struct ModelLoopOutcome {
     hit_step_cap: bool,
     /// The model that produced the last response (may differ from the input if failover fired).
     active_model: String,
+    /// A plan a CLI-bridge model proposed this loop (tailed from the sink as [`StreamEvent::Plan`]).
+    /// `None` on the in-process path, where the `present_plan` handler sets `pending_plan` directly.
+    plan: Option<forge_types::PlanProposal>,
 }
 
 /// One interactive session. Construct with [`Session::start`], then drive [`Session::run_turn`].
@@ -441,6 +444,9 @@ pub struct Session {
     catalog: Option<ModelCatalog>,
     /// The agent's task list (the `update_tasks` tool), rehydrated from the store on resume.
     tasks: Vec<forge_types::TodoItem>,
+    /// A plan proposed this turn via `present_plan` (planning mode), awaiting interactive approval
+    /// at turn end. `Some` between the proposal and the approve/revise/cancel decision.
+    pending_plan: Option<forge_types::PlanProposal>,
     /// Connected external MCP servers (mcp-client.md). `None` when no servers are configured —
     /// the whole MCP path is then inert (zero overhead for non-MCP users).
     mcp: Option<Arc<forge_mcp::McpManager>>,
@@ -600,6 +606,7 @@ impl Session {
             current_turn_seq: 0,
             catalog: None,
             tasks,
+            pending_plan: None,
             mcp: None,
             lattice: None,
             lattice_watcher: None,
@@ -1290,6 +1297,12 @@ impl Session {
         specs.push(ask_user_spec());
         // The task-tracking tool — always advertised so the model can keep a live todo list.
         specs.push(update_tasks_spec());
+        // The plan-presentation tool — offered ONLY in planning mode, so the model proposes a plan
+        // (rendered as an interactive card) instead of editing. Gating it to Plan mode also makes
+        // the approve→Auto-edit→build flow non-recursive (the build turn can't re-propose a plan).
+        if self.mode == PermissionMode::Plan {
+            specs.push(present_plan_spec());
+        }
         // The skill-loading tool — advertised (with the available-skills list) only when a
         // non-empty catalog is attached, so the model can find + apply Forge's own skills.
         if let Some(cat) = &self.skills {
@@ -2058,6 +2071,13 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         let mut final_text = String::new();
         let mut context_tokens: u64 = 0;
         let mut hit_step_cap = true;
+        // A plan a bridge model proposes via the out-of-band sink (StreamEvent::Plan). Captured by
+        // the per-step stream closure and returned in the outcome for the turn's approval flow.
+        // Only honored in planning mode (the bridge advertises present_plan unconditionally — it
+        // can't see the parent's runtime temper — so the parent gates here): outside Plan mode a
+        // stray plan is dropped, which also stops the post-approval build turn from re-proposing.
+        let mut proposed_plan: Option<forge_types::PlanProposal> = None;
+        let in_plan_mode = self.mode == PermissionMode::Plan;
         // Harness reliability guards. `empty_nudges`: bounded retries when the model returns nothing
         // (narrate-then-stall / transient empty) before giving up. `last_tool_sig`/`repeat_count`:
         // doom-loop detection — the same tool batch repeated DOOM_LOOP_THRESHOLD× halts the turn.
@@ -2075,73 +2095,83 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                 let sent = self.transcript_with_preamble(&active_model);
                 // Tight scope: borrow provider + presenter only for the streamed call, so the
                 // failover branch below has full `&mut self` for benching + warnings.
-                let result =
-                    {
-                        let provider = &self.provider;
-                        let presenter = &mut self.presenter;
-                        // Bump on every stream event so the idle watchdog can distinguish a live
-                        // stream from a stalled half-open connection — a stall fails over (below)
-                        // instead of hanging the turn forever.
-                        let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                        let act = std::sync::Arc::clone(&activity);
-                        let mut sink =
-                            |ev: StreamEvent| {
-                                act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                match ev {
-                                    StreamEvent::Text(t) => {
-                                        presenter.emit(PresenterEvent::AssistantDelta(t))
-                                    }
-                                    StreamEvent::Reasoning(t) => {
-                                        presenter.emit(PresenterEvent::Reasoning(t))
-                                    }
-                                    StreamEvent::ToolStarted { name, args } => {
-                                        presenter.emit(PresenterEvent::ToolStart { name, args })
-                                    }
-                                    StreamEvent::ToolFinished { name, ok, summary } => presenter
-                                        .emit(PresenterEvent::ToolResult { name, ok, summary }),
-                                    StreamEvent::SubagentStarted { id, agent, task } => presenter
-                                        .emit(PresenterEvent::SubagentStart {
-                                            id,
-                                            agent,
-                                            task,
-                                            model: None,
-                                        }),
-                                    StreamEvent::SubagentProgress { id, snippet } => presenter
-                                        .emit(PresenterEvent::SubagentProgress { id, snippet }),
-                                    StreamEvent::SubagentFinished {
-                                        id,
-                                        agent,
-                                        ok,
-                                        summary,
-                                        cost_usd,
-                                    } => presenter.emit(PresenterEvent::SubagentResult {
-                                        id,
-                                        agent,
-                                        ok,
-                                        summary,
-                                        cost_usd,
-                                    }),
-                                    // A bridged turn's `update_tasks` (tailed from the sink): surface the
-                                    // list live so the sticky panel updates during the turn. The parent's
-                                    // post-turn store reload (below) keeps `self.tasks` authoritative.
-                                    StreamEvent::Tasks(tasks) => {
-                                        presenter.emit(PresenterEvent::Tasks(tasks))
-                                    }
+                let result = {
+                    let provider = &self.provider;
+                    let presenter = &mut self.presenter;
+                    // Bump on every stream event so the idle watchdog can distinguish a live
+                    // stream from a stalled half-open connection — a stall fails over (below)
+                    // instead of hanging the turn forever.
+                    let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let act = std::sync::Arc::clone(&activity);
+                    let mut sink = |ev: StreamEvent| {
+                        act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        match ev {
+                            StreamEvent::Text(t) => {
+                                presenter.emit(PresenterEvent::AssistantDelta(t))
+                            }
+                            StreamEvent::Reasoning(t) => {
+                                presenter.emit(PresenterEvent::Reasoning(t))
+                            }
+                            StreamEvent::ToolStarted { name, args } => {
+                                presenter.emit(PresenterEvent::ToolStart { name, args })
+                            }
+                            StreamEvent::ToolFinished { name, ok, summary } => {
+                                presenter.emit(PresenterEvent::ToolResult { name, ok, summary })
+                            }
+                            StreamEvent::SubagentStarted { id, agent, task } => {
+                                presenter.emit(PresenterEvent::SubagentStart {
+                                    id,
+                                    agent,
+                                    task,
+                                    model: None,
+                                })
+                            }
+                            StreamEvent::SubagentProgress { id, snippet } => {
+                                presenter.emit(PresenterEvent::SubagentProgress { id, snippet })
+                            }
+                            StreamEvent::SubagentFinished {
+                                id,
+                                agent,
+                                ok,
+                                summary,
+                                cost_usd,
+                            } => presenter.emit(PresenterEvent::SubagentResult {
+                                id,
+                                agent,
+                                ok,
+                                summary,
+                                cost_usd,
+                            }),
+                            // A bridged turn's `update_tasks` (tailed from the sink): surface the
+                            // list live so the sticky panel updates during the turn. The parent's
+                            // post-turn store reload (below) keeps `self.tasks` authoritative.
+                            StreamEvent::Tasks(tasks) => {
+                                presenter.emit(PresenterEvent::Tasks(tasks))
+                            }
+                            // A bridged turn's `present_plan`: in planning mode, render the
+                            // card now and stash it for the turn's approval flow (picked up
+                            // via the outcome). Ignored outside Plan mode (stray proposal).
+                            StreamEvent::Plan(plan) => {
+                                if in_plan_mode {
+                                    presenter.emit(PresenterEvent::PlanProposed(plan.clone()));
+                                    proposed_plan = Some(plan);
                                 }
-                            };
-                        let completion_opts = CompletionOptions {
-                            effort: self.pinned_effort,
-                            temperature: Some(CODING_TEMPERATURE),
-                        };
-                        let fut = provider.complete_with(
-                            &active_model,
-                            &sent,
-                            specs,
-                            &completion_opts,
-                            &mut sink,
-                        );
-                        stream_with_idle_timeout(fut, &activity, stream_idle).await
+                            }
+                        }
                     };
+                    let completion_opts = CompletionOptions {
+                        effort: self.pinned_effort,
+                        temperature: Some(CODING_TEMPERATURE),
+                    };
+                    let fut = provider.complete_with(
+                        &active_model,
+                        &sent,
+                        specs,
+                        &completion_opts,
+                        &mut sink,
+                    );
+                    stream_with_idle_timeout(fut, &activity, stream_idle).await
+                };
                 match result {
                     Ok(r) => {
                         if !r.content.is_empty() {
@@ -2388,6 +2418,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             context_tokens,
             hit_step_cap,
             active_model,
+            plan: proposed_plan,
         })
     }
 
@@ -2646,6 +2677,13 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         let mut context_tokens = outcome.context_tokens;
         let mut active_model = outcome.active_model;
 
+        // A CLI-bridge model proposed a plan (the sink already rendered the card). Seed tasks,
+        // persist it, and stash it for the approval flow below — the in-process path did this in
+        // the `present_plan` handler already.
+        if let Some(plan) = outcome.plan {
+            self.ingest_plan(plan);
+        }
+
         // Ran the full step budget while the model still wanted tools: pause loudly instead of
         // ending silently mid-task (the #1 "stops responding" bug). The work so far is persisted,
         // so the user can resume by sending `continue`.
@@ -2791,6 +2829,18 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             }
         }
         // ── End auto-review gate ───────────────────────────────────────────────────────────────
+
+        // ── Plan approval (planning mode → interactive approve → auto-build) ──────────────────
+        // If the model proposed a plan this turn (present_plan), ask the user to approve it now —
+        // the model loop has ended, so blocking on the presenter is safe (no stream is being read,
+        // and bridge turns are fully drained). Approval switches to Auto-edit and recursively runs
+        // the build turn through the full machinery (autofix, self-review, gate); typed feedback
+        // runs a fresh planning turn; Cancel falls through and ends the turn in planning mode.
+        if let Some(plan) = self.pending_plan.take() {
+            if let Some(followup) = self.resolve_plan_approval(&plan) {
+                return Box::pin(self.run_turn_with(&followup, &[], Some(TaskTier::Complex))).await;
+            }
+        }
 
         let (session_in, session_out) = self.store.session_tokens(&self.id)?;
         self.presenter.emit(PresenterEvent::Cost {
@@ -3017,6 +3067,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         if name == subagent::SPAWN_AGENTS_TOOL
             || name == ASK_USER_TOOL
             || name == UPDATE_TASKS_TOOL
+            || name == PRESENT_PLAN_TOOL
             || name == USE_SKILL_TOOL
         {
             return false;
@@ -3141,6 +3192,10 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         // Task tracking is core-owned (it mutates session state + persists + emits to the TUI).
         if call.name == UPDATE_TASKS_TOOL {
             return self.update_tasks(msg_id, call);
+        }
+        // Plan presentation is core-owned (seeds tasks, persists the plan, drives the approval flow).
+        if call.name == PRESENT_PLAN_TOOL {
+            return self.present_plan(msg_id, call);
         }
         // Skill loading is core-owned (it reads the attached catalog). Returns the skill's
         // methodology as the tool result so the model follows it; unknown name → a helpful error.
@@ -3670,9 +3725,110 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         Ok(result)
     }
 
+    /// Persist a plan, seed the task list from its steps, surface the tasks, and stash the plan for
+    /// the turn-end approval flow. Shared by the in-process `present_plan` handler and the CLI-bridge
+    /// ingestion in [`run_turn_with`]. Does NOT emit the plan card — the caller does (path-specific).
+    fn ingest_plan(&mut self, plan: forge_types::PlanProposal) {
+        persist_plan(&self.id, &plan);
+        self.tasks = plan
+            .steps
+            .iter()
+            .map(|s| forge_types::TodoItem {
+                title: s.title.trim().to_string(),
+                status: forge_types::TodoStatus::Pending,
+            })
+            .collect();
+        let _ = self.store.set_tasks(&self.id, &self.tasks);
+        self.presenter
+            .emit(PresenterEvent::Tasks(self.tasks.clone()));
+        self.pending_plan = Some(plan);
+    }
+
+    /// Ask the user to approve a proposed plan (called at turn end, after the model loop, so it's
+    /// safe to block on the presenter). Returns the follow-up prompt to run next — the build prompt
+    /// (after switching to Auto-edit) or a revision prompt — or `None` to cancel (stay in planning).
+    fn resolve_plan_approval(&mut self, plan: &forge_types::PlanProposal) -> Option<String> {
+        let n = plan.steps.len();
+        let q = format!(
+            "Build this plan? — \"{}\" ({n} step{}). Choose Build it / Cancel, or type changes to revise.",
+            plan.title.trim(),
+            if n == 1 { "" } else { "s" }
+        );
+        let opts = [
+            forge_tui::QChoice {
+                label: "Build it".into(),
+                description: "Switch to Auto-edit and implement the plan now".into(),
+            },
+            forge_tui::QChoice {
+                label: "Cancel".into(),
+                description: "Discard the plan; stay in planning mode".into(),
+            },
+        ];
+        let ans = self.presenter.ask(&q, &opts, true);
+        let a = ans.trim();
+        if a.eq_ignore_ascii_case("Build it")
+            || a.eq_ignore_ascii_case("build")
+            || a.eq_ignore_ascii_case("yes")
+        {
+            let label = self.set_temper(PermissionMode::AcceptEdits).label();
+            self.presenter
+                .emit(PresenterEvent::Temper(label.to_string()));
+            self.presenter.emit(PresenterEvent::Warning(
+                "plan approved — building in Auto-edit".to_string(),
+            ));
+            Some(PLAN_BUILD_PROMPT.to_string())
+        } else if a.is_empty()
+            || a == forge_tui::NO_ANSWER
+            || a.eq_ignore_ascii_case("Cancel")
+            || a.eq_ignore_ascii_case("no")
+        {
+            self.presenter.emit(PresenterEvent::Warning(
+                "plan cancelled — still in planning mode".to_string(),
+            ));
+            None
+        } else {
+            // Free-text feedback → revise. Stay in planning mode so present_plan remains available.
+            Some(format!(
+                "The user did not approve the plan yet. They want these changes before building:\n\n\
+                 {a}\n\nRevise the plan accordingly and call present_plan again with the updated steps."
+            ))
+        }
+    }
+
     /// The current task list (for the composition root / TUI to render on resume).
     pub fn tasks(&self) -> &[forge_types::TodoItem] {
         &self.tasks
+    }
+
+    /// Present a plan for review (the `present_plan` virtual tool, planning mode). Renders the plan
+    /// card, seeds the live task list from its steps, persists it to `.forge/plans/`, and stashes it
+    /// for the turn-end approval flow. Returns a result that tells the model to STOP — the user
+    /// approves it interactively (and on approval is switched to Auto-edit to build).
+    fn present_plan(
+        &mut self,
+        msg_id: &str,
+        call: &forge_types::ToolCall,
+    ) -> Result<String, CoreError> {
+        let args_json = serde_json::to_string(&call.args)?;
+        let plan = parse_plan(&call.args);
+        if plan.steps.is_empty() {
+            let result = "error: present_plan requires a non-empty `steps` array".to_string();
+            self.store
+                .record_tool_call(msg_id, &call.name, &args_json, &result, "allowed", "error")?;
+            return Ok(result);
+        }
+        // Render the card now (in-process path); the bridge path emits this from the sink instead.
+        self.presenter
+            .emit(PresenterEvent::PlanProposed(plan.clone()));
+        // Persist + seed tasks + stash for the turn-end approval flow (shared with the bridge path).
+        self.ingest_plan(plan);
+        let result = "Plan presented to the user for approval. STOP now — do NOT start \
+                      implementing. The user will review the plan and decide; if they approve, \
+                      you'll be switched to Auto-edit and asked to build it."
+            .to_string();
+        self.store
+            .record_tool_call(msg_id, &call.name, &args_json, &result, "allowed", "ok")?;
+        Ok(result)
     }
 
     /// Load a Forge skill's methodology (the `use_skill` virtual tool) and return it as the tool
@@ -3857,6 +4013,129 @@ pub fn update_tasks_spec() -> ToolSpec {
                 }
             },
             "required": ["tasks"]
+        }),
+    }
+}
+
+/// The plan-presentation virtual tool name (planning mode).
+pub const PRESENT_PLAN_TOOL: &str = "present_plan";
+
+/// The prompt that drives the build turn after a plan is approved (mirrors `/execute`).
+const PLAN_BUILD_PROMPT: &str = "Implement the plan you just proposed, step by step — make the \
+    edits and run the commands needed to carry it out. Update each task's status (in_progress → \
+    done) with update_tasks as you go. If something forces a deviation from the plan, say so and \
+    keep going.";
+
+/// Parse `present_plan` arguments into a [`PlanProposal`] (tolerant of missing/loose fields).
+/// Shared by the in-process intercept and the CLI-bridge `mcp-serve` handler.
+pub fn parse_plan(args: &serde_json::Value) -> forge_types::PlanProposal {
+    use forge_types::{PlanProposal, PlanStep};
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Plan")
+        .to_string();
+    let steps = args
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let title = s.get("title").and_then(|v| v.as_str())?.trim();
+                    (!title.is_empty()).then(|| PlanStep {
+                        title: title.to_string(),
+                        detail: s
+                            .get("detail")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let notes = args
+        .get("notes")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    PlanProposal {
+        title,
+        steps,
+        notes,
+    }
+}
+
+/// Persist a proposed plan to `.forge/plans/<session>.md` (human-readable markdown) so it survives
+/// the session and the user can open/track it. Called on every `present_plan` — creation, draft,
+/// revision. Best-effort: a write failure never breaks the turn.
+pub fn persist_plan(session_id: &str, plan: &forge_types::PlanProposal) {
+    let dir = std::path::Path::new(".forge").join("plans");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let mut md = format!("# {}\n\n", plan.title.trim());
+    for (i, s) in plan.steps.iter().enumerate() {
+        md.push_str(&format!("{}. {}\n", i + 1, s.title.trim()));
+        let d = s.detail.trim();
+        if !d.is_empty() {
+            md.push_str(&format!("   - {d}\n"));
+        }
+    }
+    if let Some(n) = plan
+        .notes
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        md.push_str(&format!("\n> Notes: {n}\n"));
+    }
+    let safe: String = session_id
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-')
+        .take(48)
+        .collect();
+    let name = if safe.is_empty() {
+        "plan".to_string()
+    } else {
+        safe
+    };
+    let _ = std::fs::write(dir.join(format!("{name}.md")), md);
+}
+
+/// The `ToolSpec` advertised for [`PRESENT_PLAN_TOOL`] — offered only in planning mode.
+pub fn present_plan_spec() -> ToolSpec {
+    ToolSpec {
+        name: PRESENT_PLAN_TOOL.to_string(),
+        description: "Present your proposed plan for the user to approve (planning mode). Call this \
+            ONCE you have investigated enough — pass a short `title`, an ordered `steps` array (each \
+            step a `title` + optional one-line `detail`), and optional `notes` (risks/assumptions). \
+            It renders an interactive plan card: the user approves to auto-build (you switch to \
+            Auto-edit), types changes to revise, or cancels. Do NOT edit anything before presenting."
+            .to_string(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "short plan title" },
+                "steps": {
+                    "type": "array",
+                    "description": "the ordered plan steps",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string", "description": "what this step does" },
+                            "detail": { "type": "string", "description": "optional one-line elaboration" }
+                        },
+                        "required": ["title"]
+                    }
+                },
+                "notes": { "type": "string", "description": "optional risks/assumptions" }
+            },
+            "required": ["title", "steps"]
         }),
     }
 }
@@ -4556,6 +4835,85 @@ mod tests {
             .iter()
             .any(|e| matches!(e, PresenterEvent::Tasks(t) if t.len() == 2));
         assert!(emitted, "a Tasks event was emitted for the TUI");
+    }
+
+    #[test]
+    fn parse_plan_reads_fields_and_filters_empty_steps() {
+        let v = serde_json::json!({
+            "title": "  Refactor main.rs  ",
+            "steps": [
+                {"title": "Extract args", "detail": "  clap defs  "},
+                {"title": "   "},
+                {"title": "Split dispatch"}
+            ],
+            "notes": "  keep the API stable  "
+        });
+        let p = parse_plan(&v);
+        assert_eq!(p.title, "Refactor main.rs");
+        assert_eq!(p.steps.len(), 2, "the blank-title step is dropped");
+        assert_eq!(p.steps[0].title, "Extract args");
+        assert_eq!(p.steps[0].detail, "clap defs");
+        assert_eq!(p.steps[1].detail, "");
+        assert_eq!(p.notes.as_deref(), Some("keep the API stable"));
+
+        let empty = parse_plan(&serde_json::json!({}));
+        assert_eq!(empty.title, "Plan");
+        assert!(empty.steps.is_empty());
+        assert!(empty.notes.is_none());
+    }
+
+    fn one_step_plan() -> forge_types::PlanProposal {
+        forge_types::PlanProposal {
+            title: "T".into(),
+            steps: vec![forge_types::PlanStep {
+                title: "a".into(),
+                detail: String::new(),
+            }],
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn plan_approval_build_switches_to_auto_edit() {
+        let mut s = scripted_session("Build it", Arc::new(Mutex::new(0)));
+        s.set_temper(PermissionMode::Plan);
+        let next = s.resolve_plan_approval(&one_step_plan());
+        assert_eq!(next.as_deref(), Some(PLAN_BUILD_PROMPT));
+        assert_eq!(
+            s.mode,
+            PermissionMode::AcceptEdits,
+            "build flips to Auto-edit"
+        );
+    }
+
+    #[test]
+    fn plan_approval_cancel_stays_in_planning() {
+        let mut s = scripted_session("Cancel", Arc::new(Mutex::new(0)));
+        s.set_temper(PermissionMode::Plan);
+        assert!(s.resolve_plan_approval(&one_step_plan()).is_none());
+        assert_eq!(s.mode, PermissionMode::Plan, "cancel keeps planning mode");
+    }
+
+    #[test]
+    fn plan_approval_free_text_revises_without_switching() {
+        let mut s = scripted_session("make it shorter", Arc::new(Mutex::new(0)));
+        s.set_temper(PermissionMode::Plan);
+        let next = s
+            .resolve_plan_approval(&one_step_plan())
+            .expect("revision prompt");
+        assert!(
+            next.contains("make it shorter"),
+            "carries the user's feedback"
+        );
+        assert!(
+            next.contains("present_plan"),
+            "asks the model to re-present"
+        );
+        assert_eq!(
+            s.mode,
+            PermissionMode::Plan,
+            "revise does not switch to Auto-edit"
+        );
     }
 
     /// Requests a `list_dir` tool call once, then answers `done` after the tool result.

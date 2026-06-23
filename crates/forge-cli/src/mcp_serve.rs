@@ -126,6 +126,12 @@ impl ServerHandler for ForgeMcp {
         let ts = forge_core::update_tasks_spec();
         let ts_schema: JsonObject = ts.schema.as_object().cloned().unwrap_or_default();
         tools.push(Tool::new(ts.name, ts.description, Arc::new(ts_schema)));
+        // Advertise plan presentation so a bridge model can propose a plan in planning mode. The
+        // bridge can't see the parent's runtime temper, so it's advertised unconditionally; the
+        // parent honors the plan only when it is actually in Plan mode (gated in run_model_loop).
+        let ps = forge_core::present_plan_spec();
+        let ps_schema: JsonObject = ps.schema.as_object().cloned().unwrap_or_default();
+        tools.push(Tool::new(ps.name, ps.description, Arc::new(ps_schema)));
         // Advertise skill loading (with the available-skills list) so a bridge model finds + uses
         // Forge's own skills instead of its native ones.
         if !self.skills.skill_listing().is_empty() {
@@ -177,6 +183,20 @@ impl ServerHandler for ForgeMcp {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "task list updated: {} task(s) — {done} done",
                 tasks.len()
+            ))]));
+        }
+
+        // Plan presentation — report the plan to the out-of-band sink so the parent renders the
+        // card and runs the approval flow (which persists + seeds tasks). The parent ignores it
+        // unless it's in planning mode, so building/normal turns are unaffected.
+        if name == forge_core::PRESENT_PLAN_TOOL {
+            let plan = forge_core::parse_plan(&args);
+            let n = plan.steps.len();
+            report_to_sink(serde_json::json!({ "k": "plan", "plan": plan }));
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Plan ({n} step(s)) presented to the user for approval. STOP now — do NOT start \
+                 implementing. If the user approves, you'll be switched to Auto-edit and asked to \
+                 build it."
             ))]));
         }
 

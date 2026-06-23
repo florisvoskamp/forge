@@ -221,6 +221,10 @@ pub enum StreamEvent {
     /// `mcp-serve` process). Tailed from the out-of-band sink so the TUI's sticky task panel
     /// updates LIVE during the turn, not only on completion (CLI bridge only).
     Tasks(Vec<forge_types::TodoItem>),
+    /// The bridge model proposed a plan (`present_plan` in the `mcp-serve` process). Tailed from
+    /// the out-of-band sink so the parent renders the plan card and runs the approval flow at turn
+    /// end, exactly like the in-process path (CLI bridge only).
+    Plan(forge_types::PlanProposal),
 }
 
 /// A sink for [`StreamEvent`]s as they arrive (text, reasoning, tool activity).
