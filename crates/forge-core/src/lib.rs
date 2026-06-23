@@ -298,6 +298,21 @@ fn tool_batch_signature(calls: &[forge_types::ToolCall]) -> u64 {
     h.finish()
 }
 
+/// The live context-fill token count to report on the gauge for `model` after a call.
+///
+/// For a direct API model the provider's reported `input_tokens` IS the request size, the truest
+/// fill measure. But a subscription CLI bridge (claude-cli/codex-cli) runs its own internal agent
+/// loop and reports CUMULATIVE usage across every internal step — not the size of the request we
+/// sent — so over a long turn it balloons past the window (e.g. 900k against a 272k context). There
+/// the conservative transcript estimate, which reflects the context we actually manage, is correct.
+fn context_fill_tokens(model: &str, transcript_est: u64, reported_input: u64) -> u64 {
+    if forge_mesh::catalog::is_subscription(model) {
+        transcript_est
+    } else {
+        reported_input
+    }
+}
+
 /// Real token cost of one message: its content (BPE-counted, cached) + the chat framing overhead +
 /// any tool-call name/arguments it carries (which the model also pays for).
 fn message_tokens(m: &Message) -> usize {
@@ -2226,8 +2241,15 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             // Compute the real cost from token counts and the model's price (FR-5, A-7), pricing
             // cache-read tokens at the discounted rate so it tracks the provider's actual bill.
             resp.usage.cost_usd = self.pricing.cost_for_usage(&active_model, &resp.usage);
-            // The last call's input size is the live context fill (tui-token-counter.md).
-            context_tokens = resp.usage.input_tokens;
+            // The last call's input size is the live context fill (tui-token-counter.md) — except a
+            // subscription CLI bridge reports cumulative internal usage, so [`context_fill_tokens`]
+            // substitutes the transcript estimate there (else the gauge reads a bogus 337% and trips
+            // the phantom "auto-compact imminent" hint).
+            context_tokens = context_fill_tokens(
+                &active_model,
+                self.estimated_transcript_tokens(),
+                resp.usage.input_tokens,
+            );
 
             self.transcript.push(Message::assistant_tool_calls(
                 &resp.content,
@@ -2638,8 +2660,11 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         // process), persisting to the store but not touching our in-memory list. Reload and
         // surface it so bridge-driven task updates show in the TUI (the in-process path already
         // emitted live during the turn, so this is a no-op there).
+        // Guard: only adopt the store's copy when it has tasks. A bridge that persisted under a
+        // different db path/session leaves `persisted` empty — without this, an empty reload would
+        // wipe the list we already surfaced live and hide the panel at turn end.
         if let Ok(persisted) = self.store.tasks(&self.id) {
-            if persisted != self.tasks {
+            if !persisted.is_empty() && persisted != self.tasks {
                 self.tasks = persisted;
                 self.presenter
                     .emit(PresenterEvent::Tasks(self.tasks.clone()));
@@ -6704,6 +6729,26 @@ mod tests {
         assert_eq!(tool_batch_signature(&a), tool_batch_signature(&a2));
         assert_ne!(tool_batch_signature(&a), tool_batch_signature(&b));
         assert_ne!(tool_batch_signature(&a), tool_batch_signature(&c));
+    }
+
+    #[test]
+    fn context_fill_uses_estimate_only_for_subscription_bridges() {
+        // Direct API model: trust the provider's real input-token count.
+        assert_eq!(
+            context_fill_tokens("anthropic::claude-sonnet-4-5", 1_000, 50_000),
+            50_000
+        );
+        assert_eq!(context_fill_tokens("openai::gpt-4o", 1_000, 50_000), 50_000);
+        // Subscription CLI bridge: its reported usage is cumulative (here a bogus 900k), so the
+        // gauge must use the transcript estimate instead — this is the 337%-gauge fix.
+        assert_eq!(
+            context_fill_tokens("claude-cli::opus", 90_000, 900_000),
+            90_000
+        );
+        assert_eq!(
+            context_fill_tokens("codex-cli::gpt-5.5", 90_000, 900_000),
+            90_000
+        );
     }
 
     #[test]

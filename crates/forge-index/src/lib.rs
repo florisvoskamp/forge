@@ -137,6 +137,14 @@ impl Lattice {
                     if is_skippable_dir(&name) {
                         continue;
                     }
+                    // Skip nested git repositories — vendored deps, submodules, or scratch clones
+                    // (e.g. SWE-bench workdirs) checked out under the project root. Indexing them
+                    // swamps `impact`/`query` with unrelated hits, like a generic `Command` matching
+                    // across a cloned django/ tree. The root itself is never checked here (only its
+                    // descendants), so the project's own repo is always indexed.
+                    if path.join(".git").exists() {
+                        continue;
+                    }
                     stack.push(path);
                 } else if lang_for_path(&name).is_some() {
                     self.index_file(&path, &mut stats)?;
@@ -823,6 +831,31 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].rel_path, "src/lib.rs");
         assert!(lat.query("should_not_index", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn skips_nested_git_repositories() {
+        let t = Tmp::new();
+        t.write("src/lib.rs", "pub fn project_symbol() {}\n");
+        // A vendored / scratch clone checked out under the root (e.g. a SWE-bench workdir): it is a
+        // git repo of its own, so its symbols must not pollute the index.
+        t.write("workdir/django__django/.git/HEAD", "ref: refs/heads/main\n");
+        t.write(
+            "workdir/django__django/cmd.rs",
+            "pub fn vendored_symbol() {}\n",
+        );
+        let lat = lattice(&t.root);
+
+        let stats = lat.update().unwrap();
+        assert_eq!(
+            stats.files_indexed, 1,
+            "only the project's own src/, not the nested clone"
+        );
+        assert_eq!(lat.query("project_symbol", 10).unwrap().len(), 1);
+        assert!(
+            lat.query("vendored_symbol", 10).unwrap().is_empty(),
+            "nested-git-repo symbols must be excluded"
+        );
     }
 
     struct FakeEmbedder;
