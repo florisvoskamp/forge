@@ -284,6 +284,20 @@ fn validate_tool_args(schema: &serde_json::Value, args: &serde_json::Value) -> R
     ))
 }
 
+/// A stable hash of a tool-call batch (each call's name + JSON arguments), used by the agent loop's
+/// doom-loop guard to detect a model repeating the *exact* same call(s) step after step. Identical
+/// args → identical result, so a repeat is a death-spiral (re-reading a file, retrying a failing
+/// edit) worth halting rather than burning steps on.
+fn tool_batch_signature(calls: &[forge_types::ToolCall]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for c in calls {
+        c.name.hash(&mut h);
+        c.args.to_string().hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Real token cost of one message: its content (BPE-counted, cached) + the chat framing overhead +
 /// any tool-call name/arguments it carries (which the model also pays for).
 fn message_tokens(m: &Message) -> usize {
@@ -2029,6 +2043,12 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         let mut final_text = String::new();
         let mut context_tokens: u64 = 0;
         let mut hit_step_cap = true;
+        // Harness reliability guards. `empty_nudges`: bounded retries when the model returns nothing
+        // (narrate-then-stall / transient empty) before giving up. `last_tool_sig`/`repeat_count`:
+        // doom-loop detection — the same tool batch repeated DOOM_LOOP_THRESHOLD× halts the turn.
+        let mut empty_nudges = 0usize;
+        let mut last_tool_sig: Option<u64> = None;
+        let mut repeat_count = 0usize;
 
         for step in 0..max_steps {
             // Stream the reply, with transparent failover for this step's completion.
@@ -2248,16 +2268,55 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             self.store.record_usage(&self.id, &msg_id, &resp.usage)?;
 
             if !resp.wants_tools() {
-                final_text = resp.content;
-                hit_step_cap = false;
-                // A response with neither text nor a tool call is a silent dead-end (a model
-                // glitch / refusal parsed as empty). Surface it so the turn never just "stops".
-                if final_text.trim().is_empty() {
+                // A response with neither text nor a tool call is a silent dead-end (model glitch,
+                // narrate-then-stall, or a transient empty completion). Rather than just stopping,
+                // nudge it to continue a bounded number of times — this recovers the common case
+                // where the model would have made progress on a retry.
+                if resp.content.trim().is_empty() {
+                    const MAX_EMPTY_NUDGES: usize = 2;
+                    if empty_nudges < MAX_EMPTY_NUDGES {
+                        empty_nudges += 1;
+                        self.presenter.emit(PresenterEvent::Warning(format!(
+                            "model returned an empty response — nudging it to continue ({empty_nudges}/{MAX_EMPTY_NUDGES})"
+                        )));
+                        let nudge = "Your last response was empty. Continue with the task: call a \
+                                     tool to make progress, or state your final answer. Do not reply \
+                                     with an empty message.";
+                        let nseq = self.next_seq();
+                        let _ = self
+                            .store
+                            .add_message(&self.id, nseq, Role::System, nudge, None);
+                        self.transcript.push(Message::system(nudge));
+                        continue;
+                    }
                     self.presenter.emit(PresenterEvent::Warning(
                         "model returned an empty response (no text, no tool call) — stopping the turn"
                             .to_string(),
                     ));
                 }
+                final_text = resp.content;
+                hit_step_cap = false;
+                break;
+            }
+
+            // Doom-loop guard: if the model emits the exact same tool call(s) several steps running,
+            // it's stuck (re-reading the same file, retrying an identical failing edit). Identical
+            // args yield identical results, so halt with a clear message instead of burning the
+            // remaining step budget + tokens.
+            const DOOM_LOOP_THRESHOLD: usize = 3;
+            let sig = tool_batch_signature(&resp.tool_calls);
+            if last_tool_sig == Some(sig) {
+                repeat_count += 1;
+            } else {
+                repeat_count = 0;
+                last_tool_sig = Some(sig);
+            }
+            if repeat_count + 1 >= DOOM_LOOP_THRESHOLD {
+                self.presenter.emit(PresenterEvent::Warning(format!(
+                    "the model repeated the same tool call {DOOM_LOOP_THRESHOLD}× — stopping to \
+                     avoid a loop"
+                )));
+                hit_step_cap = false;
                 break;
             }
 
@@ -6628,6 +6687,24 @@ mod tests {
     }
 
     // ── Auto-review gate tests ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_batch_signature_distinguishes_calls() {
+        use forge_types::ToolCall;
+        let mk = |name: &str, args: serde_json::Value| ToolCall {
+            id: "x".into(),
+            name: name.into(),
+            args,
+        };
+        let a = vec![mk("read_file", serde_json::json!({"path": "a.rs"}))];
+        let a2 = vec![mk("read_file", serde_json::json!({"path": "a.rs"}))];
+        let b = vec![mk("read_file", serde_json::json!({"path": "b.rs"}))];
+        let c = vec![mk("edit_file", serde_json::json!({"path": "a.rs"}))];
+        // Identical batches hash equal (drives doom-loop detection); different args or tool differ.
+        assert_eq!(tool_batch_signature(&a), tool_batch_signature(&a2));
+        assert_ne!(tool_batch_signature(&a), tool_batch_signature(&b));
+        assert_ne!(tool_batch_signature(&a), tool_batch_signature(&c));
+    }
 
     #[test]
     fn severity_meets_high_threshold() {
