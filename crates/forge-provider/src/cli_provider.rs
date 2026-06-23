@@ -257,11 +257,22 @@ fn bare_model(model: &str) -> &str {
 /// in tests — the boundary guarantee is that Forge passes only the prompt and non-secret flags,
 /// never a credential or auth token (the CLI sources those itself).
 /// The `--mcp-config` JSON wiring claude to spawn `<forge_exe> mcp-serve` as a stdio MCP
-/// server (Forge's tools under Forge's permission gate). No secrets — just the binary path.
-fn forge_mcp_config(forge_exe: &str) -> String {
+/// server (Forge's tools under Forge's permission gate). No secrets — just the binary path and
+/// the per-turn out-of-band env (sink + checkpoint context) the served tools need to report
+/// tasks/plans and snapshot edits back to the parent. A host that hands its MCP servers a curated
+/// env (codex strips everything but PATH/HOME/…) would otherwise leave `mcp-serve` blind, so the
+/// values are passed explicitly rather than relied upon to inherit.
+fn forge_mcp_config(forge_exe: &str, mcp_env: &[(String, String)]) -> String {
+    let env_obj = serde_json::Value::Object(
+        mcp_env
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect(),
+    );
     format!(
-        r#"{{"mcpServers":{{"forge":{{"command":{exe},"args":["mcp-serve"]}}}}}}"#,
-        exe = serde_json::Value::String(forge_exe.to_string())
+        r#"{{"mcpServers":{{"forge":{{"command":{exe},"args":["mcp-serve"],"env":{env}}}}}}}"#,
+        exe = serde_json::Value::String(forge_exe.to_string()),
+        env = env_obj,
     )
 }
 
@@ -271,7 +282,13 @@ fn forge_mcp_config(forge_exe: &str) -> String {
 /// OS `ARG_MAX`, which surfaced as `failed to start codex: Argument list too long (os error 7)`.
 /// Both `claude --print` and `codex exec` read their instructions from stdin when no prompt
 /// positional is given.
-fn build_args(kind: CliKind, bare_model: &str, harness: bool, forge_exe: &str) -> Vec<String> {
+fn build_args(
+    kind: CliKind,
+    bare_model: &str,
+    harness: bool,
+    forge_exe: &str,
+    mcp_env: &[(String, String)],
+) -> Vec<String> {
     let mut args: Vec<String> = match (kind, harness) {
         // Phase 2 harness: Forge serves its tools via `forge mcp-serve`. `--allowedTools
         // "mcp__forge"` permits ONLY Forge's tools, so claude can't use its built-ins (they'd
@@ -289,7 +306,7 @@ fn build_args(kind: CliKind, bare_model: &str, harness: bool, forge_exe: &str) -
             "--tools".into(),
             "".into(),
             "--mcp-config".into(),
-            forge_mcp_config(forge_exe),
+            forge_mcp_config(forge_exe, mcp_env),
             "--strict-mcp-config".into(),
             "--allowedTools".into(),
             "mcp__forge".into(),
@@ -355,6 +372,21 @@ fn build_args(kind: CliKind, bare_model: &str, harness: bool, forge_exe: &str) -
             "read-only".into(),
         ],
     };
+    // codex hands its stdio MCP servers a CURATED env (only PATH/HOME/LANG/… survive — verified
+    // live: a custom `FORGE_*` set on the codex process never reaches `forge mcp-serve`). So the
+    // sink + checkpoint context the served tools need is injected explicitly as TOML overrides;
+    // without it `update_tasks`/`present_plan` write to a dead sink and never reach the parent TUI,
+    // and bridge edits aren't snapshotted for `/undo`. (claude carries the same env in its
+    // `--mcp-config` JSON above.)
+    if matches!((kind, harness), (CliKind::Codex, true)) {
+        for (k, v) in mcp_env {
+            args.push("-c".into());
+            args.push(format!(
+                "mcp_servers.forge.env.{k}={}",
+                serde_json::Value::String(v.clone())
+            ));
+        }
+    }
     if !bare_model.is_empty() {
         args.push("--model".into());
         args.push(bare_model.into());
@@ -960,8 +992,6 @@ impl Provider for CliProvider {
             .ok()
             .and_then(|p| p.to_str().map(str::to_string))
             .unwrap_or_else(|| "forge".to_string());
-        let args = build_args(self.kind, bare_model(model), self.harness, &forge_exe);
-
         // A bridge turn (interactive OR harness) runs Forge's own tools inside `forge mcp-serve`, a
         // separate process. Give it an out-of-band JSONL sink so that process can report `update_tasks`
         // and any spawned-subagent lifecycle back to us — without it those events have nowhere to go
@@ -976,6 +1006,40 @@ impl Provider for CliProvider {
             std::fs::File::create(&p).ok().map(|_| p)
         };
 
+        // The env `forge mcp-serve` needs to round-trip a bridge turn's activity (sink) and snapshot
+        // the model's edits into the parent turn (checkpoint context). These are set in *this*
+        // process by the parent's `run_turn`, but a host that curates its MCP servers' env (codex)
+        // strips them, so they're forwarded explicitly into the MCP config (see `build_args`).
+        let mcp_env: Vec<(String, String)> = {
+            let mut env = Vec::new();
+            if let Some(p) = &sink_path {
+                if let Some(s) = p.to_str() {
+                    env.push((SUBAGENT_SINK_ENV.to_string(), s.to_string()));
+                }
+            }
+            // Names mirror forge_core::snapshot::ENV_* and the CLI's FORGE_SUBAGENT_DEPTH (stable
+            // cross-process contract strings; forge-provider can't depend on those crates).
+            for key in [
+                "FORGE_CHECKPOINT_SESSION",
+                "FORGE_CHECKPOINT_SEQ",
+                "FORGE_CHECKPOINT_ROOT",
+                "FORGE_SUBAGENT_DEPTH",
+            ] {
+                if let Ok(val) = std::env::var(key) {
+                    env.push((key.to_string(), val));
+                }
+            }
+            env
+        };
+
+        let args = build_args(
+            self.kind,
+            bare_model(model),
+            self.harness,
+            &forge_exe,
+            &mcp_env,
+        );
+
         let mut cmd = bridge_command(&self.binary);
         cmd.args(&args)
             // The prompt is written to stdin (not argv) to avoid `ARG_MAX` on big transcripts.
@@ -983,6 +1047,9 @@ impl Provider for CliProvider {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // claude inherits this process env for its MCP child, so the sink env also works via the
+        // process; codex does not, hence the explicit `mcp_env` injection above. Setting it here too
+        // is harmless and keeps the claude path robust if the JSON `env` is ever dropped.
         if let Some(p) = &sink_path {
             cmd.env(SUBAGENT_SINK_ENV, p);
         }
@@ -1435,7 +1502,7 @@ mod tests {
 
     #[test]
     fn claude_harness_args_route_tools_through_forge_mcp() {
-        let args = build_args(CliKind::ClaudeCode, "sonnet", true, "/bin/forge");
+        let args = build_args(CliKind::ClaudeCode, "sonnet", true, "/bin/forge", &[]);
         // Forge owns the tools: strict MCP + only mcp__forge tools.
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(args.contains(&"mcp__forge".to_string()));
@@ -1459,7 +1526,7 @@ mod tests {
 
     #[test]
     fn claude_text_mode_runs_a_self_agent_with_accept_edits() {
-        let args = build_args(CliKind::ClaudeCode, "sonnet", false, "/bin/forge");
+        let args = build_args(CliKind::ClaudeCode, "sonnet", false, "/bin/forge", &[]);
         assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
         let i = args.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(args[i + 1], "acceptEdits");
@@ -1468,7 +1535,7 @@ mod tests {
 
     #[test]
     fn codex_harness_args_wire_forge_mcp_and_approve_tools() {
-        let args = build_args(CliKind::Codex, "", true, "/bin/forge");
+        let args = build_args(CliKind::Codex, "", true, "/bin/forge", &[]);
         assert_eq!(args[0], "exec");
         assert!(args.contains(&"--json".to_string()));
         // Sandbox stays read-only: codex's OWN shell can't write, so every write/side-effect
@@ -1497,6 +1564,34 @@ mod tests {
     }
 
     #[test]
+    fn harness_forwards_sink_and_checkpoint_env_to_the_mcp_server() {
+        // The out-of-band env `forge mcp-serve` needs (sink + checkpoint context). codex curates
+        // its MCP server env to PATH/HOME/… and drops everything else (verified live), so these
+        // must be injected explicitly — otherwise update_tasks/present_plan write to a dead sink
+        // and never reach the parent TUI, and bridge edits aren't snapshotted for /undo.
+        let env = vec![
+            (
+                "FORGE_SUBAGENT_SINK".to_string(),
+                "/tmp/s.jsonl".to_string(),
+            ),
+            ("FORGE_CHECKPOINT_SESSION".to_string(), "sess-1".to_string()),
+        ];
+        // codex: nested TOML overrides.
+        let codex = build_args(CliKind::Codex, "", true, "/bin/forge", &env).join(" ");
+        assert!(codex.contains("mcp_servers.forge.env.FORGE_SUBAGENT_SINK=\"/tmp/s.jsonl\""));
+        assert!(codex.contains("mcp_servers.forge.env.FORGE_CHECKPOINT_SESSION=\"sess-1\""));
+        // claude: carried in the --mcp-config JSON `env` object.
+        let claude = build_args(CliKind::ClaudeCode, "sonnet", true, "/bin/forge", &env);
+        let mc = claude.iter().position(|a| a == "--mcp-config").unwrap();
+        let cfg = &claude[mc + 1];
+        assert!(cfg.contains("\"FORGE_SUBAGENT_SINK\":\"/tmp/s.jsonl\""));
+        assert!(cfg.contains("\"FORGE_CHECKPOINT_SESSION\":\"sess-1\""));
+        // Text-mode (no Forge MCP server) ignores the env — no overrides leak in.
+        let text = build_args(CliKind::Codex, "", false, "/bin/forge", &env).join(" ");
+        assert!(!text.contains("mcp_servers.forge.env"));
+    }
+
+    #[test]
     fn harness_preamble_nudges_to_forge_tools_only_in_harness_mode() {
         let out = apply_harness_preamble(true, "User: search the web".into());
         assert!(out.contains("mcp__forge__web_search"));
@@ -1514,7 +1609,7 @@ mod tests {
 
     #[test]
     fn codex_text_mode_is_a_plain_read_only_agent() {
-        let args = build_args(CliKind::Codex, "", false, "/bin/forge");
+        let args = build_args(CliKind::Codex, "", false, "/bin/forge", &[]);
         assert_eq!(args[0], "exec");
         assert!(args.contains(&"--json".to_string()));
         assert!(args.contains(&"read-only".to_string()));

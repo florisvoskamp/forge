@@ -138,6 +138,9 @@ impl Presenter for ChannelPresenter {
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     fullscreen: bool,
+    /// Whether mouse capture is on (full-screen wheel scroll). Off by default so the terminal's
+    /// native click-drag text selection keeps working. Tracked so teardown matches setup.
+    mouse_capture: bool,
 }
 
 /// Set while a full-screen (alternate-screen) TUI is active, so the panic hook knows to leave the
@@ -165,17 +168,21 @@ pub fn install_panic_restore() {
 }
 
 impl Tui {
-    pub fn new(fullscreen: bool) -> io::Result<Self> {
+    pub fn new(fullscreen: bool, mouse_capture: bool) -> io::Result<Self> {
         // Belt-and-suspenders: if *anything* panics while the terminal is in raw mode, restore
         // it before the panic prints — otherwise a panic would leave the shell wedged (no echo,
         // Ctrl-C inert). `Drop` covers the normal/unwind path; this covers the print itself.
         install_panic_restore();
         enable_raw_mode()?;
         crossterm::execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
+        // Mouse capture only matters in full-screen mode (it routes the wheel to us as scroll
+        // events). It's opt-in because capturing the mouse disables native click-drag selection.
+        let mouse_capture = mouse_capture && fullscreen;
         if fullscreen {
-            // Capture the mouse so the wheel reaches us as scroll events. Without this the terminal
-            // translates the wheel into ↑/↓ keys on the alternate screen (walking prompt history).
-            crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+            crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+            if mouse_capture {
+                crossterm::execute!(io::stdout(), EnableMouseCapture)?;
+            }
             IN_ALT_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let backend = CrosstermBackend::new(io::stdout());
@@ -188,6 +195,7 @@ impl Tui {
         Ok(Self {
             terminal,
             fullscreen,
+            mouse_capture,
         })
     }
 
@@ -323,7 +331,10 @@ impl Tui {
         let out = f();
         enable_raw_mode()?;
         if self.fullscreen {
-            crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+            crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+            if self.mouse_capture {
+                crossterm::execute!(io::stdout(), EnableMouseCapture)?;
+            }
         }
         let backend = CrosstermBackend::new(io::stdout());
         self.terminal = Terminal::with_options(
@@ -351,7 +362,10 @@ impl Drop for Tui {
         let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste, DisableFocusChange);
         if self.fullscreen {
             IN_ALT_SCREEN.store(false, std::sync::atomic::Ordering::Relaxed);
-            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            if self.mouse_capture {
+                let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
+            }
+            let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
         }
         let _ = disable_raw_mode();
         let _ = self.terminal.show_cursor();

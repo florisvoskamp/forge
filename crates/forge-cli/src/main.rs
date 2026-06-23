@@ -4634,7 +4634,13 @@ async fn run_chat_tui(
         });
     }
 
-    let mut tui = Tui::new(fullscreen).context("initializing TUI")?;
+    // Mouse capture (full-screen wheel scroll) is opt-in: it disables native click-drag text
+    // selection, so it stays off unless the user enables `[tui] mouse_capture`.
+    let mouse_capture = forge_config::load()
+        .ok()
+        .map(|c| c.tui.mouse_capture)
+        .unwrap_or(false);
+    let mut tui = Tui::new(fullscreen, mouse_capture).context("initializing TUI")?;
     let mut app = App::default();
     app.fullscreen = fullscreen;
     app.transcript_follow = true;

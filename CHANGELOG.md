@@ -34,6 +34,23 @@ All notable changes to Forge are documented here. The format follows
   templates, and this changelog.
 
 ### Fixed
+- **The plan card and task list now actually appear on the codex bridge.** codex hands its stdio
+  MCP servers a *curated* environment (only `PATH`/`HOME`/`LANG`/… survive — verified live), so the
+  `FORGE_SUBAGENT_SINK` and checkpoint-context env that the parent sets for `forge mcp-serve` never
+  reached it. The served `present_plan`/`update_tasks` wrote to a dead sink, so the parent TUI never
+  got the events — the model *did* call the tools (visible in the live stream), nothing rendered.
+  Forge now injects that env explicitly into the MCP config (`-c mcp_servers.forge.env.*` for codex,
+  the `env` object in claude's `--mcp-config`). Same gap silently broke `/undo` snapshots of
+  codex-made edits (the checkpoint env was stripped too); both are fixed. Verified end-to-end: a
+  live codex turn's `update_tasks` + `present_plan` now round-trip to the parent sink.
+- Full-screen chat is no longer laggy on long conversations. The transcript was re-wrapped
+  character-by-character in full every frame (~60×/sec while streaming), which is O(transcript) and
+  showed up as input/scroll lag once the log grew. The wrap is now memoized (re-wrapped only when the
+  log or width changes) and each frame clones just the visible window, not the whole transcript.
+- Text selection works again in full-screen mode. Mouse capture (added for wheel-scroll) disabled
+  the terminal's native click-drag selection. It's now **opt-in** (`[tui] mouse_capture`, default
+  off): by default you select/copy text normally and scroll with PgUp/PgDn/Home/End; enable it to
+  get wheel scroll back (at the cost of needing Shift to select).
 - Plan mode now works on CLI bridges: the harness tool-preamble names `mcp__forge__present_plan`
   (and notes that hosts like codex load MCP tools lazily and won't pre-list them). codex 0.141 only
   surfaces a subset of MCP tools up front, so a bridged model told to "present a plan" couldn't find
