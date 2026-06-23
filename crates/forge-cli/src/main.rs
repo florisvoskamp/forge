@@ -4432,6 +4432,21 @@ async fn claude_quota_is_stale(
         .is_none_or(|a| a > max_age)
 }
 
+/// Copy mouse-selected transcript text to the OS clipboard (best-effort), noting the result in the
+/// TUI. The TUI process stays alive to own the X11/Wayland selection, so the paste survives.
+fn copy_to_clipboard(text: &str, app: &mut forge_tui::App) {
+    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
+        Ok(()) => {
+            let n = text.chars().count();
+            app.note(&format!(
+                "📋 copied {n} char{}",
+                if n == 1 { "" } else { "s" }
+            ));
+        }
+        Err(_) => app.note("⚠ clipboard unavailable"),
+    }
+}
+
 async fn chat(
     mock: bool,
     mode: Option<Mode>,
@@ -4838,6 +4853,30 @@ async fn run_chat_tui(
                     }
                     continue;
                 }
+                forge_tui::InputEvent::Mouse { kind, col, row } => {
+                    // Full-screen mouse: drag to select text (copied on release), click the floating
+                    // jump-to-bottom bar. Only meaningful in the transcript (not the activity viewer).
+                    use forge_tui::MouseKind;
+                    if app.fullscreen && app.viewer.is_none() {
+                        match kind {
+                            MouseKind::Down => {
+                                if app.jump_bar_hit(col, row) {
+                                    app.transcript_to_bottom();
+                                } else {
+                                    app.clear_selection();
+                                    app.selection_begin(col, row);
+                                }
+                            }
+                            MouseKind::Drag => app.selection_extend(col, row),
+                            MouseKind::Up => {
+                                if let Some(text) = app.selection_text() {
+                                    copy_to_clipboard(&text, &mut app);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 forge_tui::InputEvent::Key(k) => k,
             };
 
@@ -5227,6 +5266,14 @@ async fn run_chat_tui(
                     let (_, max_scroll) = app.transcript_metrics(tui.width(), body);
                     app.transcript_scroll_down(body as usize, max_scroll);
                 }
+                dirty = true;
+                continue;
+            }
+
+            // Ctrl+End jumps the transcript to the tail and resumes following (mirrors clicking the
+            // floating jump-to-bottom bar).
+            if app.fullscreen && matches!(key, KeyKind::JumpBottom) {
+                app.transcript_to_bottom();
                 dirty = true;
                 continue;
             }

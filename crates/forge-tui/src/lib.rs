@@ -53,7 +53,7 @@ pub use commands::{
     COMMANDS,
 };
 pub use config_editor::{ConfigAction, ConfigEditor, RowKind, SettingRow};
-pub use driver::{ChannelPresenter, InputEvent, Tui, UiMsg};
+pub use driver::{ChannelPresenter, InputEvent, MouseKind, Tui, UiMsg};
 pub use init_wizard::{BridgeItem, ProviderItem, WizardInput, WizardOutcome};
 /// A styled scrollback line, re-exported so binaries can route out-of-band output to the right
 /// sink (native scrollback inline, or the transcript log full-screen) without depending on ratatui.

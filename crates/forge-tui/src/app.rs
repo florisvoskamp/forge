@@ -23,6 +23,7 @@ const OKGREEN: Color = Color::Rgb(120, 210, 140);
 const ERRRED: Color = Color::Rgb(240, 110, 110);
 const WARNYEL: Color = Color::Rgb(235, 200, 110);
 const TOOLCYAN: Color = Color::Rgb(120, 200, 215);
+const SELECT_BG: Color = Color::Rgb(48, 78, 128); // mouse text-selection highlight
 const STATUSBG: Color = Color::Rgb(28, 28, 34); // status bar background
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -359,6 +360,31 @@ pub struct App {
     /// char-by-char every frame is O(transcript) and was the full-screen input/scroll lag on long
     /// conversations; this caches it so a streaming frame only re-wraps the one in-flight edge line.
     wrap_cache: std::cell::RefCell<WrapCache>,
+    /// Screen geometry of the transcript area (col0, row0, width, height) captured each render, plus
+    /// the scroll offset used — so a mouse event can be mapped to a wrapped-row/col in the log. `Cell`
+    /// because it's written from the (immutable-`&self`) render path.
+    transcript_geom: std::cell::Cell<Option<TranscriptGeom>>,
+    /// Screen geometry of the floating "jump to bottom" bar (row, col0, width) when shown, for
+    /// click hit-testing. `None` when at the bottom (bar hidden).
+    jump_bar_geom: std::cell::Cell<Option<(u16, u16, u16)>>,
+    /// Active text selection in transcript coords: (wrapped_row, col) anchor + cursor. `None` when
+    /// nothing is selected. Highlighted in the transcript and copied to the clipboard on release.
+    selection: Option<(TextPos, TextPos)>,
+}
+
+/// A position in the wrapped transcript: `row` is the wrapped-row index in the cache, `col` the
+/// 0-based column within that row.
+type TextPos = (usize, u16);
+
+/// Transcript area geometry captured at render time, used to map mouse cells → transcript text.
+#[derive(Debug, Clone, Copy)]
+struct TranscriptGeom {
+    col0: u16,
+    row0: u16,
+    width: u16,
+    height: u16,
+    /// The scroll offset (top wrapped-row index) the last frame rendered with.
+    scroll: usize,
 }
 
 /// Cached result of wrapping [`App::main_log`] to a width. Valid while `(width, rev)` are unchanged.
@@ -577,6 +603,8 @@ pub enum KeyKind {
     PageUp,
     /// PageDown — scroll the full-screen transcript down (shell-handled).
     PageDown,
+    /// Ctrl+End — jump the full-screen transcript to the bottom and resume following (shell-handled).
+    JumpBottom,
 }
 
 /// The result of feeding a keystroke to the input line.
@@ -752,7 +780,8 @@ pub fn handle_key(input: &mut String, cursor: &mut usize, key: KeyKind) -> Input
         | KeyKind::CycleTemper
         | KeyKind::ToggleSubagentDetail
         | KeyKind::PageUp
-        | KeyKind::PageDown => InputOutcome::Editing,
+        | KeyKind::PageDown
+        | KeyKind::JumpBottom => InputOutcome::Editing,
     }
 }
 
@@ -1789,6 +1818,84 @@ impl App {
         self.wrap_cache.borrow().rows.len() + self.streaming_edge(width).len()
     }
 
+    /// Map a screen cell to a transcript position (wrapped-row, col) if it's inside the transcript
+    /// area, using the geometry captured at the last render.
+    fn pointer_to_text(&self, col: u16, row: u16) -> Option<TextPos> {
+        let g = self.transcript_geom.get()?;
+        if row < g.row0 || row >= g.row0 + g.height || col < g.col0 || col >= g.col0 + g.width {
+            return None;
+        }
+        Some((g.scroll + (row - g.row0) as usize, col - g.col0))
+    }
+
+    /// True if a screen cell is on the floating jump-to-bottom bar.
+    pub fn jump_bar_hit(&self, col: u16, row: u16) -> bool {
+        match self.jump_bar_geom.get() {
+            Some((br, c0, w)) => row == br && col >= c0 && col < c0 + w,
+            None => false,
+        }
+    }
+
+    /// Begin a text selection at a screen cell (left-button down in the transcript). Returns false
+    /// if the cell isn't inside the transcript area (the caller may treat it as a click elsewhere).
+    pub fn selection_begin(&mut self, col: u16, row: u16) -> bool {
+        match self.pointer_to_text(col, row) {
+            Some(p) => {
+                self.selection = Some((p, p));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Extend the active selection to a screen cell (left-button drag), clamped to the area.
+    pub fn selection_extend(&mut self, col: u16, row: u16) {
+        let Some((anchor, _)) = self.selection else {
+            return;
+        };
+        let Some(g) = self.transcript_geom.get() else {
+            return;
+        };
+        let cr = row.clamp(g.row0, g.row0 + g.height.saturating_sub(1));
+        let cc = col.clamp(g.col0, g.col0 + g.width.saturating_sub(1));
+        if let Some(p) = self.pointer_to_text(cc, cr) {
+            self.selection = Some((anchor, p));
+        }
+    }
+
+    /// The currently selected text (joined across wrapped rows), or `None` if nothing/empty is
+    /// selected. The shell copies this to the clipboard on button release.
+    pub fn selection_text(&self) -> Option<String> {
+        let (a, b) = self.selection?;
+        let ((r0, c0), (r1, c1)) = if a <= b { (a, b) } else { (b, a) };
+        let width = self.transcript_geom.get()?.width;
+        self.ensure_wrapped_main(width);
+        let cache = self.wrap_cache.borrow();
+        let mut out = String::new();
+        for r in r0..=r1 {
+            let Some(line) = cache.rows.get(r) else { break };
+            let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
+            let start = (if r == r0 { c0 } else { 0 } as usize).min(chars.len());
+            let end = (if r == r1 { c1 } else { chars.len() as u16 } as usize).min(chars.len());
+            if r > r0 {
+                out.push('\n');
+            }
+            out.extend(&chars[start..end.max(start)]);
+        }
+        let trimmed = out.trim_end_matches('\n').to_string();
+        (!trimmed.trim().is_empty()).then_some(trimmed)
+    }
+
+    /// Clear any active selection (e.g. a fresh click or a new turn).
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Whether a selection is currently held (for the shell to decide click vs select).
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
     /// Append flushed lines to the bounded main-chat log used by the activity viewer.
     fn fold_main_log(&mut self, lines: &[TextLine<'static>]) {
         if lines.is_empty() {
@@ -2486,7 +2593,55 @@ fn render_transcript_area(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(edge[i - cache.rows.len()].clone());
         }
     }
+    drop(cache);
     frame.render_widget(Paragraph::new(lines), area);
+
+    // Record geometry so mouse events can map a cell → a wrapped-row/col in the log.
+    app.transcript_geom.set(Some(TranscriptGeom {
+        col0: area.x,
+        row0: area.y,
+        width: area.width,
+        height: area.height,
+        scroll,
+    }));
+
+    // Paint the selection highlight directly onto the rendered cells (preserves fg colors).
+    if let Some((a, b)) = app.selection {
+        let ((r0, c0), (r1, c1)) = if a <= b { (a, b) } else { (b, a) };
+        let buf = frame.buffer_mut();
+        for r in r0..=r1 {
+            if r < scroll || r >= scroll + body_h {
+                continue;
+            }
+            let y = area.y + (r - scroll) as u16;
+            let start = if r == r0 { c0 } else { 0 };
+            let end = if r == r1 { c1 } else { area.width };
+            for c in start..end.min(area.width) {
+                if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(area.x + c, y)) {
+                    cell.set_bg(SELECT_BG);
+                }
+            }
+        }
+    }
+
+    // Floating "jump to bottom" bar — only while scrolled up off the tail.
+    if scroll < max_scroll && area.height > 0 {
+        let label = " ↓ Jump to bottom · Ctrl+End ";
+        let w = (label.chars().count() as u16).min(area.width);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + area.height - 1;
+        let bar = Paragraph::new(TextLine::from(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Rgb(20, 22, 28))
+                .bg(ORANGE)
+                .bold(),
+        )));
+        frame.render_widget(bar, Rect::new(x, y, w, 1));
+        app.jump_bar_geom.set(Some((y, x, w)));
+    } else {
+        app.jump_bar_geom.set(None);
+    }
 }
 
 fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
@@ -4813,6 +4968,56 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(last.contains("NEWEST"), "cap append reflected: {last:?}");
+    }
+
+    #[test]
+    fn mouse_selection_extracts_text_within_and_across_wrapped_rows() {
+        let mut app = App {
+            fullscreen: true,
+            ..Default::default()
+        };
+        app.push_scrollback(vec![TextLine::from("alpha"), TextLine::from("bravo")]);
+        app.ensure_wrapped_main(80);
+        app.transcript_geom.set(Some(TranscriptGeom {
+            col0: 0,
+            row0: 0,
+            width: 80,
+            height: 10,
+            scroll: 0,
+        }));
+        // A cell outside the area is not a selection start.
+        assert!(
+            !app.selection_begin(0, 50),
+            "row below the area → no selection"
+        );
+
+        // Single-row: select all of "alpha".
+        assert!(app.selection_begin(0, 0));
+        app.selection_extend(5, 0);
+        assert_eq!(app.selection_text().as_deref(), Some("alpha"));
+
+        // Across two rows: "pha" + newline + "bra".
+        assert!(app.selection_begin(2, 0));
+        app.selection_extend(3, 1);
+        assert_eq!(app.selection_text().as_deref(), Some("pha\nbra"));
+
+        // Clearing drops the selection (no text to copy).
+        app.clear_selection();
+        assert!(!app.has_selection());
+        assert!(app.selection_text().is_none());
+    }
+
+    #[test]
+    fn jump_bar_hit_tests_only_its_own_row_and_span() {
+        let app = App {
+            fullscreen: true,
+            ..Default::default()
+        };
+        app.jump_bar_geom.set(Some((20, 10, 8))); // row 20, cols [10, 18)
+        assert!(app.jump_bar_hit(10, 20));
+        assert!(app.jump_bar_hit(17, 20));
+        assert!(!app.jump_bar_hit(18, 20), "past the right edge");
+        assert!(!app.jump_bar_hit(12, 19), "wrong row");
     }
 
     #[test]

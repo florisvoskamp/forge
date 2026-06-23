@@ -7,6 +7,14 @@ All notable changes to Forge are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Mouse text selection in full-screen mode, no Shift needed. Forge now does its own click-drag
+  selection (highlighted in place) and copies the text to the clipboard on release — so the wheel
+  still scrolls AND plain drag selects, where kitty/most terminals otherwise force Shift+drag once an
+  app reports the mouse. Drag-motion is only reported while a button is held, so there's no hover
+  overhead. Disable all mouse reporting with `[tui] mouse_capture = false`.
+- Floating "↓ Jump to bottom · Ctrl+End" bar in the full-screen transcript: appears only while
+  scrolled up off the tail; click it or press Ctrl+End to jump back to the live tail and resume
+  following.
 - `scripts/tui-drive.sh` — drive `forge chat` in a real full-screen TUI inside tmux, send a
   scripted key sequence, and capture/assert on the rendered screen (the alt-screen grid, which a raw
   PTY byte-stream can't show). The `--mock` provider is now plan- and task-aware, so `/plan …`

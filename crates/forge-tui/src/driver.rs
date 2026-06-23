@@ -23,26 +23,37 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use crate::app::{self, App, KeyKind, LIVE_H};
 use crate::{Presenter, PresenterEvent};
 
-/// Enable **minimal** mouse reporting: button + wheel (`?1000h`) with SGR encoding (`?1006h`), but
-/// deliberately NOT motion tracking (`?1002h`/`?1003h`). The wheel reaches us as scroll events while
-/// drag-motion is left to the terminal, so the terminal's native click-drag text selection keeps
-/// working. (crossterm's `EnableMouseCapture` turns motion tracking on, which disables selection.)
-const ENABLE_WHEEL_MOUSE: &str = "\x1b[?1000h\x1b[?1006h";
-/// Undo [`ENABLE_WHEEL_MOUSE`].
-const DISABLE_WHEEL_MOUSE: &str = "\x1b[?1000l\x1b[?1006l";
+/// Enable mouse reporting: button (`?1000h`) + drag-motion (`?1002h`) + SGR encoding (`?1006h`).
+/// Drag-motion is ON so Forge can do its OWN click-drag text selection (and copy to the clipboard),
+/// which means the wheel scrolls AND drag selects without the user holding Shift — kitty only forces
+/// Shift for *its* native selection, which we don't use. Clicks drive the jump-to-bottom bar etc.
+const ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+/// Undo [`ENABLE_MOUSE`].
+const DISABLE_MOUSE: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1006l";
 
-fn enable_wheel_mouse() -> io::Result<()> {
+fn enable_mouse() -> io::Result<()> {
     use std::io::Write;
     let mut out = io::stdout();
-    write!(out, "{ENABLE_WHEEL_MOUSE}")?;
+    write!(out, "{ENABLE_MOUSE}")?;
     out.flush()
 }
 
-fn disable_wheel_mouse() {
+fn disable_mouse() {
     use std::io::Write;
     let mut out = io::stdout();
-    let _ = write!(out, "{DISABLE_WHEEL_MOUSE}");
+    let _ = write!(out, "{DISABLE_MOUSE}");
     let _ = out.flush();
+}
+
+/// A mouse button transition Forge cares about (left button only; 0-based cell coords).
+#[derive(Debug, Clone, Copy)]
+pub enum MouseKind {
+    /// Left button pressed — start a selection or hit a clickable element.
+    Down,
+    /// Left button held and moved — extend the selection.
+    Drag,
+    /// Left button released — finalize the selection (copy).
+    Up,
 }
 
 /// An input event from the terminal — either a keystroke or a bracketed paste.
@@ -59,6 +70,13 @@ pub enum InputEvent {
     /// translating it into ↑/↓ keys (which would walk the prompt history).
     Scroll {
         up: bool,
+    },
+    /// A left-button mouse event at a cell (full-screen mode). Drives in-app text selection and
+    /// clickable elements (the jump-to-bottom bar).
+    Mouse {
+        kind: MouseKind,
+        col: u16,
+        row: u16,
     },
 }
 
@@ -203,7 +221,7 @@ impl Tui {
         if fullscreen {
             crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
             if mouse_capture {
-                enable_wheel_mouse()?;
+                enable_mouse()?;
             }
             IN_ALT_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -279,11 +297,24 @@ impl Tui {
             Event::Paste(s) => return Ok(Some(InputEvent::Paste(s))),
             Event::FocusGained => return Ok(Some(InputEvent::Focus(true))),
             Event::FocusLost => return Ok(Some(InputEvent::Focus(false))),
-            Event::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollUp => return Ok(Some(InputEvent::Scroll { up: true })),
-                MouseEventKind::ScrollDown => return Ok(Some(InputEvent::Scroll { up: false })),
-                _ => return Ok(None),
-            },
+            Event::Mouse(m) => {
+                use crossterm::event::MouseButton;
+                let mk = match m.kind {
+                    MouseEventKind::ScrollUp => return Ok(Some(InputEvent::Scroll { up: true })),
+                    MouseEventKind::ScrollDown => {
+                        return Ok(Some(InputEvent::Scroll { up: false }))
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => MouseKind::Down,
+                    MouseEventKind::Drag(MouseButton::Left) => MouseKind::Drag,
+                    MouseEventKind::Up(MouseButton::Left) => MouseKind::Up,
+                    _ => return Ok(None),
+                };
+                return Ok(Some(InputEvent::Mouse {
+                    kind: mk,
+                    col: m.column,
+                    row: m.row,
+                }));
+            }
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 let key = match k.code {
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -330,6 +361,9 @@ impl Tui {
                     }
                     KeyCode::Right => KeyKind::Right,
                     KeyCode::Home => KeyKind::Home,
+                    KeyCode::End if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyKind::JumpBottom
+                    }
                     KeyCode::End => KeyKind::End,
                     KeyCode::PageUp => KeyKind::PageUp,
                     KeyCode::PageDown => KeyKind::PageDown,
@@ -355,7 +389,7 @@ impl Tui {
         if self.fullscreen {
             crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
             if self.mouse_capture {
-                enable_wheel_mouse()?;
+                enable_mouse()?;
             }
         }
         let backend = CrosstermBackend::new(io::stdout());
@@ -385,7 +419,7 @@ impl Drop for Tui {
         if self.fullscreen {
             IN_ALT_SCREEN.store(false, std::sync::atomic::Ordering::Relaxed);
             if self.mouse_capture {
-                disable_wheel_mouse();
+                disable_mouse();
             }
             let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
         }
