@@ -7,12 +7,25 @@ All notable changes to Forge are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Anchored-block fuzzy tier for `edit_file` / `multi_edit`: when an `old` block's interior was
+  paraphrased but its first/last lines match, the unique span between those anchors is replaced —
+  guarded by uniqueness + a disproportionate-match rejection so it can't silently eat the wrong
+  region.
+- `docs/harness/competitive-analysis.md` — recon of competing coding-agent harnesses and a
+  prioritized backlog of techniques to port.
 - `forge doctor` — diagnose your setup (providers/keys, CLI bridges, Ollama, MCP, config, git,
   terminal) with actionable fixes.
 - Startup update check — a throttled notice when a newer release is available (disable with
   `[update] check = false` or `FORGE_NO_UPDATE_CHECK=1`).
 - Community infrastructure: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, issue
   templates, and this changelog.
+
+### Fixed
+- `forge bench swe` no longer fails with `os error 2` when `--workdir` is relative (the default):
+  the per-instance clone was double-nesting the path. The workdir is now absolutized first.
+- Local Ollama models that emit Hermes/Qwen-style `<tool_call>` XML (e.g. `qwen3-coder`) are now
+  driven correctly: `ollama::` is routed through Ollama's OpenAI-compatible `/v1` endpoint, which
+  parses those into structured tool calls instead of leaking them as text and dead-ending the turn.
 
 ## [0.2.0] - 2026-06-23
 

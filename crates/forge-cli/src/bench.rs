@@ -110,12 +110,18 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
 /// Clone (or reuse) the instance's repo under `root/<instance_id>` and hard-reset it to a clean
 /// `base_commit`, so each run starts from the exact pre-fix state.
 fn prepare_repo(inst: &SweInstance, root: &Path) -> Result<PathBuf> {
+    // Absolutize `root` first: the per-instance turn changes the process CWD, and `git clone` is
+    // invoked with `current_dir(root)` while passing the target path — if both stay relative the
+    // target resolves to `root/root/<id>` (double-nested) and the later checkout, run from the
+    // original CWD, fails with `os error 2`. An absolute `dir` removes that ambiguity entirely.
+    std::fs::create_dir_all(root)?;
+    let root = std::fs::canonicalize(root)
+        .with_context(|| format!("resolving workdir {}", root.display()))?;
     let dir = root.join(&inst.instance_id);
     if !dir.join(".git").exists() {
-        std::fs::create_dir_all(root)?;
         let url = format!("https://github.com/{}.git", inst.repo);
         run_git(
-            root,
+            &root,
             &["clone", "--quiet", &url, dir.to_string_lossy().as_ref()],
         )
         .with_context(|| format!("cloning {}", inst.repo))?;

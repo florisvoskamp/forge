@@ -81,21 +81,49 @@ pub async fn list_models(namespace: &str) -> Result<Vec<String>, ProviderError> 
 pub(crate) fn build_client() -> Client {
     let resolver = ServiceTargetResolver::from_resolver_fn(
         |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-            let is_cerebras = st.model.model_name.namespace_is("cerebras");
-            if !is_cerebras {
-                return Ok(st);
+            if st.model.model_name.namespace_is("cerebras") {
+                let bare = st.model.model_name.namespace_and_name().1.to_string();
+                return Ok(ServiceTarget {
+                    endpoint: Endpoint::from_static("https://api.cerebras.ai/v1/"),
+                    auth: AuthData::from_env("CEREBRAS_API_KEY"),
+                    model: ModelIden::new(AdapterKind::OpenAI, bare),
+                });
             }
-            let bare = st.model.model_name.namespace_and_name().1.to_string();
-            Ok(ServiceTarget {
-                endpoint: Endpoint::from_static("https://api.cerebras.ai/v1/"),
-                auth: AuthData::from_env("CEREBRAS_API_KEY"),
-                model: ModelIden::new(AdapterKind::OpenAI, bare),
-            })
+            // Route `ollama::` through ollama's OpenAI-compatible endpoint instead of genai's
+            // native Ollama adapter. The native path leaves tool calls from models that emit
+            // Hermes/Qwen-style `<tool_call>…</tool_call>` XML (e.g. qwen3-coder) unparsed — they
+            // leak into message text and the turn dead-ends with "empty response". Ollama's `/v1`
+            // server parses those into structured tool_calls, so the OpenAI adapter drives them
+            // correctly. ollama ignores the bearer token; a placeholder satisfies the adapter.
+            // genai recognises `ollama` as a native adapter and strips the namespace, so match on
+            // the resolved adapter kind (not the namespace, which is gone by here).
+            if st.model.adapter_kind == AdapterKind::Ollama {
+                let bare = st.model.model_name.namespace_and_name().1.to_string();
+                let host = std::env::var("OLLAMA_HOST")
+                    .unwrap_or_else(|_| "http://localhost:11434".into());
+                return Ok(ServiceTarget {
+                    endpoint: Endpoint::from_owned(ollama_v1_endpoint(&host)),
+                    auth: AuthData::from_single("ollama"),
+                    model: ModelIden::new(AdapterKind::OpenAI, bare),
+                });
+            }
+            Ok(st)
         },
     );
     Client::builder()
         .with_service_target_resolver(resolver)
         .build()
+}
+
+/// Build ollama's OpenAI-compatible base URL from an `OLLAMA_HOST` value. The host is often bare
+/// (`127.0.0.1:11434`) or lacks the trailing `/v1/`; genai needs a full, scheme-qualified URL.
+fn ollama_v1_endpoint(host: &str) -> String {
+    let host = if host.starts_with("http") {
+        host.to_string()
+    } else {
+        format!("http://{host}")
+    };
+    format!("{}/v1/", host.trim_end_matches('/'))
 }
 
 /// Forge model ids are `"provider::model"`. genai 0.6 resolves the adapter from a
@@ -561,6 +589,24 @@ impl Provider for GenAiProvider {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ollama_v1_endpoint_normalizes_host_forms() {
+        assert_eq!(
+            ollama_v1_endpoint("http://localhost:11434"),
+            "http://localhost:11434/v1/"
+        );
+        // Bare host (ollama's common OLLAMA_HOST form) gets a scheme.
+        assert_eq!(
+            ollama_v1_endpoint("127.0.0.1:11434"),
+            "http://127.0.0.1:11434/v1/"
+        );
+        // A trailing slash isn't doubled.
+        assert_eq!(
+            ollama_v1_endpoint("http://box:11434/"),
+            "http://box:11434/v1/"
+        );
+    }
 
     #[test]
     fn cache_breakpoints_mark_system_and_last_message() {

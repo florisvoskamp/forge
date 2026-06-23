@@ -131,6 +131,70 @@ fn flexible_replace(content: &str, old: &str, new: &str) -> Option<String> {
     Some(out)
 }
 
+/// Anchored-block fallback for `edit_file`: the safety net for when a model paraphrases the *middle*
+/// of a block but reproduces its first and last lines closely. Matches the first and last non-empty
+/// trimmed lines of `old` as anchors and replaces the unique span between them — even if the interior
+/// lines differ. Two rails keep this from silently eating the wrong region: (1) uniqueness — exactly
+/// one anchored span may match, else `None` (caller errors); (2) disproportion — the matched span may
+/// not balloon past `old` (≥ max(old+3, old*2) lines or max(+500, *4) chars), which would mean the
+/// anchors landed too far apart. Only attempted for `old` of ≥3 lines; 1–2 line edits are fully
+/// covered by exact + whitespace match.
+fn block_anchor_replace(content: &str, old: &str, new: &str) -> Option<String> {
+    let old_lines: Vec<&str> = old.lines().collect();
+    if old_lines.len() < 3 {
+        return None;
+    }
+    let trimmed: Vec<&str> = old_lines.iter().map(|l| l.trim()).collect();
+    let first_idx = trimmed.iter().position(|l| !l.is_empty())?;
+    let last_idx = trimmed.iter().rposition(|l| !l.is_empty())?;
+    if last_idx <= first_idx {
+        return None; // need two distinct anchor lines
+    }
+    let (first, last) = (trimmed[first_idx], trimmed[last_idx]);
+
+    let segs: Vec<&str> = content.split_inclusive('\n').collect();
+    let old_len = old_lines.len();
+    // Disproportion cap (lines); also bounds the forward search for the closing anchor.
+    let max_span = old_len.saturating_mul(2).max(old_len + 3);
+
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (s, seg) in segs.iter().enumerate() {
+        if seg.trim() != first {
+            continue;
+        }
+        let hi = (s + max_span).min(segs.len());
+        for (e, eseg) in segs.iter().enumerate().take(hi).skip(s + 1) {
+            if eseg.trim() == last {
+                spans.push((s, e)); // nearest closing anchor for this start
+                break;
+            }
+        }
+    }
+    if spans.len() != 1 {
+        return None; // not found, or ambiguous
+    }
+    let (s, e) = spans[0];
+    if e - s + 1 >= max_span {
+        return None; // disproportionate (lines)
+    }
+    let start: usize = segs[..s].iter().map(|x| x.len()).sum();
+    let end: usize = start + segs[s..=e].iter().map(|x| x.len()).sum::<usize>();
+    let old_chars = old.len();
+    if end - start >= (old_chars + 500).max(old_chars.saturating_mul(4)) {
+        return None; // disproportionate (chars)
+    }
+
+    let mut replacement = new.to_string();
+    if content[start..end].ends_with('\n') && !replacement.ends_with('\n') {
+        replacement.push('\n');
+    }
+    let mut out = String::with_capacity(content.len() - (end - start) + replacement.len());
+    out.push_str(&content[..start]);
+    out.push_str(&replacement);
+    out.push_str(&content[end..]);
+    Some(out)
+}
+
 /// Hard cap on a single `read_file` result so one read can't flood the model's context. A whole
 /// file over this is truncated (head kept — imports/signatures live there) with a marker telling
 /// the model to request a specific line range instead.
@@ -278,8 +342,11 @@ fn apply_edit(content: &str, old: &str, new: &str) -> Result<(String, &'static s
         1 => Ok((content.replacen(old, new, 1), "")),
         0 => flexible_replace(content, old, new)
             .map(|u| (u, " (matched ignoring whitespace)"))
+            .or_else(|| {
+                block_anchor_replace(content, old, new).map(|u| (u, " (matched on block anchors)"))
+            })
             .ok_or_else(|| {
-                "`old` not found (also tried a whitespace-insensitive match; \
+                "`old` not found (also tried whitespace-insensitive and block-anchor matches; \
                  add surrounding context so it matches exactly once)"
                     .to_string()
             }),
@@ -1038,6 +1105,57 @@ mod tests {
         );
         // Genuinely absent → None.
         assert!(flexible_replace(content, "let y = 9;", "z").is_none());
+    }
+
+    #[test]
+    fn block_anchor_replace_matches_when_middle_paraphrased() {
+        // The model reproduced the first/last lines but rewrote the interior. Exact and
+        // whitespace matching both miss; anchors recover it.
+        let content = "fn f() {\n    let a = 1;\n    let b = 2;\n    return a + b;\n}\n";
+        let old = "fn f() {\n    let a = 0;\n    return a;\n}";
+        let new = "fn f() {\n    return 42;\n}";
+        let out = block_anchor_replace(content, old, new).expect("anchors match");
+        assert_eq!(
+            out, "fn f() {\n    return 42;\n}\n",
+            "interior replaced: {out:?}"
+        );
+    }
+
+    #[test]
+    fn block_anchor_replace_rejects_ambiguous_and_disproportionate() {
+        // Two spans share the same first/last anchors → ambiguous → None.
+        let dup = "a\nx\nb\na\ny\nb\n";
+        assert!(
+            block_anchor_replace(dup, "a\nq\nb", "z").is_none(),
+            "ambiguous anchors → None"
+        );
+        // Anchors land far apart (interior dwarfs `old`) → disproportionate → None.
+        let huge = format!("open\n{}close\n", "filler\n".repeat(50));
+        let old = "open\nx\nclose";
+        assert!(
+            block_anchor_replace(&huge, old, "y").is_none(),
+            "disproportionate span → None"
+        );
+        // 1–2 line `old` is never block-anchored (exact/whitespace own that case).
+        assert!(block_anchor_replace("a\nb\n", "a\nb", "c").is_none());
+    }
+
+    #[test]
+    fn apply_edit_falls_through_exact_then_whitespace_then_anchor() {
+        // Exact wins outright.
+        let (out, note) = apply_edit("let x = 1;\n", "let x = 1;", "let x = 2;").unwrap();
+        assert_eq!(out, "let x = 2;\n");
+        assert_eq!(note, "");
+        // Falls through to the block-anchor tier when the interior drifts.
+        let content = "fn g() {\n    old_body();\n    more();\n}\n";
+        let (out, note) = apply_edit(
+            content,
+            "fn g() {\n    body();\n}",
+            "fn g() {\n    new();\n}",
+        )
+        .unwrap();
+        assert_eq!(out, "fn g() {\n    new();\n}\n");
+        assert_eq!(note, " (matched on block anchors)");
     }
 
     #[test]
