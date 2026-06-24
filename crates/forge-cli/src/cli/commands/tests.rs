@@ -86,6 +86,25 @@ fn expand_at_files_reads_referenced_files_and_skips_nonfiles() {
 }
 
 #[test]
+fn expand_at_files_survives_multibyte_whitespace() {
+    // Regression: a pasted block often carries a non-breaking space (U+00A0, 2 bytes). The old
+    // byte-by-byte scan cast each byte to a char and sliced mid-character → "not a char boundary"
+    // panic that crashed the turn. A multi-line prompt with leading NBSP must parse cleanly and
+    // still resolve a real @file.
+    let dir = std::env::temp_dir().join(format!("forge-nbsp-{}", forge_types::new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("data.txt");
+    std::fs::write(&f, "payload").unwrap();
+    let path = f.to_string_lossy();
+    // \u{a0} = NBSP, \u{2003} = em space — both multi-byte; the panic was triggered by these.
+    let prompt = format!("\u{a0}\u{a0}pasted\u{2003}block\nnow read @{path} thanks");
+    let (blocks, included, _) = expand_at_files(&prompt);
+    assert_eq!(included, vec![path.to_string()]);
+    assert!(blocks[0].contains("payload"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn copy_catalog_assets_imports_then_skips_existing() {
     // A Codex-style prompt: plain markdown, no frontmatter (name = file stem, description =
     // first body line). The lenient command reader must accept it and we must copy it.
