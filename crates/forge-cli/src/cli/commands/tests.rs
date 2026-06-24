@@ -3,9 +3,44 @@ use super::import::{convert_mdc_to_command_md, copy_catalog_assets};
 use super::local::bridge_plans;
 use super::run::{
     chat_action, expand_at_files, loop_stop_reason, models_for_provider, models_provider_view,
-    ChatAction, LOOP_MAX_ITERS,
+    nth_assistant_response, ChatAction, LOOP_MAX_ITERS,
 };
 use crate::*;
+
+#[test]
+fn nth_assistant_response_counts_back_from_the_latest() {
+    use forge_types::Role;
+    // history() is oldest-first, user + assistant interleaved.
+    let history = vec![
+        (Role::User, "q1".to_string()),
+        (Role::Assistant, "first answer".to_string()),
+        (Role::User, "q2".to_string()),
+        (Role::Assistant, "second answer".to_string()),
+        (Role::User, "q3".to_string()),
+        (Role::Assistant, "third answer".to_string()),
+    ];
+    // 1 = most recent, 2 = the one before, …
+    assert_eq!(
+        nth_assistant_response(&history, 1).as_deref(),
+        Some("third answer")
+    );
+    assert_eq!(
+        nth_assistant_response(&history, 2).as_deref(),
+        Some("second answer")
+    );
+    assert_eq!(
+        nth_assistant_response(&history, 3).as_deref(),
+        Some("first answer")
+    );
+    // Beyond the available responses → None (the caller shows a "only N so far" note).
+    assert_eq!(nth_assistant_response(&history, 4), None);
+    // Empty / user-only history → None.
+    assert_eq!(nth_assistant_response(&[], 1), None);
+    assert_eq!(
+        nth_assistant_response(&[(Role::User, "hi".into())], 1),
+        None
+    );
+}
 
 #[test]
 fn expand_at_files_reads_referenced_files_and_skips_nonfiles() {

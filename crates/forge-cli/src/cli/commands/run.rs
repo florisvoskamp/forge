@@ -567,6 +567,24 @@ pub(crate) fn copy_selection(clipboard: &mut Option<arboard::Clipboard>, text: &
     }
 }
 
+/// The Nth-latest non-empty assistant response from a [`Session::history`] list (which is
+/// oldest-first, user + assistant only). `nth` is 1-based counting back from the most recent
+/// (1 = the last response, 2 = the one before). `None` when fewer than `nth` assistant responses
+/// exist. Pure, so `/copy`'s selection logic is unit-tested without a live session.
+pub(crate) fn nth_assistant_response(
+    history: &[(forge_types::Role, String)],
+    nth: usize,
+) -> Option<String> {
+    history
+        .iter()
+        .filter(|(role, text)| {
+            matches!(role, forge_types::Role::Assistant) && !text.trim().is_empty()
+        })
+        .map(|(_, text)| text.clone())
+        .rev()
+        .nth(nth.saturating_sub(1))
+}
+
 pub(crate) async fn chat(
     mock: bool,
     mode: Option<Mode>,
@@ -2838,27 +2856,18 @@ pub(crate) async fn dispatch_command(
         // `/copy [N]` — resolve the Nth-latest assistant response and hand it to the loop to copy
         // (the loop owns the clipboard). N is 1-based from the most recent (1 = last response).
         CommandAction::Copy { nth } => {
-            let text = {
-                let s = session.lock().await;
-                s.history()
-                    .into_iter()
-                    .filter(|(role, _)| matches!(role, forge_types::Role::Assistant))
-                    .map(|(_, text)| text)
-                    .rev()
-                    .nth(nth - 1)
-            };
-            match text {
-                Some(t) if !t.trim().is_empty() => return Ok(DispatchOutcome::CopyToClipboard(t)),
-                _ => app.note(&format!(
-                    "no assistant response #{nth} to copy (only {} so far)",
-                    {
-                        let s = session.lock().await;
-                        s.history()
-                            .iter()
-                            .filter(|(role, _)| matches!(role, forge_types::Role::Assistant))
-                            .count()
-                    }
-                )),
+            let history = { session.lock().await.history() };
+            match nth_assistant_response(&history, nth) {
+                Some(t) => return Ok(DispatchOutcome::CopyToClipboard(t)),
+                None => {
+                    let n = history
+                        .iter()
+                        .filter(|(role, _)| matches!(role, forge_types::Role::Assistant))
+                        .count();
+                    app.note(&format!(
+                        "no assistant response #{nth} to copy (only {n} so far)"
+                    ));
+                }
             }
         }
         CommandAction::Lattice(symbol) => {

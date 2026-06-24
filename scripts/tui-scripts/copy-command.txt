@@ -1,0 +1,9 @@
+# Verify /copy: a turn produces an assistant response, then /copy reports it copied.
+send hello, please reply with a short greeting
+sleep 2500
+capture after-response
+expect ⚒ forge
+send /copy
+sleep 1000
+capture after-copy
+expect copied response to clipboard

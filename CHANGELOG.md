@@ -6,6 +6,15 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-06-24
+
+### Added
+- **`/copy [N]` — copy an assistant response to the clipboard.** `/copy` copies the most recent
+  assistant response; `/copy N` copies the Nth-latest (1-based from the most recent — `/copy 2` is
+  the second-to-last). `/yank` is an alias. The text is resolved from the session transcript and
+  written to the system clipboard, with a confirmation note. (An interactive code-block picker and a
+  `w`-to-file option are planned as a follow-up.)
+
 ## [0.3.7] - 2026-06-24
 
 ### Changed
