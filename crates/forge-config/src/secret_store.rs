@@ -46,7 +46,8 @@ fn keyring_available() -> bool {
             // then also return promptly (and fall back to the file on their own Err). Only a true
             // hang never sends, tripping the recv timeout below. The detached thread is left to
             // unblock on its own rather than wedging the main path.
-            let _ = keyring::Entry::new(KEYRING_SERVICE, "__forge_probe__").map(|e| e.get_password());
+            let _ =
+                keyring::Entry::new(KEYRING_SERVICE, "__forge_probe__").map(|e| e.get_password());
             let _ = tx.send(());
         });
         match rx.recv_timeout(KEYRING_PROBE_TIMEOUT) {
@@ -65,13 +66,12 @@ fn keyring_available() -> bool {
 
 /// Store `value` under `key`: OS keyring first, encrypted file on keyring failure/unavailability.
 pub fn set(key: &str, value: &str) -> Result<(), ConfigError> {
-    if keyring_available() {
-        if keyring::Entry::new(KEYRING_SERVICE, key)
+    if keyring_available()
+        && keyring::Entry::new(KEYRING_SERVICE, key)
             .and_then(|e| e.set_password(value))
             .is_ok()
-        {
-            return Ok(());
-        }
+    {
+        return Ok(());
     }
     file_set(key, value)
 }
