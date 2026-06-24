@@ -44,8 +44,21 @@ fn is_free(id: &str, cost: f64, subscription: bool) -> bool {
         return false;
     }
     match provider_of(id) {
+        // Genuinely free: local inference, and free-tier API providers we know charge nothing.
+        "ollama" | "groq" | "cerebras" => true,
+        // Gemini has a standing free tier (Google AI Studio, no card) — but only Flash / Flash-Lite
+        // (and the open Gemma models); the Pro models were pulled from the free tier (Apr 2026) and
+        // are paid-only. So an unpriced Gemini model is free UNLESS it's a Pro model. (Per Google's
+        // Gemini API pricing + rate-limit docs.)
+        "gemini" => !id.contains("pro"),
+        // Paid gateways: only their explicit `:free`-suffixed variants are free.
         "openrouter" | "opencode_go" => id.contains(":free"),
-        _ => true,
+        // Every other metered API provider (openai, xai, deepseek, anthropic, minimax, mimo, …) has
+        // no standing free model tier — only temporary signup/trial credits — so an UNPRICED model
+        // is paid-with-unknown-cost, NOT free. Reading "no price in our bundled table" as "free" was
+        // the bug — it billed the user by routing to e.g. gpt-5-pro thinking it cost $0. A model
+        // counts free only with positive evidence (a config price of 0, or a `:free` variant).
+        _ => false,
     }
 }
 
@@ -77,6 +90,11 @@ pub fn is_routable(id: &str) -> bool {
         "-audio",
         "audio-",
         "-ocr",
+        "sora",       // video generation
+        "realtime",   // realtime voice/audio sessions, not a chat-completions model
+        "transcribe", // speech-to-text
+        "babbage",    // legacy base-completion models (not chat)
+        "davinci",
     ];
     !BLOCK.iter().any(|b| m.contains(b))
 }
@@ -774,9 +792,25 @@ mod tests {
         assert!(!is_routable("gemini::gemini-embedding-001"));
         assert!(!is_routable("groq::whisper-large-v3"));
         assert!(!is_routable("groq::meta-llama/llama-prompt-guard-2-86m"));
+        // OpenAI's list mixes in video / realtime-voice / speech-to-text / legacy base models too.
+        assert!(!is_routable("openai::sora-2"));
+        assert!(!is_routable("openai::sora-2-pro"));
+        assert!(!is_routable("openai::gpt-realtime"));
+        assert!(!is_routable("openai::gpt-realtime-mini"));
+        assert!(!is_routable("openai::gpt-4o-transcribe"));
+        assert!(!is_routable("openai::davinci-002"));
+        assert!(!is_routable("openai::babbage-002"));
         assert!(is_routable("gemini::gemini-flash-lite-latest"));
         assert!(is_routable("codex-cli::gpt-5.5"));
         assert!(is_routable("groq::llama-3.1-8b-instant"));
+        assert!(
+            is_routable("openai::gpt-5.5"),
+            "real chat model stays routable"
+        );
+        assert!(
+            is_routable("openai::gpt-4o-search-preview"),
+            "search-augmented chat stays routable"
+        );
 
         // A trivial pick from a gemini-like set must be a fast chat model, not deep-research.
         let cat = ModelCatalog::new(vec![
@@ -840,6 +874,67 @@ mod tests {
             .find(|m| m.id == "opencode_go::glm-5.2")
             .unwrap();
         assert!(glm.paid && !glm.free, "{glm:?}");
+    }
+
+    #[test]
+    fn unpriced_metered_api_models_are_paid_not_free() {
+        // The live billing bug: gpt-5.5 / gpt-5-pro / gemini-3-pro have no entry in the bundled
+        // price table, so the old `_ => true` fallback read them as FREE and cost-routing would
+        // bill the user. An UNPRICED model from a metered API provider must read as paid; only
+        // genuinely-free providers (local/free-tier) are free without a price.
+        let cat = ModelCatalog::new(vec![
+            "openai::gpt-5.5".into(),
+            "openai::gpt-5-pro".into(),
+            "gemini::gemini-3-pro-preview".into(),
+            "xai::grok-4".into(),
+            "deepseek::deepseek-v4-pro".into(),
+            "ollama::qwen2.5-coder:3b".into(),
+        ]);
+        let infos = cat.infos(&Pricing::default());
+        for id in [
+            "openai::gpt-5.5",
+            "openai::gpt-5-pro",
+            "gemini::gemini-3-pro-preview",
+            "xai::grok-4",
+            "deepseek::deepseek-v4-pro",
+        ] {
+            let m = infos.iter().find(|m| m.id == id).unwrap();
+            assert!(
+                m.paid && !m.free,
+                "unpriced metered API model must be paid, not free: {m:?}"
+            );
+        }
+        let local = infos.iter().find(|m| m.provider == "ollama").unwrap();
+        assert!(local.free, "local ollama is genuinely free");
+    }
+
+    #[test]
+    fn gemini_flash_is_free_but_pro_is_paid() {
+        // Gemini keeps a standing free tier for Flash / Flash-Lite (and Gemma), but Pro is paid-only
+        // since Apr 2026. Unpriced Flash → free; unpriced Pro → paid.
+        let cat = ModelCatalog::new(vec![
+            "gemini::gemini-3-flash-preview".into(),
+            "gemini::gemini-2.5-flash-lite".into(),
+            "gemini::gemini-flash-latest".into(),
+            "gemini::gemini-3-pro-preview".into(),
+            "gemini::gemini-pro-latest".into(),
+        ]);
+        let infos = cat.infos(&Pricing::default());
+        for id in [
+            "gemini::gemini-3-flash-preview",
+            "gemini::gemini-2.5-flash-lite",
+            "gemini::gemini-flash-latest",
+        ] {
+            let m = infos.iter().find(|m| m.id == id).unwrap();
+            assert!(
+                m.free && !m.paid,
+                "unpriced Gemini Flash is free-tier: {m:?}"
+            );
+        }
+        for id in ["gemini::gemini-3-pro-preview", "gemini::gemini-pro-latest"] {
+            let m = infos.iter().find(|m| m.id == id).unwrap();
+            assert!(m.paid && !m.free, "Gemini Pro is paid-only: {m:?}");
+        }
     }
 
     #[test]

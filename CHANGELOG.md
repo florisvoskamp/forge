@@ -6,6 +6,25 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-06-24
+
+### Fixed
+- **Billing safety: unpriced paid-provider models are no longer treated as "free".** A model from a
+  metered API provider (OpenAI, xAI, DeepSeek, Anthropic, …) that Forge holds no bundled price for
+  was classified `free` (unpriced → `$0`), so cost-aware routing would happily pick e.g.
+  `gpt-5.5-pro`, `gpt-5-pro`, `o3`, or `gemini-3-pro` for a cheap tier — and **bill the user** —
+  while reporting it as free. "Free" now requires positive evidence: genuinely-free providers
+  (local `ollama`, free-tier `groq`/`cerebras`), an explicit `:free` variant, or a configured price
+  of `0`. Everything else unpriced is **paid (unknown cost)**. **Gemini keeps its real free tier**:
+  its Flash / Flash-Lite (and Gemma) models stay free, but Gemini Pro — paid-only since the free
+  tier dropped it (Apr 2026) — is correctly paid. This also stops the trivial tier from routing to a
+  paid model just because it had no price.
+- **More non-chat models excluded from routing.** `is_routable` now also filters video (`sora`),
+  realtime voice (`*realtime*`), speech-to-text (`*transcribe*`), and legacy base-completion models
+  (`babbage`, `davinci`) — these leaked into the routable set from providers' full model lists (on
+  top of the image/TTS/embedding/deep-research/moderation models already excluded). They remain
+  visible in `forge models`, just never routed to.
+
 ## [0.3.3] - 2026-06-24
 
 ### Fixed
@@ -280,7 +299,8 @@ Initial public release: Model Mesh routing, multi-provider support, cost/budget 
 inline TUI, session persistence + checkpoints, permission broker, subagents, Assay analysis,
 Lattice code intelligence, MCP client, web tools, hooks, skills/commands, and more.
 
-[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/florisvoskamp/forge/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/florisvoskamp/forge/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/florisvoskamp/forge/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/florisvoskamp/forge/compare/v0.3.0...v0.3.1
