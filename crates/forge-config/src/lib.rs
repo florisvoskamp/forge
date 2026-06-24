@@ -2082,8 +2082,13 @@ pub fn api_key(provider: &str) -> Result<String, ConfigError> {
             }
         }
     }
+    // A stored-but-EMPTY keyring entry (corruption, a botched `forge auth`) must not count as a key:
+    // returning "" produces a cryptic provider 401 instead of the actionable MissingKey below. This
+    // mirrors has_api_key, which already requires non-empty.
     if let Some(key) = secret_store::get(provider) {
-        return Ok(key);
+        if !key.is_empty() {
+            return Ok(key);
+        }
     }
     Err(ConfigError::MissingKey(provider.into(), var.into()))
 }

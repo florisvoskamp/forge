@@ -152,24 +152,53 @@ fn resolve_on_path(bin: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&paths).find_map(|dir| try_base(&dir.join(bin)))
 }
 
-/// Build the base [`Command`] to launch a bridge CLI named/located at `binary`. On Windows the CLIs
-/// are commonly `.cmd` shims (how npm installs them), which `CreateProcess` cannot launch directly —
-/// those are run through `cmd /C`. A real `.exe`, or any Unix binary, launches directly. This is the
-/// difference between the bridge working and failing to start on Windows.
-fn bridge_command(binary: &str) -> Command {
+/// Build the [`Command`] to launch a bridge CLI named/located at `binary` with `args`. On Windows the
+/// CLIs are commonly `.cmd` shims (how npm installs them), which `CreateProcess` cannot launch
+/// directly — those run through `cmd /C`. A real `.exe`, or any Unix binary, launches directly.
+///
+/// `args` is taken here (not appended by the caller) because the Windows path must build the whole
+/// `cmd` command line at once: `cmd` strips the first/last quote of its `/C` string, so a quoted shim
+/// path breaks the moment a second quoted token (an argument containing a space, e.g. an
+/// `--mcp-config` path under `C:\Users\First Last\…`) appears. We pass `/S` + an outer-quoted command
+/// with every token individually quoted, so spaces in the path AND in any argument survive — the
+/// difference between the bridge launching and failing on a Windows profile whose path has a space.
+fn bridge_command(binary: &str, args: &[String]) -> Command {
     #[cfg(windows)]
-    if let Some(p) = resolve_on_path(binary) {
-        let is_script = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
-        if is_script {
-            let mut cmd = Command::new("cmd");
-            cmd.arg("/C").arg(&p);
-            return cmd;
+    {
+        use std::os::windows::process::CommandExt;
+        if let Some(p) = resolve_on_path(binary) {
+            let is_script = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+            if is_script {
+                // `raw_arg` is a std-only extension; reach the inner std Command (this is a
+                // tokio::process::Command). `/S` makes cmd strip just the outer quote pair below.
+                let mut cmd = Command::new("cmd");
+                cmd.as_std_mut().raw_arg("/S");
+                cmd.as_std_mut().raw_arg("/C");
+                cmd.as_std_mut().raw_arg(windows_cmd_line(&p, args));
+                return cmd;
+            }
         }
     }
-    Command::new(binary)
+    let mut cmd = Command::new(binary);
+    cmd.args(args);
+    cmd
+}
+
+/// The raw command line for `cmd /S /C` launching `program` (a resolved `.cmd`/`.bat`) with `args`:
+/// every token double-quoted (embedded quotes doubled, per `cmd`), and the whole wrapped in an outer
+/// pair that `/S` strips. Pure + cross-platform so it can be unit-tested off Windows.
+#[cfg(any(windows, test))]
+fn windows_cmd_line(program: &std::path::Path, args: &[String]) -> String {
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let mut inner = q(&program.to_string_lossy());
+    for a in args {
+        inner.push(' ');
+        inner.push_str(&q(a));
+    }
+    format!("\"{inner}\"")
 }
 
 /// Forge model ids for every CLI bridge whose CLI is installed — the always-available
@@ -1061,10 +1090,9 @@ impl Provider for CliProvider {
             &mcp_env,
         );
 
-        let mut cmd = bridge_command(&self.binary);
-        cmd.args(&args)
-            // The prompt is written to stdin (not argv) to avoid `ARG_MAX` on big transcripts.
-            .stdin(Stdio::piped())
+        let mut cmd = bridge_command(&self.binary, &args);
+        // The prompt is written to stdin (not argv) to avoid `ARG_MAX` on big transcripts.
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -1096,7 +1124,12 @@ impl Provider for CliProvider {
             let bytes = prompt.into_bytes();
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
-                let _ = stdin.write_all(&bytes).await;
+                // Surface a write failure (broken pipe if the child died early, etc.) instead of
+                // dropping it — otherwise the child can wait forever for EOF and the turn only fails
+                // after the idle watchdog, with no clue why.
+                if let Err(e) = stdin.write_all(&bytes).await {
+                    tracing::warn!("failed writing prompt to bridge stdin: {e}");
+                }
                 let _ = stdin.shutdown().await;
             });
         }
@@ -1214,18 +1247,24 @@ impl Provider for CliProvider {
         if stalled {
             terminate(&mut child, pgid).await;
             // A stalled bridge is retryable (fail over), like a stalled genai stream — distinct from
-            // a turn that's simply taking a while but still streaming.
+            // a turn that's simply taking a while but still streaming. Include the CLI's stderr: when
+            // a bridge fails to start/run (e.g. a Windows launch problem), its error message is the
+            // only clue to WHY it keeps benching — otherwise the user just sees "stalled".
+            let stderr_text = err_task.await.unwrap_or_default();
             return Err(ProviderError::Unavailable(format!(
-                "`{}` produced no output for {}s — killed (stalled)",
+                "`{}` produced no output for {}s — killed (stalled){}",
                 self.binary,
-                idle.as_secs()
+                idle.as_secs(),
+                stderr_suffix(&stderr_text)
             )));
         }
         if let Err(e) = read {
             terminate(&mut child, pgid).await;
+            let stderr_text = err_task.await.unwrap_or_default();
             return Err(ProviderError::Request(format!(
-                "reading `{}` output failed: {e}",
-                self.binary
+                "reading `{}` output failed: {e}{}",
+                self.binary,
+                stderr_suffix(&stderr_text)
             )));
         }
 
@@ -1356,6 +1395,27 @@ async fn tail_subagent_sink(
     }
 }
 
+/// Format a bridge's captured stderr as a trailing ` — stderr: …` clause for an error message
+/// (empty when there's nothing). Trimmed and tail-capped so a noisy CLI can't bloat the error.
+fn stderr_suffix(stderr: &str) -> String {
+    let t = stderr.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    const TAIL: usize = 600;
+    let tail = if t.len() > TAIL {
+        let start = t.len() - TAIL;
+        // Snap to a char boundary so slicing can't panic on multibyte output.
+        let start = (start..t.len())
+            .find(|i| t.is_char_boundary(*i))
+            .unwrap_or(t.len());
+        format!("…{}", &t[start..])
+    } else {
+        t.to_string()
+    };
+    format!(" — stderr: {tail}")
+}
+
 async fn read_to_cap<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -1432,13 +1492,34 @@ mod tests {
         let shim = dir.join("fakeclaude.cmd");
         std::fs::write(&shim, b"@echo off\n").unwrap();
         // A `.cmd` shim is launched through `cmd /C`, not directly.
-        let cmd = bridge_command(shim.to_str().unwrap());
+        let cmd = bridge_command(shim.to_str().unwrap(), &["-p".into()]);
         assert_eq!(cmd.as_std().get_program(), std::ffi::OsStr::new("cmd"));
         // A non-script path launches directly.
         let exe = dir.join("faketool.exe");
         std::fs::write(&exe, b"MZ").unwrap();
-        let direct = bridge_command(exe.to_str().unwrap());
+        let direct = bridge_command(exe.to_str().unwrap(), &["-p".into()]);
         assert_eq!(direct.as_std().get_program(), exe.as_os_str());
+    }
+
+    #[test]
+    fn windows_cmd_line_quotes_path_and_every_arg_for_cmd() {
+        // A shim path AND an argument both containing spaces: each token must stay quoted, with an
+        // outer pair `/S` strips. Without this, `cmd` strips the path's quotes and the launch breaks
+        // on any Windows profile whose name has a space.
+        let p = std::path::Path::new(r"C:\Users\First Last\npm\claude.cmd");
+        let args = vec![
+            "-p".to_string(),
+            "--mcp-config".to_string(),
+            r"C:\Users\First Last\cfg.json".to_string(),
+        ];
+        let line = windows_cmd_line(p, &args);
+        assert_eq!(
+            line,
+            r#"""C:\Users\First Last\npm\claude.cmd" "-p" "--mcp-config" "C:\Users\First Last\cfg.json"""#
+        );
+        // Outer pair present (the one `/S` consumes), and each space-bearing token is individually
+        // quoted so cmd keeps it intact.
+        assert!(line.starts_with("\"\"") && line.ends_with("\"\""));
     }
 
     #[test]

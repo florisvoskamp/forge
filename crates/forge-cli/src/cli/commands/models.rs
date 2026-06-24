@@ -80,10 +80,23 @@ pub(crate) async fn discover_catalog(config: &forge_config::Config) -> forge_mes
             .filter(|p| forge_config::has_api_key(p))
             .map(str::to_string),
     );
-    for p in providers {
-        match tokio::time::timeout(Duration::from_secs(4), forge_provider::list_models(&p)).await {
+    for p in &providers {
+        // A KEYED provider failing/timing out means the user configured a key but its models silently
+        // vanish from routing (the mesh then falls back to the built-in defaults) — make that LOUD,
+        // and give it a more forgiving budget so a slow/cold connection (e.g. OpenRouter's large list
+        // on Windows) doesn't drop it. Keyless `ollama` failing just means it isn't running: debug.
+        let keyed = p != "ollama";
+        let budget = Duration::from_secs(if keyed { 8 } else { 4 });
+        match tokio::time::timeout(budget, forge_provider::list_models(p)).await {
             Ok(Ok(list)) => models.extend(list),
+            Ok(Err(e)) if keyed => tracing::warn!(
+                "model discovery FAILED for keyed provider '{p}': {e} — its models won't be routable this session (check the key / network)"
+            ),
             Ok(Err(e)) => tracing::debug!("model discovery skipped {p}: {e}"),
+            Err(_) if keyed => tracing::warn!(
+                "model discovery TIMED OUT for keyed provider '{p}' after {}s — its models won't be routable this session",
+                budget.as_secs()
+            ),
             Err(_) => tracing::debug!("model discovery timed out for {p}"),
         }
     }
