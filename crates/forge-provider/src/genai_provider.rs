@@ -428,7 +428,8 @@ fn parse_secs(s: &str) -> Option<f64> {
     let mut num = String::new();
     let mut started = false;
     for c in s.chars() {
-        if c.is_ascii_digit() || (c == '.' && started) {
+        // Accept a leading decimal point (`.5s`) too, and at most one dot.
+        if c.is_ascii_digit() || (c == '.' && !num.contains('.')) {
             num.push(c);
             started = true;
         } else if started {

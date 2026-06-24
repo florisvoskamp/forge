@@ -6,6 +6,36 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-06-24
+
+### Fixed
+A multi-agent audit of the workspace surfaced these (verified) bugs, fixed here:
+
+- **Windows: CLI bridges and MCP servers failed to launch when a path contained a space.** A `.cmd`
+  shim was run as `cmd /C "<path>"`, but `cmd` strips the first/last quote of its `/C` string, so a
+  quoted path broke the moment a second quoted token (an argument with a space — e.g. an
+  `--mcp-config` path under `C:\Users\First Last\…`) appeared. Now launched via `cmd /S /C` with the
+  whole command line individually quoted, so spaces in the path **and** in any argument survive.
+  Applies to both the claude/codex bridges and stdio MCP servers. This could manifest as a bridge
+  that's installed and detected yet keeps benching itself (and the mesh then routing elsewhere).
+- **Bridge failures hid the CLI's own error.** A stalled or crashed bridge now includes the CLI's
+  `stderr` tail in the error (so a benched bridge shows *why* it failed), and a prompt-to-stdin write
+  failure is logged instead of silently dropped (which could leave the CLI waiting for EOF).
+- **A configured provider whose model discovery failed vanished silently.** A keyed provider that
+  errors or times out during discovery is now logged at `warn` (not `debug`), and keyed providers get
+  a more forgiving discovery budget (8s vs 4s) so a slow/cold connection — e.g. OpenRouter's large
+  model list — doesn't drop it and force a fallback to the built-in defaults.
+- **`@path` completion was dead on Windows** outside a git repo: the fallback shelled out to Unix
+  `find` (a different, incompatible tool on Windows). Replaced with a portable `std::fs` walk.
+- **Architect mode reused the wrong failover chain.** When the editor model differed from the routed
+  model, an editor-model failure failed over using the *routed* model's fallbacks; it now runs
+  without cross-model failover (matching the self-review / autofix re-runs).
+- **An empty keyring entry counted as an API key**, producing a cryptic provider 401 instead of the
+  actionable "no key — run `forge auth`" message. `api_key()` now requires a non-empty value, like
+  `has_api_key()`.
+- **A server retry-after of the form `.5s` (leading decimal point) was ignored**, discarding the
+  server's cooldown hint; the parser now accepts a leading dot.
+
 ## [0.3.2] - 2026-06-24
 
 ### Fixed
@@ -250,7 +280,8 @@ Initial public release: Model Mesh routing, multi-provider support, cost/budget 
 inline TUI, session persistence + checkpoints, permission broker, subagents, Assay analysis,
 Lattice code intelligence, MCP client, web tools, hooks, skills/commands, and more.
 
-[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/florisvoskamp/forge/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/florisvoskamp/forge/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/florisvoskamp/forge/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/florisvoskamp/forge/compare/v0.2.0...v0.3.0

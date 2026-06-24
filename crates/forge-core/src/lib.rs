@@ -2776,9 +2776,18 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         let max_steps = self.config.mesh.max_steps.max(1);
 
         // Primary turn: pass the routing decision so failover, step-0 routing record, and quota
-        // hints are all active.
+        // hints are all active — EXCEPT when architect mode swapped in a different editor model. The
+        // routed `decision` describes the ROUTED model's failover chain (ranked for a different
+        // model/tier); reusing it here would fail an editor-model error over to nonsensical
+        // fallbacks. Match the self-review / autofix re-runs and run without a decision (no
+        // cross-model failover) when the model was switched.
+        let primary_decision = if edit_model == routed_model {
+            Some(&decision)
+        } else {
+            None
+        };
         let outcome = self
-            .run_model_loop(edit_model, &specs, Some(&decision), max_steps, stream_idle)
+            .run_model_loop(edit_model, &specs, primary_decision, max_steps, stream_idle)
             .await?;
         let mut final_text = outcome.final_text;
         let mut context_tokens = outcome.context_tokens;

@@ -75,7 +75,10 @@ pub(crate) fn sync_palette_to_slash_token(app: &mut forge_tui::App) {
     }
 }
 
-/// Enumerate project files for `@path` completion: `git ls-files` first, `find` fallback.
+/// Enumerate project files for `@path` completion: `git ls-files` first, then a portable directory
+/// walk. The fallback used to shell out to Unix `find`, which silently produced nothing on Windows
+/// (where `find.exe` is an unrelated text-search tool) — so `@path` completion was dead outside a git
+/// repo on Windows. A plain `std::fs` walk works everywhere and needs no external program.
 pub(crate) fn load_at_files() -> Vec<String> {
     if let Ok(out) = std::process::Command::new("git")
         .args(["ls-files"])
@@ -88,18 +91,43 @@ pub(crate) fn load_at_files() -> Vec<String> {
                 .collect();
         }
     }
-    if let Ok(out) = std::process::Command::new("find")
-        .args([".", "-maxdepth", "5", "-type", "f", "-not", "-path", "*/.*"])
-        .output()
-    {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .map(|s| s.trim_start_matches("./").to_string())
-                .collect();
+    let base = std::path::Path::new(".");
+    let mut out = Vec::new();
+    walk_at_files(base, base, 5, &mut out);
+    out
+}
+
+/// Recursive file walk for [`load_at_files`]: up to `depth` levels under `base`, files only,
+/// skipping dot-entries, with `/`-normalized paths relative to `base`. Bounded so a giant tree can't
+/// stall completion.
+fn walk_at_files(
+    dir: &std::path::Path,
+    base: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    if depth == 0 || out.len() >= 10_000 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue; // skip .git, dotfiles, hidden dirs
+        }
+        let Ok(ft) = entry.file_type() else { continue };
+        let path = entry.path();
+        if ft.is_dir() {
+            walk_at_files(&path, base, depth - 1, out);
+        } else if ft.is_file() {
+            let rel = path.strip_prefix(base).unwrap_or(&path);
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+        if out.len() >= 10_000 {
+            return;
         }
     }
-    Vec::new()
 }
 
 /// Keep the `@path` picker in sync with the `@token` at the cursor: open + filter when present,
