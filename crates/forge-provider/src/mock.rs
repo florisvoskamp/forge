@@ -77,6 +77,8 @@ impl Provider for MockProvider {
             || lu.contains("mock:tasks")
             || lu.contains("task list")
             || lu.contains("track tasks");
+        // A response that contains a fenced code block (exercises the `/copy` block picker).
+        let wants_code = lu.contains("mock:code") || lu.contains("code block");
 
         // Planning turn → render the plan card, then stop for approval.
         if wants_plan {
@@ -133,6 +135,14 @@ impl Provider for MockProvider {
                 30,
                 12,
             ));
+        }
+
+        // Code-block turn → a terminal answer containing a fenced block (for the /copy picker).
+        if wants_code {
+            let content =
+                "Here's a snippet:\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\nThat's it.";
+            stream_words(content, on_event);
+            return Ok(resp(content, vec![], 42, 18));
         }
 
         // Default: a read_file round-trip then a final answer. The token counts here are load-bearing

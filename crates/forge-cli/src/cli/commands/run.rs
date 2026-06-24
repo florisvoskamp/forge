@@ -567,6 +567,95 @@ pub(crate) fn copy_selection(clipboard: &mut Option<arboard::Clipboard>, text: &
     }
 }
 
+/// The Nth-latest non-empty assistant response from a [`Session::history`] list (which is
+/// oldest-first, user + assistant only). `nth` is 1-based counting back from the most recent
+/// (1 = the last response, 2 = the one before). `None` when fewer than `nth` assistant responses
+/// exist. Pure, so `/copy`'s selection logic is unit-tested without a live session.
+pub(crate) fn nth_assistant_response(
+    history: &[(forge_types::Role, String)],
+    nth: usize,
+) -> Option<String> {
+    history
+        .iter()
+        .filter(|(role, text)| {
+            matches!(role, forge_types::Role::Assistant) && !text.trim().is_empty()
+        })
+        .map(|(_, text)| text.clone())
+        .rev()
+        .nth(nth.saturating_sub(1))
+}
+
+/// Extract fenced code blocks from a markdown string as `(lang, code)` pairs (lang is the fence
+/// info string, e.g. `rust`, or `""`). Handles the common ```-fence form; an unterminated final
+/// block is still captured. Used by `/copy` to offer per-block selection.
+pub(crate) fn extract_code_blocks(md: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut in_block = false;
+    let mut lang = String::new();
+    let mut buf = String::new();
+    for line in md.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("```") {
+            if in_block {
+                blocks.push((std::mem::take(&mut lang), std::mem::take(&mut buf)));
+                in_block = false;
+            } else {
+                in_block = true;
+                lang = rest.trim().to_string();
+            }
+        } else if in_block {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    if in_block && !buf.trim().is_empty() {
+        blocks.push((lang, buf));
+    }
+    blocks
+}
+
+/// A sensible file extension for a fenced block's language tag (`rust` → `rs`, …); `txt` default.
+fn ext_for_lang(lang: &str) -> &'static str {
+    match lang
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "rust" | "rs" => "rs",
+        "python" | "py" => "py",
+        "bash" | "sh" | "shell" | "zsh" => "sh",
+        "javascript" | "js" => "js",
+        "typescript" | "ts" => "ts",
+        "json" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "go" => "go",
+        "c" => "c",
+        "cpp" | "c++" => "cpp",
+        "java" => "java",
+        "html" => "html",
+        "css" => "css",
+        "sql" => "sql",
+        "markdown" | "md" => "md",
+        _ => "txt",
+    }
+}
+
+/// Write copied text to a timestamped file in the cwd (the `w` key in the `/copy` picker — useful
+/// over SSH where the clipboard can't reach the local machine). Returns the path written.
+fn write_copy_to_file(text: &str, lang: &str) -> std::io::Result<std::path::PathBuf> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(format!("forge-copy-{ts}.{}", ext_for_lang(lang)));
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
 pub(crate) async fn chat(
     mock: bool,
     mode: Option<Mode>,
@@ -1223,6 +1312,13 @@ pub(crate) async fn run_chat_tui(
                             DispatchOutcome::ToggleRemote { exposure } => {
                                 toggle_remote(&mut remote, &mut app, &mut tui, exposure).await?;
                             }
+                            DispatchOutcome::CopyToClipboard(text) => {
+                                let chars = text.chars().count();
+                                copy_selection(&mut clipboard, &text);
+                                app.note(&format!(
+                                    "✓ copied response to clipboard ({chars} chars)"
+                                ));
+                            }
                         }
                     }
                     KeyKind::CycleTemper | KeyKind::ToggleSubagentDetail => {}
@@ -1374,8 +1470,42 @@ pub(crate) async fn run_chat_tui(
                                     &mut busy_since,
                                 )
                                 .await?;
+                            } else if kind == forge_tui::PickerKind::CopyBlocks {
+                                // Enter copies the selected candidate (full response or a block) to
+                                // the clipboard. Row id is the index into copy_candidates.
+                                if let Some((_, text)) = row
+                                    .id
+                                    .parse::<usize>()
+                                    .ok()
+                                    .and_then(|i| app.copy_candidates.get(i).cloned())
+                                {
+                                    let chars = text.chars().count();
+                                    copy_selection(&mut clipboard, &text);
+                                    app.note(&format!("✓ copied to clipboard ({chars} chars)"));
+                                }
+                                app.copy_candidates.clear();
                             } else {
                                 picker_accept(kind, &row, &session, &mut tui, &mut app).await?;
+                            }
+                        }
+                    }
+                    // `w` in the copy picker writes the selected candidate to a file instead of the
+                    // clipboard (useful over SSH). Other chars filter the list as usual.
+                    KeyKind::Char(c)
+                        if app.picker.kind == Some(forge_tui::PickerKind::CopyBlocks)
+                            && (c == 'w' || c == 'W') =>
+                    {
+                        let pick = app
+                            .picker
+                            .selected_row()
+                            .and_then(|r| r.id.parse::<usize>().ok())
+                            .and_then(|i| app.copy_candidates.get(i).cloned());
+                        app.picker.close();
+                        app.copy_candidates.clear();
+                        if let Some((lang, text)) = pick {
+                            match write_copy_to_file(&text, &lang) {
+                                Ok(path) => app.note(&format!("✓ wrote to {}", path.display())),
+                                Err(e) => app.note(&format!("write failed: {e}")),
                             }
                         }
                     }
@@ -1736,6 +1866,13 @@ pub(crate) async fn run_chat_tui(
                                 DispatchOutcome::ToggleRemote { exposure } => {
                                     toggle_remote(&mut remote, &mut app, &mut tui, exposure)
                                         .await?;
+                                }
+                                DispatchOutcome::CopyToClipboard(text) => {
+                                    let chars = text.chars().count();
+                                    copy_selection(&mut clipboard, &text);
+                                    app.note(&format!(
+                                        "✓ copied response to clipboard ({chars} chars)"
+                                    ));
                                 }
                             }
                         } else {
@@ -2508,6 +2645,9 @@ pub(crate) enum DispatchOutcome {
     /// `/remote [--lan|--local|--anywhere]` — toggle remote control on (start the server) or off
     /// (stop it). The [`remote::Exposure`] selects bind address / public-tunnel mode.
     ToggleRemote { exposure: remote::Exposure },
+    /// `/copy [N]` — write the resolved assistant response text to the clipboard. The driver loop
+    /// owns the `arboard::Clipboard`, so dispatch resolves the text and hands it back to copy.
+    CopyToClipboard(String),
 }
 
 /// Build a fully-populated [`forge_tui::MeshOverlay`] from a routing explanation.
@@ -2818,6 +2958,56 @@ pub(crate) async fn dispatch_command(
         }
         // `/compact` makes a model call → run it as a background task so the spinner ticks.
         CommandAction::Compact => return Ok(DispatchOutcome::RunCompact),
+        // `/copy [N]` — resolve the Nth-latest assistant response and hand it to the loop to copy
+        // (the loop owns the clipboard). N is 1-based from the most recent (1 = last response).
+        CommandAction::Copy { nth } => {
+            let history = { session.lock().await.history() };
+            match nth_assistant_response(&history, nth) {
+                Some(text) => {
+                    let blocks = extract_code_blocks(&text);
+                    if blocks.is_empty() {
+                        // No code → copy the whole response straight away (no picker needed).
+                        return Ok(DispatchOutcome::CopyToClipboard(text));
+                    }
+                    // Code present → offer a picker: the full response, or any individual block.
+                    // Row `id` is the index into `app.copy_candidates`; 0 = full response.
+                    let mut rows = vec![forge_tui::PickerRow {
+                        id: "0".into(),
+                        title: "Full response".into(),
+                        subtitle: format!("{} chars", text.chars().count()),
+                    }];
+                    let mut candidates: Vec<(String, String)> = vec![(String::new(), text.clone())];
+                    for (i, (lang, code)) in blocks.into_iter().enumerate() {
+                        let label = if lang.is_empty() {
+                            format!("Code block {}", i + 1)
+                        } else {
+                            format!("Code block {} · {lang}", i + 1)
+                        };
+                        rows.push(forge_tui::PickerRow {
+                            id: (i + 1).to_string(),
+                            title: label,
+                            subtitle: format!("{} lines", code.lines().count()),
+                        });
+                        candidates.push((lang, code));
+                    }
+                    app.copy_candidates = candidates;
+                    app.picker.open_with(
+                        forge_tui::PickerKind::CopyBlocks,
+                        "copy — Enter: clipboard · w: write to file · Esc: cancel",
+                        rows,
+                    );
+                }
+                None => {
+                    let n = history
+                        .iter()
+                        .filter(|(role, _)| matches!(role, forge_types::Role::Assistant))
+                        .count();
+                    app.note(&format!(
+                        "no assistant response #{nth} to copy (only {n} so far)"
+                    ));
+                }
+            }
+        }
         CommandAction::Lattice(symbol) => {
             if symbol.is_empty() {
                 app.note("usage: /lattice <symbol>");
@@ -3545,6 +3735,8 @@ pub(crate) async fn picker_accept(
         forge_tui::PickerKind::AssayChoice => {}
         // The models browser drills/steps within the render loop; Enter never resolves here.
         forge_tui::PickerKind::Models => {}
+        // The copy picker resolves in the render loop (it needs the clipboard); never here.
+        forge_tui::PickerKind::CopyBlocks => {}
         forge_tui::PickerKind::ResumeMode => {
             if row.id == "full" {
                 let n = {

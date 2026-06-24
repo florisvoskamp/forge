@@ -302,6 +302,11 @@ pub struct App {
     /// The interactive session/checkpoint picker (RFC session-management-and-commands). Modal
     /// while open; reused for `/sessions`, `/resume`, and `/checkpoints`.
     pub picker: crate::commands::Picker,
+    /// Candidates for the `/copy` block picker (`PickerKind::CopyBlocks`) as `(lang, text)`: index 0
+    /// is the full response (lang `""`), 1.. are the fenced code blocks (lang = the fence info). A
+    /// picker row's `id` is the index here; Enter copies the text to the clipboard, `w` writes it to
+    /// a file (extension derived from `lang`) — both handled in the render loop.
+    pub copy_candidates: Vec<(String, String)>,
     /// For the `/models` browser only: `Some(provider)` when drilled into a provider's models,
     /// `None` at the top-level provider list. Lets Esc step back a level instead of closing.
     pub models_drilled: Option<String>,
