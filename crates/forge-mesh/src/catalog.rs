@@ -926,7 +926,10 @@ mod tests {
             "gemini::gemini-flash-latest",
         ] {
             let m = infos.iter().find(|m| m.id == id).unwrap();
-            assert!(m.free && !m.paid, "unpriced Gemini Flash is free-tier: {m:?}");
+            assert!(
+                m.free && !m.paid,
+                "unpriced Gemini Flash is free-tier: {m:?}"
+            );
         }
         for id in ["gemini::gemini-3-pro-preview", "gemini::gemini-pro-latest"] {
             let m = infos.iter().find(|m| m.id == id).unwrap();
