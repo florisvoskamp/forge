@@ -61,6 +61,11 @@ pub const COMMANDS: &[Command] = &[
         usage: "/config",
     },
     Command {
+        name: "copy",
+        desc: "copy the last assistant response to the clipboard (/copy N for the Nth-latest)",
+        usage: "/copy [N]",
+    },
+    Command {
         name: "thinking",
         desc: "toggle model reasoning/thinking display on or off",
         usage: "/thinking",
@@ -229,6 +234,11 @@ pub enum CommandAction {
     Plan(String),
     /// Approve the proposed plan and execute it (`/execute`): switches to Auto-edit and builds it.
     Execute,
+    /// Copy an assistant response to the clipboard (`/copy [N]`). `nth` is 1-based and counts back
+    /// from the most recent assistant message: 1 = the last response, 2 = the one before it.
+    Copy {
+        nth: usize,
+    },
     Quit,
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
@@ -502,6 +512,16 @@ pub fn parse_command(line: &str) -> CommandAction {
             CommandAction::Replay(id_a, id_b)
         }
         "effort" => CommandAction::SetEffort((!arg.is_empty()).then_some(arg)),
+        "copy" | "yank" => {
+            // `/copy` → last response; `/copy N` → Nth-latest. Non-numeric / <1 args fall back to 1.
+            let nth = arg
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(1);
+            CommandAction::Copy { nth }
+        }
         "clear" | "cls" => CommandAction::ClearScreen,
         "usage" => CommandAction::Usage,
         "mesh" => CommandAction::Mesh((!arg.is_empty()).then_some(arg)),
@@ -679,6 +699,10 @@ pub enum PickerKind {
     /// On resuming a previously-compacted session: continue with the compacted context, or reload
     /// the full original history into the model's view.
     ResumeMode,
+    /// Pick what part of an assistant response to copy (`/copy` when the response has code blocks):
+    /// the full response or an individual fenced block. Enter → clipboard, `w` → write to a file.
+    /// Each row's `id` is the index into [`App::copy_candidates`](crate::App::copy_candidates).
+    CopyBlocks,
 }
 
 /// One row in an interactive picker: an opaque `id` the loop acts on, plus two display strings.
@@ -814,6 +838,12 @@ mod tests {
         assert_eq!(parse_command("/config"), CommandAction::Config);
         assert_eq!(parse_command("/cfg"), CommandAction::Config);
         assert_eq!(parse_command("/settings"), CommandAction::Config);
+        // /copy: bare → last response; numeric arg → that depth; junk/zero → clamp to 1.
+        assert_eq!(parse_command("/copy"), CommandAction::Copy { nth: 1 });
+        assert_eq!(parse_command("/copy 3"), CommandAction::Copy { nth: 3 });
+        assert_eq!(parse_command("/copy 0"), CommandAction::Copy { nth: 1 });
+        assert_eq!(parse_command("/copy abc"), CommandAction::Copy { nth: 1 });
+        assert_eq!(parse_command("/yank 2"), CommandAction::Copy { nth: 2 });
         assert_eq!(parse_command("/mcp"), CommandAction::Mcp(None));
         assert_eq!(
             parse_command("/mcp gitlab"),

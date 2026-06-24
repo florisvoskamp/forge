@@ -1,0 +1,36 @@
+# Verify /copy end-to-end.
+# 1) A plain response → /copy copies it directly (no picker).
+send hello, please reply with a short greeting
+sleep 2500
+capture after-response
+expect ⚒ forge
+send /copy
+sleep 800
+capture after-direct-copy
+expect copied response to clipboard
+
+# 2) A response WITH a code block → /copy opens the block picker.
+send mock:code please
+sleep 2500
+capture after-code-response
+send /copy
+sleep 800
+capture picker-open
+expect Full response
+expect Code block
+expect write to file
+# Select the code block (Down once) and copy it with Enter.
+key Down
+key Enter
+sleep 600
+capture after-block-copy
+expect copied to clipboard
+
+# 3) Re-open the picker and write the selection to a file with `w` (SSH-friendly).
+send /copy
+sleep 800
+capture picker-reopen
+key w
+sleep 600
+capture after-write
+expect wrote to
