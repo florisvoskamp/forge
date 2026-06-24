@@ -574,13 +574,14 @@ impl HeuristicRouter {
         // Demote a near-limit subscription (Warning, L3) to the back — still a fallback, but the
         // mesh tries everything else first. Stable, so it preserves the order within each group.
         usable.sort_by_key(|m| quota.is_pressured(forge_config::provider_of(m)));
-        // Provider-diverse failover: round-robin across providers so one provider's rate-limit
-        // storm (e.g. a free tier with many models) can't dominate the head of the chain. The
-        // primary pick — position 0 — is unchanged (it's the top-ranked model, its provider's
-        // first entry, taken first), but the *tail* now alternates providers so failover crosses
-        // to a different provider (other free tiers, the claude/codex subscription bridges) within
-        // a hop or two instead of churning through one provider's entire benched block.
-        interleave_by_provider(usable)
+        // Failover follows the mesh ranking verbatim: the Nth model Forge tries is the Nth-best
+        // ranked model, not the top model of the Nth provider. (A previous round-robin interleave
+        // destroyed cross-provider rank order — e.g. it sent release work to a low-ranked free
+        // model after a higher-ranked provider's first model failed.) Rate-limit storms are
+        // handled lazily downstream instead: forge-core skips a provider's *remaining* chain
+        // entries only after one of its models actually returns a rate-limit error, so rank order
+        // is preserved for every other failure mode.
+        usable
     }
 
     /// Build the ordered failover chain for the routed tier: that tier's usable models first,
@@ -605,42 +606,6 @@ impl HeuristicRouter {
         }
         chain
     }
-}
-
-/// Re-thread a rank-ordered model list so providers alternate, while preserving each provider's
-/// internal order (so a provider's best model is still tried before its second-best). Position 0
-/// is unchanged — it's the first model of the first-seen provider, i.e. the overall top-ranked
-/// entry — so the *primary pick* never changes; only the failover tail becomes provider-diverse.
-///
-/// Example: `[g1, g2, g3, claude, o1]` (g* = same provider) → `[g1, claude, o1, g2, g3]`. A 429
-/// storm on `g*` now costs every Nth slot instead of the whole head of the chain.
-fn interleave_by_provider(models: Vec<String>) -> Vec<String> {
-    use std::collections::VecDeque;
-    // Groups in first-seen (= rank) order; each keeps its models in rank order.
-    let mut groups: Vec<(String, VecDeque<String>)> = Vec::new();
-    for m in models {
-        let p = forge_config::provider_of(&m).to_string();
-        match groups.iter_mut().find(|(gp, _)| *gp == p) {
-            Some((_, q)) => q.push_back(m),
-            None => {
-                let mut q = VecDeque::new();
-                q.push_back(m);
-                groups.push((p, q));
-            }
-        }
-    }
-    let mut out = Vec::new();
-    let mut progressed = true;
-    while progressed {
-        progressed = false;
-        for (_, q) in groups.iter_mut() {
-            if let Some(m) = q.pop_front() {
-                out.push(m);
-                progressed = true;
-            }
-        }
-    }
-    out
 }
 
 /// A `(u8, f64)`-comparable cost key. `f64` isn't `Ord`, so wrap it for use inside tuple
@@ -838,30 +803,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interleave_keeps_primary_but_spreads_providers() {
-        // A free tier (gemini) floods the head; subscription + another provider sit behind it.
-        let ranked = vec![
-            "gemini::g1".to_string(),
-            "gemini::g2".to_string(),
-            "gemini::g3".to_string(),
-            "anthropic::claude".to_string(),
-            "groq::q1".to_string(),
-            "gemini::g4".to_string(),
-        ];
-        let out = interleave_by_provider(ranked);
-        // Primary pick (position 0) is unchanged — still the overall top-ranked model.
-        assert_eq!(out[0], "gemini::g1");
-        // The very next entries cross to OTHER providers, not gemini's benched siblings, so a
-        // gemini rate-limit storm reaches claude/groq within one or two failover hops.
-        assert_eq!(out[1], "anthropic::claude");
-        assert_eq!(out[2], "groq::q1");
-        assert_eq!(out[3], "gemini::g2");
-        // No model is lost and each provider keeps its internal rank order.
-        assert_eq!(out.len(), 6);
-        let gemini: Vec<&String> = out.iter().filter(|m| m.starts_with("gemini::")).collect();
+    fn failover_chain_follows_mesh_rank_order_not_provider_interleave() {
+        // The failover chain must walk models in the SAME order the mesh ranks them — the Nth
+        // model tried is the Nth-best ranked model, NOT the top model of the Nth provider. (A
+        // prior round-robin interleave broke this, which is how release work landed on a
+        // low-ranked free model after a higher-ranked provider's first model failed over.)
+        let r = mixed_router();
+        let health = ModelHealth::default();
+        let quota = SubscriptionQuota::default();
+        let hints = RouteHints::default();
+        let tier = TaskTier::Complex;
+
+        let ranked_usable: Vec<String> = r
+            .candidates_for_tier(tier, hints, &quota)
+            .into_iter()
+            .filter(|m| r.is_usable(m, &health, &quota))
+            .collect();
+        let chain = r.ordered_usable_for_tier(tier, &health, hints, &quota);
         assert_eq!(
-            gemini,
-            ["gemini::g1", "gemini::g2", "gemini::g3", "gemini::g4"]
+            chain, ranked_usable,
+            "failover order must equal mesh rank order with no provider interleaving"
         );
     }
 

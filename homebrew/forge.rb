@@ -9,24 +9,24 @@
 class Forge < Formula
   desc "Multi-provider mesh AI coding CLI"
   homepage "https://github.com/florisvoskamp/forge"
-  version "0.3.10" # release: update sha256 values from checksums.txt after the tag workflow finishes
+  version "0.4.0" # release: update sha256 values from checksums.txt after the tag workflow finishes
   license "MIT"
 
   on_macos do
     on_arm do
       url "https://github.com/florisvoskamp/forge/releases/download/v#{version}/forge-aarch64-apple-darwin.tar.gz"
-      sha256 "6d4f054c37ab9e5d30f6dc6b9fd741fa42ec73a80b46a3a63788148ed68b3749"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
     on_intel do
       url "https://github.com/florisvoskamp/forge/releases/download/v#{version}/forge-x86_64-apple-darwin.tar.gz"
-      sha256 "30251c7af3e0208286310fec3bb7cd7f12a0c607ab58ff7eafa40ac585ab1120"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/florisvoskamp/forge/releases/download/v#{version}/forge-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "b4fb2f057bafe1c48c4ff3e26d9d5dba30ac3f7bb541cdb56baabecf122bf6ad"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
 

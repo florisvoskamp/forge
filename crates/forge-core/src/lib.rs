@@ -2135,6 +2135,11 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         // ever hard-stops, so a repeated call doesn't kill an otherwise-recoverable turn.
         let mut continue_nudges = 0usize;
         let mut doom_nudged = false;
+        // `toolcall_repair_nudges`: bounded retries when a direct model writes a tool call as TEXT
+        // (`<invoke>` / `default_api:` markup) that the provider couldn't decode AND the text
+        // recovery pass missed — so nothing executed. Without this the narration is accepted as a
+        // final answer and the turn "succeeds" having done nothing (the phantom-release bug).
+        let mut toolcall_repair_nudges = 0usize;
 
         for step in 0..max_steps {
             // Stream the reply, with transparent failover for this step's completion.
@@ -2273,12 +2278,28 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                         self.presenter.emit(PresenterEvent::ModelSearch {
                             model: active_model.clone(),
                         });
+                        // Lazy 429-skip: the chain is in strict mesh-rank order, but a rate limit is
+                        // usually provider-wide, so trying the failed provider's lower-ranked
+                        // siblings next would just 429 again. ONLY on a rate-limit, skip this
+                        // provider's remaining chain entries and cross to the next provider; every
+                        // other failure keeps rank order intact. (Without this, dropping the old
+                        // provider-interleave would re-expose the 429-storm the interleave guarded.)
+                        let skip_provider = if e.is_rate_limited() {
+                            Some(forge_config::provider_of(&active_model).to_string())
+                        } else {
+                            None
+                        };
                         // Advance down the chain to the next model we can use. A model whose window
                         // still holds the conversation is used immediately; one that's too small is
                         // a switch that needs (lossy) compaction, so it's gated by consent
                         // (Yes/No/Always) — "No" skips it and we keep looking for one that fits.
                         let mut picked = None;
                         for next in chain.by_ref() {
+                            if let Some(p) = &skip_provider {
+                                if forge_config::provider_of(&next) == p.as_str() {
+                                    continue;
+                                }
+                            }
                             match self.admit_failover_model(&next).await {
                                 Ok(true) => {
                                     picked = Some(next);
@@ -2414,6 +2435,38 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                     // calls as text and spiralling, the bug behind the per-turn nudge spam). The
                     // user can send `continue` to re-run the bridge cleanly.
                 } else {
+                    // Honest-failure guard: a direct model wrote a tool call as TEXT (e.g.
+                    // `<invoke>`/`default_api:` markup) instead of invoking it, and neither the
+                    // provider nor the text-recovery pass turned it into a real call — so NOTHING
+                    // ran. Accepting this as the final answer is how a turn "succeeds" while having
+                    // merged no PR and pushed no tag. Detect it and nudge the model to actually
+                    // call the tool (bounded); never silently accept narrated tool calls.
+                    if forge_provider::looks_like_unexecuted_tool_call(&resp.content) {
+                        const MAX_TOOLCALL_REPAIR_NUDGES: usize = 2;
+                        if toolcall_repair_nudges < MAX_TOOLCALL_REPAIR_NUDGES {
+                            toolcall_repair_nudges += 1;
+                            self.presenter.emit(PresenterEvent::Warning(format!(
+                                "model wrote a tool call as text instead of invoking it — nothing ran; asking it to retry ({toolcall_repair_nudges}/{MAX_TOOLCALL_REPAIR_NUDGES})"
+                            )));
+                            let nudge = "Your last message contained a tool call written as TEXT \
+                                         (e.g. `<invoke …>` or `default_api:` syntax). That tool DID \
+                                         NOT run — text is not a tool call. Make the call through the \
+                                         function-calling interface instead. Do not paste tool-call \
+                                         markup into your message.";
+                            let nseq = self.next_seq();
+                            let _ =
+                                self.store
+                                    .add_message(&self.id, nseq, Role::System, nudge, None);
+                            self.transcript.push(Message::system(nudge));
+                            continue;
+                        }
+                        // Retries exhausted: do NOT pretend it worked. Surface it loudly so the user
+                        // knows the turn's actions never executed, then end (can't loop forever).
+                        self.presenter.emit(PresenterEvent::Warning(
+                            "model kept emitting tool calls as text that never executed — the turn did NOT complete its actions"
+                                .to_string(),
+                        ));
+                    }
                     // Direct model, non-empty text, no tool call — usually the real final answer.
                     // But a weaker model often narrates its NEXT action ("now I'll edit X") without
                     // calling the tool, or signs off with tasks still open. If the tracked task list
@@ -6711,6 +6764,130 @@ mod tests {
             message: "429".into(),
             retry_after: Some(std::time::Duration::from_secs(42)),
         }
+    }
+
+    fn unavailable(_m: &str) -> forge_provider::ProviderError {
+        forge_provider::ProviderError::Unavailable("502".into())
+    }
+
+    /// Fails `bad` models with a chosen error; every other model answers with its OWN id as the
+    /// content, so a test can tell WHICH fallback actually served the turn.
+    struct EchoProvider {
+        bad: std::collections::HashSet<String>,
+        err: fn(&str) -> forge_provider::ProviderError,
+    }
+    #[async_trait::async_trait]
+    impl Provider for EchoProvider {
+        async fn complete(
+            &self,
+            model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            if self.bad.contains(model) {
+                return Err((self.err)(model));
+            }
+            on_event(StreamEvent::Text(model.into()));
+            Ok(forge_provider::ModelResponse {
+                content: model.into(),
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_skips_the_failed_providers_remaining_chain_entries() {
+        // Chain is in mesh-rank order [prova::2, provb::1]. prova::1 rate-limits — a 429 is
+        // provider-wide, so the lazy-skip must pass over prova::2 (same provider) and cross to
+        // provb::1, NOT churn through prova's siblings.
+        let provider = Arc::new(EchoProvider {
+            bad: ["prova::1".to_string()].into_iter().collect(),
+            err: rate_limited,
+        });
+        let router = Arc::new(FixedRouter {
+            model: "prova::1".into(),
+            fallbacks: vec!["prova::2".into(), "provb::1".into()],
+        });
+        let (_store, mut session) = fixed_session(provider, router);
+        let answer = session.run_turn("do it").await.unwrap();
+        assert_eq!(
+            answer, "provb::1",
+            "429 on prova::1 must skip same-provider prova::2 and use provb::1"
+        );
+    }
+
+    /// Narrates a tool call as TEXT for the first `narrate` completions, then answers cleanly.
+    struct NarrateThenAnswerProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        narrate: usize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for NarrateThenAnswerProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let text = if n < self.narrate {
+                "<invoke name=\"shell\"><parameter name=\"command\">git push</parameter></invoke>"
+            } else {
+                "all done"
+            };
+            on_event(StreamEvent::Text(text.into()));
+            Ok(forge_provider::ModelResponse {
+                content: text.into(),
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn narrated_tool_call_is_not_accepted_as_a_final_answer() {
+        // A direct model writes a tool call as text (nothing executes). The honest-failure guard
+        // must NOT accept it as the turn's answer — it nudges the model, which then answers for
+        // real. Proven by the final text being the clean answer, not the narrated markup.
+        let provider = Arc::new(NarrateThenAnswerProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            narrate: 1,
+        });
+        let router = Arc::new(FixedRouter {
+            model: "direct::model".into(),
+            fallbacks: vec![],
+        });
+        let (_store, mut session) = fixed_session(provider, router);
+        let answer = session.run_turn("ship it").await.unwrap();
+        assert_eq!(
+            answer, "all done",
+            "narrated tool-call text must be nudged, not accepted as the final answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_rate_limit_failure_keeps_strict_rank_order() {
+        // A NON-429 failure (outage) must NOT skip the provider — strict mesh-rank order means the
+        // very next-ranked model (prova::2) is tried, even though it shares prova::1's provider.
+        let provider = Arc::new(EchoProvider {
+            bad: ["prova::1".to_string()].into_iter().collect(),
+            err: unavailable,
+        });
+        let router = Arc::new(FixedRouter {
+            model: "prova::1".into(),
+            fallbacks: vec!["prova::2".into(), "provb::1".into()],
+        });
+        let (_store, mut session) = fixed_session(provider, router);
+        let answer = session.run_turn("do it").await.unwrap();
+        assert_eq!(
+            answer, "prova::2",
+            "an outage keeps rank order — next-ranked prova::2 is tried, not skipped"
+        );
     }
 
     /// Fails the first `fail_first` calls with a context-overflow error, then answers. Used to

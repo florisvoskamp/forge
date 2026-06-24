@@ -150,6 +150,11 @@ impl Store {
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Forge runs multiple processes against the same global db (the TUI plus the
+        // `mcp-serve` bridge subprocess). WAL still allows only one writer at a time, so a
+        // concurrent writer hits SQLITE_BUSY immediately without this — surfacing as
+        // "database is locked" and, in the field, a mid-turn session crash. Wait instead.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // Migrate before schema so old DBs get the composite PK before CREATE TABLE IF NOT EXISTS no-ops.
         let _ = migrate_subscription_usage(&conn);
         conn.execute_batch(schema::SCHEMA)?;

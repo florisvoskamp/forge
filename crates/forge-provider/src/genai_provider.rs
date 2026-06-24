@@ -607,6 +607,20 @@ impl Provider for GenAiProvider {
             }
         }
 
+        // Recovery pass: some native adapters (e.g. genai's Gemini adapter on newer models) don't
+        // decode the model's function calls into structured tool_calls — they leak into `content`
+        // as `<invoke>`/`<tool_call>` markup. Without this, Forge sees no tool calls, treats the
+        // narration as a final answer, and "succeeds" without acting (the phantom-release bug). When
+        // the structured capture came back empty, reconstruct calls from the text and strip the
+        // markup so the visible content stays clean.
+        if tool_calls.is_empty() {
+            let (recovered, cleaned) = crate::recover_text_tool_calls(&content);
+            if !recovered.is_empty() {
+                tool_calls = recovered;
+                content = cleaned;
+            }
+        }
+
         Ok(ModelResponse {
             content,
             tool_calls,
