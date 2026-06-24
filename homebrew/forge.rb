@@ -15,18 +15,18 @@ class Forge < Formula
   on_macos do
     on_arm do
       url "https://github.com/florisvoskamp/forge/releases/download/v#{version}/forge-aarch64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "41a7d3e8b340a284dd89b80c5abec7a2f01cdd95ac212cb508735ef2169dbfeb"
     end
     on_intel do
       url "https://github.com/florisvoskamp/forge/releases/download/v#{version}/forge-x86_64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "3e5f905716c0c703b366e7af39fc7da3c8b693d9d14c6bd466ab214947c8216e"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/florisvoskamp/forge/releases/download/v#{version}/forge-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "6659449d9e78e8b25bf4619475d7ec2ad9692f9fcaa8d411ebe7f4b5442de3c1"
     end
   end
 
