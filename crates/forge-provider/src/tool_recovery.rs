@@ -12,6 +12,7 @@
 //!   - Anthropic / Claude-style:  `<invoke name="T"><parameter name="p">v</parameter></invoke>`,
 //!     optionally wrapped in `<function_calls>…</function_calls>`.
 //!   - Qwen / ollama-style:       `<tool_call>{"name":"T","arguments":{…}}</tool_call>`.
+//!
 //! Wrapper namespaces some SDKs prepend (`default_api:`, `default_api.`, `functions.`,
 //! `mcp__forge__`) are normalized back to the bare Forge tool name so the recovered call dispatches.
 
@@ -32,10 +33,7 @@ pub fn recover_text_tool_calls(content: &str) -> (Vec<ToolCall>, String) {
     let mut cleaned = content.to_string();
 
     for (open, close) in [("<invoke", "</invoke>"), ("<tool_call>", "</tool_call>")] {
-        loop {
-            let Some(start) = cleaned.find(open) else {
-                break;
-            };
+        while let Some(start) = cleaned.find(open) {
             let Some(rel_end) = cleaned[start..].find(close) else {
                 break; // unterminated — leave it as text rather than guess
             };
