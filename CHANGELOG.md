@@ -6,6 +6,32 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A bridge turn can no longer end with the plan half-done or falsely "done."** A CLI bridge
+  (claude-cli/codex) is a one-shot subprocess that runs its own loop and exits, so a long plan
+  could stop partway — the bridge did a few steps (merged + tagged), exited after launching the
+  async release build, and the dependent steps (brew sha, verify) never ran; forge accepted the
+  exit as "done." Completion is now defined by the TASK LIST and verified, not by the subprocess
+  exiting (`crates/forge-core/src/lib.rs`):
+  - **Task-driven re-drive.** While tracked tasks remain unfinished, forge re-invokes the bridge to
+    continue (a clean new process — what the user typing `continue` does). Bounded.
+  - **Progress gate (anti-spiral).** A re-run must make real progress — start a tool or close a
+    task — or the turn HALTS loudly instead of re-driving. This is the guard the earlier
+    bridge-nudge lacked: a bridge that just re-narrates can't loop.
+  - **Objective verification gate.** When the bridge reports every task Done, forge forces a
+    tool-grounded verification turn ("prove each task is actually complete by checking real state —
+    git, gh, files — and reopen anything that isn't") before the turn can end. The verification must
+    run a real INSPECTION tool (not just re-mark `update_tasks`); if the model never inspects, forge
+    re-prompts then ends flagged UNVERIFIED rather than reporting success. Self-reported "done" is
+    never trusted on its own — which is what produced the phantom release.
+  - The bridge preamble now mandates completing the whole task and WAITING for any async job it
+    launches (a release build, CI) rather than treating "launched" as "done"
+    (`crates/forge-provider/src/cli_provider.rs`).
+  - **Invariant:** forge never reports a phantom success — incomplete work is completed+verified,
+    re-driven, halted loudly, or flagged UNVERIFIED. Documented in `docs/harness/bridge-completion.md`
+    with the end-to-end test method (`scripts/bridge-e2e.sh` drives real subscription bridges and
+    asserts on the real filesystem + run log).
+
 ## [0.4.0] - 2026-06-24
 
 Reliability release: every fix here came out of Forge attempting (and botching) its own release,

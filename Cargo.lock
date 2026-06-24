@@ -1888,10 +1888,12 @@ dependencies = [
  "genai",
  "httpmock",
  "libc",
+ "reqwest",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "webpki-root-certs",
 ]
 
 [[package]]

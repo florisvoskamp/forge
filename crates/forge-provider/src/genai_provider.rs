@@ -60,7 +60,9 @@ impl GenAiProvider {
 pub async fn list_models(namespace: &str) -> Result<Vec<String>, ProviderError> {
     let kind = AdapterKind::from_lower_str(normalize_namespace(namespace))
         .ok_or_else(|| ProviderError::Request(format!("no genai adapter for `{namespace}`")))?;
-    let names = Client::default()
+    let names = Client::builder()
+        .with_reqwest(build_reqwest_client())
+        .build()
         .all_model_names(kind, None)
         .await
         .map_err(|e| ProviderError::Request(e.to_string()))?;
@@ -69,6 +71,26 @@ pub async fn list_models(namespace: &str) -> Result<Vec<String>, ProviderError> 
         .into_iter()
         .map(|n| format!("{namespace}::{n}"))
         .collect())
+}
+
+/// Build a `reqwest::Client` with Mozilla's bundled root CAs (`webpki-root-certs`) as the sole
+/// trust store. This makes HTTPS independent of the OS certificate store so it works even on bare
+/// containers that have no `ca-certificates` package installed.
+fn build_reqwest_client() -> reqwest::Client {
+    let certs = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .filter_map(|der| reqwest::Certificate::from_der(der.as_ref()).ok());
+    reqwest::Client::builder()
+        .tcp_nodelay(true)
+        .gzip(true)
+        .pool_max_idle_per_host(4)
+        .http2_keep_alive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true)
+        .http2_adaptive_window(true)
+        .tls_certs_only(certs)
+        .build()
+        .expect("failed to build reqwest client with bundled CA certificates")
 }
 
 /// Build the genai client with a custom-endpoint resolver for providers genai has no native
@@ -111,6 +133,7 @@ pub(crate) fn build_client() -> Client {
         },
     );
     Client::builder()
+        .with_reqwest(build_reqwest_client())
         .with_service_target_resolver(resolver)
         .build()
 }

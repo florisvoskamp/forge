@@ -18,6 +18,8 @@ genai.workspace = true
 futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+reqwest.workspace = true
+webpki-root-certs = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

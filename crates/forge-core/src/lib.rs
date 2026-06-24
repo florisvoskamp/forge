@@ -2140,8 +2140,43 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         // recovery pass missed — so nothing executed. Without this the narration is accepted as a
         // final answer and the turn "succeeds" having done nothing (the phantom-release bug).
         let mut toolcall_repair_nudges = 0usize;
+        // `bridge_continue_nudges`: bounded RE-RUNS of a CLI bridge whose turn returned with tracked
+        // tasks still unfinished. A bridge turn is otherwise terminal (it runs its own tool loop and
+        // returns once), so a long multi-step plan stalls partway — the bridge does a few steps,
+        // returns, and the turn ends with work pending (the half-finished release: merged + tagged
+        // but brew-sha + verify never ran). This drives a clean re-run, exactly as the user typing
+        // `continue` would.
+        let mut bridge_continue_nudges = 0usize;
+        // Verification gate: when a bridge reports every task Done, completion is NOT accepted on
+        // its say-so — forge forces ONE tool-grounded verification turn (check the real state: git,
+        // gh, files) before the turn can end. Reset to false whenever work reopens, so each fresh
+        // "all done" claim is re-verified. This is the completion AUTHORITY: "done" means forge made
+        // the model prove it with tools, not that the model asserted it.
+        // Verification attempts spent on the current "all done" claim. 0 = not yet verifying. The
+        // gate forces the bridge to PROVE completion with a real inspection tool; a verification
+        // turn that just re-marks `update_tasks` without inspecting doesn't count (the C8 hole — a
+        // model told to lie re-confirmed done without checking). Bounded so it can't loop.
+        let mut verify_attempts = 0usize;
+        // Completed-task count observed at the last bridge re-drive check — the other half of the
+        // progress signal (a re-run that closes a task but happens to run no fresh tool still counts
+        // as progress).
+        let mut bridge_done_prev = self
+            .tasks
+            .iter()
+            .filter(|t| matches!(t.status, forge_types::TodoStatus::Done))
+            .count();
+        // Counts tools that actually STARTED executing across the whole turn (bridge tools surface
+        // here via the sink too). The bridge re-drive uses the per-step delta as its progress
+        // signal: a re-run that completes no task AND runs no tool made no progress, so it's halted
+        // rather than re-driven again (the anti-spiral guard the old bridge-nudge lacked).
+        let tools_ran = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Counts INSPECTION tools (anything except `update_tasks`/`present_plan`) — the verification
+        // gate requires the bridge to actually CHECK real state, not just re-assert "done".
+        let inspect_ran = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         for step in 0..max_steps {
+            let tools_before = tools_ran.load(std::sync::atomic::Ordering::Relaxed);
+            let inspect_before = inspect_ran.load(std::sync::atomic::Ordering::Relaxed);
             // Stream the reply, with transparent failover for this step's completion.
             let mut resp = loop {
                 // Bound what we send to the active model's context window (fetched/heuristic), so a
@@ -2156,88 +2191,99 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                 // synthesize a permanent Auth failure so the existing failover branch EXCLUDES it and
                 // advances to a usable model. `has_api_key` is true for keyless providers (ollama,
                 // the claude/codex bridges), so a legitimate bridge turn is never short-circuited.
-                let result =
-                    if !forge_config::has_api_key(forge_config::provider_of(&active_model)) {
-                        Err(forge_provider::ProviderError::Auth(format!(
-                            "no API key configured for provider '{}'",
-                            forge_config::provider_of(&active_model)
-                        )))
-                    } else {
-                        let provider = &self.provider;
-                        let presenter = &mut self.presenter;
-                        // Bump on every stream event so the idle watchdog can distinguish a live
-                        // stream from a stalled half-open connection — a stall fails over (below)
-                        // instead of hanging the turn forever.
-                        let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                        let act = std::sync::Arc::clone(&activity);
-                        let mut sink =
-                            |ev: StreamEvent| {
-                                act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                match ev {
-                                    StreamEvent::Text(t) => {
-                                        presenter.emit(PresenterEvent::AssistantDelta(t))
-                                    }
-                                    StreamEvent::Reasoning(t) => {
-                                        presenter.emit(PresenterEvent::Reasoning(t))
-                                    }
-                                    StreamEvent::ToolStarted { name, args } => {
-                                        presenter.emit(PresenterEvent::ToolStart { name, args })
-                                    }
-                                    StreamEvent::ToolFinished { name, ok, summary } => presenter
-                                        .emit(PresenterEvent::ToolResult { name, ok, summary }),
-                                    StreamEvent::SubagentStarted { id, agent, task } => presenter
-                                        .emit(PresenterEvent::SubagentStart {
-                                            id,
-                                            agent,
-                                            task,
-                                            model: None,
-                                        }),
-                                    StreamEvent::SubagentProgress { id, snippet } => presenter
-                                        .emit(PresenterEvent::SubagentProgress { id, snippet }),
-                                    StreamEvent::SubagentFinished {
-                                        id,
-                                        agent,
-                                        ok,
-                                        summary,
-                                        cost_usd,
-                                    } => presenter.emit(PresenterEvent::SubagentResult {
-                                        id,
-                                        agent,
-                                        ok,
-                                        summary,
-                                        cost_usd,
-                                    }),
-                                    // A bridged turn's `update_tasks` (tailed from the sink): surface the
-                                    // list live so the sticky panel updates during the turn. The parent's
-                                    // post-turn store reload (below) keeps `self.tasks` authoritative.
-                                    StreamEvent::Tasks(tasks) => {
-                                        presenter.emit(PresenterEvent::Tasks(tasks))
-                                    }
-                                    // A bridged turn's `present_plan`: in planning mode, render the
-                                    // card now and stash it for the turn's approval flow (picked up
-                                    // via the outcome). Ignored outside Plan mode (stray proposal).
-                                    StreamEvent::Plan(plan) => {
-                                        if in_plan_mode {
-                                            presenter
-                                                .emit(PresenterEvent::PlanProposed(plan.clone()));
-                                            proposed_plan = Some(plan);
-                                        }
-                                    }
+                let result = if !forge_config::has_api_key(forge_config::provider_of(&active_model))
+                {
+                    Err(forge_provider::ProviderError::Auth(format!(
+                        "no API key configured for provider '{}'",
+                        forge_config::provider_of(&active_model)
+                    )))
+                } else {
+                    let provider = &self.provider;
+                    let presenter = &mut self.presenter;
+                    // Bump on every stream event so the idle watchdog can distinguish a live
+                    // stream from a stalled half-open connection — a stall fails over (below)
+                    // instead of hanging the turn forever.
+                    let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let act = std::sync::Arc::clone(&activity);
+                    let tools = std::sync::Arc::clone(&tools_ran);
+                    let inspects = std::sync::Arc::clone(&inspect_ran);
+                    let mut sink = |ev: StreamEvent| {
+                        act.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        match ev {
+                            StreamEvent::Text(t) => {
+                                presenter.emit(PresenterEvent::AssistantDelta(t))
+                            }
+                            StreamEvent::Reasoning(t) => {
+                                presenter.emit(PresenterEvent::Reasoning(t))
+                            }
+                            StreamEvent::ToolStarted { name, args } => {
+                                tools.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // Bookkeeping tools don't count as a real inspection — the
+                                // verification gate needs an actual state CHECK (read/shell/…).
+                                if !name.ends_with("update_tasks")
+                                    && !name.ends_with("present_plan")
+                                {
+                                    inspects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
-                            };
-                        let completion_opts = CompletionOptions {
-                            effort: self.pinned_effort,
-                            temperature: Some(CODING_TEMPERATURE),
-                        };
-                        let fut = provider.complete_with(
-                            &active_model,
-                            &sent,
-                            specs,
-                            &completion_opts,
-                            &mut sink,
-                        );
-                        stream_with_idle_timeout(fut, &activity, stream_idle).await
+                                presenter.emit(PresenterEvent::ToolStart { name, args })
+                            }
+                            StreamEvent::ToolFinished { name, ok, summary } => {
+                                presenter.emit(PresenterEvent::ToolResult { name, ok, summary })
+                            }
+                            StreamEvent::SubagentStarted { id, agent, task } => {
+                                presenter.emit(PresenterEvent::SubagentStart {
+                                    id,
+                                    agent,
+                                    task,
+                                    model: None,
+                                })
+                            }
+                            StreamEvent::SubagentProgress { id, snippet } => {
+                                presenter.emit(PresenterEvent::SubagentProgress { id, snippet })
+                            }
+                            StreamEvent::SubagentFinished {
+                                id,
+                                agent,
+                                ok,
+                                summary,
+                                cost_usd,
+                            } => presenter.emit(PresenterEvent::SubagentResult {
+                                id,
+                                agent,
+                                ok,
+                                summary,
+                                cost_usd,
+                            }),
+                            // A bridged turn's `update_tasks` (tailed from the sink): surface the
+                            // list live so the sticky panel updates during the turn. The parent's
+                            // post-turn store reload (below) keeps `self.tasks` authoritative.
+                            StreamEvent::Tasks(tasks) => {
+                                presenter.emit(PresenterEvent::Tasks(tasks))
+                            }
+                            // A bridged turn's `present_plan`: in planning mode, render the
+                            // card now and stash it for the turn's approval flow (picked up
+                            // via the outcome). Ignored outside Plan mode (stray proposal).
+                            StreamEvent::Plan(plan) => {
+                                if in_plan_mode {
+                                    presenter.emit(PresenterEvent::PlanProposed(plan.clone()));
+                                    proposed_plan = Some(plan);
+                                }
+                            }
+                        }
                     };
+                    let completion_opts = CompletionOptions {
+                        effort: self.pinned_effort,
+                        temperature: Some(CODING_TEMPERATURE),
+                    };
+                    let fut = provider.complete_with(
+                        &active_model,
+                        &sent,
+                        specs,
+                        &completion_opts,
+                        &mut sink,
+                    );
+                    stream_with_idle_timeout(fut, &activity, stream_idle).await
+                };
                 match result {
                     Ok(r) => {
                         if !r.content.is_empty() {
@@ -2428,12 +2474,142 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                             .to_string(),
                     ));
                 } else if forge_provider::is_cli_bridge(&active_model) {
-                    // A CLI-bridge turn is TERMINAL: the bridge ran its own internal tool loop and
-                    // returned the finished turn as one text response (no tool calls surface here),
-                    // so its non-empty text IS the answer. Never nudge it to "keep calling tools" —
-                    // that re-runs the entire bridge in a confused state (it begins narrating tool
-                    // calls as text and spiralling, the bug behind the per-turn nudge spam). The
-                    // user can send `continue` to re-run the bridge cleanly.
+                    // A CLI bridge is a ONE-SHOT subprocess: claude-cli/codex runs its own internal
+                    // tool loop and EXITS, so forge can't keep a single invocation going. That let a
+                    // long plan stop half-done — the bridge does a few steps (merge + tag), exits
+                    // after launching the async release build, and the dependent steps (brew sha,
+                    // verify) never run. Completion must be defined by the TASK LIST, not by the
+                    // subprocess exiting: while tracked tasks remain unfinished, re-invoke the bridge
+                    // with a continue instruction (a clean new process — exactly what the user typing
+                    // `continue` does), so a turn can't "be done" while the work isn't.
+                    //
+                    // Anti-spiral (the guard the old bridge-nudge lacked): a re-run must make
+                    // PROGRESS — start at least one tool OR close at least one task — or the turn
+                    // HALTS loudly instead of re-driving. A bridge that just re-narrates without
+                    // acting therefore cannot loop. Gated on a non-empty task list, so an ordinary
+                    // bridge Q&A (no tracked tasks) stays terminal as before.
+                    //
+                    // Tasks live in the store (the bridge's `update_tasks` runs in the separate
+                    // `mcp-serve` process), so reload before judging completion.
+                    let persisted = self.store.tasks(&self.id).unwrap_or_default();
+                    if !persisted.is_empty() {
+                        self.tasks = persisted;
+                    }
+                    let unfinished: Vec<String> = self
+                        .tasks
+                        .iter()
+                        .filter(|t| !matches!(t.status, forge_types::TodoStatus::Done))
+                        .map(|t| t.title.clone())
+                        .collect();
+                    let done_now = self.tasks.len().saturating_sub(unfinished.len());
+                    let tools_this_turn =
+                        tools_ran.load(std::sync::atomic::Ordering::Relaxed) - tools_before;
+                    let made_progress = tools_this_turn > 0 || done_now > bridge_done_prev;
+                    bridge_done_prev = done_now;
+                    const MAX_BRIDGE_CONTINUE_NUDGES: usize = 8;
+                    let inspected_this_turn =
+                        inspect_ran.load(std::sync::atomic::Ordering::Relaxed) > inspect_before;
+                    if !unfinished.is_empty() {
+                        // Work is open again — any earlier "all done" verification is stale.
+                        verify_attempts = 0;
+                        if made_progress && bridge_continue_nudges < MAX_BRIDGE_CONTINUE_NUDGES {
+                            bridge_continue_nudges += 1;
+                            self.presenter.emit(PresenterEvent::Warning(format!(
+                                "bridge yielded with {} task(s) unfinished — continuing the plan ({bridge_continue_nudges}/{MAX_BRIDGE_CONTINUE_NUDGES})",
+                                unfinished.len()
+                            )));
+                            let nudge = format!(
+                                "The plan is NOT finished — these tracked tasks are still open:\n- {}\n\n\
+                                 Continue the plan now: carry out the next unfinished step and run it \
+                                 to completion. If you launched an async job earlier (a release \
+                                 build, CI), WAIT for it (poll it) and then do the steps that depend \
+                                 on it — do not treat 'launched' as 'done'. Mark each task Done via \
+                                 update_tasks as you finish it; if one is genuinely already complete \
+                                 or impossible, mark it Done and say why. Do not stop until every \
+                                 task is resolved.",
+                                unfinished.join("\n- ")
+                            );
+                            let nseq = self.next_seq();
+                            let _ =
+                                self.store
+                                    .add_message(&self.id, nseq, Role::System, &nudge, None);
+                            self.transcript.push(Message::system(&nudge));
+                            continue;
+                        }
+                        // No progress on the re-run (would spiral) or the re-drive budget is spent:
+                        // stop LOUDLY with the work named, rather than silently reporting success.
+                        let why = if made_progress {
+                            "reached the continue limit"
+                        } else {
+                            "the last attempt made no progress (no task completed, no tool ran)"
+                        };
+                        self.presenter.emit(PresenterEvent::Warning(format!(
+                            "bridge stopped with {} task(s) still unfinished — {why}. Send `continue` to resume.",
+                            unfinished.len()
+                        )));
+                    } else if !self.tasks.is_empty() {
+                        // The bridge reports every task Done — but a self-reported status is exactly
+                        // what produced the phantom release (claimed merged + tagged; nothing ran).
+                        // Force ONE tool-grounded verification turn, then judge by whether the turn
+                        // did real, inspectable WORK:
+                        //   * If the turn ran inspectable tools at all (`did_real_work`) — file/shell/
+                        //     read ops — completion is accepted ONLY after the verification turn runs
+                        //     a real inspection (not just re-marking `update_tasks`); otherwise it
+                        //     ends flagged UNVERIFIED. This catches a model that claims done on work
+                        //     it didn't actually finish/verify.
+                        //   * If the turn did NO inspectable work (a pure reasoning/analysis plan —
+                        //     the deliverable is the answer text, there is no external state to
+                        //     check), requiring a tool inspection would over-fire. Accept after one
+                        //     verification pass with a calm "not tool-verified" note instead.
+                        // `did_real_work` is cumulative over the whole turn; `inspected_this_turn`
+                        // is whether the turn just observed ran an inspection tool.
+                        const MAX_VERIFY_ATTEMPTS: usize = 2;
+                        let did_real_work =
+                            inspect_ran.load(std::sync::atomic::Ordering::Relaxed) > 0;
+                        if verify_attempts > 0 && (inspected_this_turn || !did_real_work) {
+                            // Accept: a real check ran, OR there was no external work to tool-verify.
+                            if !inspected_this_turn && !did_real_work {
+                                self.presenter.emit(PresenterEvent::Warning(
+                                    "completion not tool-verified (no external artifacts to check) — accepting the reported result"
+                                        .to_string(),
+                                ));
+                            }
+                            // fall through to terminal
+                        } else if verify_attempts < MAX_VERIFY_ATTEMPTS {
+                            // Either the first "all done" claim (verify_attempts == 0), or a
+                            // work-producing turn that re-asserted done WITHOUT inspecting (the C8
+                            // hole) — force another tool-grounded verification.
+                            verify_attempts += 1;
+                            self.presenter.emit(PresenterEvent::Warning(format!(
+                                "all tasks reported done — verifying with a real state check before finishing ({verify_attempts}/{MAX_VERIFY_ATTEMPTS})"
+                            )));
+                            let nudge = "You reported every task Done. Before this turn can end, you \
+                                         MUST PROVE it: call an inspection tool that reads the real \
+                                         state — `mcp__forge__shell` (`git log`/`git tag`/`gh run \
+                                         list`/`gh release view`/`ls`/`cat`) or `mcp__forge__read_file` \
+                                         — and look at the actual output. Re-marking update_tasks is \
+                                         NOT verification; you must run a real check. If the output \
+                                         shows ANY task is not actually complete, mark it not done \
+                                         and finish it. (If a task has no external artifact to check — \
+                                         a pure analysis answer — say so and restate the result.) Only \
+                                         after confirming every task, state exactly what you checked and stop.";
+                            let nseq = self.next_seq();
+                            let _ =
+                                self.store
+                                    .add_message(&self.id, nseq, Role::System, nudge, None);
+                            self.transcript.push(Message::system(nudge));
+                            continue;
+                        } else {
+                            // Work was done but the verification turns never ran a real check (a
+                            // model that won't verify, e.g. one told to lie). Do NOT silently report
+                            // success — end LOUDLY flagging the completion as unverified.
+                            self.presenter.emit(PresenterEvent::Warning(
+                                "completion could NOT be tool-verified — the model reported done without \
+                                 inspecting real state. Treat this result as UNVERIFIED."
+                                    .to_string(),
+                            ));
+                        }
+                    }
                 } else {
                     // Honest-failure guard: a direct model wrote a tool call as TEXT (e.g.
                     // `<invoke>`/`default_api:` markup) instead of invoking it, and neither the
@@ -5173,11 +5349,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_bridge_turn_is_terminal_and_not_nudged() {
+    async fn cli_bridge_no_progress_stall_halts_loudly_without_spiraling() {
         use forge_types::TodoStatus;
-        // A CLI bridge runs its own internal tool loop and returns the whole turn as one text
-        // response; the parent must treat it as terminal and NEVER continue-nudge it (doing so
-        // re-runs the entire bridge and makes it spiral). Force a bridge model id via FixedRouter.
+        // A CLI-bridge turn that yields with a task still unfinished AND made no progress on that
+        // turn (no tool ran, no task closed) must HALT — not be re-driven into a narration loop
+        // (the old spiral). But it must NOT pretend success: it stops LOUDLY, naming the unfinished
+        // work, so the half-done state is visible. (A bridge that DID make progress is re-driven to
+        // completion — see the `bridge_re_drives_*` tests.)
         let store = Arc::new(Store::open_in_memory().unwrap());
         let capture = CapturePresenter::default();
         let events = capture.events.clone();
@@ -5199,16 +5377,19 @@ mod tests {
 
         let answer = session.run_turn("do the thing").await.unwrap();
 
-        // The text-only 2nd "bridge" response ended the turn — it was NOT driven onward, even
-        // though a task is still in_progress.
+        // The stall (call 1) made no progress, so the turn ends there — NOT driven into a loop.
         assert_eq!(answer, "I'll keep going on this.");
         assert_eq!(session.tasks()[0].status, TodoStatus::InProgress);
-        let nudged = events
+        // ...but it halted LOUDLY: an honest "stopped with unfinished tasks" warning was surfaced.
+        let warned_unfinished = events
             .lock()
             .unwrap()
             .iter()
             .any(|e| matches!(e, PresenterEvent::Warning(w) if w.contains("unfinished")));
-        assert!(!nudged, "a CLI-bridge turn is never continue-nudged");
+        assert!(
+            warned_unfinished,
+            "a half-done bridge turn must stop loudly, not silently report success"
+        );
     }
 
     #[test]
@@ -6948,6 +7129,259 @@ mod tests {
         assert!(
             benched.is_empty(),
             "overflow must not bench the model: {benched:?}"
+        );
+    }
+
+    /// Mimics a CLI bridge: returns text with NO structured tool calls (a bridge's tools run in
+    /// its own process; only its narration comes back here). Emits a `shell` ToolStarted on the
+    /// first `inspect_calls` invocations — that's both the "made progress" signal the re-drive gate
+    /// keys on AND the real-inspection signal the verification gate requires. 0 = never inspects
+    /// (pure reasoning / a model that won't check); usize::MAX = inspects every turn; 1 = does real
+    /// work once then stops inspecting (verification can't confirm).
+    struct BridgeProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        inspect_calls: usize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for BridgeProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.inspect_calls {
+                on_event(StreamEvent::ToolStarted {
+                    name: "shell".into(),
+                    args: "git status".into(),
+                });
+            }
+            on_event(StreamEvent::Text("working".into()));
+            Ok(forge_provider::ModelResponse {
+                content: "working".into(),
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    fn seed_tasks(store: &Store, id: &str, titles_done: &[(&str, bool)]) {
+        let tasks: Vec<forge_types::TodoItem> = titles_done
+            .iter()
+            .map(|(t, done)| forge_types::TodoItem {
+                title: (*t).to_string(),
+                status: if *done {
+                    forge_types::TodoStatus::Done
+                } else {
+                    forge_types::TodoStatus::Pending
+                },
+            })
+            .collect();
+        store.set_tasks(id, &tasks).unwrap();
+    }
+
+    /// Models a bridge that FALSELY reports done, then — when forced to verify — discovers the gap
+    /// and reopens the task before genuinely finishing. Uses structured `update_tasks` calls so the
+    /// real dispatch path drives task state (mirroring a bridge's MCP `update_tasks`).
+    struct ReopenOnVerifyProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for ReopenOnVerifyProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_types::{new_id, ToolCall};
+            let set = |status: &str| {
+                vec![ToolCall {
+                    id: new_id(),
+                    name: "update_tasks".into(),
+                    args: serde_json::json!({"tasks":[{"title":"ship","status":status}]}),
+                }]
+            };
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (content, tool_calls) = match n {
+                0 => ("marking done", set("done")), // falsely claims done
+                1 => ("all set", vec![]),           // narrates done -> triggers verification
+                2 => ("oh, not actually done", set("in_progress")), // verify reopens the gap
+                3 => ("finishing for real", set("done")), // genuinely completes
+                _ => ("verified, done", vec![]),    // verification re-confirms -> terminal
+            };
+            on_event(StreamEvent::Text(content.into()));
+            Ok(forge_provider::ModelResponse {
+                content: content.into(),
+                tool_calls,
+                usage: forge_types::Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_reopens_a_falsely_reported_done_task() {
+        // The whole point of the gate: a model can CLAIM done while the work isn't. The forced
+        // verification turn catches it, reopens the task, the re-drive finishes it, and a second
+        // verification confirms. The turn must end with the task genuinely Done — and only after
+        // more than the 2 invocations a truthful "done" would have taken.
+        let provider = Arc::new(ReopenOnVerifyProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (store, mut session) = bridge_session(provider.clone());
+        let _ = session.run_turn("ship it").await.unwrap();
+        let tasks = store.tasks(&session.id).unwrap();
+        assert_eq!(tasks[0].status, forge_types::TodoStatus::Done);
+        assert!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst) > 2,
+            "verification must have reopened the false 'done' and re-driven to a real finish"
+        );
+    }
+
+    fn bridge_session(provider: Arc<dyn Provider>) -> (Arc<Store>, Session) {
+        let router = Arc::new(FixedRouter {
+            model: "claude-cli::opus".into(),
+            fallbacks: vec![],
+        });
+        let (store, mut session) = fixed_session(provider, router);
+        // Isolate the model loop: the end-of-turn recap is a separate provider call that would
+        // otherwise inflate the invocation count these tests assert on.
+        session.config.recap.enabled = false;
+        (store, session)
+    }
+
+    #[tokio::test]
+    async fn bridge_with_unfinished_tasks_but_no_progress_halts_without_spiraling() {
+        // The anti-spiral guarantee: a bridge that yields with a task still open but did NOTHING
+        // this run (no tool, no task closed) must STOP, not be re-driven into a narration loop
+        // (the old bridge-nudge bug). Exactly one invocation.
+        let provider = Arc::new(BridgeProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            inspect_calls: 0,
+        });
+        let (store, mut session) = bridge_session(provider.clone());
+        seed_tasks(&store, &session.id, &[("ship the release", false)]);
+        let answer = session.run_turn("release it").await.unwrap();
+        assert_eq!(answer, "working");
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no-progress bridge must not be re-driven — it would spiral"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_re_drives_while_making_progress_then_stops_at_the_cap() {
+        // A bridge that keeps making progress (a tool runs each turn) but never closes the task is
+        // re-driven — proving forge won't accept a half-done plan — but BOUNDED so it can't run
+        // forever. 1 initial turn + MAX_BRIDGE_CONTINUE_NUDGES (8) re-drives = 9 invocations.
+        let provider = Arc::new(BridgeProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            inspect_calls: usize::MAX, // a tool runs every turn = progress every turn
+        });
+        let (store, mut session) = bridge_session(provider.clone());
+        seed_tasks(&store, &session.id, &[("ship the release", false)]);
+        let _ = session.run_turn("release it").await.unwrap();
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            9,
+            "must re-drive on progress but stop at the cap (1 + 8)"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_completion_accepted_when_verification_runs_a_real_inspection() {
+        // "All tasks Done" must pass a tool-grounded verification turn. Here the bridge runs an
+        // inspection tool (shell) on the verification turn → genuinely verified → accept after
+        // exactly 2 invocations (the claim + the verifying check).
+        let provider = Arc::new(BridgeProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            inspect_calls: usize::MAX, // emits a `shell` ToolStarted each turn = a real inspection
+        });
+        let (store, mut session) = bridge_session(provider.clone());
+        seed_tasks(&store, &session.id, &[("ship the release", true)]);
+        let answer = session.run_turn("release it").await.unwrap();
+        assert_eq!(answer, "working");
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an inspected verification is accepted after exactly one verification turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_reasoning_only_completion_accepted_without_overfiring() {
+        // The over-fire fix: a pure reasoning/analysis plan does NO inspectable work (the answer is
+        // the deliverable). Demanding a tool inspection would wrongly flag it. Forge runs ONE
+        // verification pass, sees there's nothing external to check, and ACCEPTS with a calm note —
+        // it does NOT loop to the cap or shout UNVERIFIED. `inspect_calls: 0` = never inspects.
+        let provider = Arc::new(BridgeProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            inspect_calls: 0,
+        });
+        let (store, mut session) = bridge_session(provider.clone());
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        session.presenter = Box::new(capture);
+        seed_tasks(&store, &session.id, &[("analyze the tradeoffs", true)]);
+        let answer = session.run_turn("think it through").await.unwrap();
+        assert_eq!(answer, "working");
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "reasoning-only completion must accept after ONE verification pass, not over-fire to the cap"
+        );
+        let ev = events.lock().unwrap();
+        let calm = ev.iter().any(
+            |e| matches!(e, PresenterEvent::Warning(w) if w.contains("no external artifacts")),
+        );
+        let shouted = ev
+            .iter()
+            .any(|e| matches!(e, PresenterEvent::Warning(w) if w.contains("UNVERIFIED")));
+        assert!(
+            calm,
+            "must note it couldn't tool-verify (no artifacts), calmly"
+        );
+        assert!(
+            !shouted,
+            "must NOT shout UNVERIFIED on a legitimate reasoning task"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_completion_flagged_unverified_when_work_done_but_never_re_checked() {
+        // The C8 hole, properly scoped: the turn DID real work (inspect_calls: 1 → a tool ran on the
+        // first turn), then claimed done but never re-inspected on verification. Forge forces the
+        // verification cap and ends LOUDLY flagging UNVERIFIED — never a silent success.
+        let provider = Arc::new(BridgeProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            inspect_calls: 1, // real work on turn 1, no inspection on the verification turns
+        });
+        let (store, mut session) = bridge_session(provider.clone());
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        session.presenter = Box::new(capture);
+        seed_tasks(&store, &session.id, &[("ship the release", true)]);
+        let _ = session.run_turn("release it").await.unwrap();
+        // 1 work/claim turn + MAX_VERIFY_ATTEMPTS (2) verification turns = 3 invocations.
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must force the verification cap, not loop forever"
+        );
+        let unverified = events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, PresenterEvent::Warning(w) if w.contains("UNVERIFIED")));
+        assert!(
+            unverified,
+            "work-producing completion never re-checked must end flagged UNVERIFIED, not as success"
         );
     }
 
