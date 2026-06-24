@@ -159,18 +159,11 @@ pub(crate) const AT_FILE_MAX_BYTES: usize = 96 * 1024;
 pub(crate) fn expand_at_files(prompt: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     let (mut blocks, mut included, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
-    let bytes = prompt.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if (bytes[i] as char).is_whitespace() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && !(bytes[i] as char).is_whitespace() {
-            i += 1;
-        }
-        let word = &prompt[start..i];
+    // Split on Unicode whitespace. The previous byte-by-byte scan cast each byte to a `char` and
+    // sliced `&prompt[start..i]` on the result — which lands MID-CHARACTER for any multi-byte
+    // whitespace (a pasted non-breaking space `\u{a0}`, an em space, …) and PANICS ("not a char
+    // boundary"), crashing the whole turn. `split_whitespace` is UTF-8-correct and recognizes those.
+    for word in prompt.split_whitespace() {
         let Some(path) = word.strip_prefix('@') else {
             continue;
         };

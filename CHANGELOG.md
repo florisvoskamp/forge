@@ -6,6 +6,16 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-06-24
+
+### Fixed
+- **Submitting a prompt with multi-byte whitespace no longer panics the turn.** Pasted text often
+  carries a non-breaking space (`U+00A0`) or other multi-byte Unicode whitespace. The `@file`
+  expansion scanned the prompt byte-by-byte, cast each byte to a `char`, and sliced the string on
+  the result — which lands mid-character for any multi-byte whitespace and panicked with
+  `end byte index … is not a char boundary` (`crates/forge-cli/src/cli/commands/run.rs`), crashing
+  the whole session. It now splits on Unicode whitespace (`split_whitespace`), which is UTF-8-correct.
+
 ## [0.3.9] - 2026-06-24
 
 ### Fixed
