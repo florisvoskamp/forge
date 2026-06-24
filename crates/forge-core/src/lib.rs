@@ -1511,11 +1511,28 @@ Rules:\n\
                 return m.clone();
             }
         }
-        // Fall back to the primary Complex-tier model from the config.
-        self.config
-            .model_for(forge_types::TaskTier::Complex)
-            .map(|s| s.to_string())
+        // Fall back to the first USABLE Complex-tier candidate. `model_for` returns the first
+        // configured candidate regardless of key — and the built-in defaults lead with
+        // `groq::…`, so on a box with no groq key the architect planner would dispatch groq and
+        // auth-fail EVERY turn (it recovers via the failover chain, but wastes a hop + warns).
+        // Pick the first candidate whose provider has a key instead (keyless bridges qualify).
+        self.first_usable_for_tier(forge_types::TaskTier::Complex)
+            .or_else(|| {
+                self.config
+                    .model_for(forge_types::TaskTier::Complex)
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| "anthropic::claude-opus-4-8".to_string())
+    }
+
+    /// The first configured candidate for `tier` whose provider has a key — keyless providers
+    /// (ollama, the claude/codex bridges) always qualify. `None` when the config lists nothing
+    /// usable. Used to keep the architect planner/editor off a keyless built-in default (groq).
+    fn first_usable_for_tier(&self, tier: forge_types::TaskTier) -> Option<String> {
+        self.config
+            .candidates_for(tier)
+            .into_iter()
+            .find(|m| forge_config::has_api_key(forge_config::provider_of(m)))
     }
 
     /// Resolve the model to use for the architect EDIT phase.
@@ -1531,11 +1548,17 @@ Rules:\n\
                 return m.clone();
             }
         }
-        // Fall back to the primary Standard-tier model from the config.
-        self.config
-            .model_for(forge_types::TaskTier::Standard)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "groq::llama-3.3-70b-versatile".to_string())
+        // Fall back to the first USABLE Standard-tier candidate (see resolve_planner_model): never
+        // a keyless built-in default. The architect EDIT phase runs with failover DISABLED
+        // (decision=None), so a keyless editor model would hard-fail the turn instead of recovering
+        // — picking a keyed model here is what keeps the edit phase alive.
+        self.first_usable_for_tier(forge_types::TaskTier::Standard)
+            .or_else(|| {
+                self.config
+                    .model_for(forge_types::TaskTier::Standard)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "anthropic::claude-opus-4-8".to_string())
     }
 
     /// Run the PLAN phase of the architect pipeline.
@@ -7737,26 +7760,53 @@ mod tests {
 
     #[test]
     fn resolve_planner_falls_back_to_complex_tier_model() {
-        // No architect_model set, no pin → first Complex-tier candidate.
-        let config = Config::default();
-        let expected = config
-            .model_for(forge_types::TaskTier::Complex)
-            .unwrap()
-            .to_string();
+        // No architect_model set, no pin → first USABLE Complex-tier candidate. Deterministic
+        // config (a single keyless candidate) so the result doesn't depend on which provider keys
+        // happen to be set in the test environment.
+        let mut config = Config::default();
+        config.mesh.models.insert(
+            forge_types::TaskTier::Complex.as_str().into(),
+            forge_config::OneOrMany::Many(vec!["ollama::big".into()]),
+        );
         let session = make_session(config);
-        assert_eq!(session.resolve_planner_model(), expected);
+        assert_eq!(session.resolve_planner_model(), "ollama::big");
     }
 
     #[test]
     fn resolve_editor_falls_back_to_standard_tier_model() {
-        // No editor_model set, no pin → first Standard-tier candidate.
-        let config = Config::default();
-        let expected = config
-            .model_for(forge_types::TaskTier::Standard)
-            .unwrap()
-            .to_string();
+        // No editor_model set, no pin → first USABLE Standard-tier candidate (deterministic config).
+        let mut config = Config::default();
+        config.mesh.models.insert(
+            forge_types::TaskTier::Standard.as_str().into(),
+            forge_config::OneOrMany::Many(vec!["ollama::mid".into()]),
+        );
         let session = make_session(config);
-        assert_eq!(session.resolve_editor_model(), expected);
+        assert_eq!(session.resolve_editor_model(), "ollama::mid");
+    }
+
+    #[test]
+    fn architect_planner_and_editor_skip_a_keyless_provider() {
+        // The friend's bug: architect_mode on + the built-in tier defaults lead with `groq::…`, so
+        // the planner/editor dispatched groq and auth-failed every turn (no groq key). The resolved
+        // model must skip a no-key provider and pick the first USABLE candidate instead.
+        assert!(
+            !forge_config::has_api_key("minimax"),
+            "test precondition: no minimax key"
+        );
+        assert!(forge_config::has_api_key("ollama"), "ollama is keyless");
+        let mut config = Config::default();
+        // First candidate keyless-unusable (no key), second keyless-usable.
+        config.mesh.models.insert(
+            forge_types::TaskTier::Complex.as_str().into(),
+            forge_config::OneOrMany::Many(vec!["minimax::abab".into(), "ollama::y".into()]),
+        );
+        config.mesh.models.insert(
+            forge_types::TaskTier::Standard.as_str().into(),
+            forge_config::OneOrMany::Many(vec!["minimax::abab".into(), "ollama::z".into()]),
+        );
+        let session = make_session(config);
+        assert_eq!(session.resolve_planner_model(), "ollama::y");
+        assert_eq!(session.resolve_editor_model(), "ollama::z");
     }
 
     #[test]
