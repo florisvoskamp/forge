@@ -556,15 +556,40 @@ pub(crate) async fn claude_quota_is_stale(
         .is_none_or(|a| a > max_age)
 }
 
-/// Copy mouse-selected transcript text to the OS clipboard. SILENT and best-effort — no scrollback
-/// note (it would spam the chat) and no terminal output (any stray write corrupts the alt-screen).
-/// Reuses a single long-lived `Clipboard`: creating one per copy makes arboard's X11 backend
-/// relinquish the selection immediately ("clipboard dropped") and log to the terminal, which
-/// wrecked the TUI layout. One instance keeps the selection-serving thread alive and quiet.
+/// Copy text to the clipboard from inside the TUI. Two paths, because neither alone is enough:
+///   1. `arboard` (the long-lived instance) — works on X11/macOS/Windows native. But on **Wayland**
+///      it silently no-ops: arboard's Wayland backend needs an owned window/surface, which a
+///      terminal app doesn't have — so `/copy` "succeeded" but copied nothing (the reported bug).
+///   2. **OSC 52** — ask the TERMINAL to set the clipboard. This is the reliable path on Wayland,
+///      over SSH, and in Windows Terminal / kitty / iTerm; it doesn't need any display server.
+/// Both are best-effort and silent (no stray VISIBLE output — OSC 52 is an out-of-band control
+/// sequence the terminal intercepts, so it doesn't corrupt the alt-screen grid). A single arboard
+/// instance is reused so its X11 selection thread stays alive (recreating it logs "clipboard
+/// dropped" and wrecks the layout).
 pub(crate) fn copy_selection(clipboard: &mut Option<arboard::Clipboard>, text: &str) {
     if let Some(cb) = clipboard.as_mut() {
         let _ = cb.set_text(text.to_owned());
     }
+    osc52_copy(text);
+}
+
+/// Emit an OSC 52 "set clipboard" escape so the terminal copies `text` (base64-encoded). When
+/// running inside tmux/screen, wrap it in the multiplexer passthrough so it reaches the outer
+/// terminal (requires tmux `set-clipboard on` / `allow-passthrough on`, the modern defaults).
+fn osc52_copy(text: &str) {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let term = std::env::var("TERM").unwrap_or_default();
+    let seq = if term.starts_with("tmux") || term.starts_with("screen") {
+        // tmux passthrough: ESC P tmux ; <payload with each ESC doubled> ESC \
+        format!("\x1bPtmux;\x1b\x1b]52;c;{b64}\x07\x1b\\")
+    } else {
+        format!("\x1b]52;c;{b64}\x07")
+    };
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
 }
 
 /// The Nth-latest non-empty assistant response from a [`Session::history`] list (which is
