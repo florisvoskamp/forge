@@ -1,0 +1,16 @@
+#!/bin/sh
+# Auto-format staged Rust before every commit, so CI's `cargo fmt --check` never blocks a PR
+# (and an auto-merge never stalls on a formatting nit). Formats with the SAME `cargo fmt` CI uses,
+# then re-stages ONLY the files that were already staged — so specific-file staging is respected
+# and unrelated working-tree changes aren't swept into the commit.
+#
+# Enable once per clone:  git config core.hooksPath .githooks   (or run scripts/setup-dev.sh)
+set -e
+
+staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+[ -z "$staged" ] && exit 0
+command -v cargo >/dev/null 2>&1 || exit 0
+
+cargo fmt --all
+# Re-add only the originally-staged Rust files.
+printf '%s\n' "$staged" | xargs git add --
