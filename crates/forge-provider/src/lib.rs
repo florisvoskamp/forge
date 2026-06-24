@@ -11,11 +11,13 @@ mod cli_provider;
 mod embedder;
 mod genai_provider;
 mod mock;
+mod tool_recovery;
 
 pub use cli_provider::{available_bridge_models, CliKind, CliProvider, SUBAGENT_SINK_ENV};
 pub use embedder::{select_embedder, GenaiEmbedder};
 pub use genai_provider::{list_models, GenAiProvider};
 pub use mock::MockProvider;
+pub use tool_recovery::{looks_like_unexecuted_tool_call, recover_text_tool_calls};
 
 /// Normalize legacy underscore-prefixed bridge ids to the canonical hyphen form so
 /// `codex_cli::gpt-5.4-mini` and `claude_cli::opus` work identically to their hyphen forms.
@@ -88,6 +90,14 @@ impl ProviderError {
     /// itself mid-session) — both auth-fail/incapability-fail identically every turn otherwise.
     pub fn is_permanent(&self) -> bool {
         matches!(self, Self::Capability(_) | Self::Auth(_))
+    }
+
+    /// Whether this is a rate-limit / quota-exhaustion failure (HTTP 429, `RESOURCE_EXHAUSTED`).
+    /// Used by the failover loop to lazily skip the *same provider's* remaining chain entries
+    /// after one of its models 429s — a rate limit is usually provider-wide, so the siblings would
+    /// 429 too. Every other failure mode keeps strict mesh-rank failover order.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, Self::RateLimited { .. })
     }
 
     /// How long to bench the model: the server-provided `retry_after` when present,

@@ -31,3 +31,6 @@ graphify-out/
 
 # E2E battery scratch output (scripts/e2e-battery.sh)
 scripts/.e2e-out/
+
+# Container-built E2E binary target dir (scripts/e2e-docker.sh)
+target-e2e/
