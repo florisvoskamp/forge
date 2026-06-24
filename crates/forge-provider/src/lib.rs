@@ -54,8 +54,11 @@ pub enum ProviderError {
     /// The provider is down / the stream dropped (5xx, connection/timeout). Retryable.
     #[error("provider unavailable: {0}")]
     Unavailable(String),
-    /// Authentication failed (HTTP 401/403) — the key is bad or lacks access. Retryable in
-    /// the sense that *another provider* may work; the bad one is benched.
+    /// Authentication failed (HTTP 401/403) — the key is bad, missing, or lacks access. Failing
+    /// over to *another* provider is correct, but the bad credential won't fix itself mid-session,
+    /// so retrying THIS model auth-fails identically every turn (the per-turn failover churn). Like
+    /// [`Capability`](Self::Capability) it's treated as PERMANENT: excluded on the long window +
+    /// periodic re-probe (so it recovers automatically once the user fixes the key).
     #[error("provider auth failed: {0}")]
     Auth(String),
     /// A PERMANENT, model-specific incapability: this model can't serve Forge's (tool-using)
@@ -80,9 +83,11 @@ impl ProviderError {
 
     /// Whether this failure is PERMANENT for the model: it will recur on every call, so the model
     /// should be *excluded* (a long bench window + periodic re-probe), not benched on the short
-    /// transient cooldown. True only for [`Capability`](Self::Capability).
+    /// transient cooldown. True for [`Capability`](Self::Capability) (the model can't serve
+    /// tool-using turns) and [`Auth`](Self::Auth) (the credential is bad/missing and won't fix
+    /// itself mid-session) — both auth-fail/incapability-fail identically every turn otherwise.
     pub fn is_permanent(&self) -> bool {
-        matches!(self, Self::Capability(_))
+        matches!(self, Self::Capability(_) | Self::Auth(_))
     }
 
     /// How long to bench the model: the server-provided `retry_after` when present,
@@ -175,6 +180,24 @@ mod error_tests {
         }
         .is_context_overflow());
         assert!(!ProviderError::Auth("401".into()).is_context_overflow());
+    }
+
+    #[test]
+    fn auth_and_capability_are_permanent_transient_outages_are_not() {
+        // Permanent → excluded (long window + re-probe), never re-tried at the top of every turn.
+        // A bad/missing credential and a tool-incapable model both recur identically every call.
+        assert!(ProviderError::Auth("401 unauthorized".into()).is_permanent());
+        assert!(ProviderError::Capability("no tool calling".into()).is_permanent());
+        // Transient → short bench + fail over (the provider may recover on its own).
+        assert!(!ProviderError::Unavailable("502".into()).is_permanent());
+        assert!(!ProviderError::RateLimited {
+            message: "429".into(),
+            retry_after: None
+        }
+        .is_permanent());
+        // All four still fail over to another model; only Request("…") is non-retryable.
+        assert!(ProviderError::Auth("403".into()).is_retryable());
+        assert!(!ProviderError::Request("malformed".into()).is_retryable());
     }
 }
 

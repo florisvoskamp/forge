@@ -1,0 +1,13 @@
+# Real agentic workload: write buggy code → write tests → run → observe failure → FIX → re-run until
+# green. Exercises write+write+shell+edit+shell in one turn (the loop that exposes mid-turn stops,
+# perms hallucination, nudge spam, doom-loops). Run via tui-drive --real --mode bypass --model <M>.
+sleep 4000
+expect message
+send Create buggy.py with a function average(nums) that returns sum(nums)/len(nums). Then write test_buggy.py that asserts average([2,4]) == 3 AND that average([]) raises ZeroDivisionError-or-clear-error (use try/except). Run `python3 test_buggy.py`. If it fails, FIX buggy.py so average([]) returns 0.0 instead of crashing, then re-run until it passes. Report the final pass/fail. Track tasks with update_tasks: write code, write tests, run+fix — mark each done.
+sleep 280000
+capture result
+reject panic
+reject <invoke
+reject denied by Forge permission
+reject continuing it
+send /quit

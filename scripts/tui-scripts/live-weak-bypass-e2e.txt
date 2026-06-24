@@ -1,0 +1,15 @@
+# Final release gate: weak FREE model, BYPASS mode (shell auto-allowed), full multi-step task
+# driven UNATTENDED end-to-end. Proves the harness drives a weak model to real completion
+# (writes code, writes tests, RUNS them, reports) without spiral/leak/perms-denial/mid-turn stop.
+# Run: scripts/tui-drive.sh --real --keep --mode bypass --model openrouter::cohere/north-mini-code:free scripts/tui-scripts/live-weak-bypass-e2e.txt
+sleep 5000
+expect message
+send Write calc.py with functions add, sub, mul, div (each takes two args). Then write test_calc.py with assert-based tests covering all four. Then run `python3 test_calc.py` and report whether it passed. Track three tasks with update_tasks: write calc, write tests, run tests — mark each done as you go.
+sleep 240000
+capture result
+reject panic
+reject <invoke
+reject denied by Forge permission
+reject continuing it
+reject allow shell
+send /quit

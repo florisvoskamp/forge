@@ -84,12 +84,24 @@ if fetch "https://github.com/$REPO/releases/download/$version/checksums.txt" > "
   fi
 fi
 
+# Note the currently-installed version (if any) so we can report update-vs-fresh. This script only
+# ever writes the binary below — it never touches your config (~/.config/forge), sessions, or API
+# keys (~/.local/share/forge), so re-running it to update or reinstall preserves all your settings.
+prev=""
+if [ -x "$INSTALL_DIR/forge" ]; then
+  prev=$("$INSTALL_DIR/forge" --version 2>/dev/null | awk '{print $NF}')
+fi
+
 tar xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "$tmp/forge-$target/forge" "$INSTALL_DIR/forge" 2>/dev/null \
   || { cp "$tmp/forge-$target/forge" "$INSTALL_DIR/forge" && chmod 0755 "$INSTALL_DIR/forge"; }
 
-printf 'install: forge %s -> %s/forge\n' "$version" "$INSTALL_DIR" >&2
+if [ -n "$prev" ]; then
+  printf 'install: forge %s -> %s (was %s; your config and sessions are preserved)\n' "$version" "$INSTALL_DIR/forge" "$prev" >&2
+else
+  printf 'install: forge %s -> %s/forge\n' "$version" "$INSTALL_DIR" >&2
+fi
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) printf 'install: add %s to your PATH:\n  export PATH="%s:$PATH"\n' "$INSTALL_DIR" "$INSTALL_DIR" >&2 ;;

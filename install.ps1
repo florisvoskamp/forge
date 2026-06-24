@@ -63,9 +63,22 @@ try {
     $exe = Join-Path $tmp "forge-$target\forge.exe"
     if (-not (Test-Path $exe)) { Die "archive did not contain forge.exe" }
 
+    # Note the currently-installed version (if any) to report update-vs-fresh. This script only ever
+    # writes the binary below — it never touches your config (%APPDATA%\forge) or sessions/API keys
+    # (%LOCALAPPDATA%\forge\data), so re-running it to update or reinstall preserves all settings.
+    $dest = Join-Path $InstallDir 'forge.exe'
+    $prev = $null
+    if (Test-Path $dest) {
+        try { $prev = (& $dest --version 2>$null | Select-Object -First 1).Split(' ')[-1] } catch { $prev = $null }
+    }
+
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Copy-Item -Path $exe -Destination (Join-Path $InstallDir 'forge.exe') -Force
-    Write-Host "install: forge $version -> $InstallDir\forge.exe"
+    Copy-Item -Path $exe -Destination $dest -Force
+    if ($prev) {
+        Write-Host "install: forge $version -> $dest (was $prev; your config and sessions are preserved)"
+    } else {
+        Write-Host "install: forge $version -> $dest"
+    }
 
     # Add to the user PATH if it isn't already there.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')

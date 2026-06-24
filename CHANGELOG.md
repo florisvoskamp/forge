@@ -6,6 +6,26 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-24
+
+### Fixed
+- Failover churn on a bad/missing API key: an auth failure (HTTP 401/403) is now treated as
+  **permanent** — the model is excluded from routing (24h + automatic re-probe) instead of being
+  short-benched and re-tried at the top of *every* turn. A keyless or misconfigured provider no
+  longer adds a failover hop + warning to each turn; it recovers automatically once the key is fixed.
+- One-line turn recap no longer invents success on a stalled turn. A turn that gave up with no
+  output (empty-response exhaustion / failover exhaustion) is no longer summarized — previously the
+  trivial-tier summarizer leaned on the *request* and reported e.g. "Fixed the bug…" for a turn that
+  did nothing. The recap prompt was also hardened to describe only what the response actually shows,
+  and to say so plainly when a turn stalled, errored, or only planned.
+
+### Changed
+- The `curl … | sh` / `irm … | iex` installer can be re-run any time to update or reinstall on any
+  platform **without touching your config, sessions, or API keys** — it only ever writes the binary
+  and updates `PATH`. A re-run now detects the previous version and confirms your settings are
+  preserved (`forge 0.3.1 -> … (was 0.3.0; your config and sessions are preserved)`).
+  `scripts/test-installer-config-safe.sh` asserts a seeded config survives two installs.
+
 ## [0.3.0] - 2026-06-24
 
 ### Added
@@ -215,7 +235,8 @@ Initial public release: Model Mesh routing, multi-provider support, cost/budget 
 inline TUI, session persistence + checkpoints, permission broker, subagents, Assay analysis,
 Lattice code intelligence, MCP client, web tools, hooks, skills/commands, and more.
 
-[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/florisvoskamp/forge/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/florisvoskamp/forge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/florisvoskamp/forge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/florisvoskamp/forge/releases/tag/v0.1.0

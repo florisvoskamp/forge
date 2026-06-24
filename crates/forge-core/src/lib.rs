@@ -1872,7 +1872,10 @@ Rules:\n\
 
     const RECAP_SYSTEM: &'static str = "You are a one-line summarizer for a coding assistant. \
 Given the user's request and the assistant's response, write a SINGLE sentence (≤12 words, \
-past tense, no punctuation at end) that captures what was accomplished. \
+past tense, no punctuation at end) describing ONLY what the assistant's RESPONSE actually shows it \
+did — never assume the request was fulfilled. If the response does not clearly show completed \
+work (it stalled, errored, only planned, or asked a question), say that instead (e.g. \
+\"stalled without completing the task\"). Do not invent success. \
 Output ONLY that sentence — no preamble, no quotation marks.";
 
     /// After a turn completes, make one cheap trivial-tier call to generate a one-line recap,
@@ -1880,6 +1883,13 @@ Output ONLY that sentence — no preamble, no quotation marks.";
     /// or any model error so it can never derail the session.
     async fn generate_recap(&mut self, prompt: &str, final_text: &str) {
         if !self.config.recap.enabled {
+            return;
+        }
+        // A stalled turn (empty-response give-up, hard failover exhaustion) leaves `final_text`
+        // empty: there is nothing the assistant actually did to summarize. Recapping anyway makes
+        // the trivial-tier summarizer lean on the *request* and invent success ("Fixed the bug…")
+        // for a turn that accomplished nothing — so skip it outright.
+        if final_text.trim().is_empty() {
             return;
         }
         let budget = BudgetState {
@@ -5986,6 +5996,42 @@ mod tests {
             ".",
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recap_is_skipped_when_the_turn_produced_no_final_text() {
+        // A stalled turn (empty-response give-up / failover exhaustion) leaves final_text empty.
+        // MockProvider always returns non-empty content, so without the guard a recap WOULD be
+        // emitted from the request alone — inventing success for a turn that did nothing. The
+        // guard must suppress it entirely.
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let config = Config::default();
+        assert!(
+            config.recap.enabled,
+            "recap on by default — guard, not disable"
+        );
+        let mut s = Session::start(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter {
+                events: events.clone(),
+            }),
+            config,
+            ".",
+        )
+        .unwrap();
+        s.generate_recap("Fix buggy.py so average([]) returns 0.0", "")
+            .await;
+        s.generate_recap("Fix buggy.py", "   \n\t ").await;
+        let recaps = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, PresenterEvent::Recap { .. }))
+            .count();
+        assert_eq!(recaps, 0, "empty/whitespace turn must not be recapped");
     }
 
     #[test]

@@ -1,0 +1,13 @@
+# Honest-review #2: a multi-step task with mesh UNPINNED (real routing) — does the harness stay
+# stable (no crash/spiral/leak) regardless of which model the mesh picks?
+# Run: scripts/tui-drive.sh --real --keep --mode accept-edits scripts/tui-scripts/live-complex-unpinned.txt
+sleep 5000
+expect message
+send Write calc.py with functions add, sub, mul, div (each takes two args). Then write test_calc.py with assert-based tests covering all four. Then run `python3 test_calc.py` and report whether it passed. Track three tasks with update_tasks: write calc, write tests, run tests — mark each done as you go.
+sleep 200000
+capture result
+reject panic
+reject <invoke
+reject denied by Forge permission
+reject continuing it
+send /quit

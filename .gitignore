@@ -28,3 +28,6 @@ graphify-out/
 # Stray nested forge runtime dirs (root /.forge already ignored above)
 **/.forge/
 .dual-graph/
+
+# E2E battery scratch output (scripts/e2e-battery.sh)
+scripts/.e2e-out/
