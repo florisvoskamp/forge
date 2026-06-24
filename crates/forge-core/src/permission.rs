@@ -132,6 +132,13 @@ fn rule_matches(rule: &PermissionRule, tool_name: &str, args: &Value) -> bool {
             .iter()
             .any(|p| candidates.iter().any(|c| path_match(p, c)));
     }
+    // Generic tools (MCP server tools, etc.): a bare "*" means "match any args". More specific
+    // patterns are intentionally not supported for non-shell/non-path tools — the only meaningful
+    // distinction users make is "deny any call to this tool" (deny = "*") vs "deny for specific
+    // args" (which requires tool-specific pattern support we don't have yet).
+    if rule.patterns.iter().any(|p| p == "*") {
+        return true;
+    }
     false
 }
 

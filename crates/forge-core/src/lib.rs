@@ -3866,6 +3866,42 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             PermissionDecision::Deny => false,
             PermissionDecision::Ask => self.presenter.confirm(&call.name, side_effect),
         };
+        // When the model routes an MCP server tool via the mcp_call meta-wrapper, also gate the
+        // inner (real) tool name against the permission broker. Without this, a per-tool
+        // allow/ask/deny rule targeting e.g. "myserver__dangerous" is bypassed on the direct
+        // path because the outer broker only sees "mcp_call".
+        let allowed = if allowed && call.name == forge_mcp::MCP_CALL {
+            let inner_name = effective_args
+                .get("name")
+                .or_else(|| effective_args.get("qualified_name"))
+                .or_else(|| effective_args.get("tool"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let inner_args = effective_args
+                .get("arguments")
+                .or_else(|| effective_args.get("args"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+            if inner_name.is_empty() {
+                true
+            } else {
+                match permission::decide(
+                    self.mode,
+                    forge_types::SideEffect::External,
+                    inner_name,
+                    &inner_args,
+                    &self.rules,
+                ) {
+                    PermissionDecision::Allow => true,
+                    PermissionDecision::Deny => false,
+                    PermissionDecision::Ask => self
+                        .presenter
+                        .confirm(inner_name, forge_types::SideEffect::External),
+                }
+            }
+        } else {
+            allowed
+        };
         let permission_label = if allowed { "allowed" } else { "denied" };
 
         let (result, ok) = if allowed {
@@ -5169,6 +5205,109 @@ mod tests {
         assert!(names
             .iter()
             .all(|n| !n.starts_with("mcp_") && !n.contains("__")));
+    }
+
+    /// Provider that always calls `mcp_call { name: "test__echo", arguments: { "msg": "hi" } }`.
+    /// Reused for the inner-gate deny test.
+    struct McpCallEchoProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for McpCallEchoProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_provider::ModelResponse;
+            use forge_types::{new_id, ToolCall, Usage};
+            if messages.iter().any(|m| m.role == Role::Tool) {
+                return Ok(ModelResponse {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                    quotas: Vec::new(),
+                });
+            }
+            Ok(ModelResponse {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "mcp_call".into(),
+                    args: serde_json::json!({
+                        "name": "test__echo",
+                        "arguments": { "msg": "hi" }
+                    }),
+                }],
+                usage: Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_inner_tool_deny_rule_honored_on_direct_path() {
+        // Bypass mode: the outer mcp_call wrapper is auto-allowed. A Configured deny rule
+        // on the inner tool "test__echo" must still block the call so per-tool
+        // allow/ask/deny rules are honored on the direct path (fix/mcp-percall-inner-gate).
+        let mcp_cfg = forge_config::McpConfig {
+            allow: forge_config::McpAllowlist {
+                servers: vec!["test".into()],
+                tools: vec!["test__echo".into()],
+            },
+            ..Default::default()
+        };
+        let deny_rule = forge_config::RuleConfig {
+            tool: "test__echo".into(),
+            deny: Some(forge_config::OneOrMany::One("*".into())),
+            allow: None,
+            ask: None,
+            reason: None,
+        };
+        let config = Config {
+            permission_mode: PermissionMode::Bypass,
+            mcp: mcp_cfg.clone(),
+            permissions: forge_config::PermissionsConfig {
+                rules: vec![deny_rule],
+            },
+            ..Config::default()
+        };
+
+        let mgr = std::sync::Arc::new(forge_mcp::testsupport::manager_with_echo(&mcp_cfg).await);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(McpCallEchoProvider),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter::default()),
+            config,
+            ".",
+        )
+        .unwrap();
+        session.set_mcp(Some(mgr));
+
+        let id = session.id().to_string();
+        let _ = session.run_turn("call echo").await.unwrap();
+
+        let tool_msgs: Vec<_> = store
+            .load_messages(&id)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert!(
+            tool_msgs
+                .iter()
+                .any(|m| m.content.contains("permission denied by policy")),
+            "inner deny rule must block mcp_call on direct path; got: {tool_msgs:?}"
+        );
+        // Confirm the allowed tool (no deny rule) is NOT blocked — regression guard.
+        assert!(
+            tool_msgs.iter().all(|m| m.content != "echo: hi"),
+            "denied tool must not produce output: {tool_msgs:?}"
+        );
     }
 
     /// A provider that calls `update_tasks` once with a 2-item list, then finishes.
