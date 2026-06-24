@@ -9,7 +9,7 @@
 class Forge < Formula
   desc "Multi-provider mesh AI coding CLI"
   homepage "https://github.com/florisvoskamp/forge"
-  version "0.3.5" # release: update sha256 values from checksums.txt after the tag workflow finishes
+  version "0.3.6" # release: update sha256 values from checksums.txt after the tag workflow finishes
   license "MIT"
 
   on_macos do

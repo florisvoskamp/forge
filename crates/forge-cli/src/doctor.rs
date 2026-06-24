@@ -299,13 +299,21 @@ fn environment_checks() -> Vec<Check> {
         ));
     }
 
-    // terminal — resolve the old "(?)": an interactive stdout with no usable TERM is exactly the
-    // class of box where the full-screen TUI can misbehave, so flag it instead of glossing over it.
+    // terminal — resolve the old "(?)". On Unix an interactive stdout with no usable TERM is the
+    // class of box where the full-screen TUI misbehaves, so flag it. On Windows TERM is a Unix
+    // concept and is normally UNSET — crossterm drives the console via the Console API regardless —
+    // so an interactive Windows console is simply OK (warning there is a false positive).
     let tty = std::io::stdout().is_terminal();
     let term = std::env::var("TERM").ok().filter(|t| !t.is_empty());
     let term_usable = term.as_deref().is_some_and(|t| t != "dumb");
     let (status, detail, fix) = if !tty {
         (Status::Info, "non-interactive (piped/CI)".to_string(), None)
+    } else if cfg!(windows) {
+        (
+            Status::Ok,
+            "interactive (Windows console)".to_string(),
+            None,
+        )
     } else if term_usable {
         (Status::Ok, format!("interactive ({})", term.unwrap()), None)
     } else {

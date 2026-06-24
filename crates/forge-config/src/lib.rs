@@ -1084,28 +1084,31 @@ impl Default for Config {
     fn default() -> Self {
         let mut models = HashMap::new();
         let many = |s: &[&str]| OneOrMany::Many(s.iter().map(|x| x.to_string()).collect());
-        // Free models lead each tier: cost-aware routing (FR-5) picks the cheapest *usable*
-        // candidate, and free providers cost $0 (unlisted in pricing), so a free model with a
-        // configured key wins — otherwise the mesh falls back down the list. Free model ids
-        // change over time; edit `[mesh.models]` to taste (see docs/features/free-models.md).
+        // Cost-aware routing (FR-5) picks the cheapest *usable* candidate regardless of list order,
+        // so a configured free provider ($0, unlisted in pricing) still wins for the actual route.
+        // Order matters only for code paths that take the FIRST candidate (e.g. an architect
+        // planner/editor fallback): those key-filter now, but we deliberately DON'T lead any tier
+        // with `groq::…` — it needs a key many users don't have, and leading with it made groq the
+        // face of every "first candidate" failure. Lead instead with a keyless/bridge option, groq
+        // last. Free model ids change over time; edit `[mesh.models]` to taste (free-models.md).
         models.insert(
             TaskTier::Trivial.as_str().into(),
-            many(&["groq::llama-3.1-8b-instant", "ollama::llama3.2"]),
+            many(&["ollama::llama3.2", "groq::llama-3.1-8b-instant"]),
         );
         models.insert(
             TaskTier::Standard.as_str().into(),
             many(&[
-                "groq::llama-3.3-70b-versatile",
                 "gemini::gemini-2.5-flash",
                 "openai::gpt-4o-mini",
+                "groq::llama-3.3-70b-versatile",
             ]),
         );
         models.insert(
             TaskTier::Complex.as_str().into(),
             many(&[
-                "groq::llama-3.3-70b-versatile",
                 "claude-cli::",
                 "anthropic::claude-opus-4-8",
+                "groq::llama-3.3-70b-versatile",
             ]),
         );
         Self {
@@ -2157,6 +2160,30 @@ mod tests {
         assert!(!paths.iter().any(|p| p.starts_with("hooks")));
         assert!(!paths.iter().any(|p| p.starts_with("mcp")));
         assert!(!paths.iter().any(|p| p.starts_with("permissions")));
+    }
+
+    #[test]
+    fn architect_mode_stays_off_when_config_omits_it() {
+        use figment::providers::{Format, Serialized, Toml};
+        // Mirror load()'s merge order (built-in defaults <- user toml) with a minimal user config
+        // that sets a few unrelated fields but NOT architect_mode. It must stay false: a user on a
+        // "default config" must never silently get the architect dual-model pipeline (which led the
+        // planner to the keyless groq default and auth-failed every turn). Guards against a stray
+        // serde-default or a deserialization quirk flipping it on.
+        let user_toml = r#"
+            permission_mode = "accept-edits"
+            [mesh]
+            prefer_subscription = true
+            failover = true
+        "#;
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(user_toml))
+            .extract()
+            .expect("minimal config should load");
+        assert!(
+            !cfg.mesh.architect_mode,
+            "architect_mode must stay false when the config omits it"
+        );
     }
 
     #[test]
