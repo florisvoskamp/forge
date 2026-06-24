@@ -6,6 +6,17 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-06-24
+
+### Changed
+- **Failover shows one animated indicator instead of a per-hop warning wall.** When the mesh fails
+  over between models (e.g. through rate-limited free models), it no longer prints a
+  `{model} {reason} — failing over` line to the chat for every hop. Instead a single animated
+  `⠋ finding a model` indicator appears in the status bar (the model being tried shows on the
+  routing line) and clears the instant real output begins — so you see *that* it's searching and
+  *what* it settled on, without the scrollback spam. A genuinely exhausted failover chain still
+  surfaces a clear warning.
+
 ## [0.3.6] - 2026-06-24
 
 ### Fixed

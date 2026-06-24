@@ -136,6 +136,12 @@ pub enum PresenterEvent {
     AssistantDone,
     /// A non-fatal advisory (e.g. budget threshold reached).
     Warning(String),
+    /// The mesh is failing over: `model` just failed and a replacement is being tried. Drives a
+    /// single animated "finding a model" status indicator instead of one scrollback warning per
+    /// hop — cleared automatically when real output (assistant text / a tool call) begins.
+    ModelSearch {
+        model: String,
+    },
     ToolStart {
         name: String,
         args: String,
@@ -305,6 +311,10 @@ impl Presenter for HeadlessPresenter {
             }
             PresenterEvent::Warning(msg) => {
                 println!("  ⚠ {msg}");
+            }
+            PresenterEvent::ModelSearch { model } => {
+                // Headless has no animated indicator; a concise dim line keeps the failover record.
+                println!("\x1b[2m  · {model} unavailable — finding another model…\x1b[0m");
             }
             PresenterEvent::ToolStart { name, args } => {
                 println!("  ↳ {name}({args})");

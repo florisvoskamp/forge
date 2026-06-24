@@ -1797,9 +1797,11 @@ Rules:\n\
         }
         let next = chain.next();
         match &next {
-            Some(n) => self.presenter.emit(PresenterEvent::Warning(format!(
-                "{model} {reason} — {label} failing over to {n}"
-            ))),
+            // A hop drives the animated "finding a model" indicator (no per-hop scrollback spam).
+            Some(_) => self.presenter.emit(PresenterEvent::ModelSearch {
+                model: model.to_string(),
+            }),
+            // The chain is exhausted — a real, terminal failure worth a visible warning.
             None => self.presenter.emit(PresenterEvent::Warning(format!(
                 "{model} {reason} — {label} chain exhausted"
             ))),
@@ -2258,19 +2260,19 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                         // failing" churn); a transient failure benches it on the short cooldown.
                         if e.is_permanent() {
                             let _ = self.store.exclude_model(&active_model, reason);
-                            self.presenter.emit(PresenterEvent::Warning(format!(
-                                "{active_model} {reason} — excluded from routing"
-                            )));
                         } else {
                             let _ = self.store.bench_for(
                                 &active_model,
                                 e.cooldown(default_cooldown),
                                 reason,
                             );
-                            self.presenter.emit(PresenterEvent::Warning(format!(
-                                "{active_model} {reason} — failing over"
-                            )));
                         }
+                        // Drive the single animated "finding a model" indicator instead of emitting
+                        // one scrollback warning per hop (the failover spam). It clears itself when
+                        // real output begins; the chain-exhausted case below still surfaces an error.
+                        self.presenter.emit(PresenterEvent::ModelSearch {
+                            model: active_model.clone(),
+                        });
                         // Advance down the chain to the next model we can use. A model whose window
                         // still holds the conversation is used immediately; one that's too small is
                         // a switch that needs (lossy) compaction, so it's gated by consent

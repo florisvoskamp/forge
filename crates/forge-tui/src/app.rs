@@ -230,6 +230,10 @@ pub struct CompactionState {
 pub struct App {
     pub session_id: String,
     pub routing: Option<RoutingView>,
+    /// While `Some`, the mesh is failing over between models — drives the animated "finding a
+    /// model" status indicator. Set on a `ModelSearch` event, cleared the moment real output
+    /// (assistant text / a tool call) arrives, so it shows only during the search, never after.
+    pub model_search: Option<String>,
     pub cost_usd: f64,
     /// Live token counter (tui-token-counter.md): session totals + current context fill.
     pub session_in: u64,
@@ -829,14 +833,25 @@ impl App {
                     rationale,
                 })
             }
+            // Failover in progress: keep a single animated indicator instead of one warning per
+            // hop. The model that just failed is recorded only for the (dim) hint; the status bar's
+            // own routing line shows the model now being tried.
+            PresenterEvent::ModelSearch { model } => {
+                self.model_search = Some(model);
+            }
             // A complete (non-streamed) assistant message: render markdown into scrollback.
             PresenterEvent::AssistantText(text) => {
+                self.model_search = None;
                 self.flush.push(header_line("⚒ forge", ORANGE));
                 self.flush.extend(crate::render::markdown_to_lines(&text));
                 self.flush.push(TextLine::default());
             }
-            PresenterEvent::Reasoning(delta) => self.reasoning.push_str(&delta),
+            PresenterEvent::Reasoning(delta) => {
+                self.model_search = None;
+                self.reasoning.push_str(&delta)
+            }
             PresenterEvent::AssistantDelta(delta) => {
+                self.model_search = None;
                 if !self.streaming_active {
                     self.flush_reasoning();
                     self.flush.push(header_line("⚒ forge", ORANGE));
@@ -862,6 +877,7 @@ impl App {
             }
             PresenterEvent::Warning(msg) => self.flush.push(warning_line(&msg)),
             PresenterEvent::ToolStart { name, args } => {
+                self.model_search = None;
                 self.flush.push(tool_start_line(&name, &args))
             }
             PresenterEvent::ToolResult { name, ok, summary } => {
@@ -1041,7 +1057,10 @@ impl App {
                 ]));
                 self.flush.push(TextLine::default());
             }
-            PresenterEvent::Done { .. } => self.done = true,
+            PresenterEvent::Done { .. } => {
+                self.model_search = None;
+                self.done = true;
+            }
             PresenterEvent::QuotaUpdate {
                 provider,
                 window,
@@ -3845,7 +3864,16 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
 
     // Line 1: spinner · [tier] model · $cost · ◆ temper · ◉ remote   (hint right-aligned)
     let mut line1: Vec<Span> = vec![Span::styled(" ", bg)];
-    if app.busy && w >= 40 {
+    if app.model_search.is_some() && w >= 40 {
+        // Failover in progress: one animated indicator (replaces the per-hop warning spam). The
+        // model now being tried is the routing line just to the right.
+        let f = SPINNER[app.tick % SPINNER.len()];
+        line1.push(Span::styled(
+            format!("{f} finding a model"),
+            Style::default().fg(WARNYEL).bg(STATUSBG),
+        ));
+        line1.push(sep());
+    } else if app.busy && w >= 40 {
         let f = SPINNER[app.tick % SPINNER.len()];
         line1.push(Span::styled(
             format!("{f} working"),
@@ -4450,6 +4478,33 @@ mod tests {
         app.apply(PresenterEvent::AssistantDone);
         assert!(app.streaming.is_empty(), "streaming buffer cleared");
         assert!(flush_text(&mut app).contains("committed text"));
+    }
+
+    #[test]
+    fn model_search_shows_one_indicator_and_clears_on_output() {
+        // Failover must drive a SINGLE animated status indicator, not one scrollback warning per
+        // hop. The indicator clears the moment real output begins.
+        let mut app = App::default();
+        app.apply(PresenterEvent::ModelSearch {
+            model: "groq::llama-3.3-70b-versatile".into(),
+        });
+        assert!(app.model_search.is_some());
+        assert!(
+            screen(&app).contains("finding a model"),
+            "animated search indicator shown in the status bar"
+        );
+        // The failed model id is NOT spammed into scrollback.
+        assert!(
+            !flush_text(&mut app).contains("groq::llama-3.3-70b-versatile"),
+            "no per-hop failover line flushed to scrollback"
+        );
+        // Output settles it.
+        app.apply(PresenterEvent::AssistantDelta("hello".into()));
+        assert!(
+            app.model_search.is_none(),
+            "indicator cleared once output begins"
+        );
+        assert!(!screen(&app).contains("finding a model"));
     }
 
     #[test]
