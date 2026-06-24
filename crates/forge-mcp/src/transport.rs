@@ -15,8 +15,7 @@ use rmcp::ServiceExt;
 pub async fn serve(server: &McpServerConfig) -> Result<RunningService<RoleClient, ()>, String> {
     match &server.transport {
         McpTransport::Stdio { command, args, env } => {
-            let mut cmd = stdio_command(command);
-            cmd.args(args);
+            let mut cmd = stdio_command(command, args);
             for (k, v) in env {
                 cmd.env(k, v);
             }
@@ -75,25 +74,48 @@ pub async fn serve(server: &McpServerConfig) -> Result<RunningService<RoleClient
     }
 }
 
-/// Build the base command to launch a stdio MCP server. On Windows the server command is often an
-/// npm-installed `.cmd` shim (`npx`, and most node-based CLIs like `caveman-shrink`), which
+/// Build the command to launch a stdio MCP server `command` with `args`. On Windows the server
+/// command is often an npm-installed `.cmd` shim (`npx`, and most node-based CLIs), which
 /// `CreateProcess` cannot launch directly — resolve it on `PATH` and, when it's a `.cmd`/`.bat`, run
-/// it through `cmd /C`. Without this, importing/connecting MCP servers fails on Windows with
-/// "program not found". On Unix this is a plain `Command::new(command)`.
-fn stdio_command(command: &str) -> tokio::process::Command {
+/// it through `cmd /S /C` with the whole command line individually quoted. `cmd` strips the first/last
+/// quote of its `/C` string, so a quoted shim path breaks the moment a second quoted token (an arg
+/// with a space) appears — `/S` + per-token quoting keeps spaces in the path AND args intact. On Unix
+/// this is a plain `Command::new(command).args(args)`.
+fn stdio_command(command: &str, args: &[String]) -> tokio::process::Command {
     #[cfg(windows)]
-    if let Some(p) = resolve_on_path(command) {
-        let is_script = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
-        if is_script {
-            let mut cmd = tokio::process::Command::new("cmd");
-            cmd.arg("/C").arg(&p);
-            return cmd;
+    {
+        use std::os::windows::process::CommandExt;
+        if let Some(p) = resolve_on_path(command) {
+            let is_script = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+            if is_script {
+                let mut cmd = tokio::process::Command::new("cmd");
+                cmd.as_std_mut().raw_arg("/S");
+                cmd.as_std_mut().raw_arg("/C");
+                cmd.as_std_mut().raw_arg(windows_cmd_line(&p, args));
+                return cmd;
+            }
         }
     }
-    tokio::process::Command::new(command)
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(args);
+    cmd
+}
+
+/// The raw command line for `cmd /S /C` launching `program` (a resolved `.cmd`/`.bat`) with `args`:
+/// every token double-quoted (embedded quotes doubled, per `cmd`), wrapped in an outer pair `/S`
+/// strips. Pure + cross-platform so it can be unit-tested off Windows.
+#[cfg(any(windows, test))]
+fn windows_cmd_line(program: &std::path::Path, args: &[String]) -> String {
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let mut inner = q(&program.to_string_lossy());
+    for a in args {
+        inner.push(' ');
+        inner.push_str(&q(a));
+    }
+    format!("\"{inner}\"")
 }
 
 /// Resolve `bin` to an executable file on `PATH`, Windows-aware (also tries `.exe`/`.cmd`/`.bat`,
@@ -170,7 +192,18 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let shim = dir.join("npx.cmd");
         std::fs::write(&shim, b"@echo off\n").unwrap();
-        let cmd = stdio_command(shim.to_str().unwrap());
+        let cmd = stdio_command(shim.to_str().unwrap(), &["-y".into()]);
         assert_eq!(cmd.as_std().get_program(), std::ffi::OsStr::new("cmd"));
+    }
+
+    #[test]
+    fn windows_cmd_line_quotes_path_and_every_arg() {
+        let p = std::path::Path::new(r"C:\Users\First Last\npm\npx.cmd");
+        let line = windows_cmd_line(p, &["-y".into(), "some pkg".into()]);
+        assert_eq!(
+            line,
+            r#"""C:\Users\First Last\npm\npx.cmd" "-y" "some pkg"""#
+        );
+        assert!(line.starts_with("\"\"") && line.ends_with("\"\""));
     }
 }
