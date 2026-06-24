@@ -632,6 +632,22 @@ impl Store {
         Ok(row)
     }
 
+    /// All transiently-benched (non-excluded) models, soonest-recovering first. The caller
+    /// applies its own filter (e.g. drop providers with no key) before picking a last-resort
+    /// model — `soonest_unbenched` can't, since the store has no notion of key presence.
+    pub fn transient_benched_ordered(&self) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT model FROM model_health
+             WHERE reason NOT LIKE 'excluded:%'
+             ORDER BY cooldown_until ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
     /// Currently-benched snapshot as of *now* (convenience over [`benched_models`]).
     pub fn current_benched(&self) -> Result<forge_types::ModelHealth> {
         self.benched_models(chrono::Utc::now().timestamp())

@@ -301,8 +301,34 @@ fn classify_genai_error(err: &genai::Error) -> ProviderError {
         }
         // A bad/truncated stream chunk — transient, worth trying elsewhere.
         genai::Error::StreamParse { .. } => ProviderError::Unavailable(short(&err.to_string())),
-        other => ProviderError::Request(short(&other.to_string())),
+        other => {
+            let s = other.to_string();
+            // A genai "Resolver error" (adapter/auth couldn't be built — almost always a missing
+            // API key) is PERMANENT for this turn: retrying dispatches the same keyless model and
+            // fails identically. Class it as Auth so the mesh EXCLUDES it (long bench + periodic
+            // re-probe) instead of surfacing the raw "Resolver error for model 'groq::…'" and, on
+            // the last-resort path, re-benching it forever.
+            if is_auth_config_failure(&s) {
+                ProviderError::Auth(short(&s))
+            } else {
+                ProviderError::Request(short(&s))
+            }
+        }
     }
+}
+
+/// Markers of a no-credentials / misconfigured-provider failure (genai's resolver couldn't build
+/// the adapter, or the provider rejected an absent key). Treated as [`ProviderError::Auth`] —
+/// permanent for the session, so the model is excluded rather than benched-and-retried.
+fn is_auth_config_failure(text: &str) -> bool {
+    let l = text.to_lowercase();
+    l.contains("resolver error")
+        || l.contains("no auth")
+        || l.contains("missing api key")
+        || l.contains("no api key")
+        || l.contains("api key not")
+        || l.contains("requires an api key")
+        || l.contains("requires api key")
 }
 
 /// A 429 whose quota is per-day or flat-out zero (a free-tier model that's disabled, like
@@ -401,6 +427,10 @@ fn classify_text(text: &str, message: String) -> ProviderError {
             retry_after,
         }
     } else if has(" 401") || has(" 403") || has("unauthorized") || has("permission denied") {
+        ProviderError::Auth(message)
+    } else if is_auth_config_failure(text) {
+        // No-credentials / resolver failure surfaced via the streaming path — permanent (excluded),
+        // not a transient outage.
         ProviderError::Auth(message)
     } else {
         // A dropped/5xx stream — treat as a transient provider problem worth failing over.
@@ -817,6 +847,19 @@ mod tests {
             other => panic!("expected RateLimited, got {other:?}"),
         }
         assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn resolver_error_no_key_classes_as_permanent_auth() {
+        // genai's no-credentials failure ("Resolver error for model 'groq::…'") must be PERMANENT
+        // (Auth → excluded), not transient — otherwise the last-resort path re-benches the keyless
+        // model forever (the "groq for everything" report).
+        let msg = "Resolver error for model 'groq::llama-3.3-70b-versatile (adapter: Groq)'";
+        let e = classify_text(msg, msg.into());
+        assert!(matches!(e, ProviderError::Auth(_)), "got {e:?}");
+        assert!(e.is_permanent());
+        assert!(is_auth_config_failure(msg));
+        assert!(!is_auth_config_failure("provider unavailable: 502 bad gateway"));
     }
 
     #[test]
