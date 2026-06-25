@@ -471,9 +471,14 @@ instruction in the task or a loaded skill body tells you to `ls`/read those dire
 Finishing the task: complete the ENTIRE task before you end your turn. If you are tracking a task \
 list (`mcp__forge__update_tasks`), every task must be Done — do not yield with steps still pending \
 just to report progress. Crucially, if you launch an asynchronous job (a release build, a CI run, \
-a long deploy), \"launched\" is NOT \"done\": WAIT for it to finish (poll it, e.g. `mcp__forge__shell` \
-`gh run watch <id>` or a sleep-and-recheck loop) and then carry out the steps that depend on it. \
-Only end your turn once the goal is fully achieved and every task is resolved.";
+a long deploy), \"launched\" is NOT \"done\": WAIT for it to finish, then carry out the steps that \
+depend on it. To wait for a job that takes minutes, do NOT use one long blocking `gh run watch` — \
+the shell tool kills any single command at its timeout (~120s) so a long watch never survives. \
+Instead call `mcp__forge__shell` in POLL mode: pass `poll_until_exit_zero: true` with a quick \
+status command (e.g. `gh run view <id> --json status,conclusion -q '.status'` returning non-zero \
+until complete, or `gh run watch <id> --exit-status` which exits 0 on success), and call it again \
+each time it returns \"not ready ... call again\" until it reports ready. Only end your turn once \
+the goal is fully achieved and every task is resolved.";
 
 /// Prepend the harness tool-preamble in harness mode; pass the prompt through unchanged
 /// otherwise (Phase-1 self-agent turns keep their own tools).

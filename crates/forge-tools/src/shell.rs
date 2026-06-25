@@ -37,6 +37,14 @@ use crate::{str_arg, Tool, ToolError};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
+/// Max wall-clock a single `poll_until_exit_zero` call may run before yielding a resumable
+/// "call again" result. Kept well under the ~120s MCP/bridge request cap so one poll call is
+/// never killed mid-flight — the model just resumes waiting by calling again. This is what lets
+/// Forge wait out a multi-minute external job (CI run, release build) that no single blocking
+/// command could outlast.
+const POLL_MAX_BUDGET_SECS: u64 = 100;
+/// Default gap between poll attempts when `poll_interval_secs` is not given.
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 /// Bytes captured per stream before we stop reading (memory bound).
 const CAPTURE_CAP: usize = 1 << 20; // 1 MiB
 /// Bytes of combined output handed back to the model (token budget).
@@ -61,7 +69,11 @@ impl Tool for ShellTool {
          that block on input fail fast); set `pty: true` to run under a pseudo-terminal so \
          tty-detecting programs see isatty=true — stdin is still closed so prompts get EOF. \
          Prefer read_file/search/list_dir over cat/grep/ls. Args: command (required), cwd \
-         (default \".\"), timeout_secs (default 120, max 600), pty (default false)."
+         (default \".\"), timeout_secs (default 120, max 600), pty (default false). To WAIT for a \
+         long external job (CI run / release build that takes minutes), set \
+         poll_until_exit_zero:true — the call re-runs `command` every poll_interval_secs until it \
+         exits 0, yielding a resumable 'call again' result if still not ready; call it repeatedly \
+         until ready instead of one long blocking watch (which gets killed at the timeout)."
     }
     fn side_effect(&self) -> SideEffect {
         SideEffect::Shell
@@ -72,8 +84,10 @@ impl Tool for ShellTool {
             "properties": {
                 "command": { "type": "string", "description": "POSIX sh -c command line." },
                 "cwd": { "type": "string", "description": "Working directory; defaults to the project root." },
-                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Default 120; clamped to 600." },
-                "pty": { "type": "boolean", "description": "Run under a pseudo-terminal so interactive/tty-detecting programs work (default false). Stdin is still closed (EOF) so prompts won't hang forever. Refused when the shell sandbox is enabled (the PTY path can't be confined by Landlock)." }
+                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Default 120; clamped to 600. In poll mode this is the per-call budget, clamped to 100s." },
+                "pty": { "type": "boolean", "description": "Run under a pseudo-terminal so interactive/tty-detecting programs work (default false). Stdin is still closed (EOF) so prompts won't hang forever. Refused when the shell sandbox is enabled (the PTY path can't be confined by Landlock)." },
+                "poll_until_exit_zero": { "type": "boolean", "description": "Poll mode (default false): re-run command every poll_interval_secs until it exits 0 or the per-call budget elapses. On budget exhaustion returns a resumable 'call again to keep waiting' result (NOT a killed timeout). Use to wait for a long external job (CI/release build); call repeatedly until ready. Not supported with pty:true." },
+                "poll_interval_secs": { "type": "integer", "minimum": 1, "description": "Gap between poll attempts in poll mode (default 5, max 60)." }
             },
             "required": ["command"]
         })
@@ -96,11 +110,80 @@ impl Tool for ShellTool {
                     .to_string(),
             );
         }
+        let poll = args
+            .get("poll_until_exit_zero")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if poll {
+            if use_pty {
+                return Ok(
+                    "shell: poll_until_exit_zero is not supported with pty:true — \
+                           re-run without pty."
+                        .to_string(),
+                );
+            }
+            let interval = args
+                .get("poll_interval_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
+                .clamp(1, 60);
+            let budget = timeout_secs.min(POLL_MAX_BUDGET_SECS);
+            return Ok(run_poll(command, cwd, budget, interval, &self.policy).await);
+        }
         if use_pty {
             Ok(run_command_pty(command, cwd, timeout_secs).await)
         } else {
             Ok(run_command(command, cwd, timeout_secs, &self.policy).await)
         }
+    }
+}
+
+/// Bounded poll loop: re-run `command` every `interval_secs` until it exits 0 or `budget_secs`
+/// of wall-clock elapses. On success returns "ready after Ns". On budget exhaustion returns a
+/// NON-error, resumable result telling the model to call again with the same args — never the
+/// hard "timed out … killed" path. Each call stays under the request cap, so the model can wait
+/// out a job far longer than any single command by calling repeatedly.
+async fn run_poll(
+    command: &str,
+    cwd: &str,
+    budget_secs: u64,
+    interval_secs: u64,
+    policy: &SandboxPolicy,
+) -> String {
+    let budget = Duration::from_secs(budget_secs);
+    let interval = Duration::from_secs(interval_secs);
+    let start = Instant::now();
+    loop {
+        // Give each attempt the remaining budget as its own timeout so a single hung attempt
+        // can never outlive the poll call.
+        let attempt_timeout = budget.saturating_sub(start.elapsed()).as_secs().max(1);
+        let (result, code) = run_command_inner(command, cwd, attempt_timeout, policy).await;
+        let elapsed = start.elapsed().as_secs();
+        let body = result.split_once("\n\n").map(|(_, b)| b).unwrap_or("");
+        if code == Some(0) {
+            return if body.trim().is_empty() {
+                format!("shell: ready after {elapsed}s (exit 0)")
+            } else {
+                format!("shell: ready after {elapsed}s (exit 0)\n\n{body}")
+            };
+        }
+        // Not ready yet. If the next sleep would cross the budget, yield a resumable result so
+        // the model can keep waiting by calling again — never the hard killed-timeout path.
+        if start.elapsed() + interval >= budget {
+            let code_str = code
+                .map(|c| format!("exit {c}"))
+                .unwrap_or_else(|| "no exit".into());
+            let tail = if body.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n\n{body}")
+            };
+            return format!(
+                "shell: not ready after {elapsed}s (last {code_str}) — call shell again with the \
+                 same poll args to keep waiting.{tail}"
+            );
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -117,6 +200,19 @@ pub async fn run_command(
     timeout_secs: u64,
     policy: &SandboxPolicy,
 ) -> String {
+    run_command_inner(command, cwd, timeout_secs, policy)
+        .await
+        .0
+}
+
+/// Like [`run_command`] but also returns the child's exit code (`None` on timeout, spawn failure,
+/// or signal death). The poll loop uses the code to detect success without parsing the header.
+async fn run_command_inner(
+    command: &str,
+    cwd: &str,
+    timeout_secs: u64,
+    policy: &SandboxPolicy,
+) -> (String, Option<i32>) {
     let (shell, flag) = shell_invocation();
     let mut cmd = Command::new(shell);
     cmd.arg(flag)
@@ -134,7 +230,7 @@ pub async fn run_command(
     let start = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return format!("shell: failed to start (cwd {cwd}): {e}"),
+        Err(e) => return (format!("shell: failed to start (cwd {cwd}): {e}"), None),
     };
     let pgid = child.id().map(|id| id as i32);
     let stdout = child.stdout.take().expect("piped stdout");
@@ -172,12 +268,12 @@ pub async fn run_command(
     if truncated || out_capped || err_capped {
         header.push_str(&format!("  ({total} bytes captured, output truncated)"));
     }
-    let _ = exit_code; // exit code is conveyed in status_line; reserved for richer wiring later
-    if body.trim().is_empty() {
+    let result = if body.trim().is_empty() {
         header
     } else {
         format!("{header}\n\n{body}")
-    }
+    };
+    (result, exit_code)
 }
 
 /// Execute `command` under a pseudo-terminal (PTY) so `isatty(stdout)` returns true in the child.
@@ -658,6 +754,76 @@ mod tests {
         async fn bad_cwd_is_a_spawn_failure_not_a_panic() {
             let out = run_command("echo hi", "/no/such/dir/xyz", 5, &no_sandbox()).await;
             assert!(out.contains("failed to start"), "spawn failure: {out}");
+        }
+
+        #[tokio::test]
+        async fn poll_returns_immediately_on_exit_zero() {
+            let out = run_poll("true", ".", 10, 1, &no_sandbox()).await;
+            assert!(
+                out.contains("ready after"),
+                "true exits 0 immediately: {out}"
+            );
+            assert!(
+                !out.contains("not ready"),
+                "must not yield resumable: {out}"
+            );
+        }
+
+        #[tokio::test]
+        async fn poll_succeeds_once_command_starts_exiting_zero() {
+            // A counter file the command increments each attempt; exits non-zero until the 3rd.
+            let f = std::env::temp_dir().join(format!("forge_poll_{}.cnt", std::process::id()));
+            let _ = std::fs::remove_file(&f);
+            let fp = f.display();
+            let cmd = format!(
+                "n=$(cat {fp} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {fp}; [ \"$n\" -ge 3 ]"
+            );
+            let out = run_poll(&cmd, ".", 30, 1, &no_sandbox()).await;
+            let _ = std::fs::remove_file(&f);
+            assert!(
+                out.contains("ready after") && !out.contains("not ready"),
+                "should succeed once the command starts exiting 0: {out}"
+            );
+        }
+
+        #[tokio::test]
+        async fn poll_wired_through_tool_run_args() {
+            // Exercises arg-parsing of poll_until_exit_zero + poll_interval_secs in ShellTool::run.
+            let tool = ShellTool::default();
+            let out = tool
+                .run(&serde_json::json!({
+                    "command": "true",
+                    "poll_until_exit_zero": true,
+                    "poll_interval_secs": 1
+                }))
+                .await
+                .unwrap();
+            assert!(
+                out.contains("ready after"),
+                "poll args honored via run(): {out}"
+            );
+        }
+
+        #[tokio::test]
+        async fn poll_yields_resumable_result_when_budget_elapses() {
+            let start = Instant::now();
+            let out = run_poll("false", ".", 2, 1, &no_sandbox()).await;
+            assert!(
+                out.contains("not ready"),
+                "always-failing yields resumable: {out}"
+            );
+            assert!(
+                out.contains("call shell again"),
+                "resumable hint present: {out}"
+            );
+            assert!(
+                !out.contains("timed out"),
+                "must NOT be the killed-timeout path: {out}"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "bounded by the budget, not the command: {out}"
+            );
         }
 
         /// Cross-platform: a disabled sandbox must not change command behaviour.
