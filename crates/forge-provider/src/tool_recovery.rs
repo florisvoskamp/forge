@@ -12,6 +12,8 @@
 //!   - Anthropic / Claude-style:  `<invoke name="T"><parameter name="p">v</parameter></invoke>`,
 //!     optionally wrapped in `<function_calls>…</function_calls>`.
 //!   - Qwen / ollama-style:       `<tool_call>{"name":"T","arguments":{…}}</tool_call>`.
+//!   - Llama / Groq-style:        `<function=T>{"p":"v"}</function>`, optionally wrapped in
+//!     `<tool_call>…</tool_call>` (observed leaking from groq llama-3.x via the mesh).
 //!
 //! Wrapper namespaces some SDKs prepend (`default_api:`, `default_api.`, `functions.`,
 //! `mcp__forge__`) are normalized back to the bare Forge tool name so the recovered call dispatches.
@@ -25,14 +27,23 @@ use serde_json::{Map, Value};
 /// cheap (a couple of substring checks) on normal prose.
 pub fn recover_text_tool_calls(content: &str) -> (Vec<ToolCall>, String) {
     // Fast bail: none of the recoverable markers are present.
-    if !content.contains("<invoke") && !content.contains("<tool_call") {
+    if !content.contains("<invoke")
+        && !content.contains("<tool_call")
+        && !content.contains("<function=")
+    {
         return (Vec::new(), content.to_string());
     }
 
     let mut calls = Vec::new();
     let mut cleaned = content.to_string();
 
-    for (open, close) in [("<invoke", "</invoke>"), ("<tool_call>", "</tool_call>")] {
+    // `<function=…>` is processed first so a `<function=…>` wrapped inside `<tool_call>…</tool_call>`
+    // is extracted before the (now-empty) tool_call wrapper is stripped as leftover.
+    for (open, close) in [
+        ("<function=", "</function>"),
+        ("<invoke", "</invoke>"),
+        ("<tool_call>", "</tool_call>"),
+    ] {
         while let Some(start) = cleaned.find(open) {
             let Some(rel_end) = cleaned[start..].find(close) else {
                 break; // unterminated — leave it as text rather than guess
@@ -62,6 +73,24 @@ fn parse_span(span: &str, idx: usize) -> Option<ToolCall> {
             args,
         })
     };
+
+    // <function=NAME>{json args}</function>  (Llama/Groq). NAME up to the first '>'; body, if
+    // present, is a JSON object of arguments. Recover even an empty body so a degenerate call can't
+    // silently vanish from the cleaned text (the honest-failure guard / dispatch error then handles
+    // it) rather than being mistaken for a final answer.
+    if let Some(after) = span.strip_prefix("<function=") {
+        let gt = after.find('>')?;
+        let name = after[..gt].trim().trim_matches(['"', '\'']).to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let body = after[gt + 1..].trim_end_matches("</function>").trim();
+        let args = serde_json::from_str::<Value>(body)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        return mk(name, args);
+    }
 
     if span.starts_with("<tool_call") {
         // Inner JSON: {"name": "...", "arguments"|"parameters": {...}}
@@ -154,6 +183,7 @@ fn normalize_tool_name(raw: &str) -> String {
 pub fn looks_like_unexecuted_tool_call(content: &str) -> bool {
     content.contains("<invoke")
         || content.contains("<tool_call")
+        || content.contains("<function=")
         || content.contains("default_api:")
         || content.contains("default_api.")
 }
@@ -210,6 +240,63 @@ mod tests {
         assert_eq!(calls[0].args["n"], 5);
         assert_eq!(calls[0].args["msg"], "hello world");
         assert_eq!(calls[0].args["on"], true);
+    }
+
+    #[test]
+    fn recovers_llama_function_format() {
+        let text = "Calling it.\n<function=read_file>{\"path\":\"x.rs\"}</function>\nok";
+        let (calls, cleaned) = recover_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].args["path"], "x.rs");
+        assert!(
+            !cleaned.contains("<function="),
+            "markup stripped: {cleaned}"
+        );
+        assert!(cleaned.contains("Calling it."));
+    }
+
+    #[test]
+    fn recovers_function_format_wrapped_in_tool_call() {
+        let text = "<tool_call><function=shell>{\"command\":\"ls\"}</function></tool_call>";
+        let (calls, cleaned) = recover_text_tool_calls(text);
+        assert_eq!(calls.len(), 1, "calls: {calls:?}");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].args["command"], "ls");
+        assert!(
+            !cleaned.contains("<function="),
+            "no leftover markup: {cleaned}"
+        );
+        assert!(!cleaned.contains("<tool_call"), "wrapper tidied: {cleaned}");
+    }
+
+    #[test]
+    fn recovers_prefixed_function_name() {
+        let text = "<function=mcp__forge__update_tasks>{\"tasks\":[]}</function>";
+        let (calls, _) = recover_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].name, "update_tasks",
+            "mcp__forge__ prefix stripped"
+        );
+    }
+
+    #[test]
+    fn empty_body_function_still_recovers_so_it_cannot_vanish() {
+        // The exact degenerate leak observed live: <function=use_tool></function>.
+        let text = "<function=use_tool></function>";
+        let (calls, cleaned) = recover_text_tool_calls(text);
+        assert_eq!(calls.len(), 1, "recovered so it isn't silently dropped");
+        assert_eq!(calls[0].name, "use_tool");
+        assert!(calls[0].args.is_object());
+        assert!(!cleaned.contains("<function="));
+    }
+
+    #[test]
+    fn detector_flags_function_format() {
+        assert!(looks_like_unexecuted_tool_call(
+            "<function=shell>{\"command\":\"ls\"}</function>"
+        ));
     }
 
     #[test]
