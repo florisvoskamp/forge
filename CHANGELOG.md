@@ -6,6 +6,13 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-06-25
+
+Patch release: bounded poll mode for the shell tool so the model can wait out long external jobs.
+
+### Added
+- **`shell` tool: `poll_until_exit_zero` + `poll_interval_secs` — wait for long external jobs without blocking.** A single blocking `gh run watch` is killed at the ~120s shell cap, making it impossible to wait out a multi-minute CI run or release build. The new poll mode re-runs `command` every `poll_interval_secs` (default 5, max 60) until it exits 0 or the per-call budget elapses (capped at 100s, well under the request cap). On budget exhaustion it returns a resumable "call again to keep waiting" result instead of a killed timeout, so the model waits by calling again rather than guessing. PTY mode is incompatible and rejected. The bridge preamble is updated to use this instead of a single blocking `gh run watch` (`crates/forge-tools/src/shell.rs`, `crates/forge-provider/src/cli_provider.rs`).
+
 ## [0.4.1] - 2026-06-25
 
 Patch release: bridge-completion reliability, HTTPS on bare systems, and a security fix for
@@ -517,7 +524,8 @@ Initial public release: Model Mesh routing, multi-provider support, cost/budget 
 inline TUI, session persistence + checkpoints, permission broker, subagents, Assay analysis,
 Lattice code intelligence, MCP client, web tools, hooks, skills/commands, and more.
 
-[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/florisvoskamp/forge/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/florisvoskamp/forge/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/florisvoskamp/forge/compare/v0.3.10...v0.4.0
 [0.3.10]: https://github.com/florisvoskamp/forge/compare/v0.3.9...v0.3.10

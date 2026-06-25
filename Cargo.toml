@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -13,18 +13,18 @@ description = "Fast, model-agnostic AI coding harness and CLI in Rust."
 
 [workspace.dependencies]
 # Internal crates
-forge-types = { path = "crates/forge-types", version = "0.4.1" }
-forge-config = { path = "crates/forge-config", version = "0.4.1" }
-forge-core = { path = "crates/forge-core", version = "0.4.1" }
-forge-index = { path = "crates/forge-index", version = "0.4.1" }
-forge-lsp = { path = "crates/forge-lsp", version = "0.4.1" }
-forge-mcp = { path = "crates/forge-mcp", version = "0.4.1" }
-forge-mesh = { path = "crates/forge-mesh", version = "0.4.1" }
-forge-provider = { path = "crates/forge-provider", version = "0.4.1" }
-forge-skills = { path = "crates/forge-skills", version = "0.4.1" }
-forge-store = { path = "crates/forge-store", version = "0.4.1" }
-forge-tools = { path = "crates/forge-tools", version = "0.4.1" }
-forge-tui = { path = "crates/forge-tui", version = "0.4.1" }
+forge-types = { path = "crates/forge-types", version = "0.4.2" }
+forge-config = { path = "crates/forge-config", version = "0.4.2" }
+forge-core = { path = "crates/forge-core", version = "0.4.2" }
+forge-index = { path = "crates/forge-index", version = "0.4.2" }
+forge-lsp = { path = "crates/forge-lsp", version = "0.4.2" }
+forge-mcp = { path = "crates/forge-mcp", version = "0.4.2" }
+forge-mesh = { path = "crates/forge-mesh", version = "0.4.2" }
+forge-provider = { path = "crates/forge-provider", version = "0.4.2" }
+forge-skills = { path = "crates/forge-skills", version = "0.4.2" }
+forge-store = { path = "crates/forge-store", version = "0.4.2" }
+forge-tools = { path = "crates/forge-tools", version = "0.4.2" }
+forge-tui = { path = "crates/forge-tui", version = "0.4.2" }
 
 # External (pinned to current stable as of 2026-06; see ADRs)
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "fs", "process", "io-util", "time", "net"] }
