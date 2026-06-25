@@ -30,6 +30,8 @@ pub fn recover_text_tool_calls(content: &str) -> (Vec<ToolCall>, String) {
     if !content.contains("<invoke")
         && !content.contains("<tool_call")
         && !content.contains("<function=")
+        && !content.contains("{\"name\"")
+        && !content.contains("```json")
     {
         return (Vec::new(), content.to_string());
     }
@@ -61,8 +63,63 @@ pub fn recover_text_tool_calls(content: &str) -> (Vec<ToolCall>, String) {
     for tag in ["<function_calls>", "</function_calls>"] {
         cleaned = cleaned.replace(tag, "");
     }
+
+    // Bare JSON object or array of objects (often fenced with ```json)
+    // We only attempt this if the remaining content is *mostly* just the JSON,
+    // to avoid false positives on prose that happens to contain a JSON example.
+    let trimmed = cleaned.trim();
+    let mut json_candidate = trimmed;
+    if json_candidate.starts_with("```json") {
+        json_candidate = json_candidate.trim_start_matches("```json").trim_start();
+        if json_candidate.ends_with("```") {
+            json_candidate = json_candidate.trim_end_matches("```").trim_end();
+        }
+    } else if json_candidate.starts_with("```") {
+        json_candidate = json_candidate.trim_start_matches("```").trim_start();
+        if json_candidate.ends_with("```") {
+            json_candidate = json_candidate.trim_end_matches("```").trim_end();
+        }
+    }
+
+    if json_candidate.starts_with('{') || json_candidate.starts_with('[') {
+        if let Ok(val) = serde_json::from_str::<Value>(json_candidate) {
+            let mut extracted = Vec::new();
+            if let Some(arr) = val.as_array() {
+                for item in arr {
+                    if let Some(call) = parse_json_tool_call(item, calls.len() + extracted.len()) {
+                        extracted.push(call);
+                    }
+                }
+            } else if let Some(call) = parse_json_tool_call(&val, calls.len()) {
+                extracted.push(call);
+            }
+
+            if !extracted.is_empty() {
+                calls.extend(extracted);
+                // If we successfully parsed the whole thing as tool calls, clear the content
+                // so it doesn't leak.
+                cleaned = String::new();
+            }
+        }
+    }
+
     let cleaned = cleaned.trim().to_string();
     (calls, cleaned)
+}
+
+fn parse_json_tool_call(v: &Value, idx: usize) -> Option<ToolCall> {
+    let name = v.get("name")?.as_str()?.to_string();
+    let args = v
+        .get("arguments")
+        .or_else(|| v.get("parameters"))
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+
+    Some(ToolCall {
+        id: format!("recovered_{idx}"),
+        name: normalize_tool_name(&name),
+        args,
+    })
 }
 
 fn parse_span(span: &str, idx: usize) -> Option<ToolCall> {
@@ -99,13 +156,7 @@ fn parse_span(span: &str, idx: usize) -> Option<ToolCall> {
             .trim_end_matches("</tool_call>")
             .trim();
         let v: Value = serde_json::from_str(inner).ok()?;
-        let name = v.get("name")?.as_str()?.to_string();
-        let args = v
-            .get("arguments")
-            .or_else(|| v.get("parameters"))
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Map::new()));
-        return mk(name, args);
+        return parse_json_tool_call(&v, idx);
     }
 
     // <invoke name="T"> … </invoke>
@@ -186,6 +237,8 @@ pub fn looks_like_unexecuted_tool_call(content: &str) -> bool {
         || content.contains("<function=")
         || content.contains("default_api:")
         || content.contains("default_api.")
+        || content.contains("{\"name\"")
+        || content.contains("```json")
 }
 
 #[cfg(test)]
@@ -305,6 +358,57 @@ mod tests {
         let (calls, cleaned) = recover_text_tool_calls(text);
         assert!(calls.is_empty());
         assert_eq!(cleaned, text);
+    }
+
+    #[test]
+    fn recovers_bare_json_tool_call() {
+        let text = "{\"name\":\"update_tasks\",\"arguments\":{\"tasks\":[{\"title\":\"Run Ruff Check\",\"status\":\"in_progress\"}]}}";
+        let (calls, cleaned) = recover_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "update_tasks");
+        assert_eq!(calls[0].args["tasks"][0]["title"], "Run Ruff Check");
+        assert!(
+            cleaned.is_empty(),
+            "cleaned should be empty when fully parsed"
+        );
+    }
+
+    #[test]
+    fn recovers_fenced_json_tool_call() {
+        let text = "```json\n{\"name\":\"update_tasks\",\"arguments\":{\"tasks\":[]}}\n```";
+        let (calls, cleaned) = recover_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "update_tasks");
+        assert!(cleaned.is_empty());
+    }
+
+    #[test]
+    fn recovers_json_array_tool_calls() {
+        let text = "[{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}, {\"name\":\"read_file\",\"arguments\":{\"path\":\"x.rs\"}}]";
+        let (calls, cleaned) = recover_text_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[1].name, "read_file");
+        assert!(cleaned.is_empty());
+    }
+
+    #[test]
+    fn ignores_prose_with_json_example() {
+        let text = "Here is an example of a JSON object:\n```json\n{\"name\":\"example\",\"arguments\":{}}\n```\nDo not run this.";
+        let (calls, cleaned) = recover_text_tool_calls(text);
+        // Because it's not *just* the JSON, it shouldn't be parsed as a tool call.
+        assert!(calls.is_empty());
+        assert_eq!(cleaned, text);
+    }
+
+    #[test]
+    fn detector_flags_bare_json() {
+        assert!(looks_like_unexecuted_tool_call(
+            "{\"name\":\"update_tasks\"}"
+        ));
+        assert!(looks_like_unexecuted_tool_call(
+            "```json\n{\"name\":\"x\"}\n```"
+        ));
     }
 
     #[test]
