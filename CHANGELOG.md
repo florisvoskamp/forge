@@ -6,6 +6,13 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-06-25
+
+Patch release: mesh routing now factors tool-call reliability to avoid auto-selecting tool-leaky models.
+
+### Fixed
+- **Mesh routing now factors tool-call reliability: a `capability::tool_reliability_penalty` demotes models that emit tool calls as TEXT instead of structured calls (the Gemini flash family) below comparable tool-reliable peers**, so a high-bench-but-tool-leaky model is no longer auto-selected #1 for a tool-driven turn; it stays in the fallback chain. Pairs with the tool_recovery `<function=NAME>` salvage from v0.4.3 (`crates/forge-mesh/src/capability.rs`, `catalog.rs`).
+
 ## [0.4.3] - 2026-06-25
 
 Patch release: tool_recovery now handles the Llama/Groq `<function=NAME>{json}</function>` format.
@@ -531,7 +538,8 @@ Initial public release: Model Mesh routing, multi-provider support, cost/budget 
 inline TUI, session persistence + checkpoints, permission broker, subagents, Assay analysis,
 Lattice code intelligence, MCP client, web tools, hooks, skills/commands, and more.
 
-[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/florisvoskamp/forge/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/florisvoskamp/forge/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/florisvoskamp/forge/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/florisvoskamp/forge/compare/v0.4.0...v0.4.1
