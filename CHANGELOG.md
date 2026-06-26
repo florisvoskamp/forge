@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.12] - 2026-06-26
+
+### Fixed
+- **No more misleading "model discovery failed — check your key" warning for completion-only
+  providers (Cerebras).** Cerebras has no native genai adapter, so `list_models()` can't enumerate
+  it and auto-discovery logged a scary keyed-provider WARN claiming its models "won't be routable
+  (check the key / network)". But Cerebras *completion* works fine via the custom service-target
+  resolver — it's just config-only (no model-listing API). Added `forge_provider::is_discoverable`
+  and the discovery loop now skips such providers quietly with accurate guidance (pin
+  `cerebras::<model>` or add it under `[mesh.models]`) instead of the alarming, inaccurate warning.
+  Verified live (`crates/forge-provider/src/genai_provider.rs`, `crates/forge-cli/src/cli/commands/models.rs`).
+
 ## [0.4.11] - 2026-06-26
 
 ### Added

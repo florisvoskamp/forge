@@ -86,6 +86,17 @@ pub(crate) async fn discover_catalog(config: &forge_config::Config) -> forge_mes
         // and give it a more forgiving budget so a slow/cold connection (e.g. OpenRouter's large list
         // on Windows) doesn't drop it. Keyless `ollama` failing just means it isn't running: debug.
         let keyed = p != "ollama";
+        // Some keyed providers are completion-only — they answer turns fine (via the custom
+        // service-target resolver) but have no model-LISTING API, so auto-discovery can't enumerate
+        // them. That's expected, not a key/network failure: skip them quietly with accurate guidance
+        // (configure their models explicitly) instead of a scary "discovery failed — check your key".
+        if keyed && !forge_provider::is_discoverable(p) {
+            tracing::debug!(
+                "'{p}' has no model-listing API — it's completion-only; pin a `{p}::<model>` id \
+                 (or add it under [mesh.models]) to route it. (Not a key/network problem.)"
+            );
+            continue;
+        }
         let budget = Duration::from_secs(if keyed { 8 } else { 4 });
         match tokio::time::timeout(budget, forge_provider::list_models(p)).await {
             Ok(Ok(list)) => models.extend(list),
