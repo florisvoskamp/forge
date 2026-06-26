@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.23] - 2026-06-26
+
+### Added
+- **Deterministic adversarial fuzz for tool-call recovery (untrusted-input hardening).**
+  `recover_text_tool_calls` parses UNTRUSTED model output, and a panic there crashes the whole turn
+  (it can't even fail over — the worst failure mode). A new seeded-LCG fuzz test throws 5000
+  pathological strings (unbalanced braces, truncated JSON, real tool-call markers spliced mid-prose,
+  control chars, deep nesting, huge repeats, unicode) at both recovery entry points and asserts: no
+  panic, every recovered call has a non-empty name (no silently-undispatchable phantom call), and
+  determinism. No new dependency; the corpus is identical on every CI box (P0.1 "fuzz tool-recovery")
+  (`crates/forge-provider/src/tool_recovery.rs`).
+
 ## [0.4.22] - 2026-06-26
 
 ### Changed

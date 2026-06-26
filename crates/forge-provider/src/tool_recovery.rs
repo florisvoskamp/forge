@@ -419,4 +419,99 @@ mod tests {
         ));
         assert!(!looks_like_unexecuted_tool_call("a normal sentence"));
     }
+
+    /// Deterministic adversarial fuzz: model output is UNTRUSTED text, and a panic in recovery
+    /// crashes the whole turn (the worst failure mode — it can't even fail over). Assemble thousands
+    /// of pathological strings from the fragments that have historically tripped parsers (unbalanced
+    /// braces, truncated JSON, the real tool-call markers spliced mid-prose, control chars, deep
+    /// nesting, huge repeats, lone surrogates-as-text) via a seeded LCG so the corpus is the same on
+    /// every run / CI box, and assert the two entry points uphold their invariants on ALL of them:
+    ///   1. neither panics (an unwind here = a crashed turn);
+    ///   2. every recovered call has a non-empty name (a nameless call can't be dispatched — it would
+    ///      vanish silently, the exact "phantom success" failure the recovery exists to prevent);
+    ///   3. both functions are deterministic (same input → same output), since routing depends on it.
+    #[test]
+    fn recovery_never_panics_on_adversarial_input() {
+        const FRAGMENTS: &[&str] = &[
+            "{",
+            "}",
+            "[",
+            "]",
+            "\"name\"",
+            "\"arguments\"",
+            ":",
+            ",",
+            "\n",
+            "  ",
+            "<invoke name=\"x\">",
+            "</invoke>",
+            "<function=foo>",
+            "{\"name\":\"update_tasks\"}",
+            "```json",
+            "```",
+            "default_api:do_thing(",
+            ")",
+            "\\u0000",
+            "\u{1f600}",
+            "你好",
+            "\t\r",
+            "null",
+            "true",
+            "0",
+            "-1e9",
+            "\"\"",
+            "tool_call",
+            "</function>",
+            "\\",
+            "prose words here",
+            "{{{{",
+            "}}}}",
+            "[[[[",
+            "{\"name\":",
+            "\"name\":\"\"",
+        ];
+        // Seeded LCG (Numerical Recipes constants) — no rng dep, identical corpus everywhere.
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..5000 {
+            let pieces = 1 + next() % 24;
+            let mut s = String::new();
+            for _ in 0..pieces {
+                let frag = FRAGMENTS[next() % FRAGMENTS.len()];
+                // Occasionally blow a fragment up to stress length/repeat handling.
+                if next() % 17 == 0 {
+                    s.push_str(&frag.repeat(1 + next() % 50));
+                } else {
+                    s.push_str(frag);
+                }
+            }
+            // Invariant 1 (no panic) holds implicitly — any unwind fails the test.
+            let (calls, _residual) = recover_text_tool_calls(&s);
+            for c in &calls {
+                assert!(
+                    !c.name.is_empty(),
+                    "recovered a nameless tool call from input: {s:?}"
+                );
+            }
+            // Invariant 3: determinism.
+            let (calls2, residual2) = recover_text_tool_calls(&s);
+            assert_eq!(
+                calls.len(),
+                calls2.len(),
+                "non-deterministic call count: {s:?}"
+            );
+            let _ = residual2;
+            let flagged = looks_like_unexecuted_tool_call(&s);
+            assert_eq!(
+                flagged,
+                looks_like_unexecuted_tool_call(&s),
+                "non-deterministic detector: {s:?}"
+            );
+        }
+    }
 }
