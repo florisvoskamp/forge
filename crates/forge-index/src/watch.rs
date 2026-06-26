@@ -3,7 +3,7 @@
 //! coalesce save bursts; skips build/VCS/vendored dirs. A watcher must never crash the session, so
 //! once running, per-file reindex errors are swallowed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -145,6 +145,38 @@ fn fstype_for_path<'a>(mountinfo: &'a str, target: &str) -> Option<&'a str> {
     best.map(|(_, fstype)| fstype)
 }
 
+/// Resolve the directory to recursively watch, given the launch `cwd` and the user's `home`.
+/// Prefers the nearest enclosing PROJECT ROOT (a dir holding `.git`, `.forge`, or `AGENTS.md`) so
+/// the watch covers the codebase rather than whatever happens to sit above it. Returns `None` —
+/// "don't watch" — when the resolved root would be the home directory itself: recursively watching
+/// all of `$HOME` is pathological (it pulls in `.cargo`, cloned `.git` trees, caches — thousands of
+/// inotify watches and a slow initial walk) and is virtually never intended. The upward climb stops
+/// at `home`, so we never walk past it into `/` and watch a system root either. When `home` is
+/// unknown (`None`), nothing is refused — fail open and watch the discovered root / `cwd`.
+pub fn resolve_watch_root(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    const MARKERS: [&str; 3] = [".git", ".forge", "AGENTS.md"];
+    let mut dir = cwd;
+    let mut found: Option<&Path> = None;
+    loop {
+        if MARKERS.iter().any(|m| dir.join(m).exists()) {
+            found = Some(dir);
+            break;
+        }
+        if Some(dir) == home {
+            break; // never climb above $HOME
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => break,
+        }
+    }
+    let root = found.unwrap_or(cwd);
+    if Some(root) == home {
+        return None; // refuse to recursively watch the entire home directory
+    }
+    Some(root.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +276,43 @@ mod tests {
             fstype_for_path(WSL_MOUNTINFO, "/mnt/computer/x"),
             Some("ext4")
         );
+    }
+
+    #[test]
+    fn resolve_watch_root_prefers_project_root_and_refuses_home() {
+        let tmp = std::env::temp_dir().join(format!(
+            "forge-root-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let home = tmp.join("home");
+        let proj = home.join("work/myproj");
+        let sub = proj.join("crates/x/src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+
+        // From deep inside the project, the watch root climbs to the .git project root.
+        assert_eq!(
+            resolve_watch_root(&sub, Some(&home)),
+            Some(proj.clone()),
+            "should scope the watch to the nearest project root"
+        );
+        // From the project root itself, it stays there.
+        assert_eq!(resolve_watch_root(&proj, Some(&home)), Some(proj.clone()));
+        // Launched in $HOME with no project marker → refuse (don't watch all of home).
+        assert_eq!(resolve_watch_root(&home, Some(&home)), None);
+        // A marker-less subdir of home that is NOT home → watch that specific dir (not all of home).
+        let loose = home.join("scratch");
+        std::fs::create_dir_all(&loose).unwrap();
+        assert_eq!(resolve_watch_root(&loose, Some(&home)), Some(loose.clone()));
+        // Even if $HOME itself holds a .git (dotfiles repo), refuse — the root resolves to home.
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        assert_eq!(resolve_watch_root(&loose, Some(&home)), None);
+        // Unknown home → never refuse; resolves to the nearest project root (home/.git now exists
+        // from the line above), proving home=None can't trigger the refuse branch.
+        assert_eq!(resolve_watch_root(&loose, None), Some(home.clone()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
