@@ -68,8 +68,52 @@ pub(crate) fn build_provider_and_router(
 /// Build a session around a caller-provided presenter, wiring all subsystems.
 /// Discover the models the user can actually use, as a [`forge_mesh::ModelCatalog`] for
 /// auto-discovery routing: query each provider that has a key (plus keyless local `ollama`) for
-/// its model list, with a short per-provider timeout, and skip any that error. Cheap providers
-/// usually number 1–3, so this runs sequentially at session start (cached for the process).
+/// its model list, with a short per-provider timeout, and skip any that error. Providers are
+/// probed concurrently so startup pays the slowest single provider's budget, not their sum.
+/// Discover one provider's listable models, honoring its timeout `budget` and logging failures with
+/// the right severity. Returns an empty Vec on any skip/failure/timeout so the caller can flatten
+/// concurrently. A KEYED provider failing/timing out means the user configured a key but its models
+/// silently vanish from routing (the mesh falls back to built-in defaults) — make that LOUD. Keyless
+/// `ollama` failing just means it isn't running: debug.
+async fn discover_provider_models(p: &str, budget: std::time::Duration) -> Vec<String> {
+    let keyed = p != "ollama";
+    // Some keyed providers are completion-only — they answer turns fine (via the custom
+    // service-target resolver) but have no model-LISTING API, so auto-discovery can't enumerate
+    // them. That's expected, not a key/network failure: skip them quietly with accurate guidance
+    // (configure their models explicitly) instead of a scary "discovery failed — check your key".
+    if keyed && !forge_provider::is_discoverable(p) {
+        tracing::debug!(
+            "'{p}' has no model-listing API — it's completion-only; pin a `{p}::<model>` id \
+             (or add it under [mesh.models]) to route it. (Not a key/network problem.)"
+        );
+        return Vec::new();
+    }
+    match tokio::time::timeout(budget, forge_provider::list_models(p)).await {
+        Ok(Ok(list)) => list,
+        Ok(Err(e)) if keyed => {
+            tracing::warn!(
+                "model discovery FAILED for keyed provider '{p}': {e} — its models won't be routable this session (check the key / network)"
+            );
+            Vec::new()
+        }
+        Ok(Err(e)) => {
+            tracing::debug!("model discovery skipped {p}: {e}");
+            Vec::new()
+        }
+        Err(_) if keyed => {
+            tracing::warn!(
+                "model discovery TIMED OUT for keyed provider '{p}' after {}s — its models won't be routable this session",
+                budget.as_secs()
+            );
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::debug!("model discovery timed out for {p}");
+            Vec::new()
+        }
+    }
+}
+
 pub(crate) async fn discover_catalog(config: &forge_config::Config) -> forge_mesh::ModelCatalog {
     use std::time::Duration;
     let mut models = Vec::new();
@@ -80,36 +124,16 @@ pub(crate) async fn discover_catalog(config: &forge_config::Config) -> forge_mes
             .filter(|p| forge_config::has_api_key(p))
             .map(str::to_string),
     );
-    for p in &providers {
-        // A KEYED provider failing/timing out means the user configured a key but its models silently
-        // vanish from routing (the mesh then falls back to the built-in defaults) — make that LOUD,
-        // and give it a more forgiving budget so a slow/cold connection (e.g. OpenRouter's large list
-        // on Windows) doesn't drop it. Keyless `ollama` failing just means it isn't running: debug.
-        let keyed = p != "ollama";
-        // Some keyed providers are completion-only — they answer turns fine (via the custom
-        // service-target resolver) but have no model-LISTING API, so auto-discovery can't enumerate
-        // them. That's expected, not a key/network failure: skip them quietly with accurate guidance
-        // (configure their models explicitly) instead of a scary "discovery failed — check your key".
-        if keyed && !forge_provider::is_discoverable(p) {
-            tracing::debug!(
-                "'{p}' has no model-listing API — it's completion-only; pin a `{p}::<model>` id \
-                 (or add it under [mesh.models]) to route it. (Not a key/network problem.)"
-            );
-            continue;
-        }
-        let budget = Duration::from_secs(if keyed { 8 } else { 4 });
-        match tokio::time::timeout(budget, forge_provider::list_models(p)).await {
-            Ok(Ok(list)) => models.extend(list),
-            Ok(Err(e)) if keyed => tracing::warn!(
-                "model discovery FAILED for keyed provider '{p}': {e} — its models won't be routable this session (check the key / network)"
-            ),
-            Ok(Err(e)) => tracing::debug!("model discovery skipped {p}: {e}"),
-            Err(_) if keyed => tracing::warn!(
-                "model discovery TIMED OUT for keyed provider '{p}' after {}s — its models won't be routable this session",
-                budget.as_secs()
-            ),
-            Err(_) => tracing::debug!("model discovery timed out for {p}"),
-        }
+    // Probe every provider CONCURRENTLY: each `list_models` is an independent network call to a
+    // different endpoint, so a sequential loop made startup pay the SUM of every provider's budget
+    // (3 keyed providers × 8s ≈ 24s worst case). `join_all` makes it the MAX instead (~8s), the same
+    // pattern `drop_unaffordable_models` already uses. Results are flattened in provider order so the
+    // catalog stays deterministic (dedup below relies on a stable first-seen order).
+    let probes = providers.iter().map(|p| {
+        discover_provider_models(p, Duration::from_secs(if p != "ollama" { 8 } else { 4 }))
+    });
+    for list in futures::future::join_all(probes).await {
+        models.extend(list);
     }
     // Always-available subscription bridges (claude-cli/codex-cli) if their CLI is installed.
     // They don't rate-limit like the free API tiers, so the mesh can rely on them — and being

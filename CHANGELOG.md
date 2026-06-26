@@ -6,6 +6,15 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.21] - 2026-06-26
+
+### Changed
+- **Model discovery probes every provider concurrently.** Startup queried each keyed provider's
+  model list in a sequential loop, paying the *sum* of per-provider timeouts (3 keyed providers ×
+  8s ≈ 24s worst case on a slow/cold network). It now `join_all`s the probes — startup pays the
+  *slowest single* provider's budget (~8s). Same logging, same deterministic catalog order; the
+  per-provider logic moved into a `discover_provider_models` helper.
+
 ## [0.4.20] - 2026-06-26
 
 ### Added
