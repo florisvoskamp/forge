@@ -5927,6 +5927,141 @@ mod tests {
         );
     }
 
+    /// Always issues the exact same tool call (a fresh id each time, but identical name + args, so
+    /// `tool_batch_signature` sees a repeat). Models a stuck model re-reading the same file forever.
+    struct DoomLoopProvider;
+    #[async_trait::async_trait]
+    impl Provider for DoomLoopProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_types::{new_id, ToolCall, Usage};
+            Ok(forge_provider::ModelResponse {
+                content: "let me read it again".into(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "read_file".into(),
+                    args: serde_json::json!({"path": "Cargo.toml"}),
+                }],
+                usage: Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn doom_loop_halts_a_model_repeating_the_same_call() {
+        // The doom-loop guard must stop a model that emits the EXACT same tool call step after step
+        // (identical args → identical result → no progress) rather than burning the whole step budget
+        // + quota. It nudges once to change approach, then halts loudly if the repeat continues.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(DoomLoopProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        // Must RETURN (not hang / not run forever); the guard breaks the loop.
+        session.run_turn("read the file").await.unwrap();
+
+        let warnings: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PresenterEvent::Warning(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect();
+        // The guard fired: first a "change approach" nudge, then a loud halt — assert the halt so we
+        // know it actually STOPPED the loop (not merely nudged and then hit the step cap).
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("kept repeating the same tool call")),
+            "the doom-loop guard should halt a repeating model; warnings: {warnings:?}"
+        );
+    }
+
+    /// Reads a UNIQUE non-existent path each call. Every call fails the same WAY (`NotFound`) but with
+    /// DIFFERENT args, so the identical-call doom-loop never fires — only the failure-loop guard,
+    /// which tracks failures by (tool, error-kind) across the turn, can catch it.
+    struct FailureLoopProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for FailureLoopProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_types::{new_id, ToolCall, Usage};
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(forge_provider::ModelResponse {
+                content: "let me try a different file".into(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "read_file".into(),
+                    args: serde_json::json!({"path": format!("does-not-exist-{n}.rs")}),
+                }],
+                usage: Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_loop_halts_a_model_failing_the_same_way() {
+        // The failure-loop guard must stop a model that keeps hitting the same KIND of error with
+        // different arguments (edits that never match, reads of paths that don't exist) — which the
+        // identical-call doom-loop can't see, because the call signature keeps changing.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(FailureLoopProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        session.run_turn("find the config").await.unwrap();
+
+        let warnings: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PresenterEvent::Warning(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            warnings.iter().any(|w| w.contains("kept failing") && w.contains("after a nudge")),
+            "the failure-loop guard should halt a model failing the same way; warnings: {warnings:?}"
+        );
+    }
+
     /// Stalls on the 2nd call (text, no tool call) while a task is still in_progress, then — once
     /// the harness nudges it to continue — marks the task Done and finishes.
     struct StallThenFinishProvider {

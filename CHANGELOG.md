@@ -6,6 +6,19 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-06-26
+
+Harness conformance tests for the runaway-prevention guards.
+
+### Added
+- **End-to-end conformance tests for the doom-loop and failure-loop guards** — the two quota-critical
+  runaway guards previously had no loop-level test. A `DoomLoopProvider` (same call every step) proves
+  the identical-call guard halts loudly; a `FailureLoopProvider` (a unique non-existent path each call
+  → same `NotFound` kind, differing signatures) proves the failure-by-kind guard halts where the
+  doom-loop can't see it. Both assert the turn actually STOPS rather than burning the step budget
+  (`crates/forge-core/src/lib.rs`). Part of the "prove the harness with deterministic mock-provider
+  tests" effort that already surfaced the 0.4.6 direct-gate bug.
+
 ## [0.4.6] - 2026-06-26
 
 Make the direct-path completion-verification gate actually work.
