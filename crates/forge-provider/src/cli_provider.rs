@@ -2637,4 +2637,94 @@ mod tests {
         }
         path.to_string_lossy().into_owned()
     }
+
+    /// Deterministic adversarial fuzz for the bridge stdout parsers. Every bridge turn streams the
+    /// CLI subprocess's stdout line-by-line through `parse_line` (claude/codex/antigravity) and, in
+    /// harness mode, `parse_sink_line` — UNTRUSTED input that drifts with each CLI version. A panic
+    /// in any of them crashes the turn mid-stream (worse than a clean failure: partial/inconsistent
+    /// state). Assemble thousands of pathological lines from the JSON-event fragments these parsers
+    /// key on (truncated/unbalanced JSON, wrong-typed fields, the real event `type`s with missing
+    /// payloads, control chars, huge repeats, unicode) via a seeded LCG (identical corpus on every
+    /// CI box) and assert both entry points never panic and are deterministic on ALL of them.
+    #[test]
+    fn bridge_line_parsers_never_panic_on_adversarial_input() {
+        const FRAGMENTS: &[&str] = &[
+            "{",
+            "}",
+            "[",
+            "]",
+            ":",
+            ",",
+            "\"type\"",
+            "\"text\"",
+            "\"delta\"",
+            "\"content\"",
+            "\"tool_use\"",
+            "\"assistant\"",
+            "\"message\"",
+            "\"usage\"",
+            "\"session_id\"",
+            "\"name\"",
+            "\"input\"",
+            "\"thread.started\"",
+            "\"item.completed\"",
+            "\"agent_message\"",
+            "\"token_count\"",
+            "null",
+            "true",
+            "false",
+            "0",
+            "-1",
+            "1e999",
+            "\"\"",
+            "\\",
+            "\\u0000",
+            "\u{1f4a9}",
+            "日本語",
+            "\t",
+            "\r",
+            "{\"type\":\"result\"}",
+            "{\"type\":",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[",
+            "}]}}",
+            "rate limit",
+            "ok",
+        ];
+        let mut seed: u64 = 0xda3e_39cb_94b9_5bdb;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..6000 {
+            let pieces = 1 + next() % 20;
+            let mut line = String::new();
+            for _ in 0..pieces {
+                let frag = FRAGMENTS[next() % FRAGMENTS.len()];
+                if next() % 19 == 0 {
+                    line.push_str(&frag.repeat(1 + next() % 40));
+                } else {
+                    line.push_str(frag);
+                }
+            }
+            // No panic (implicit: any unwind fails the test) + determinism, for every bridge kind.
+            for kind in CliKind::all() {
+                let a = parse_line(kind, &line);
+                let b = parse_line(kind, &line);
+                assert_eq!(
+                    a.len(),
+                    b.len(),
+                    "non-deterministic parse_line({kind:?}): {line:?}"
+                );
+            }
+            let s1 = parse_sink_line(&line);
+            let s2 = parse_sink_line(&line);
+            assert_eq!(
+                s1.is_some(),
+                s2.is_some(),
+                "non-deterministic parse_sink_line: {line:?}"
+            );
+        }
+    }
 }
