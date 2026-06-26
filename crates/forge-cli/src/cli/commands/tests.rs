@@ -142,6 +142,38 @@ fn copy_catalog_assets_imports_then_skips_existing() {
 }
 
 #[test]
+fn export_copies_agent_md_files_then_skips_existing() {
+    // `forge skill export` copies agents via count_copy_md_files (the catalog only tracks
+    // commands+skills). Verify the agent copy: `.md` files are copied, non-md ignored, re-run skips.
+    use super::import::{count_copy_md_files, ImportCounts};
+    let root = std::env::temp_dir().join(format!("forge-exp-{}", forge_types::new_id()));
+    let src = root.join("agents");
+    let dst = root.join("out/agents");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("reviewer.md"), "---\nname: reviewer\n---\nReview.").unwrap();
+    std::fs::write(src.join("planner.md"), "---\nname: planner\n---\nPlan.").unwrap();
+    std::fs::write(src.join("README.txt"), "not an agent").unwrap();
+
+    let mut first = ImportCounts::default();
+    count_copy_md_files(&src, &dst, &mut first);
+    assert_eq!(first.copied_agents, 2, "both .md agents copied");
+    assert!(dst.join("reviewer.md").exists());
+    assert!(dst.join("planner.md").exists());
+    assert!(
+        !dst.join("README.txt").exists(),
+        "non-md files are not agents"
+    );
+
+    // Re-running keeps existing agents instead of overwriting them.
+    let mut second = ImportCounts::default();
+    count_copy_md_files(&src, &dst, &mut second);
+    assert_eq!(second.copied_agents, 0);
+    assert_eq!(second.skipped_agents, 2, "already present → skipped");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn loop_stops_on_sentinel_or_iteration_cap() {
     // Keeps looping while the model hasn't signalled done and we're under the cap.
     assert!(loop_stop_reason(Some("still working on it"), 1).is_none());

@@ -422,12 +422,34 @@ pub(crate) enum SkillCmd {
         #[arg(long, default_value = "user")]
         scope: SkillScope,
     },
+    /// Export this machine's Forge skills, commands, and agents to a portable directory — the
+    /// inverse of `forge import`. Writes `<dest>/commands`, `<dest>/skills`, `<dest>/agents` in the
+    /// same layout import reads, so the bundle can be copied to another machine or shared. Existing
+    /// files in the destination are kept (never overwritten).
+    ///
+    /// Examples:
+    ///   forge skill export ./my-forge-skills
+    ///   forge skill export /tmp/bundle --scope project
+    Export {
+        /// Destination directory (created if absent).
+        dest: std::path::PathBuf,
+        /// Which scope to export: `user`, `project`, or `all` (default — the effective merged set).
+        #[arg(long, default_value = "all")]
+        scope: ExportScope,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub(crate) enum SkillScope {
     User,
     Project,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum ExportScope {
+    User,
+    Project,
+    All,
 }
 
 #[derive(Subcommand)]

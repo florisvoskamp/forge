@@ -506,3 +506,24 @@ exist** — the orchestrate skill's "survey available skills" step found the CLI
   `forge_skills::Catalog::{skill_listing, skill_guidance}`.
 - Attached at the composition root: `Session::set_skills(Arc<Catalog>)` (forge-cli
   `build_session_with`); only advertised when the catalog is non-empty.
+
+## Update — `forge skill export` (the inverse of import)
+
+`forge import <tool>` copies an external tool's commands/skills/agents *into* Forge. The export
+direction completes the round-trip so a user can move their Forge library to another machine or
+share it:
+
+- **`forge skill export <dir> [--scope user|project|all]`** (forge-cli `skills_export`) writes
+  `<dir>/commands`, `<dir>/skills`, `<dir>/agents` — the **same on-disk layout** `forge import`
+  reads. `--scope all` (default) exports the effective merged set (project shadows user); `user` /
+  `project` narrow it.
+- **Reuses the import machinery, in reverse.** Commands + skills go through the very same
+  `copy_catalog_assets(catalog, cmd_dst, skill_dst)` helper import uses — so a malformed file is
+  validated/skipped by the real catalog readers, skill *directories* (SKILL.md + resource files)
+  are copied whole, and a file already present in the destination is **kept, never overwritten**
+  (re-running is idempotent). Agents are plain `.md` files (not catalog entries) and are copied with
+  `count_copy_md_files`.
+- Prints a tally (`N command(s), N skill(s), N agent(s)`), notes how many were already present, and
+  surfaces any malformed sources — mirroring the import UX.
+- Tested end-to-end (project-scope round-trip of commands+skill+resources+agent, plus idempotent
+  re-run) and a hermetic unit test for the agent copy.

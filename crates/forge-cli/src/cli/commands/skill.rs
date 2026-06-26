@@ -44,7 +44,88 @@ pub(crate) async fn skill_cmd(sub: SkillCmd) -> Result<()> {
             name,
             scope,
         } => skill_from_session(&session_id, name.as_deref(), scope).await,
+        SkillCmd::Export { dest, scope } => skills_export(&dest, scope),
     }
+}
+
+/// `forge skill export <dir> [--scope user|project|all]` — copy this machine's discovered skills,
+/// commands, and agents into `<dir>` (as `commands/`, `skills/`, `agents/`), the same layout
+/// `forge import` reads. The inverse of import: validates via the real catalog readers (malformed
+/// files are skipped + warned) and never overwrites a file already present in the destination.
+pub(crate) fn skills_export(dest: &std::path::Path, scope: ExportScope) -> Result<()> {
+    use crate::cli::commands::import::{copy_catalog_assets, count_copy_md_files, ImportCounts};
+    use forge_skills::{Scope, ScopedDir, Sources};
+
+    let want_user = matches!(scope, ExportScope::User | ExportScope::All);
+    let want_project = matches!(scope, ExportScope::Project | ExportScope::All);
+
+    let mut sources = Sources {
+        commands: Vec::new(),
+        skills: Vec::new(),
+    };
+    let mut agent_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if want_user {
+        let base =
+            forge_config::config_dir().context("no user config directory on this platform")?;
+        sources.commands.push(ScopedDir {
+            scope: Scope::User,
+            path: base.join("commands"),
+        });
+        sources.skills.push(ScopedDir {
+            scope: Scope::User,
+            path: base.join("skills"),
+        });
+        agent_dirs.push(base.join("agents"));
+    }
+    if want_project {
+        sources.commands.push(ScopedDir {
+            scope: Scope::Project,
+            path: std::path::PathBuf::from("./.forge/commands"),
+        });
+        sources.skills.push(ScopedDir {
+            scope: Scope::Project,
+            path: std::path::PathBuf::from("./.forge/skills"),
+        });
+        agent_dirs.push(std::path::PathBuf::from("./.forge/agents"));
+    }
+
+    // Commands + skills go through the same catalog-copy helper `forge import` uses (inverse direction).
+    let cat = forge_skills::Catalog::load(&sources);
+    let counts = copy_catalog_assets(&cat, &dest.join("commands"), &dest.join("skills"));
+
+    // Agents are plain `.md` files (not catalog entries) — copy them directly.
+    let mut agents = ImportCounts::default();
+    let agent_dst = dest.join("agents");
+    for d in &agent_dirs {
+        if d.exists() {
+            count_copy_md_files(d, &agent_dst, &mut agents);
+        }
+    }
+
+    let copied = counts.copied_commands + counts.copied_skills + agents.copied_agents;
+    println!(
+        "exported to {} — {} command(s), {} skill(s), {} agent(s)",
+        dest.display(),
+        counts.copied_commands,
+        counts.copied_skills,
+        agents.copied_agents,
+    );
+    let skipped = counts.skipped_commands + counts.skipped_skills + agents.skipped_agents;
+    if skipped > 0 {
+        println!("  ({skipped} already present in the destination — kept, not overwritten)");
+    }
+    for w in cat.warnings() {
+        eprintln!("skipped (malformed): {w}");
+    }
+    if copied == 0 && skipped == 0 {
+        println!("nothing exported — no skills/commands/agents found in the selected scope");
+    } else {
+        println!(
+            "import on another machine with: copy these into your Forge config dir, \
+             or `forge import` a tool that reads this layout"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) async fn skill_from_session(
