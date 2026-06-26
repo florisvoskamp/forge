@@ -6,6 +6,27 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.45] - 2026-06-27
+
+### Fixed
+- **P0 panic: malformed `<parameter>` tag crashed the whole turn** (`crates/forge-provider/src/tool_recovery.rs`).
+  When a model emitted a `<parameter>` open tag missing its `>`, the first `>` landed inside the closing
+  `</parameter>`, making `gt > val_end` so the byte-range slice (`after[gt..val_end]`) panicked — on
+  untrusted model output, with no failover. This was reachable on the bridge after v0.4.44 routed prose
+  recovery there. Both slice sites (`parse_invoke_span`, `parse_parameter_tags`) now use guarded
+  `.get(gt..val_end)` and stop parsing params on a malformed tag. The fuzz corpus
+  (`recovery_never_panics_on_adversarial_input`) gained `<parameter>` fragments that reproduce it, plus
+  a direct test `malformed_parameter_tag_does_not_panic`.
+- **P1 panic: resume mutex poisoning bricked every later turn** (`crates/forge-provider/src/cli_provider.rs`).
+  `self.resume.lock().unwrap()` panicked permanently once the mutex was poisoned by any prior panic. Now
+  poison-tolerant (`unwrap_or_else(PoisonError::into_inner)`) — a poisoned lock degrades to a fresh,
+  full-transcript turn instead of a sticky brick.
+- **P1: prose-recovery could double-execute a tool the CLI already ran.** Recovery now only fires when the
+  turn streamed ZERO native tool events (`tool_names` empty) — the pure prose-fallback case. If the CLI
+  executed a tool natively, a tool-shaped fragment in the final text is treated as prose, not re-executed
+  (guards against double-running a destructive `shell`/write). Test:
+  `prose_recovery_skipped_when_cli_ran_a_native_tool`.
+
 ## [0.4.44] - 2026-06-27
 
 ### Fixed

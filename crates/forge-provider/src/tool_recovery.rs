@@ -172,7 +172,12 @@ fn parse_span(span: &str, idx: usize) -> Option<ToolCall> {
         let pname = attr_value(after, "name")?;
         let gt = after.find('>')? + 1;
         let val_end = after.find("</parameter>")?;
-        let raw = after[gt..val_end].trim();
+        // A malformed open tag (no closing `>`) makes the first `>` land INSIDE `</parameter>`, so
+        // `gt > val_end` and a raw `after[gt..val_end]` slice would panic on untrusted model output.
+        // `.get` returns None for an inverted/out-of-bounds range; stop parsing params on a bad one.
+        let Some(raw) = after.get(gt..val_end).map(str::trim) else {
+            break;
+        };
         args.insert(pname, coerce(raw));
         rest = &after[val_end + "</parameter>".len()..];
     }
@@ -210,7 +215,11 @@ fn parse_parameter_tags(s: &str) -> Map<String, Value> {
         let Some(val_end) = after.find("</parameter>") else {
             break;
         };
-        let raw = after[gt + 1..val_end].trim();
+        // Guard against an inverted range (open tag missing its `>` → first `>` is inside
+        // `</parameter>`, so `gt+1 > val_end`): `.get` returns None instead of panicking.
+        let Some(raw) = after.get(gt + 1..val_end).map(str::trim) else {
+            break;
+        };
         args.insert(key, coerce(raw));
         rest = &after[val_end + "</parameter>".len()..];
     }
@@ -413,6 +422,21 @@ mod tests {
     }
 
     #[test]
+    fn malformed_parameter_tag_does_not_panic() {
+        // The exact inverted-bounds case: an `<parameter>` open tag missing its `>`, so the first
+        // `>` lands inside `</parameter>` (gt > val_end). Pre-fix this panicked the slice and crashed
+        // the whole turn on untrusted model output. Both recovery entry points must return cleanly.
+        for input in [
+            "<invoke name=\"T\"><parameter name=\"x\"</parameter> trailing>",
+            "<function=shell><parameter=cmd</parameter> ls>",
+            "<invoke name=\"R\"><parameter name=\"a\"</parameter><parameter name=\"b\">ok</parameter></invoke>",
+        ] {
+            // Reaching here without unwinding IS the assertion (pre-fix this panicked).
+            let (_calls, _cleaned) = recover_text_tool_calls(input);
+        }
+    }
+
+    #[test]
     fn plain_prose_is_untouched() {
         let text = "Here is the plan. I will run the build and report back.";
         let (calls, cleaned) = recover_text_tool_calls(text);
@@ -522,6 +546,13 @@ mod tests {
             "\"\"",
             "tool_call",
             "</function>",
+            // <parameter> fragments — combine into malformed tags (open tag missing its `>`) that
+            // make `gt > val_end` and used to panic the slice in parse_invoke_span / parse_parameter_tags.
+            "<parameter name=\"x\"",
+            "<parameter=key",
+            "<parameter name=\"x\">",
+            "</parameter>",
+            ">",
             "\\",
             "prose words here",
             "{{{{",

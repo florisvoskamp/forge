@@ -1186,7 +1186,14 @@ impl Provider for CliProvider {
         // messages, or start FRESH with the full transcript. Resume when we hold a session id and the
         // transcript only grew (a shrink → it was compacted/reset, so the high-water mark is stale).
         let (mut prompt, resume_id): (String, Option<String>) = {
-            let st = self.resume.lock().unwrap();
+            // Poison-tolerant: if a prior turn panicked while holding this lock, a plain `.unwrap()`
+            // would panic on EVERY later turn — a sticky brick with no recovery. Recover the guard
+            // and carry on; the worst case is treating the session as stale (a fresh, full-transcript
+            // turn), which is exactly the safe fallback.
+            let st = self
+                .resume
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let can_resume = self.resumes()
                 && st.session_id.is_some()
                 && st.sent <= messages.len()
@@ -1546,13 +1553,21 @@ impl Provider for CliProvider {
         // the run-loop executes them and re-drives with real results. This only fires on actual
         // tool-call markup; a normal final answer has none. Native tool_use the CLI already ran is
         // streamed as ToolStarted/Finished events (not in `content`), so there's no double-execution.
-        let (tool_calls, content) = {
+        // Only recover when the CLI executed NO native tools this turn (`tool_names`, populated on
+        // every ToolStarted, is empty). That's the pure prose-fallback case — the model wrote tool
+        // calls as text and nothing ran. If native tools DID run, a `<…>`-shaped fragment in the
+        // final text is far more likely a description/leftover than an unexecuted call, and recovering
+        // it would risk DOUBLE-executing a tool the CLI already ran (e.g. a second `shell` / write).
+        // Conservative by design: a missed recovery just re-drives; a double-exec could be destructive.
+        let (tool_calls, content) = if tool_names.is_empty() {
             let (recovered, cleaned) = crate::recover_text_tool_calls(&text);
             if recovered.is_empty() {
                 (Vec::new(), text)
             } else {
                 (recovered, cleaned)
             }
+        } else {
+            (Vec::new(), text)
         };
 
         Ok(ModelResponse {
@@ -2632,6 +2647,45 @@ mod tests {
             !res.content.contains("<function_calls>"),
             "recovered markup must be stripped from content: {:?}",
             res.content
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prose_recovery_skipped_when_cli_ran_a_native_tool() {
+        // Double-execution guard: if the CLI executed a native tool this turn (a streamed tool_use),
+        // a tool-call-shaped fragment in the final text must NOT be recovered — recovering it would
+        // run the tool a SECOND time (Forge-side). Recovery is only for the pure prose-fallback case
+        // where nothing ran. Here a native `shell` runs AND prose `<function=shell>` is in the text.
+        let fake = make_fake_cli(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"shell","input":{"command":"ls"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"ok"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"ran it: <function=shell>{\"command\":\"rm -rf /\"}</function>"}]}}
+{"type":"result","is_error":false,"result":"","usage":{"input_tokens":5,"output_tokens":3}}"#,
+        );
+        let provider = CliProvider::claude_code().with_binary(&fake);
+        let mut events: Vec<StreamEvent> = Vec::new();
+        let mut on_event = |ev: StreamEvent| events.push(ev);
+        let res = provider
+            .complete(
+                "claude-cli::sonnet",
+                &[Message::user("hi")],
+                &[],
+                &mut on_event,
+            )
+            .await
+            .expect("fake stream parses");
+
+        assert!(
+            res.tool_calls.is_empty(),
+            "must NOT recover prose after a native tool ran (double-exec risk): {:?}",
+            res.tool_calls
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolStarted { name, .. } if name == "shell")),
+            "the native shell tool_use should still have streamed as an event"
         );
     }
 
