@@ -43,7 +43,10 @@ impl Tool for ReadFileTool {
         "Read the contents of a UTF-8 text file, returned verbatim (no line numbers — so the text \
          can be matched exactly by edit_file). Optionally slice to a line range with \
          `start_line`/`end_line` (both 1-indexed, inclusive). Very large files are truncated; pass \
-         a line range to read a specific section. Always read a file before editing it."
+         a line range to read a specific section. To read SEVERAL files at once, pass `paths` (an \
+         array) instead of `path` — they come back in one response under `===== <path> =====` \
+         headers, which is far cheaper than one call per file when exploring. Always read a file \
+         before editing it."
     }
     fn side_effect(&self) -> SideEffect {
         SideEffect::ReadOnly
@@ -52,20 +55,32 @@ impl Tool for ReadFileTool {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
+                "path": { "type": "string", "description": "Single file to read." },
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Several files to read in ONE call (batch). Each is returned \
+                                    whole under a `===== <path> =====` header; per-file and total \
+                                    size caps apply. Prefer this over many read_file calls when \
+                                    gathering context. `start_line`/`end_line` are ignored here."
+                },
                 "start_line": {
                     "type": "integer",
-                    "description": "First line to read (1-indexed, inclusive). Default: 1."
+                    "description": "First line to read (1-indexed, inclusive). Default: 1. \
+                                    Single-file (`path`) only."
                 },
                 "end_line": {
                     "type": "integer",
-                    "description": "Last line to read (1-indexed, inclusive). Default: end of file."
+                    "description": "Last line to read (1-indexed, inclusive). Default: end of file. \
+                                    Single-file (`path`) only."
                 }
-            },
-            "required": ["path"]
+            }
         })
     }
     async fn run(&self, args: &Value) -> Result<String, ToolError> {
+        if let Some(paths) = args.get("paths").and_then(Value::as_array) {
+            return Ok(read_many(paths).await);
+        }
         let path = str_arg(args, "path")?;
         let start_line = args
             .get("start_line")
@@ -87,6 +102,61 @@ impl Tool for ReadFileTool {
         };
         Ok(cap_read(out))
     }
+}
+
+/// Per-file byte cap for a batched `read_file` (`paths`). Smaller than the single-file cap so one
+/// large file in a batch can't crowd out the others; the model can re-read it alone with a range.
+const BATCH_READ_PER_FILE_BYTES: usize = 64 * 1024;
+/// Total byte cap across a whole batch, so a many-file request can't flood context. Once exceeded,
+/// remaining files are listed but not read (the model can request them in a follow-up batch).
+const BATCH_READ_TOTAL_BYTES: usize = 256 * 1024;
+
+/// Read several files in one call. A missing/unreadable file becomes an inline `[error: …]` block
+/// rather than failing the whole batch — partial context still helps. Each file is capped, and the
+/// batch stops reading once the total budget is spent (remaining paths are noted, not silently
+/// dropped).
+async fn read_many(paths: &[Value]) -> String {
+    let mut out = String::new();
+    let mut spent = 0usize;
+    for (i, p) in paths.iter().enumerate() {
+        let Some(path) = p.as_str() else { continue };
+        out.push_str(&format!("===== {path} =====\n"));
+        if spent >= BATCH_READ_TOTAL_BYTES {
+            let left = paths.len() - i;
+            out.push_str(&format!(
+                "[batch total cap reached — {left} file(s) not read; request them in a follow-up]\n"
+            ));
+            break;
+        }
+        match tokio::fs::read_to_string(path).await {
+            Ok(content) => {
+                let body = cap_bytes(content, BATCH_READ_PER_FILE_BYTES);
+                spent += body.len();
+                out.push_str(&body);
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Err(e) => out.push_str(&format!("[error: {e}]\n")),
+        }
+    }
+    out
+}
+
+/// Truncate at a byte budget on a char boundary, appending a range hint when cut.
+fn cap_bytes(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[… truncated at {} KiB — read this file alone with a line range for more …]",
+        &s[..end],
+        max / 1024
+    )
 }
 
 /// Whitespace-insensitive fallback for `edit_file`: when `old` doesn't match the file byte-for-byte
@@ -1377,5 +1447,42 @@ mod tests {
     async fn read_file_requires_path() {
         let err = ReadFileTool.run(&json!({})).await.unwrap_err();
         assert!(matches!(err, ToolError::BadArgs(_)));
+    }
+
+    #[tokio::test]
+    async fn read_file_batches_multiple_paths_in_one_call() {
+        let dir = temp_dir("read-batch");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "alpha-body").unwrap();
+        std::fs::write(&b, "beta-body").unwrap();
+
+        let out = ReadFileTool
+            .run(&json!({ "paths": [a.to_str().unwrap(), b.to_str().unwrap()] }))
+            .await
+            .unwrap();
+
+        assert!(out.contains(&format!("===== {} =====", a.display())));
+        assert!(out.contains("alpha-body"));
+        assert!(out.contains(&format!("===== {} =====", b.display())));
+        assert!(out.contains("beta-body"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_file_batch_reports_missing_file_inline_not_fatal() {
+        let dir = temp_dir("read-batch-miss");
+        let a = dir.join("present.txt");
+        std::fs::write(&a, "here").unwrap();
+        let missing = dir.join("nope.txt");
+
+        let out = ReadFileTool
+            .run(&json!({ "paths": [a.to_str().unwrap(), missing.to_str().unwrap()] }))
+            .await
+            .unwrap();
+
+        assert!(out.contains("here"));
+        assert!(out.contains("[error:"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

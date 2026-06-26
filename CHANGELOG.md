@@ -6,6 +6,19 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.40] - 2026-06-26
+
+### Added
+- **Batch `read_file` — read several files in one tool call** (`crates/forge-tools/src/core_tools.rs`).
+  `read_file` now accepts an optional `paths` array in addition to single `path`; the files come back
+  in one response under `===== <path> =====` headers. This directly attacks the harness's structural
+  cost on the bridge — each MCP tool round-trip re-processes the growing context, and the explore phase
+  was the round-trip-heaviest (500+ tool calls on the worst SWE-bench instances). Batching the read
+  phase collapses N round-trips into one. A missing/unreadable file in a batch becomes an inline
+  `[error: …]` block (partial context still helps) rather than failing the whole call; per-file
+  (64 KiB) and total (256 KiB) caps bound context, with remaining files noted, not silently dropped.
+  Single-path behavior (incl. `start_line`/`end_line`) is unchanged.
+
 ## [0.4.39] - 2026-06-26
 
 ### Changed
