@@ -6,6 +6,16 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.22] - 2026-06-26
+
+### Changed
+- **`forge doctor` runs its live probes concurrently.** The two LIVE diagnostics each looped
+  sequentially: `provider_reachability_checks` awaited each keyed provider's `list_models` one at a
+  time (N × 8s) and `bridge_roundtrip_checks` launched each CLI bridge one at a time (3 × 30s ≈ 90s
+  worst case). Both now `join_all` their independent probes — doctor pays the *slowest single* probe
+  per section instead of the sum — so a multi-provider, multi-bridge environment finishes in seconds
+  instead of minutes. Same checks, same severities, same stable output order (`forge-cli/doctor.rs`).
+
 ## [0.4.21] - 2026-06-26
 
 ### Changed

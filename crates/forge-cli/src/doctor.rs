@@ -385,13 +385,14 @@ fn short(s: &str) -> String {
 /// keyless default (the "groq for everything" churn) — a key-PRESENCE check can't see this.
 async fn provider_reachability_checks() -> Vec<Check> {
     const REACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
-    let mut out = Vec::new();
-    for p in forge_config::known_key_providers() {
-        if !forge_config::has_api_key(p) {
-            continue;
-        }
-        let res = tokio::time::timeout(REACH_TIMEOUT, forge_provider::list_models(p)).await;
-        let c = match res {
+    // Probe every keyed provider CONCURRENTLY — each is an independent network call, so a sequential
+    // loop made doctor pay the SUM of every provider's timeout (N keyed providers × 8s). join_all
+    // collapses that to the slowest single probe; results stay in provider order.
+    let probes = forge_config::known_key_providers()
+        .filter(|p| forge_config::has_api_key(p))
+        .map(|p| async move {
+            let res = tokio::time::timeout(REACH_TIMEOUT, forge_provider::list_models(p)).await;
+            match res {
             Ok(Ok(list)) if !list.is_empty() => check(
                 Status::Ok,
                 &format!("{p} reachable"),
@@ -426,10 +427,9 @@ async fn provider_reachability_checks() -> Vec<Check> {
                      falls back to another provider",
                 ),
             ),
-        };
-        out.push(c);
-    }
-    out
+            }
+        });
+    futures::future::join_all(probes).await
 }
 
 /// LIVE: for each AVAILABLE CLI bridge, actually launch it with a tiny prompt and confirm it
@@ -439,58 +439,59 @@ async fn provider_reachability_checks() -> Vec<Check> {
 async fn bridge_roundtrip_checks() -> Vec<Check> {
     const BRIDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     use forge_provider::Provider as _;
-    let mut out = Vec::new();
-    for k in forge_provider::CliKind::all() {
-        if !k.available() {
-            continue;
-        }
-        // harness=false → a plain CLI turn (no Forge-tool MCP bridge): the cheapest probe that
-        // still exercises the binary launch + auth + a streamed reply.
-        let provider = forge_provider::CliProvider::new(k)
-            .with_harness(false)
-            .with_timeout(BRIDGE_TIMEOUT);
-        let model = k.default_model_id();
-        let msgs = [forge_types::Message::user("Reply with the single word: ok")];
-        let mut sink = |_ev: forge_provider::StreamEvent| {};
-        let fut = provider.complete(&model, &msgs, &[], &mut sink);
-        let label = format!("{} turn", k.prefix());
-        let fix = match k {
-            forge_provider::CliKind::ClaudeCode => {
-                "run `claude` once to log in; if it's a Windows .cmd shim, confirm it launches"
+    // Launch every available bridge CONCURRENTLY — each spawns its OWN independent subprocess, so a
+    // sequential loop made doctor pay the SUM of every bridge's 30s budget (3 bridges ≈ 90s worst
+    // case). join_all collapses that to the slowest single launch; results stay in CliKind order.
+    let probes = forge_provider::CliKind::all()
+        .into_iter()
+        .filter(|k| k.available())
+        .map(|k| async move {
+            // harness=false → a plain CLI turn (no Forge-tool MCP bridge): the cheapest probe that
+            // still exercises the binary launch + auth + a streamed reply.
+            let provider = forge_provider::CliProvider::new(k)
+                .with_harness(false)
+                .with_timeout(BRIDGE_TIMEOUT);
+            let model = k.default_model_id();
+            let msgs = [forge_types::Message::user("Reply with the single word: ok")];
+            let mut sink = |_ev: forge_provider::StreamEvent| {};
+            let fut = provider.complete(&model, &msgs, &[], &mut sink);
+            let label = format!("{} turn", k.prefix());
+            let fix = match k {
+                forge_provider::CliKind::ClaudeCode => {
+                    "run `claude` once to log in; if it's a Windows .cmd shim, confirm it launches"
+                }
+                forge_provider::CliKind::Codex => "run `codex login`; confirm the binary launches",
+                forge_provider::CliKind::Antigravity => {
+                    "run `agy` once to log in; confirm the binary launches"
+                }
+            };
+            match tokio::time::timeout(BRIDGE_TIMEOUT + std::time::Duration::from_secs(2), fut)
+                .await
+            {
+                Ok(Ok(resp)) if !resp.content.trim().is_empty() => {
+                    check(Status::Ok, &label, "launches + answers", None)
+                }
+                Ok(Ok(_)) => check(
+                    Status::Warn,
+                    &label,
+                    "launched but returned no text",
+                    Some(fix),
+                ),
+                Ok(Err(e)) => check(
+                    Status::Fail,
+                    &label,
+                    format!("launch failed: {}", short(&e.to_string())),
+                    Some(fix),
+                ),
+                Err(_) => check(
+                    Status::Fail,
+                    &label,
+                    "timed out — bridge did not respond",
+                    Some(fix),
+                ),
             }
-            forge_provider::CliKind::Codex => "run `codex login`; confirm the binary launches",
-            forge_provider::CliKind::Antigravity => {
-                "run `agy` once to log in; confirm the binary launches"
-            }
-        };
-        let c = match tokio::time::timeout(BRIDGE_TIMEOUT + std::time::Duration::from_secs(2), fut)
-            .await
-        {
-            Ok(Ok(resp)) if !resp.content.trim().is_empty() => {
-                check(Status::Ok, &label, "launches + answers", None)
-            }
-            Ok(Ok(_)) => check(
-                Status::Warn,
-                &label,
-                "launched but returned no text",
-                Some(fix),
-            ),
-            Ok(Err(e)) => check(
-                Status::Fail,
-                &label,
-                format!("launch failed: {}", short(&e.to_string())),
-                Some(fix),
-            ),
-            Err(_) => check(
-                Status::Fail,
-                &label,
-                "timed out — bridge did not respond",
-                Some(fix),
-            ),
-        };
-        out.push(c);
-    }
-    out
+        });
+    futures::future::join_all(probes).await
 }
 
 fn binary_on_path(bin: &str) -> bool {
