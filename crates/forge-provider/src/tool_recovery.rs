@@ -142,10 +142,14 @@ fn parse_span(span: &str, idx: usize) -> Option<ToolCall> {
             return None;
         }
         let body = after[gt + 1..].trim_end_matches("</function>").trim();
+        // Preferred: a JSON object body (Llama/Groq). Fallback: some models (e.g. qwen3-coder)
+        // emit a MIXED format — Anthropic-style `<parameter …>` sub-tags INSIDE a `<function=…>`
+        // tag — whose body is not JSON. Recover those params so the call isn't reduced to empty
+        // args (an empty-arg call dispatches as a no-op and was seen to loop until timeout).
         let args = serde_json::from_str::<Value>(body)
             .ok()
             .filter(Value::is_object)
-            .unwrap_or_else(|| Value::Object(Map::new()));
+            .unwrap_or_else(|| Value::Object(parse_parameter_tags(body)));
         return mk(name, args);
     }
 
@@ -182,6 +186,35 @@ fn parse_span(span: &str, idx: usize) -> Option<ToolCall> {
         }
     }
     mk(name, Value::Object(args))
+}
+
+/// Pull `<parameter …>value</parameter>` sub-tags out of a tag body, supporting BOTH spellings a
+/// model might use: Anthropic `<parameter name="key">` and Llama-ish `<parameter=key>`. Used as the
+/// fallback when a `<function=…>` body isn't JSON (the mixed format some local models emit). Skips a
+/// malformed tag rather than aborting, so one bad param can't drop the whole call.
+fn parse_parameter_tags(s: &str) -> Map<String, Value> {
+    let mut args = Map::new();
+    let mut rest = s;
+    while let Some(p) = rest.find("<parameter") {
+        let after = &rest[p..];
+        let Some(gt) = after.find('>') else { break };
+        let head = &after[..gt];
+        let key = if let Some(k) = attr_value(head, "name") {
+            k
+        } else if let Some(k) = head.strip_prefix("<parameter=") {
+            k.trim().trim_matches(['"', '\'']).to_string()
+        } else {
+            rest = &after[gt + 1..];
+            continue;
+        };
+        let Some(val_end) = after.find("</parameter>") else {
+            break;
+        };
+        let raw = after[gt + 1..val_end].trim();
+        args.insert(key, coerce(raw));
+        rest = &after[val_end + "</parameter>".len()..];
+    }
+    args
 }
 
 /// Extract `attr="value"` (or `attr='value'`) immediately following the tag name.
@@ -350,6 +383,33 @@ mod tests {
         assert!(looks_like_unexecuted_tool_call(
             "<function=shell>{\"command\":\"ls\"}</function>"
         ));
+    }
+
+    #[test]
+    fn recovers_function_with_parameter_subtags() {
+        // qwen3-coder mixed format observed live on failover: a <function=…> tag whose body is
+        // NOT json but Anthropic-style <parameter=…> sub-tags. Before the fix this recovered the
+        // name but EMPTY args → an empty `shell({})` no-op that looped until timeout.
+        let text = "<function=shell>\n<parameter=command>\nls -la src/\n</parameter>\n</function>";
+        let (calls, cleaned) = recover_text_tool_calls(text);
+        assert_eq!(calls.len(), 1, "should recover one call");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].args["command"], "ls -la src/");
+        assert!(
+            !cleaned.contains("<function="),
+            "tag must be stripped: {cleaned:?}"
+        );
+    }
+
+    #[test]
+    fn recovers_function_with_quoted_parameter_name() {
+        // The other parameter spelling: <parameter name="key"> inside a <function=…> tag.
+        let text =
+            "<function=search><parameter name=\"query\">resolve_redirects</parameter></function>";
+        let (calls, _) = recover_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].args["query"], "resolve_redirects");
     }
 
     #[test]
