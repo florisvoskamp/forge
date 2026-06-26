@@ -6,6 +6,16 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.17] - 2026-06-26
+
+### Fixed
+- **Transcript text now wraps on terminal cell width, not char count (wide-glyph overflow).** The
+  line wrappers (`wrap_lines`, `wrap_words`) counted characters per row, but a CJK ideograph / emoji
+  is 2 cells — so a line of wide glyphs over-filled each row and the renderer overflowed or truncated
+  it. Both now measure `unicode-width` cells and break a wide glyph to the next row instead of
+  splitting it. Pairs with 0.4.16's selection fix: wide glyphs now both render AND select correctly
+  (`crates/forge-tui/src/transcript.rs`, `crates/forge-tui/src/app.rs`).
+
 ## [0.4.16] - 2026-06-26
 
 ### Fixed

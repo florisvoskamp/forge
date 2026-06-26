@@ -2053,25 +2053,31 @@ fn body_line(text: &str) -> TextLine<'static> {
 /// this module). Words longer than `width` are hard-split so a single long token can't overflow.
 /// Always returns at least one (possibly empty) line.
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     let width = width.max(1);
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
     for word in text.split_whitespace() {
-        let ww = word.chars().count();
+        // Measure in terminal CELLS (CJK/emoji = 2) so a row never overflows its column width.
+        let ww = UnicodeWidthStr::width(word);
         if ww > width {
             if !cur.is_empty() {
                 lines.push(std::mem::take(&mut cur));
             }
             let mut chunk = String::new();
+            let mut chunk_w = 0usize;
             for ch in word.chars() {
-                if chunk.chars().count() == width {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(1);
+                if chunk_w + cw > width && chunk_w > 0 {
                     lines.push(std::mem::take(&mut chunk));
+                    chunk_w = 0;
                 }
                 chunk.push(ch);
+                chunk_w += cw;
             }
             cur = chunk;
-            cur_w = cur.chars().count();
+            cur_w = chunk_w;
             continue;
         }
         let add = if cur.is_empty() { ww } else { ww + 1 };
@@ -5534,5 +5540,20 @@ mod tests {
         // The actual selection bug: selecting the trailing 'x' by its on-screen column. Cell 6 must
         // map to char 3, not 6 (which would be out of bounds / drift past the string).
         assert_eq!(&wide[App::cell_to_char_index(&wide, 6)..], &['x']);
+    }
+
+    #[test]
+    fn wrap_words_measures_wide_glyphs_in_cells() {
+        use unicode_width::UnicodeWidthStr;
+        // A long unbreakable run of CJK (each 2 cells) must hard-split so no row exceeds the width in
+        // CELLS — a char-count wrapper would double-fill each row.
+        let rows = super::wrap_words(&"語".repeat(20), 8);
+        for r in &rows {
+            assert!(
+                UnicodeWidthStr::width(r.as_str()) <= 8,
+                "row '{r}' is {} cells > 8",
+                UnicodeWidthStr::width(r.as_str())
+            );
+        }
     }
 }

@@ -145,8 +145,8 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Wrap one styled line to `width` columns, preserving each span's style across the break. A blank
-/// line stays one blank line. Char-based (approximates display width); deterministic so the scroll
-/// math is exact.
+/// line stays one blank line. Measures terminal CELL width (CJK/emoji = 2) so wide glyphs don't
+/// overflow; deterministic so the scroll math is exact.
 pub(crate) fn wrap_lines(lines: &[TextLine<'_>], width: usize) -> Vec<TextLine<'static>> {
     if width == 0 {
         return lines
@@ -161,6 +161,7 @@ pub(crate) fn wrap_lines(lines: &[TextLine<'_>], width: usize) -> Vec<TextLine<'
             })
             .collect();
     }
+    use unicode_width::UnicodeWidthChar;
     let mut out: Vec<TextLine<'static>> = Vec::with_capacity(lines.len());
     for line in lines {
         let mut cur: Vec<Span<'static>> = Vec::new();
@@ -169,8 +170,19 @@ pub(crate) fn wrap_lines(lines: &[TextLine<'_>], width: usize) -> Vec<TextLine<'
             let style = span.style;
             let mut buf = String::new();
             for ch in span.content.chars() {
+                // Wrap on terminal CELL width, not char count: a CJK ideograph / emoji is 2 cells, so
+                // counting it as 1 over-fills the row and the renderer overflows/truncates. A wide
+                // glyph that won't fit in the remaining cells starts the next row (never split across).
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(1);
+                if cur_w + cw > width && cur_w > 0 {
+                    if !buf.is_empty() {
+                        cur.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    out.push(TextLine::from(std::mem::take(&mut cur)));
+                    cur_w = 0;
+                }
                 buf.push(ch);
-                cur_w += 1;
+                cur_w += cw;
                 if cur_w >= width {
                     cur.push(Span::styled(std::mem::take(&mut buf), style));
                     out.push(TextLine::from(std::mem::take(&mut cur)));
@@ -398,5 +410,31 @@ mod tests {
         // One 200-char logical line wraps into several visual rows at width 40.
         let wrapped = wrap_lines(&view.lines, 39);
         assert!(wrapped.len() >= 5, "wrapped into {} rows", wrapped.len());
+    }
+
+    #[test]
+    fn wide_glyph_lines_wrap_on_cell_width_not_char_count() {
+        use unicode_width::UnicodeWidthStr;
+        // 30 CJK ideographs = 60 CELLS. At width 10, each row must be ≤ 10 cells — a char-count
+        // wrapper would pack 10 ideographs (20 cells) per row and overflow the column.
+        let cjk = "日".repeat(30);
+        let lines = vec![TextLine::from(Span::raw(cjk))];
+        let wrapped = wrap_lines(&lines, 10);
+        for row in &wrapped {
+            let cells: usize = row
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(
+                cells <= 10,
+                "a wrapped row is {cells} cells — overflows width 10"
+            );
+        }
+        assert!(
+            wrapped.len() >= 6,
+            "60 cells / 10 → ≥6 rows, got {}",
+            wrapped.len()
+        );
     }
 }
