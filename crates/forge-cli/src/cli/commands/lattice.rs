@@ -56,29 +56,48 @@ pub(crate) async fn lattice_cmd(op: LatticeOp) -> Result<()> {
                 }
             }
         }
-        LatticeOp::Impact { symbol } => {
+        LatticeOp::Impact { symbol, scope } => {
             let lat = forge_index::Lattice::new(store, &cwd);
-            let blast = lat.impact(&symbol, 4).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let blast = lat
+                .impact_in_scope(&symbol, 4, scope.as_deref())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let scope_note = scope
+                .as_deref()
+                .map(|s| format!(" (scoped to {s})"))
+                .unwrap_or_default();
             if blast.roots.is_empty() {
-                println!("no symbol named '{symbol}' — run `forge lattice update` first?");
+                if scope.is_some() {
+                    println!("no symbol named '{symbol}'{scope_note} — wrong --scope, or run `forge lattice update`?");
+                } else {
+                    println!("no symbol named '{symbol}' — run `forge lattice update` first?");
+                }
             } else if blast.dependents.is_empty() {
-                println!("⌬ {symbol}: no known references (leaf, or callers not yet indexed)");
+                println!("⌬ {symbol}{scope_note}: no known references (leaf, or callers not yet indexed)");
             } else {
                 println!(
-                    "⌬ impact · {symbol} — {} site(s) across {} file(s)",
+                    "⌬ impact · {symbol}{scope_note} — {} site(s) across {} file(s)",
                     blast.total_sites,
                     blast.files.len()
                 );
                 for d in &blast.dependents {
                     println!("  ← {:<8} {} {}:{}", d.kind, d.name, d.rel_path, d.line);
                 }
-                println!(
-                    "  ⓘ name-based: matches ANY symbol named '{symbol}' ({} definition(s) carry \
-                     this name). References to a same-named item in an unrelated module/crate are \
-                     included — confirm a hit is the right definition (grep/read it) before \
-                     treating a cross-module reference as a real blocker.",
-                    blast.roots.len()
-                );
+                if scope.is_some() {
+                    println!(
+                        "  ⓘ name-based, confined to the scope. References to a same-named item \
+                         OUTSIDE the scope are excluded; within it, confirm a hit is the right \
+                         definition before treating it as a real blocker."
+                    );
+                } else {
+                    println!(
+                        "  ⓘ name-based: matches ANY symbol named '{symbol}' ({} definition(s) carry \
+                         this name). References to a same-named item in an unrelated module/crate are \
+                         included — narrow with `--scope <path>`, and confirm a hit is the right \
+                         definition (grep/read it) before treating a cross-module reference as a real \
+                         blocker.",
+                        blast.roots.len()
+                    );
+                }
             }
         }
         LatticeOp::Path { from, to } => {

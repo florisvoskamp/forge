@@ -118,7 +118,10 @@ local, free, automatic, and always fresh** — graphify's value with none of its
 - **Structural queries**: `query` (relevant nodes for a string), `path` (relationship between
   two symbols), `explain` (focused subgraph for a concept) — graphify parity, native.
 - **Impact / blast-radius** (`impact <symbol>`): reverse-call + dependents closure — "what
-  breaks if I change X". Graphify cannot do this.
+  breaks if I change X". Graphify cannot do this. Refs are name-keyed (no cross-crate binding), so
+  a symbol that exists in several crates mixes their references; narrow with
+  `impact <symbol> --scope <path-prefix>` (e.g. `crates/forge-core`) to confine the blast radius to
+  one crate/dir.
 - **`forge lattice` command family**: `query`, `explain`, `path`, `impact`, `why`, `update`,
   `status` — added to the clap `Command` enum (`crates/forge-cli/src/main.rs:29`).
 - **A `lattice` tool** (`forge-tools`) the model can call to ask the index directly — a

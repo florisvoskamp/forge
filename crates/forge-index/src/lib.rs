@@ -514,12 +514,30 @@ impl Lattice {
 
     /// Reverse-dependency closure: who references `symbol`, transitively, up to `max_depth` hops.
     pub fn impact(&self, symbol: &str, max_depth: usize) -> Result<BlastRadius, LatticeError> {
+        self.impact_in_scope(symbol, max_depth, None)
+    }
+
+    /// Like [`impact`](Self::impact), but confine the roots, the dependents, and the whole walk to
+    /// nodes whose repo-relative path starts with `scope` (e.g. `crates/forge-core`). tree-sitter
+    /// refs are keyed by *name* with no cross-crate binding, so an unscoped `impact` on a symbol
+    /// that exists in several crates mixes their blast radii together. `scope` confines it to one
+    /// crate/dir so the result is unambiguous for a within-crate refactor check.
+    pub fn impact_in_scope(
+        &self,
+        symbol: &str,
+        max_depth: usize,
+        scope: Option<&str>,
+    ) -> Result<BlastRadius, LatticeError> {
+        let in_scope = |h: &NodeHit| scope.is_none_or(|s| h.rel_path.starts_with(s));
         let roots = self.rows_to_hits(self.store.lattice_nodes_by_name(
             &self.repo_root,
             symbol,
             32,
         )?)?;
-        let roots: Vec<NodeHit> = roots.into_iter().filter(|h| h.name == symbol).collect();
+        let roots: Vec<NodeHit> = roots
+            .into_iter()
+            .filter(|h| h.name == symbol && in_scope(h))
+            .collect();
 
         let mut seen: HashSet<String> = HashSet::from([symbol.to_string()]);
         let mut frontier = vec![symbol.to_string()];
@@ -534,6 +552,11 @@ impl Lattice {
                     name,
                     200,
                 )?)? {
+                    // A scoped walk only follows + reports dependents inside the scope, so the
+                    // closure can't wander into a same-named symbol in another crate.
+                    if !in_scope(&hit) {
+                        continue;
+                    }
                     if seen.insert(hit.name.clone()) {
                         next.push(hit.name.clone());
                     }
@@ -1137,6 +1160,38 @@ mod tests {
             blast.dependents.iter().any(|d| d.name == "caller"),
             "caller references target: {blast:?}"
         );
+    }
+
+    #[test]
+    fn impact_scope_confines_to_a_path_prefix() {
+        // Same symbol name `dup` defined + called in two separate trees; --scope must isolate them.
+        let t = Tmp::new();
+        t.write("crates/a/src/lib.rs", "pub fn dup() {}\n");
+        t.write(
+            "crates/a/src/use.rs",
+            "use crate::dup;\npub fn a_caller() { dup(); }\n",
+        );
+        t.write("crates/b/src/lib.rs", "pub fn dup() {}\n");
+        t.write(
+            "crates/b/src/use.rs",
+            "use crate::dup;\npub fn b_caller() { dup(); }\n",
+        );
+        let lat = lattice(&t.root);
+        lat.update().unwrap();
+
+        // Unscoped: both crates' callers show up (the cross-crate name collision).
+        let all = lat.impact("dup", 3).unwrap();
+        assert!(all.dependents.iter().any(|d| d.name == "a_caller"));
+        assert!(all.dependents.iter().any(|d| d.name == "b_caller"));
+
+        // Scoped to crates/a: only a_caller, and every reported file is under the scope.
+        let scoped = lat.impact_in_scope("dup", 3, Some("crates/a")).unwrap();
+        assert!(scoped.dependents.iter().any(|d| d.name == "a_caller"));
+        assert!(
+            !scoped.dependents.iter().any(|d| d.name == "b_caller"),
+            "crates/b reference must be excluded by the scope: {scoped:?}"
+        );
+        assert!(scoped.files.iter().all(|f| f.starts_with("crates/a")));
     }
 
     #[test]

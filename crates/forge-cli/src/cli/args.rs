@@ -492,6 +492,10 @@ pub(crate) enum LatticeOp {
     Impact {
         /// Symbol name.
         symbol: String,
+        /// Confine the blast radius to a repo-relative path prefix (e.g. `crates/forge-core`), so a
+        /// symbol that exists in several crates doesn't mix their references together.
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// Shortest call/reference chain of symbol names from A to B.
     Path {
