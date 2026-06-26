@@ -6,6 +6,25 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-06-26
+
+Bridge efficiency: claude session resume (the bridge-superiority lever).
+
+### Added
+- **CLI-bridge session resume (claude `--resume`) — Forge through the bridge now sends only the NEW
+  messages per turn instead of re-rendering the whole transcript every call.** A bridge `complete()`
+  is a fresh process each time and used to re-stream the entire conversation; for a multi-step turn
+  that re-drives several times, that re-sends the full history on every call — the biggest source of
+  bridge token waste. Now Forge captures claude's own `session_id` from its `stream-json` output and,
+  on the next call, spawns `claude -p --resume <id>` streaming only the delta (a `continue` nudge or
+  the new user turn). claude reloads the prior context from its own session store — fewer tokens in
+  *and* a prompt-cache hit on its side. Safety: a transcript shrink (compaction) or model change
+  (failover) forces a fresh session, and any failed resumed turn optimistically resets so the retry
+  is fresh; claude-only (`with_session_resume(false)` is the escape hatch); codex/agy unchanged.
+  Verified with unit tests + an `#[ignore]` live e2e that drives two real `claude` turns and asserts
+  the resumed turn recalls a fact from turn 1 while only the delta was sent
+  (`crates/forge-provider/src/cli_provider.rs`).
+
 ## [0.4.8] - 2026-06-26
 
 More harness conformance tests — empty-response and tool-call-as-text guards.

@@ -240,6 +240,22 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Cap on captured stderr (for error messages) so a chatty CLI can't blow memory.
 const STDERR_CAP: usize = 16 * 1024;
 
+/// Cross-call session-continuity state for the bridge (claude `--resume`). After the first turn we
+/// hold the CLI's own `session_id` and how many transcript messages it has already seen; the next
+/// turn RESUMES that session and sends ONLY the new messages, so claude reloads its context from its
+/// own store instead of Forge re-rendering + re-sending the whole transcript every re-drive. That is
+/// the headline bridge-efficiency win (fewer tokens in *and* a prompt-cache hit on claude's side).
+#[derive(Default)]
+struct ResumeState {
+    /// The CLI session id captured from a prior turn's stream (`None` → next turn is fresh).
+    session_id: Option<String>,
+    /// Count of transcript messages already handed to that session (the resume "high-water mark").
+    sent: usize,
+    /// The bare model the live session was started under. Resuming it under a DIFFERENT model (after
+    /// a mesh re-route / failover) would be wrong, so a model change forces a fresh session.
+    model: String,
+}
+
 /// A [`Provider`] that delegates the completion to an external agent CLI.
 pub struct CliProvider {
     kind: CliKind,
@@ -249,6 +265,12 @@ pub struct CliProvider {
     /// `forge mcp-serve` MCP server under Forge's permission gate. When false, the CLI runs as
     /// its own agent with its own tools. Both claude (Phase 2) and codex (Phase 3) support it.
     harness: bool,
+    /// Whether to reuse the CLI's session across calls via `--resume` (claude only). On by default;
+    /// `with_session_resume(false)` forces the legacy full-transcript path (escape hatch / tests).
+    resume_enabled: bool,
+    /// Live `--resume` state (see [`ResumeState`]). Interior-mutable because [`Provider::complete`]
+    /// takes `&self`; the lock is only ever held briefly to read/update, never across an `.await`.
+    resume: std::sync::Mutex<ResumeState>,
 }
 
 impl CliProvider {
@@ -258,6 +280,10 @@ impl CliProvider {
             binary: kind.default_binary().to_string(),
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             harness: true,
+            // Resume is a claude-only capability; the flag is harmless for the other kinds (they
+            // never consult it). Default on so the efficiency win applies without opt-in.
+            resume_enabled: true,
+            resume: std::sync::Mutex::new(ResumeState::default()),
         }
     }
 
@@ -265,6 +291,36 @@ impl CliProvider {
     pub fn with_harness(mut self, harness: bool) -> Self {
         self.harness = harness;
         self
+    }
+
+    /// Toggle CLI session reuse via `--resume` (claude only). Off → always send the full transcript.
+    pub fn with_session_resume(mut self, enabled: bool) -> Self {
+        self.resume_enabled = enabled;
+        self
+    }
+
+    /// Whether this bridge reuses the CLI session across calls (claude + enabled).
+    fn resumes(&self) -> bool {
+        self.resume_enabled && self.kind == CliKind::ClaudeCode
+    }
+
+    /// Record a live session after a successful turn so the next call can `--resume` it.
+    fn record_session(&self, id: Option<String>, sent: usize, model: &str) {
+        if let Ok(mut st) = self.resume.lock() {
+            if let Some(id) = id {
+                st.session_id = Some(id);
+            }
+            st.sent = sent;
+            st.model = model.to_string();
+        }
+    }
+
+    /// Forget the session (after a resumed turn failed, or the transcript shrank) so the next call
+    /// starts fresh with the full transcript.
+    fn reset_session(&self) {
+        if let Ok(mut st) = self.resume.lock() {
+            *st = ResumeState::default();
+        }
     }
 
     pub fn claude_code() -> Self {
@@ -332,6 +388,7 @@ fn build_args(
     harness: bool,
     forge_exe: &str,
     mcp_env: &[(String, String)],
+    resume_id: Option<&str>,
 ) -> Vec<String> {
     let mut args: Vec<String> = match (kind, harness) {
         // Phase 2 harness: Forge serves its tools via `forge mcp-serve`. `--allowedTools
@@ -442,6 +499,12 @@ fn build_args(
         args.push("--model".into());
         args.push(bare_model.into());
     }
+    // Resume a prior claude session (continuity + prompt-cache; claude-only). Appended after the
+    // standard flags; only the new turn's messages are streamed to stdin (see `complete`).
+    if let (CliKind::ClaudeCode, Some(id)) = (kind, resume_id) {
+        args.push("--resume".into());
+        args.push(id.into());
+    }
     // The prompt is fed via stdin (see build_args doc), so no trailing positional: `codex exec`
     // with no PROMPT reads instructions from stdin.
     args
@@ -510,6 +573,34 @@ fn apply_harness_preamble(harness: bool, prompt: String) -> String {
     } else {
         prompt
     }
+}
+
+/// Render only the NEW User/System messages in `tail` (the slice of the transcript not yet sent to a
+/// resumed CLI session). Assistant + Tool messages are skipped: the resumed session already holds the
+/// model's own prior turn and the tool results it produced, so re-sending Forge's record of them
+/// would duplicate. The result is the just the new instruction(s) — a `continue` nudge, or a new user
+/// turn. Empty if `tail` carries nothing the model still needs to act on.
+fn render_resume_delta(tail: &[Message]) -> String {
+    let mut out = Vec::new();
+    for m in tail {
+        match m.role {
+            Role::System => out.push(m.content.clone()),
+            Role::User => out.push(format!("User: {}", m.content)),
+            Role::Assistant | Role::Tool => {} // the resumed session already has these
+        }
+    }
+    out.join("\n\n")
+}
+
+/// Extract claude's stream-json `session_id` from one raw NDJSON line (every line carries it). Used
+/// to capture the session so the next turn can `--resume` it. `None` if absent / unparseable.
+fn claude_session_id(line: &str) -> Option<String> {
+    serde_json::from_str::<Value>(line)
+        .ok()?
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Flatten a transcript into a single prompt string for a one-shot CLI invocation. System
@@ -1067,13 +1158,45 @@ impl Provider for CliProvider {
         // builds its own registry — not from this param; text mode uses the CLI's own tools.
         on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
-        let mut prompt = render_prompt(messages);
+        // Decide whether to RESUME the CLI's prior session (claude `--resume`) and send only the new
+        // messages, or start FRESH with the full transcript. Resume when we hold a session id and the
+        // transcript only grew (a shrink → it was compacted/reset, so the high-water mark is stale).
+        let (mut prompt, resume_id): (String, Option<String>) = {
+            let st = self.resume.lock().unwrap();
+            let can_resume = self.resumes()
+                && st.session_id.is_some()
+                && st.sent <= messages.len()
+                && st.model == bare_model(model); // a model change → fresh session
+            if can_resume {
+                let delta = render_resume_delta(&messages[st.sent..]);
+                if delta.trim().is_empty() {
+                    // Nothing new to act on (shouldn't normally happen) — fall back to a fresh render.
+                    (
+                        apply_harness_preamble(self.harness, render_prompt(messages)),
+                        None,
+                    )
+                } else {
+                    // Resume: claude already holds the prior CONTEXT in its own session, so we skip
+                    // the (potentially huge) transcript — the headline efficiency win. We DO re-apply
+                    // the harness preamble: it's small, and re-stating "use the mcp__forge__ tools"
+                    // each turn keeps a resumed claude from drifting onto native tools.
+                    (
+                        apply_harness_preamble(self.harness, delta),
+                        st.session_id.clone(),
+                    )
+                }
+            } else {
+                (
+                    apply_harness_preamble(self.harness, render_prompt(messages)),
+                    None,
+                )
+            }
+        };
         // Soft nudge: steer the CLI to route web access through Forge's MCP tools rather than
         // its own native search/browsing. codex's subscription-backed web search (web.run)
         // can't be hard-disabled from here, so this instruction is best-effort; claude has no
         // native search left (its built-ins are off). Forge still observes any native search
         // in the event stream and surfaces it.
-        prompt = apply_harness_preamble(self.harness, prompt);
         // Clamp to the CLI's hard input cap (codex rejects stdin > 1 MiB outright). Reserve a
         // small margin under the cap for any bytes the CLI itself may prepend. Without this a long
         // transcript fails the turn with `input_too_large` instead of running on a trimmed prompt.
@@ -1134,6 +1257,7 @@ impl Provider for CliProvider {
             self.harness,
             &forge_exe,
             &mcp_env,
+            resume_id.as_deref(),
         );
 
         let mut cmd = bridge_command(&self.binary, &args);
@@ -1200,6 +1324,8 @@ impl Provider for CliProvider {
         let mut quotas: Vec<forge_types::QuotaHint> = Vec::new();
         // Codex's quota lives in its session rollout file, keyed by this id (read after the turn).
         let mut codex_thread: Option<String> = None;
+        // claude's stream-json `session_id`, captured so the NEXT turn can `--resume` it.
+        let mut captured_session: Option<String> = None;
         let mut in_band_error: Option<String> = None;
         // tool_use id → name, so a later tool_result can be labelled.
         let mut tool_names: std::collections::HashMap<String, String> =
@@ -1237,6 +1363,10 @@ impl Provider for CliProvider {
                     Ok(BridgeEvent::Sub(ev)) => on_event(ev),
                     Ok(BridgeEvent::Line(line)) => {
                         let Some(line) = line? else { break };
+                        // Capture claude's session id (present on every line) for the next `--resume`.
+                        if self.resumes() && captured_session.is_none() {
+                            captured_session = claude_session_id(&line);
+                        }
                         for item in parse_line(self.kind, &line) {
                             match item {
                                 Parsed::Reasoning(t) => on_event(StreamEvent::Reasoning(t)),
@@ -1288,6 +1418,14 @@ impl Provider for CliProvider {
         }
         if let Some(p) = &sink_path {
             let _ = std::fs::remove_file(p);
+        }
+
+        // If this was a RESUMED turn, optimistically forget the session now; a successful turn
+        // re-records it just below. So any failure path (stall / read error / in-band error / bad
+        // exit) leaves us FRESH — the next attempt sends the full transcript instead of trying to
+        // resume a session that may have just gone bad. (A fresh turn has nothing to forget.)
+        if resume_id.is_some() {
+            self.reset_session();
         }
 
         if stalled {
@@ -1360,6 +1498,14 @@ impl Provider for CliProvider {
                     self.kind.setup_hint(),
                 )));
             }
+        }
+
+        // Success: record the live session (claude only — `captured_session` is None otherwise) so
+        // the next turn can `--resume` it and send just the new messages. `sent = messages.len()`
+        // marks everything claude has now seen; the response Forge appends next becomes part of a
+        // later delta but is filtered out as an Assistant message (see `render_resume_delta`).
+        if self.resumes() {
+            self.record_session(captured_session, messages.len(), bare_model(model));
         }
 
         Ok(ModelResponse {
@@ -1650,7 +1796,7 @@ mod tests {
 
     #[test]
     fn claude_harness_args_route_tools_through_forge_mcp() {
-        let args = build_args(CliKind::ClaudeCode, "sonnet", true, "/bin/forge", &[]);
+        let args = build_args(CliKind::ClaudeCode, "sonnet", true, "/bin/forge", &[], None);
         // Forge owns the tools: strict MCP + only mcp__forge tools.
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(args.contains(&"mcp__forge".to_string()));
@@ -1673,8 +1819,132 @@ mod tests {
     }
 
     #[test]
+    fn resume_id_adds_resume_flag_for_claude_only() {
+        // claude: a session id appends `--resume <id>`.
+        let args = build_args(
+            CliKind::ClaudeCode,
+            "sonnet",
+            true,
+            "/bin/forge",
+            &[],
+            Some("sess-123"),
+        );
+        let r = args
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("--resume present");
+        assert_eq!(args[r + 1], "sess-123");
+        // codex has no `--resume` flag (it uses an `exec resume` subcommand), so it's never added.
+        let codex = build_args(
+            CliKind::Codex,
+            "",
+            true,
+            "/bin/forge",
+            &[],
+            Some("sess-123"),
+        );
+        assert!(!codex.iter().any(|a| a == "--resume"));
+        // No resume id → no flag.
+        let fresh = build_args(CliKind::ClaudeCode, "sonnet", true, "/bin/forge", &[], None);
+        assert!(!fresh.iter().any(|a| a == "--resume"));
+    }
+
+    #[test]
+    fn render_resume_delta_sends_only_new_user_and_system_messages() {
+        use forge_types::Message;
+        // A resumed session already holds the model's prior turn + tool results, so the delta is just
+        // the NEW user/system instruction(s); Assistant + Tool messages are skipped.
+        let tail = vec![
+            Message::assistant("I finished step 1."),
+            Message::tool_result("call-1", "ok".to_string()),
+            Message::system("The plan is NOT finished — continue."),
+            Message::user("also handle the edge case"),
+        ];
+        let delta = render_resume_delta(&tail);
+        assert!(delta.contains("The plan is NOT finished"));
+        assert!(delta.contains("User: also handle the edge case"));
+        assert!(
+            !delta.contains("I finished step 1"),
+            "assistant turn is not re-sent"
+        );
+        assert!(!delta.contains("ok"), "tool result is not re-sent");
+        // Nothing actionable → empty (caller falls back to a fresh full render).
+        assert!(render_resume_delta(&[Message::assistant("x")]).is_empty());
+    }
+
+    #[test]
+    fn claude_session_id_extracts_the_field() {
+        assert_eq!(
+            claude_session_id(r#"{"type":"system","session_id":"abc-123","x":1}"#),
+            Some("abc-123".to_string())
+        );
+        assert_eq!(claude_session_id(r#"{"type":"assistant"}"#), None);
+        assert_eq!(claude_session_id("not json"), None);
+        assert_eq!(claude_session_id(r#"{"session_id":""}"#), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns the real `claude` CLI (needs install + auth + network); run with --ignored"]
+    async fn e2e_claude_resume_preserves_context_across_calls() {
+        use forge_types::Message;
+        let provider = CliProvider::claude_code().with_harness(false);
+        let model = "claude-cli::haiku";
+        let mut sink = |_e: StreamEvent| {};
+
+        // Turn 1: establish a fact; the provider captures claude's session id.
+        let msgs1 = vec![Message::user(
+            "Remember this codeword: BANANA. Just acknowledge.",
+        )];
+        let r1 = provider
+            .complete(model, &msgs1, &[], &mut sink)
+            .await
+            .expect("turn 1 should succeed");
+        assert!(!r1.content.trim().is_empty());
+
+        // Grow the transcript the way Forge does (assistant reply + a NEW user turn). Turn 2 RESUMES:
+        // only the new user message is sent, yet claude must still recall the codeword from turn 1.
+        let msgs2 = vec![
+            msgs1[0].clone(),
+            Message::assistant(&r1.content),
+            Message::user("What was the codeword? Reply with just the word."),
+        ];
+        let r2 = provider
+            .complete(model, &msgs2, &[], &mut sink)
+            .await
+            .expect("turn 2 should succeed");
+        assert!(
+            r2.content.to_uppercase().contains("BANANA"),
+            "the resumed session must recall the codeword from turn 1; got: {}",
+            r2.content
+        );
+    }
+
+    #[test]
+    fn only_claude_resumes_and_it_is_toggleable() {
+        assert!(
+            CliProvider::claude_code().resumes(),
+            "claude resumes by default"
+        );
+        assert!(!CliProvider::codex().resumes(), "codex does not");
+        assert!(!CliProvider::antigravity().resumes(), "agy does not");
+        assert!(
+            !CliProvider::claude_code()
+                .with_session_resume(false)
+                .resumes(),
+            "the escape hatch disables it"
+        );
+    }
+
+    #[test]
     fn claude_text_mode_runs_a_self_agent_with_accept_edits() {
-        let args = build_args(CliKind::ClaudeCode, "sonnet", false, "/bin/forge", &[]);
+        let args = build_args(
+            CliKind::ClaudeCode,
+            "sonnet",
+            false,
+            "/bin/forge",
+            &[],
+            None,
+        );
         assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
         let i = args.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(args[i + 1], "acceptEdits");
@@ -1691,6 +1961,7 @@ mod tests {
                 harness,
                 "/bin/forge",
                 &[],
+                None,
             );
             assert!(
                 args.contains(&"-p".to_string()),
@@ -1716,7 +1987,7 @@ mod tests {
 
     #[test]
     fn codex_harness_args_wire_forge_mcp_and_approve_tools() {
-        let args = build_args(CliKind::Codex, "", true, "/bin/forge", &[]);
+        let args = build_args(CliKind::Codex, "", true, "/bin/forge", &[], None);
         assert_eq!(args[0], "exec");
         assert!(args.contains(&"--json".to_string()));
         // Sandbox stays read-only: codex's OWN shell can't write, so every write/side-effect
@@ -1758,17 +2029,24 @@ mod tests {
             ("FORGE_CHECKPOINT_SESSION".to_string(), "sess-1".to_string()),
         ];
         // codex: nested TOML overrides.
-        let codex = build_args(CliKind::Codex, "", true, "/bin/forge", &env).join(" ");
+        let codex = build_args(CliKind::Codex, "", true, "/bin/forge", &env, None).join(" ");
         assert!(codex.contains("mcp_servers.forge.env.FORGE_SUBAGENT_SINK=\"/tmp/s.jsonl\""));
         assert!(codex.contains("mcp_servers.forge.env.FORGE_CHECKPOINT_SESSION=\"sess-1\""));
         // claude: carried in the --mcp-config JSON `env` object.
-        let claude = build_args(CliKind::ClaudeCode, "sonnet", true, "/bin/forge", &env);
+        let claude = build_args(
+            CliKind::ClaudeCode,
+            "sonnet",
+            true,
+            "/bin/forge",
+            &env,
+            None,
+        );
         let mc = claude.iter().position(|a| a == "--mcp-config").unwrap();
         let cfg = &claude[mc + 1];
         assert!(cfg.contains("\"FORGE_SUBAGENT_SINK\":\"/tmp/s.jsonl\""));
         assert!(cfg.contains("\"FORGE_CHECKPOINT_SESSION\":\"sess-1\""));
         // Text-mode (no Forge MCP server) ignores the env — no overrides leak in.
-        let text = build_args(CliKind::Codex, "", false, "/bin/forge", &env).join(" ");
+        let text = build_args(CliKind::Codex, "", false, "/bin/forge", &env, None).join(" ");
         assert!(!text.contains("mcp_servers.forge.env"));
     }
 
@@ -1790,7 +2068,7 @@ mod tests {
 
     #[test]
     fn codex_text_mode_is_a_plain_read_only_agent() {
-        let args = build_args(CliKind::Codex, "", false, "/bin/forge", &[]);
+        let args = build_args(CliKind::Codex, "", false, "/bin/forge", &[], None);
         assert_eq!(args[0], "exec");
         assert!(args.contains(&"--json".to_string()));
         assert!(args.contains(&"read-only".to_string()));

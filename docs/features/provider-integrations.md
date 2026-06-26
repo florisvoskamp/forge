@@ -491,3 +491,34 @@ content (last-resort) rather than an empty success.
    (Self-contained, zero-risk, unlocks routing immediately.)
 2. **PR B — CLI-bridge:** `CliProvider` + routing branch + negative paths + boundary test +
    ToS docs/notice. (Builds on A's routing seam; opt-in.)
+
+---
+
+## Update — bridge session resume (claude `--resume`): the efficiency win
+
+A bridge `complete()` is a fresh `claude`/`codex`/`agy` process each call, and originally it
+re-rendered the **whole** transcript to stdin every time. For a multi-step harness turn that
+re-drives several times (and across turns of a session), that re-sends the entire conversation on
+every call — the single biggest source of bridge token waste vs. running the CLI directly.
+
+**Fix (claude):** capture the CLI's own `session_id` from its `stream-json` output, and on the next
+call spawn `claude -p --resume <session_id>` and stream **only the new messages** (a `continue`
+nudge, or the new user turn) instead of the full transcript. claude reloads the prior context from
+its own session store — so Forge sends a few tokens instead of the whole history, **and** claude
+gets a prompt-cache hit on its restored context. This is what makes Forge-through-the-bridge cheaper
+than the raw CLI on a long turn, not just as cheap.
+
+Mechanics (`crates/forge-provider/src/cli_provider.rs`):
+- `ResumeState { session_id, sent, model }` on `CliProvider` (interior-mutable; the lock is never
+  held across an `.await`). Lives for the whole Forge session (the `DispatchProvider` is built once).
+- `render_resume_delta` sends only the new **User/System** messages from `messages[sent..]` — the
+  resumed session already holds the model's own prior Assistant turn + tool results, so those are
+  skipped (re-sending them would duplicate). The harness **preamble is re-applied** (it's small, and
+  keeps a resumed claude on the `mcp__forge__` tools); the large transcript is what's skipped.
+- **Safety:** a transcript shrink (compaction) or a **model change** (failover/re-route) forces a
+  fresh session; any failed resumed turn optimistically forgets the session so the retry is fresh.
+- **Scope:** claude only (its `--resume <id>` + stable `stream-json` `session_id`). codex (`exec
+  resume`) and agy stay on the full-transcript path; `with_session_resume(false)` is the escape hatch.
+- **Verified:** unit tests for the delta/extraction/flag/gate, plus an `#[ignore]` live e2e
+  (`e2e_claude_resume_preserves_context_across_calls`) that drives two real `claude` turns and
+  asserts the resumed turn recalls a fact established in turn 1 while only the delta was sent.
