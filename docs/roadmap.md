@@ -13,6 +13,29 @@
 
 ---
 
+## Road to v1.0.0 (active push)
+
+The current effort hardens Forge toward **v1.0.0**: the best coding-agent harness there is,
+proven with metrics on both API and subscription/bridge models. Themes + ranked plan live in the
+Helm note *Forge — Road to v1.0.0*; the competitor-derived adoption backlog is
+[`docs/harness/competitor-gap-analysis.md`](harness/competitor-gap-analysis.md). Shipped so far:
+
+- **Stability foundation** — root-caused the minimal-container startup hang (blocking lattice
+  index → `spawn_blocking`); closed the no-CA-cert panic landmines; reachable-panic sweep.
+- **Harness robustness** — tool-failure loop guard (halt on repeated same-kind errors); zero-LLM
+  compaction prune pass before the summarize round-trip.
+- **Bridge superiority tooling** — per-instance token metrics + `forge bench report` showing
+  resolve rate **and** tokens-per-success per agent (the proof that Forge-through-a-bridge beats
+  the native CLI).
+- **Antigravity (`agy`) bridge** — free Gemini as a first-class mesh citizen ($0).
+- **Security** — broadened the unoverridable secret-file denylist (dotenv variants, keys, cloud
+  creds). **Diagnostics** — `forge doctor` now runs a real raw-mode viability probe.
+
+Next: bridge stream-json transport, direct-path goal verification, TUI upgrades, local-Whisper
+voice input, full docs pass.
+
+---
+
 ## How to read this
 
 - **Status**: `done` (shipped + tested), `partial` (works but incomplete/mislabelled),
