@@ -850,11 +850,18 @@ fn find_codex_rollout(thread_id: &str) -> Option<std::path::PathBuf> {
 
 fn usage_from(v: &Value) -> Usage {
     let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    // claude/codex report the UNCACHED `input_tokens` separately from `cache_read_input_tokens` and
+    // `cache_creation_input_tokens`. Forge's `Usage.input_tokens` is the FULL input the model
+    // processed (cached is a subset, see its doc), so sum all three — otherwise a resumed /
+    // prompt-cached bridge turn looks almost free, undercounting input everywhere (the token gauge,
+    // and — critically — any Forge-vs-raw-CLI efficiency comparison, which then isn't apples-to-apples
+    // because the raw-CLI metric counts cache reads).
+    let cache_read = n("cache_read_input_tokens");
     Usage {
-        input_tokens: n("input_tokens"),
+        input_tokens: n("input_tokens") + cache_read + n("cache_creation_input_tokens"),
         output_tokens: n("output_tokens"),
-        // Subscription bridge reports cache reads; carried for parity (cost stays $0 below).
-        cached_input_tokens: n("cache_read_input_tokens"),
+        // The cached subset of `input_tokens` (billed at a fraction; cost stays $0 on a subscription).
+        cached_input_tokens: cache_read,
         // Subscription-billed via the user's own CLI — $0 against Forge's USD budget (FR-5).
         cost_usd: 0.0,
     }

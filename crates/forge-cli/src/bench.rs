@@ -61,14 +61,18 @@ pub struct Prediction {
 }
 
 /// Per-instance resource accounting, written to a `<out>.metrics.jsonl` sidecar alongside the
-/// predictions. This is what powers the headline comparison: not just *resolved rate* but
-/// **tokens-per-success** and cost/wall — so "Forge bridging model X" can be shown to use fewer
-/// tokens (and equal-or-better resolve rate) than running model X's own CLI directly.
+/// predictions. This powers the comparison: not just *resolved rate* but **tokens-per-success** and
+/// cost/wall — measuring whether "Forge bridging model X" uses more or fewer tokens (and resolves
+/// more or fewer) than running model X's own CLI directly. (Note: it does NOT presume Forge wins —
+/// an early measurement that appeared to show a large Forge token saving was an accounting bug where
+/// the bridge dropped cache-read tokens the raw-CLI metric counted; once both count cache reads +
+/// writes, Forge's MCP-per-turn harness can actually cost *more* tokens than the native CLI loop.)
 ///
-/// Token/cost capture is reliable for the in-process Forge agent (read from its own usage DB,
-/// which records bridge usage too). For an external CLI it is best-effort: parsed from the CLI's
-/// machine output where available (claude `--output-format json`), else left at 0 and flagged
-/// `metrics_complete = false` so the report can exclude it from token claims rather than lie.
+/// `input_tokens` is the FULL input the model processed (uncached + cache reads + cache writes), the
+/// same on both sides (the bridge via `cli_provider::usage_from`, the external CLI via
+/// `parse_external_usage`), so the two are apples-to-apples. Capture is reliable for the in-process
+/// Forge agent (its own usage DB records bridge usage); for an external CLI it is best-effort (parsed
+/// from claude `--output-format json`), else 0 and flagged `metrics_complete = false` rather than lie.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InstanceMetric {
     pub instance_id: String,
@@ -745,12 +749,18 @@ fn parse_external_usage(agent: Agent, stdout: &str) -> (u64, u64, f64, bool) {
         let inp = u(usage, &["input_tokens", "prompt_tokens", "input"]);
         let out = u(usage, &["output_tokens", "completion_tokens", "output"]);
         let (inp, out) = (inp?, out?);
+        // Count the FULL input the model processed — uncached `input_tokens` PLUS cache reads PLUS
+        // cache writes — so this matches what the Forge bridge now records (cli_provider `usage_from`)
+        // and the two agents' token totals are apples-to-apples. (Cache reads/writes are billed at a
+        // fraction, but they are real input the model saw; omitting them flatters whichever side
+        // caches more.)
         let cache = u(usage, &["cache_read_input_tokens", "cached_input_tokens"]).unwrap_or(0);
+        let cache_write = u(usage, &["cache_creation_input_tokens"]).unwrap_or(0);
         let cost = ["total_cost_usd", "cost_usd", "cost"]
             .iter()
             .find_map(|k| v.get(k).and_then(|x| x.as_f64()))
             .unwrap_or(0.0);
-        Some((inp + cache, out, cost))
+        Some((inp + cache + cache_write, out, cost))
     }
 
     match agent {
@@ -961,6 +971,21 @@ mod tests {
         assert_eq!(i, 2000, "input + cache_read folded in"); // 1200 + 800
         assert_eq!(o, 340);
         assert!((c - 0.0345).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_claude_json_usage_counts_cache_reads_and_writes() {
+        // The full input the model processed = uncached + cache reads + cache writes. Counting only
+        // the uncached `input_tokens` (the old bug) made a prompt-cached run look ~free and broke the
+        // Forge-vs-raw-CLI comparison (the bridge undercounted the same way).
+        let out = r#"{"usage":{"input_tokens":1000,"output_tokens":50,"cache_read_input_tokens":40000,"cache_creation_input_tokens":5000}}"#;
+        let (i, o, _c, ok) = parse_external_usage(Agent::ClaudeCode, out);
+        assert!(ok);
+        assert_eq!(
+            i, 46000,
+            "1000 uncached + 40000 cache-read + 5000 cache-write"
+        );
+        assert_eq!(o, 50);
     }
 
     #[test]
