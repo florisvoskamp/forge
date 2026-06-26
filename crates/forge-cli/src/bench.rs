@@ -447,6 +447,57 @@ struct AgentSummary {
     complete: usize,
 }
 
+/// Aggregate one agent's per-instance metric rows against the official `resolved` set into an
+/// [`AgentSummary`]. Pure (no I/O) so the headline comparison's arithmetic is unit-testable: an
+/// instance counts as `resolved` iff the scorer put its id in `resolved`; token/cost totals only
+/// include rows whose capture was `metrics_complete` (so a partial capture can't understate
+/// tokens-per-success and flatter Forge). Assumes `rows` is non-empty (one file = one agent).
+fn summarize_agent(
+    rows: &[InstanceMetric],
+    resolved: &std::collections::BTreeSet<String>,
+) -> AgentSummary {
+    let mut s = AgentSummary {
+        agent: rows[0].agent.clone(),
+        instances: rows.len(),
+        patched: 0,
+        resolved: 0,
+        total_tokens: 0,
+        total_cost: 0.0,
+        total_wall: 0.0,
+        complete: 0,
+    };
+    for r in rows {
+        if r.patched {
+            s.patched += 1;
+        }
+        if resolved.contains(&r.instance_id) {
+            s.resolved += 1;
+        }
+        if r.metrics_complete {
+            s.complete += 1;
+            s.total_tokens += r.total_tokens;
+            s.total_cost += r.cost_usd;
+        }
+        s.total_wall += r.wall_secs;
+    }
+    s
+}
+
+/// The tokens-per-success cell: total tokens (across all attempts) per resolved instance — the
+/// efficiency number, lower is better. Only an honest number when there ARE eval results, at least
+/// one instance resolved, AND every row's token capture was complete; otherwise it's `incomplete`
+/// (some capture missing → would understate) or `n/a` (no evals / nothing resolved). Pure so the
+/// honesty conditions are locked down by tests — this is the headline efficiency claim.
+fn tok_per_success_cell(s: &AgentSummary, have_evals: bool) -> String {
+    if have_evals && s.resolved > 0 && s.complete == s.instances {
+        format!("{}", s.total_tokens / s.resolved as u64)
+    } else if s.complete < s.instances {
+        "incomplete".to_string()
+    } else {
+        "n/a".to_string()
+    }
+}
+
 /// The headline comparison: join per-instance metrics with the official eval's `resolved_ids` and
 /// print, per agent, **both** the resolve rate AND tokens-per-success (+ cost/wall). This is how
 /// "Forge bridging model X beats running model X's own CLI" is shown — same instances, same scorer,
@@ -470,32 +521,7 @@ pub fn report(metrics: &[PathBuf], evals: &[PathBuf]) -> Result<()> {
         if rows.is_empty() {
             continue;
         }
-        let agent = rows[0].agent.clone();
-        let mut s = AgentSummary {
-            agent,
-            instances: rows.len(),
-            patched: 0,
-            resolved: 0,
-            total_tokens: 0,
-            total_cost: 0.0,
-            total_wall: 0.0,
-            complete: 0,
-        };
-        for r in &rows {
-            if r.patched {
-                s.patched += 1;
-            }
-            if resolved.contains(&r.instance_id) {
-                s.resolved += 1;
-            }
-            if r.metrics_complete {
-                s.complete += 1;
-                s.total_tokens += r.total_tokens;
-                s.total_cost += r.cost_usd;
-            }
-            s.total_wall += r.wall_secs;
-        }
-        summaries.push(s);
+        summaries.push(summarize_agent(&rows, &resolved));
     }
     if summaries.is_empty() {
         anyhow::bail!("no metrics rows found in the given files");
@@ -511,15 +537,7 @@ pub fn report(metrics: &[PathBuf], evals: &[PathBuf]) -> Result<()> {
         } else {
             "n/a".to_string()
         };
-        // tokens-per-success: total tokens spent (across all attempts) per resolved instance. The
-        // efficiency number — lower is better. Only honest when token capture was complete.
-        let tok_per_success = if have_evals && s.resolved > 0 && s.complete == s.instances {
-            format!("{}", s.total_tokens / s.resolved as u64)
-        } else if s.complete < s.instances {
-            "incomplete".to_string()
-        } else {
-            "n/a".to_string()
-        };
+        let tok_per_success = tok_per_success_cell(s, have_evals);
         let mean_cost = if s.complete > 0 {
             format!("${:.4}", s.total_cost / s.complete as f64)
         } else {
@@ -838,6 +856,82 @@ mod tests {
         let p = dir.join("preds.metrics.jsonl");
         std::fs::write(&p, &jsonl).unwrap();
         assert_eq!(load_metrics(&p).unwrap(), m);
+    }
+
+    fn mk(id: &str, patched: bool, complete: bool, tokens: u64) -> InstanceMetric {
+        InstanceMetric {
+            instance_id: id.into(),
+            agent: "forge".into(),
+            input_tokens: tokens,
+            output_tokens: 0,
+            total_tokens: tokens,
+            cost_usd: 0.01,
+            wall_secs: 2.0,
+            patched,
+            metrics_complete: complete,
+        }
+    }
+
+    #[test]
+    fn summarize_agent_counts_resolved_patched_and_complete() {
+        use std::collections::BTreeSet;
+        let rows = vec![
+            mk("a-1", true, true, 100),  // patched, complete, RESOLVED
+            mk("a-2", true, true, 200),  // patched, complete, not resolved
+            mk("a-3", false, false, 50), // not patched, INCOMPLETE, resolved
+        ];
+        let resolved: BTreeSet<String> = ["a-1", "a-3"].iter().map(|s| s.to_string()).collect();
+        let s = summarize_agent(&rows, &resolved);
+        assert_eq!(s.agent, "forge");
+        assert_eq!(s.instances, 3);
+        assert_eq!(s.patched, 2);
+        assert_eq!(s.resolved, 2, "a-1 + a-3 are in the resolved set");
+        assert_eq!(s.complete, 2, "a-3's capture was incomplete");
+        // Only complete rows contribute tokens — a-3's 50 is excluded so tok/success can't be understated.
+        assert_eq!(s.total_tokens, 300);
+        assert_eq!(s.total_wall, 6.0);
+    }
+
+    #[test]
+    fn tok_per_success_is_honest_only_with_complete_capture() {
+        // All complete, evals present, 2 resolved, 300 tokens → 150 per success.
+        let full = AgentSummary {
+            agent: "forge".into(),
+            instances: 2,
+            patched: 2,
+            resolved: 2,
+            total_tokens: 300,
+            total_cost: 0.02,
+            total_wall: 4.0,
+            complete: 2,
+        };
+        assert_eq!(tok_per_success_cell(&full, true), "150");
+        // No eval reports → can't claim a success rate → n/a (even with complete capture).
+        assert_eq!(tok_per_success_cell(&full, false), "n/a");
+        // Resolved zero → dividing would be meaningless → n/a.
+        let none_resolved = AgentSummary {
+            resolved: 0,
+            ..AgentSummary {
+                agent: "forge".into(),
+                instances: 2,
+                patched: 0,
+                resolved: 0,
+                total_tokens: 300,
+                total_cost: 0.0,
+                total_wall: 0.0,
+                complete: 2,
+            }
+        };
+        assert_eq!(tok_per_success_cell(&none_resolved, true), "n/a");
+        // Partial token capture (complete < instances) → refuse to print a flattering number.
+        let partial = AgentSummary {
+            instances: 3,
+            complete: 2,
+            resolved: 2,
+            total_tokens: 300,
+            ..full
+        };
+        assert_eq!(tok_per_success_cell(&partial, true), "incomplete");
     }
 
     #[test]

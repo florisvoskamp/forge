@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.15] - 2026-06-26
+
+### Added
+- **Test coverage for the `forge bench report` comparison logic.** The headline "Forge bridging model
+  X vs X's own CLI" report (#227) had no test for its arithmetic or its honesty gates. Extracted the
+  aggregation into pure `summarize_agent()` + `tok_per_success_cell()` and unit-tested them: an
+  instance counts as resolved only if the official scorer put its id in `resolved_ids`; token totals
+  include **only** `metrics_complete` rows (a partial capture can't understate tokens-per-success and
+  flatter Forge); and tokens-per-success prints a real number **only** with eval results + ≥1 resolved
+  + complete capture, else `incomplete`/`n/a`. Locks down the integrity of the proven-with-metrics
+  comparison (`crates/forge-cli/src/bench.rs`).
+
 ## [0.4.14] - 2026-06-26
 
 ### Fixed
