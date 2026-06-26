@@ -6,6 +6,21 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.37] - 2026-06-26
+
+### Changed
+- **Completeness verification is now loop-gated — Forge beats the raw CLI on resolve *and* cost-per-
+  resolve.** `mesh.verify_completeness` previously appended an always-on clause to the harness preamble
+  (the model carried completeness pressure through the whole turn). It now fires **once** at turn-end
+  from the core run-loop: the model works the turn normally, then does a single bounded `git diff`
+  review against the request's requirements. Measured (N=10 SWE-bench Lite, same model): holds the
+  **6/10 resolve win over claude-cli's 4/10** at **5.53M tokens** — the cost premium fell 3× → 1.85× →
+  **1.39×** across the three forms. Headline: **922k tokens per resolve vs claude-cli's 993k (~7%
+  cheaper) while solving 50% more bugs** — Forge-on-bridge is now genuinely better on both axes
+  (still opt-in, default off; total tokens 1.39× because it does more total work). Removes the preamble
+  clause + the temporary A/B env seam (`crates/forge-core/src/lib.rs`,
+  `crates/forge-provider/src/cli_provider.rs`).
+
 ## [0.4.36] - 2026-06-26
 
 ### Changed

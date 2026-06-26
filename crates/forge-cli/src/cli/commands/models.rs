@@ -26,8 +26,7 @@ pub(crate) fn build_provider_and_router(
         let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
         Arc::new(
             DispatchProvider::new(harness)
-                .with_max_output_tokens(config.mesh.effective_max_output_tokens())
-                .with_verify_completeness(config.mesh.verify_completeness),
+                .with_max_output_tokens(config.mesh.effective_max_output_tokens()),
         )
     };
     let mut heuristic = HeuristicRouter::new(config.clone()).with_pin(pin);
@@ -671,8 +670,7 @@ pub(crate) async fn probe_models(
     use std::time::Duration;
     let harness = config.mesh.bridge_mode == forge_config::BridgeMode::Harness;
     let provider = DispatchProvider::new(harness)
-        .with_max_output_tokens(config.mesh.effective_max_output_tokens())
-        .with_verify_completeness(config.mesh.verify_completeness);
+        .with_max_output_tokens(config.mesh.effective_max_output_tokens());
     let default_cooldown = Duration::from_secs(config.mesh.failover_cooldown_secs);
     let ping = [forge_types::Message::user("ping")];
     // Probe WITH a representative tool: the real agent loop always advertises tools, so a model

@@ -369,14 +369,6 @@ impl DispatchProvider {
         self
     }
 
-    /// Opt into completeness re-verification on the CLI bridges (`mesh.verify_completeness`):
-    /// higher resolve rate on under-scoped fixes, ~3× tokens. Only affects the harness-mode bridges.
-    pub fn with_verify_completeness(mut self, on: bool) -> Self {
-        self.claude_cli = self.claude_cli.with_verify_completeness(on);
-        self.codex_cli = self.codex_cli.with_verify_completeness(on);
-        self
-    }
-
     fn cli_notice(&self) {
         self.notice.call_once(|| {
             tracing::warn!(

@@ -271,9 +271,6 @@ pub struct CliProvider {
     /// Live `--resume` state (see [`ResumeState`]). Interior-mutable because [`Provider::complete`]
     /// takes `&self`; the lock is only ever held briefly to read/update, never across an `.await`.
     resume: std::sync::Mutex<ResumeState>,
-    /// Opt-in (`mesh.verify_completeness`): append the [`COMPLETENESS_CLAUSE`] to the harness
-    /// preamble — higher resolve rate on under-scoped fixes, ~3× the tokens. Off by default.
-    verify_completeness: bool,
 }
 
 impl CliProvider {
@@ -287,20 +284,12 @@ impl CliProvider {
             // never consult it). Default on so the efficiency win applies without opt-in.
             resume_enabled: true,
             resume: std::sync::Mutex::new(ResumeState::default()),
-            verify_completeness: false,
         }
     }
 
     /// Toggle harness mode (Forge-tool MCP bridge) vs Phase-1 self-agent.
     pub fn with_harness(mut self, harness: bool) -> Self {
         self.harness = harness;
-        self
-    }
-
-    /// Opt into the completeness clause (`mesh.verify_completeness`): re-verify the fix against every
-    /// requirement before finishing — higher resolve, ~3× tokens.
-    pub fn with_verify_completeness(mut self, on: bool) -> Self {
-        self.verify_completeness = on;
         self
     }
 
@@ -590,35 +579,14 @@ until complete, or `gh run watch <id> --exit-status` which exits 0 on success), 
 each time it returns \"not ready ... call again\" until it reports ready. Only end your turn once \
 the goal is fully achieved and every task is resolved.";
 
-/// Optional, opt-in (`mesh.verify_completeness`) clause appended to the harness preamble. It makes
-/// the model re-read the request and check its change against EVERY requirement before finishing —
-/// which measurably raises resolve rate on under-scoped fixes (SWE-bench: 4/10 → 6/10, beating the
-/// raw CLI) at ~1.85× the tokens (a bounded one-pass diff review — 6/10 vs the raw CLI's 4/10 on N=10).
-/// Default OFF: a "max-resolve, higher-cost" mode users opt into, not the default tax.
-const COMPLETENESS_CLAUSE: &str = "\n\n\
-Completeness — do ONE final review before you finish (a single bounded pass — do NOT re-explore the \
-codebase): (1) run `git diff` once to see your COMPLETE change; (2) re-read the request and write the \
-distinct requirements/cases it lists (issues routinely specify several, e.g. \"reject a dotted \
-blueprint name AND a dotted endpoint\"); (3) for each, confirm your diff already handles it. Only if \
-the diff is MISSING a requirement, add that specific fix — otherwise finish. A change that handles \
-only the first of several cases is INCOMPLETE. Keep this to one diff read + targeted fixes, not a \
-fresh investigation.";
-
-/// Prepend the harness tool-preamble in harness mode (plus the opt-in completeness clause when
-/// `verify_completeness`); pass the prompt through unchanged otherwise (Phase-1 self-agent turns
-/// keep their own tools).
-fn apply_harness_preamble(harness: bool, verify_completeness: bool, prompt: String) -> String {
+/// Prepend the harness tool-preamble in harness mode; pass the prompt through unchanged otherwise
+/// (Phase-1 self-agent turns keep their own tools). Completeness verification (`mesh.verify_
+/// completeness`) is NOT here — it's delivered by the core run-loop's one-shot turn-end re-drive
+/// (forge-core), which is cheaper than an always-on preamble clause (it lets the model work the
+/// turn normally, then do a single final diff-review).
+fn apply_harness_preamble(harness: bool, prompt: String) -> String {
     if harness {
-        // FORGE_COMPLETENESS_LOOP (A/B harness): when set, completeness is delivered by the core
-        // loop's one-shot re-drive instead of this always-on preamble clause — so suppress the clause
-        // here to compare the two mechanisms cleanly. Temporary experiment seam.
-        let loop_mode = std::env::var_os("FORGE_COMPLETENESS_LOOP").is_some();
-        let extra = if verify_completeness && !loop_mode {
-            COMPLETENESS_CLAUSE
-        } else {
-            ""
-        };
-        format!("{HARNESS_TOOL_PREAMBLE}{extra}\n\n{prompt}")
+        format!("{HARNESS_TOOL_PREAMBLE}\n\n{prompt}")
     } else {
         prompt
     }
@@ -1228,11 +1196,7 @@ impl Provider for CliProvider {
                 if delta.trim().is_empty() {
                     // Nothing new to act on (shouldn't normally happen) — fall back to a fresh render.
                     (
-                        apply_harness_preamble(
-                            self.harness,
-                            self.verify_completeness,
-                            render_prompt(messages),
-                        ),
+                        apply_harness_preamble(self.harness, render_prompt(messages)),
                         None,
                     )
                 } else {
@@ -1241,17 +1205,13 @@ impl Provider for CliProvider {
                     // the harness preamble: it's small, and re-stating "use the mcp__forge__ tools"
                     // each turn keeps a resumed claude from drifting onto native tools.
                     (
-                        apply_harness_preamble(self.harness, self.verify_completeness, delta),
+                        apply_harness_preamble(self.harness, delta),
                         st.session_id.clone(),
                     )
                 }
             } else {
                 (
-                    apply_harness_preamble(
-                        self.harness,
-                        self.verify_completeness,
-                        render_prompt(messages),
-                    ),
+                    apply_harness_preamble(self.harness, render_prompt(messages)),
                     None,
                 )
             }
@@ -2224,7 +2184,7 @@ mod tests {
 
     #[test]
     fn harness_preamble_nudges_to_forge_tools_only_in_harness_mode() {
-        let out = apply_harness_preamble(true, false, "User: search the web".into());
+        let out = apply_harness_preamble(true, "User: search the web".into());
         assert!(out.contains("mcp__forge__web_search"));
         assert!(out.contains("Do NOT use any") || out.contains("MUST use"));
         // Skills steering: point the bridged model at Forge's use_skill, not the filesystem.
@@ -2235,24 +2195,7 @@ mod tests {
         assert!(out.contains("mcp__forge__spawn_agents"));
         assert!(out.ends_with("User: search the web"));
         // Phase-1 self-agent turns are untouched.
-        assert_eq!(
-            apply_harness_preamble(false, false, "User: hi".into()),
-            "User: hi"
-        );
-    }
-
-    #[test]
-    fn completeness_clause_is_opt_in_only() {
-        // Default (off): the completeness clause is NOT in the preamble — so the default cost isn't
-        // tripled. On: it IS appended (the opt-in "max-resolve" mode).
-        let off = apply_harness_preamble(true, false, "User: fix it".into());
-        let on = apply_harness_preamble(true, true, "User: fix it".into());
-        assert!(!off.contains("Completeness — do ONE final review"));
-        assert!(on.contains("Completeness — do ONE final review"));
-        assert!(on.contains("run `git diff`"));
-        // Both still carry the base harness preamble + end on the prompt.
-        assert!(off.contains("mcp__forge__shell") && on.contains("mcp__forge__shell"));
-        assert!(on.ends_with("User: fix it"));
+        assert_eq!(apply_harness_preamble(false, "User: hi".into()), "User: hi");
     }
 
     #[test]

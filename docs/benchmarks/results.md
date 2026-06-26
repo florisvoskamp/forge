@@ -110,27 +110,30 @@ missed the *endpoint* one). The raw CLI has no completeness self-check; Forge's 
 opt-in preamble clause that makes the model re-read the request and verify its change against EVERY
 requirement before finishing. Measured (same 10 instances, same model, only the clause changed):
 
-| | resolved | total tokens |
-|---|---|---|
-| claude-cli direct | 4/10 | 3.97M |
-| Forge front-loaded (no completeness) | 4/10 | 3.72M |
-| Forge + completeness (open-ended) | 6/10 | 11.3M |
-| **Forge + completeness (bounded, shipped)** | **6/10** | **6.86M** |
+| | resolved | total tokens | **tokens / resolve** |
+|---|---|---|---|
+| claude-cli direct | 4/10 | 3.97M | 993k |
+| Forge front-loaded (no completeness) | 4/10 | 3.72M | 930k |
+| Forge + completeness, open-ended | 6/10 | 11.3M | 1.88M |
+| Forge + completeness, bounded preamble | 6/10 | 6.86M | 1.14M |
+| **Forge + completeness, loop-gated (shipped)** | **6/10** | **5.53M** | **922k** |
 
 So Forge **beats the raw CLI on resolve (6 vs 4)** — gaining `requests-2148` and `pytest-11148` (the
-latter claude-cli bailed on instantly). The clause that ships is the **bounded** form (one `git diff`
-review pass, no re-exploration): it holds the full 6/10 win at **6.86M tokens — 39% cheaper than the
-open-ended version** (11.3M) it replaces. Default-off (a quality-for-cost trade).
+latter claude-cli bailed on instantly). Three forms of the completeness check were measured; the one
+that ships is **loop-gated** — fired ONCE at turn-end by the core run-loop (the model works the turn
+normally, then does a single bounded `git diff` review), not an always-on preamble clause. It holds
+the full 6/10 win at **5.53M tokens** — the cost premium fell **3× → 1.85× → 1.39×** (open-ended →
+bounded-preamble → loop-gated). Default-off (`mesh.verify_completeness`).
 
-**Honest on the remaining cost:** 6.86M is still ~1.85× claude-cli's 3.97M *total*. Per **resolve** the
-gap is small — Forge ~1.14M/solve vs claude-cli ~0.99M/solve. So the honest claim is: **Forge resolves
-50% more bugs than the raw CLI (6 vs 4) at a ~15% higher per-solve token cost.** A real solve-rate win
-at a modest premium, not a free one. (N=10 — a clean fair-accounted signal, not a large-sample proof.)
+**The headline, fairly stated:** per **resolve**, Forge is now **922k vs claude-cli's 993k — ~7%
+cheaper — while solving 50% more bugs (6 vs 4).** So Forge-on-bridge is genuinely better than the raw
+CLI on *both* axes that matter: more solved, *and* lower cost per solve. Total tokens are 1.39× because
+it does more total work (solving 6 vs 4). (N=10 — a clean fair-accounted signal, not a large-sample
+proof; the per-resolve edge is small and would firm up or soften with more instances.)
 
-**Still open** toward winning resolve at *parity total tokens*: the completeness pass still does extra
-work; a loop-gated one-shot version (fires once at turn-end vs living in the preamble all turn) is the
-next lever. The median-speed gap (per-step MCP cost) is structural. `forge bench swe` now bounds the
-in-process Forge turn by `--timeout-secs` (was unbounded → one instance ran 22 minutes).
+`forge bench swe` also bounds the in-process Forge turn by `--timeout-secs` (was unbounded → one
+instance ran 22 minutes). Remaining structural gap: median per-step MCP latency (Forge ~3× claude-code's
+in-process tool steps) — a coarser/batch-tool project, not a quick lever.
 
 ---
 

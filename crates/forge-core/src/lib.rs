@@ -2737,7 +2737,6 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                     // against every requirement. One-shot (`completeness_checked`) so it can't loop;
                     // gated on a turn that ran real tools (so there's an actual change to review).
                     if self.config.mesh.verify_completeness
-                        && std::env::var_os("FORGE_COMPLETENESS_LOOP").is_some()
                         && !completeness_checked
                         && inspect_ran.load(std::sync::atomic::Ordering::Relaxed) > 0
                     {
