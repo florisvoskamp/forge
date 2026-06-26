@@ -10,12 +10,17 @@ use forge_config::LspConfig;
 use crate::server::LspServer;
 use crate::types::Diagnostic;
 
+/// Owns the live language-server processes and routes a file to the right one.
+///
+/// One server is spawned lazily per `(language, repo-root)` and reused across calls (kept in
+/// `servers`), so repeated diagnostics on the same project don't pay startup each time.
 pub struct LspRegistry {
     config: LspConfig,
     servers: Mutex<HashMap<(String, PathBuf), LspServer>>,
 }
 
 impl LspRegistry {
+    /// Build a registry from the user's `[lsp]` config (which servers are enabled, their commands).
     pub fn from_config(config: &LspConfig) -> Self {
         Self {
             config: config.clone(),
@@ -23,6 +28,8 @@ impl LspRegistry {
         }
     }
 
+    /// Diagnostics for one file, or an empty vec if the language is unconfigured, the server binary
+    /// isn't on PATH, or it doesn't answer within `timeout`. Never errors — best-effort by design.
     pub async fn diagnostics_for(&self, abs_path: &Path, timeout: Duration) -> Vec<Diagnostic> {
         let Some(lang) = lang_from_ext(abs_path) else {
             return vec![];
@@ -94,6 +101,7 @@ impl LspRegistry {
     }
 }
 
+/// Map a file extension to the language key used to look up its server (`None` = unsupported).
 pub fn lang_from_ext(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()? {
         "rs" => Some("rust"),
@@ -105,6 +113,8 @@ pub fn lang_from_ext(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// Walk up from `path` to the nearest project root (a dir holding `Cargo.toml`, `package.json`,
+/// `pyproject.toml`, `go.mod`, or `.git`) — the directory the language server is rooted at.
 pub fn repo_root(path: &Path) -> Option<PathBuf> {
     let mut dir = path.parent()?;
     loop {
@@ -123,6 +133,7 @@ pub fn repo_root(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve a server command to an executable path (absolute path as-is, else searched on `PATH`).
 pub fn which(cmd: &str) -> Option<PathBuf> {
     let p = Path::new(cmd);
     if p.is_absolute() {

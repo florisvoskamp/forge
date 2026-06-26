@@ -2652,6 +2652,62 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn truncated_stream_line_is_skipped_not_fatal() {
+        // Stream resilience: a corrupt/truncated NDJSON line spliced between valid lines must be
+        // skipped (parse fails open → empty), not abort the turn or panic. Text from the valid lines
+        // still accumulates.
+        let fake = make_fake_cli(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"before \"}]}}\n\
+             {\"type\":\"assistant\",\"message\":{\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"after\"}]}}\n\
+             {\"type\":\"result\",\"is_error\":false,\"result\":\"\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}",
+        );
+        let provider = CliProvider::claude_code().with_binary(&fake);
+        let mut on_event = |_: StreamEvent| {};
+        let res = provider
+            .complete(
+                "claude-cli::sonnet",
+                &[Message::user("hi")],
+                &[],
+                &mut on_event,
+            )
+            .await
+            .expect("a truncated line must not fail the turn");
+        assert!(res.content.contains("before"), "got: {:?}", res.content);
+        assert!(res.content.contains("after"), "got: {:?}", res.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_tool_result_without_started_does_not_panic_or_phantom() {
+        // A tool_result for an id with no preceding tool_use (stream corruption / missing start) must
+        // not panic and must not synthesize a phantom tool call — its name just defaults empty.
+        let fake = make_fake_cli(
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"ghost\",\"is_error\":false,\"content\":\"x\"}]}}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n\
+             {\"type\":\"result\",\"is_error\":false,\"result\":\"done\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}",
+        );
+        let provider = CliProvider::claude_code().with_binary(&fake);
+        let mut on_event = |_: StreamEvent| {};
+        let res = provider
+            .complete(
+                "claude-cli::sonnet",
+                &[Message::user("hi")],
+                &[],
+                &mut on_event,
+            )
+            .await
+            .expect("orphan tool_result must not fail the turn");
+        assert!(
+            res.tool_calls.is_empty(),
+            "no phantom call: {:?}",
+            res.tool_calls
+        );
+        assert_eq!(res.content, "done");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn prose_recovery_skipped_when_cli_ran_a_native_tool() {
         // Double-execution guard: if the CLI executed a native tool this turn (a streamed tool_use),
         // a tool-call-shaped fragment in the final text must NOT be recovered — recovering it would
