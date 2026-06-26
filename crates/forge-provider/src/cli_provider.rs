@@ -596,12 +596,13 @@ the goal is fully achieved and every task is resolved.";
 /// raw CLI) but costs ~3× the tokens (more re-reading + re-verification). Default OFF: a "max-resolve,
 /// higher-cost" mode users opt into, not the default tax.
 const COMPLETENESS_CLAUSE: &str = "\n\n\
-Completeness — before you finish: RE-READ the original request/issue and check your change against \
-EVERY requirement and case it describes, not just the first. Requests routinely specify multiple \
-conditions (e.g. \"reject a dotted blueprint name AND a dotted endpoint\"); a fix that handles only \
-one of them is INCOMPLETE and will fail. List the distinct requirements the request states, confirm \
-each is handled by your change (verify with a real `mcp__forge__` read/shell check, not from \
-memory), and address any you missed before ending the turn.";
+Completeness — do ONE final review before you finish (a single bounded pass — do NOT re-explore the \
+codebase): (1) run `git diff` once to see your COMPLETE change; (2) re-read the request and write the \
+distinct requirements/cases it lists (issues routinely specify several, e.g. \"reject a dotted \
+blueprint name AND a dotted endpoint\"); (3) for each, confirm your diff already handles it. Only if \
+the diff is MISSING a requirement, add that specific fix — otherwise finish. A change that handles \
+only the first of several cases is INCOMPLETE. Keep this to one diff read + targeted fixes, not a \
+fresh investigation.";
 
 /// Prepend the harness tool-preamble in harness mode (plus the opt-in completeness clause when
 /// `verify_completeness`); pass the prompt through unchanged otherwise (Phase-1 self-agent turns
@@ -2242,9 +2243,9 @@ mod tests {
         // tripled. On: it IS appended (the opt-in "max-resolve" mode).
         let off = apply_harness_preamble(true, false, "User: fix it".into());
         let on = apply_harness_preamble(true, true, "User: fix it".into());
-        assert!(!off.contains("Completeness — before you finish"));
-        assert!(on.contains("Completeness — before you finish"));
-        assert!(on.contains("EVERY requirement and case"));
+        assert!(!off.contains("Completeness — do ONE final review"));
+        assert!(on.contains("Completeness — do ONE final review"));
+        assert!(on.contains("run `git diff`"));
         // Both still carry the base harness preamble + end on the prompt.
         assert!(off.contains("mcp__forge__shell") && on.contains("mcp__forge__shell"));
         assert!(on.ends_with("User: fix it"));
