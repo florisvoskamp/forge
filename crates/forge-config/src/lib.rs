@@ -910,6 +910,12 @@ pub struct MeshConfig {
     /// no-op without a cached dataset / API key (falls back to the heuristic).
     #[serde(default = "default_benchmark_ranking")]
     pub benchmark_ranking: bool,
+    /// Opt-in "max-resolve" mode for CLI-bridge harness turns: append a completeness clause that
+    /// makes the model re-verify its change against EVERY requirement before finishing. Measured to
+    /// raise SWE-bench resolve (4/10 → 6/10, beating the raw CLI) at ~3× the tokens — so it's OFF by
+    /// default and turned on only when solve rate matters more than cost.
+    #[serde(default = "default_verify_completeness")]
+    pub verify_completeness: bool,
     /// Which subscription plan backs each CLI bridge (`claude-cli` → "max-20x", `codex-cli` →
     /// "plus"), captured by `forge init`. Records the usage headroom the user has: the
     /// subscription-conservation layer reads it so a larger plan (more headroom) is spent more
@@ -1005,6 +1011,10 @@ fn default_subscription_conserve() -> bool {
 
 fn default_benchmark_ranking() -> bool {
     true
+}
+
+fn default_verify_completeness() -> bool {
+    false
 }
 
 /// The Artificial Analysis Data API key (ADR-0011), for benchmark-driven ranking. Read from
@@ -1224,6 +1234,7 @@ impl Default for Config {
                 max_steps: default_max_steps(),
                 subscription_conserve: default_subscription_conserve(),
                 benchmark_ranking: default_benchmark_ranking(),
+                verify_completeness: default_verify_completeness(),
                 bridge_models: HashMap::new(),
                 subscriptions: HashMap::new(),
                 disabled: Vec::new(),

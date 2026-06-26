@@ -6,6 +6,19 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.35] - 2026-06-26
+
+### Added
+- **`mesh.verify_completeness` — opt-in "max-resolve" mode that beats the raw CLI on resolve rate.**
+  When on, the CLI-bridge harness preamble gains a completeness clause: re-read the request and verify
+  the change against EVERY requirement before finishing. On SWE-bench Lite (N=10, same model, only the
+  clause changed) this took Forge-on-bridge from **4/10 → 6/10 resolved — beating claude-cli's 4/10** —
+  by catching under-scoped fixes (e.g. a flask change that handled the blueprint-name dot but missed
+  the endpoint dot). The cost is honest: **~3× the tokens** (more re-reading + re-verification), so it
+  is **default OFF** — a deliberate quality-for-cost trade you turn on when solve rate matters more than
+  spend. Documented with the measured numbers in `docs/benchmarks/results.md`
+  (`crates/forge-config`, `crates/forge-provider/src/cli_provider.rs`).
+
 ## [0.4.34] - 2026-06-26
 
 ### Added

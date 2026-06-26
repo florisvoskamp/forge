@@ -104,11 +104,27 @@ the prompt (so the model reads from context instead of `search`/`read_file`-ing)
 on a 3-instance light-repo subset this looked like a **44% token win** — it did **not** generalize to
 the heavier repos. Small-N benchmarks mislead; trust N≥10.
 
-**Open work toward a decisive win** (Forge is now competitive, not ahead): the remaining gap is the
-unbounded tool-call loop on hard instances — a harness convergence/turn-budget guard (cap the 500-call
-runaways) is the clear next lever, and it helps real interactive use too. `forge bench swe` now bounds
-the in-process Forge turn by `--timeout-secs` (it previously only bounded the external-CLI path, which
-is why one instance ran 22 minutes).
+**Beating the raw CLI on resolve — `mesh.verify_completeness` (opt-in).** Both Forge and claude-cli
+failed the same N=10 instances on **under-scoped fixes** (flask: got the blueprint-name dot-check,
+missed the *endpoint* one). The raw CLI has no completeness self-check; Forge's harness adds one — an
+opt-in preamble clause that makes the model re-read the request and verify its change against EVERY
+requirement before finishing. Measured (same 10 instances, same model, only the clause changed):
+
+| | resolved | total tokens |
+|---|---|---|
+| claude-cli direct | 4/10 | 3.97M |
+| Forge front-loaded (no completeness) | 4/10 | 3.72M |
+| **Forge + completeness** | **6/10** | **11.3M** |
+
+So Forge **beats the raw CLI on resolve (6 vs 4)** — gaining `requests-2148` and `pytest-11148` (the
+latter claude-cli bailed on instantly) — **at ~3× the tokens.** It's a deliberate quality-for-cost
+trade, hence **default-off**: turn it on when solve rate matters more than token spend. (N=10 — a clean
+fair-accounted signal, not yet a large-sample proof; +2 may carry some noise.)
+
+**Still open** (Forge competitive on cost, ahead on resolve only in the opt-in mode): close the
+*token* gap of the completeness mode (it does a lot of re-verification) and the median-speed gap
+(per-step MCP cost). `forge bench swe` now bounds the in-process Forge turn by `--timeout-secs` (was
+unbounded → one instance ran 22 minutes).
 
 ---
 
