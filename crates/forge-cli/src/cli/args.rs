@@ -79,6 +79,17 @@ pub(crate) enum BenchCmd {
         #[arg(required = true)]
         reports: Vec<std::path::PathBuf>,
     },
+    /// Join per-instance metrics with the official eval report(s) and print resolve rate AND
+    /// tokens-per-success per agent — the headline efficiency comparison (e.g. Forge-bridging-X
+    /// vs X's own CLI).
+    Report {
+        /// One or more `<out>.metrics.jsonl` sidecars from `bench swe` (typically one per agent).
+        #[arg(long = "metrics", required = true)]
+        metrics: Vec<std::path::PathBuf>,
+        /// Official `run_evaluation` `*.json` report(s); omit to print token/patch stats only.
+        #[arg(long = "eval")]
+        evals: Vec<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
