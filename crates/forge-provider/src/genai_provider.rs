@@ -82,6 +82,15 @@ pub async fn list_models(namespace: &str) -> Result<Vec<String>, ProviderError> 
         .collect())
 }
 
+/// Whether `namespace` has a genai adapter that can LIST its models (i.e. [`list_models`] can work).
+/// Some providers are completion-only: Cerebras has no native adapter and is reached via the
+/// custom service-target resolver in [`build_client`], so it answers completions fine but cannot be
+/// enumerated. The caller uses this to skip such providers in auto-discovery WITHOUT logging a
+/// scary "discovery failed — check your key" warning (the key is fine; they're just config-only).
+pub fn is_discoverable(namespace: &str) -> bool {
+    AdapterKind::from_lower_str(normalize_namespace(namespace)).is_some()
+}
+
 /// Build a `reqwest::Client` with Mozilla's bundled root CAs (`webpki-root-certs`) as the sole
 /// trust store. This makes HTTPS independent of the OS certificate store so it works even on bare
 /// containers that have no `ca-certificates` package installed.
@@ -867,6 +876,19 @@ mod tests {
     fn to_genai_model_splits_on_first_separator() {
         // genai splits namespace on the FIRST `::`, so the remainder stays intact.
         assert_eq!(to_genai_model("openai::a::b"), "openai::a::b");
+    }
+
+    #[test]
+    fn cerebras_is_not_discoverable_but_adapter_backed_providers_are() {
+        // Cerebras is completion-only (custom resolver, no native adapter) → not auto-discoverable,
+        // so the discovery loop skips it quietly instead of warning "check your key".
+        assert!(!is_discoverable("cerebras"));
+        // Providers genai has a native adapter for CAN be listed.
+        assert!(is_discoverable("anthropic"));
+        assert!(is_discoverable("openai"));
+        assert!(is_discoverable("groq"));
+        // The OpenRouter alias normalizes to its adapter too.
+        assert!(is_discoverable("openrouter"));
     }
 
     #[test]
