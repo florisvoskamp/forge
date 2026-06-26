@@ -52,7 +52,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features
+      # `--locked` fails if Cargo.lock is out of sync with Cargo.toml. Without it, a version bump
+      # that forgets to refresh the lock (e.g. `cargo update -p forge` — a no-op, the root crate is
+      # forge-cli) sails through every PR and only blows up at release time, where the build DOES use
+      # `--locked` (cost us a failed v0.4.42 release). Catch the drift here, on every PR.
+      - run: cargo clippy --locked --all-targets --all-features
 
   test:
     needs: guard

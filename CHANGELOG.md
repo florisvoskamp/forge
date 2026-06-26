@@ -6,6 +6,15 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.43] - 2026-06-27
+
+### Changed
+- **CI now runs `cargo clippy --locked`**, so a `Cargo.lock` out of sync with `Cargo.toml` fails a PR
+  instead of slipping through to the release (`.github/workflows/ci.yml`). The lock had silently
+  drifted since v0.4.37 — the bump step ran `cargo update -p forge`, a no-op (the root crate is
+  forge-cli) — and only the release build's `--locked` caught it, failing v0.4.42's first release in
+  14s. `--locked` on the clippy job catches that drift on every PR from now on.
+
 ## [0.4.42] - 2026-06-27
 
 ### Fixed
