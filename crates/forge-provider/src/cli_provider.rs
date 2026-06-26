@@ -42,6 +42,9 @@ pub enum CliKind {
     ClaudeCode,
     /// OpenAI Codex (`codex`), ChatGPT subscription.
     Codex,
+    /// Google Antigravity (`agy`) — free Gemini access (plus proxied Claude/GPT). Text-mode only
+    /// (no MCP/`--tools` wiring), so it always runs as its own agent.
+    Antigravity,
 }
 
 impl CliKind {
@@ -50,6 +53,7 @@ impl CliKind {
         match self {
             CliKind::ClaudeCode => "claude-cli",
             CliKind::Codex => "codex-cli",
+            CliKind::Antigravity => "agy-cli",
         }
     }
 
@@ -57,12 +61,13 @@ impl CliKind {
         match self {
             CliKind::ClaudeCode => "claude",
             CliKind::Codex => "codex",
+            CliKind::Antigravity => "agy",
         }
     }
 
     /// All bridge kinds.
-    pub fn all() -> [CliKind; 2] {
-        [CliKind::ClaudeCode, CliKind::Codex]
+    pub fn all() -> [CliKind; 3] {
+        [CliKind::ClaudeCode, CliKind::Codex, CliKind::Antigravity]
     }
 
     /// Whether this bridge's CLI is installed (its binary resolves on `PATH`). A subscription
@@ -95,6 +100,9 @@ impl CliKind {
                 "gpt-5.4",
                 "gpt-5.4-mini",
             ],
+            // `agy --model` (Antigravity 1.0.8 `agy models`). Free Gemini tiers: flash = fast/cheap
+            // (trivial/standard), pro = the capable tier (complex). Verified accepted live.
+            CliKind::Antigravity => &["gemini-3.5-flash", "gemini-3.1-pro"],
         }
     }
 
@@ -105,6 +113,9 @@ impl CliKind {
                 "install Claude Code and run `claude` once to log in (Pro/Max subscription)"
             }
             CliKind::Codex => "install Codex and run `codex login` (ChatGPT subscription)",
+            CliKind::Antigravity => {
+                "install Antigravity and run `agy` once to log in (free Gemini access)"
+            }
         }
     }
 
@@ -116,7 +127,7 @@ impl CliKind {
     fn max_input_chars(self) -> Option<usize> {
         match self {
             CliKind::Codex => Some(1_048_576),
-            CliKind::ClaudeCode => None,
+            CliKind::ClaudeCode | CliKind::Antigravity => None,
         }
     }
 }
@@ -264,6 +275,10 @@ impl CliProvider {
         Self::new(CliKind::Codex)
     }
 
+    pub fn antigravity() -> Self {
+        Self::new(CliKind::Antigravity)
+    }
+
     /// Override the binary (path or name). Used by tests to point at a fake CLI.
     pub fn with_binary(mut self, binary: impl Into<String>) -> Self {
         self.binary = binary.into();
@@ -400,6 +415,13 @@ fn build_args(
             "--sandbox".into(),
             "read-only".into(),
         ],
+        // Antigravity (`agy`) has no MCP/`--tools` wiring, so it ALWAYS runs as its own agent
+        // (text mode), regardless of `harness`. `-p`/--print with no positional → agy reads the
+        // prompt from stdin (verified live, like claude). `--dangerously-skip-permissions`
+        // auto-approves agy's own tools so it doesn't block headless. `--model` is appended below.
+        (CliKind::Antigravity, _) => {
+            vec!["-p".into(), "--dangerously-skip-permissions".into()]
+        }
     };
     // codex hands its stdio MCP servers a CURATED env (only PATH/HOME/LANG/… survive — verified
     // live: a custom `FORGE_*` set on the codex process never reaches `forge mcp-serve`). So the
@@ -1019,6 +1041,19 @@ fn parse_line(kind: CliKind, line: &str) -> Vec<Parsed> {
     match kind {
         CliKind::ClaudeCode => parse_claude_line(line),
         CliKind::Codex => parse_codex_line(line),
+        CliKind::Antigravity => parse_antigravity_line(line),
+    }
+}
+
+/// agy `-p` prints the answer as PLAIN TEXT (no JSON event stream like claude/codex), so every
+/// non-empty stdout line is answer text that accumulates into the final response. There are no
+/// tool/usage/quota events to parse — usage stays $0 (free Gemini tier) and the answer is the
+/// accumulated text.
+fn parse_antigravity_line(line: &str) -> Vec<Parsed> {
+    if line.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![Parsed::Text(format!("{line}\n"))]
     }
 }
 
@@ -1644,6 +1679,39 @@ mod tests {
         let i = args.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(args[i + 1], "acceptEdits");
         assert!(args.contains(&"--model".to_string()) && args.contains(&"sonnet".to_string()));
+    }
+
+    #[test]
+    fn antigravity_args_are_text_mode_print_with_model() {
+        // agy has no MCP/--tools, so it's text mode regardless of the harness flag.
+        for harness in [true, false] {
+            let args = build_args(
+                CliKind::Antigravity,
+                "gemini-3.5-flash",
+                harness,
+                "/bin/forge",
+                &[],
+            );
+            assert!(
+                args.contains(&"-p".to_string()),
+                "non-interactive print mode"
+            );
+            assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+            // Never wires Forge's MCP server (agy can't host it).
+            assert!(!args.iter().any(|a| a.contains("mcp")));
+            assert!(!args.iter().any(|a| a == "--tools"));
+            let i = args.iter().position(|a| a == "--model").unwrap();
+            assert_eq!(args[i + 1], "gemini-3.5-flash");
+        }
+    }
+
+    #[test]
+    fn antigravity_parse_line_treats_plaintext_as_answer_text() {
+        assert_eq!(parse_antigravity_line("   "), Vec::<Parsed>::new());
+        assert_eq!(
+            parse_antigravity_line("hello world"),
+            vec![Parsed::Text("hello world\n".to_string())]
+        );
     }
 
     #[test]

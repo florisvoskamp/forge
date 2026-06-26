@@ -272,7 +272,10 @@ fn default_model_available(model: &str) -> bool {
 
 /// A model billed to an already-paid subscription (the CLI bridges) — $0 marginal cost.
 fn is_subscription(model: &str) -> bool {
-    matches!(forge_config::provider_of(model), "claude-cli" | "codex-cli")
+    matches!(
+        forge_config::provider_of(model),
+        "claude-cli" | "codex-cli" | "agy-cli"
+    )
 }
 
 /// Tier classification with the human-readable signals that drove it.

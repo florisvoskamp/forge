@@ -28,6 +28,9 @@ pub fn normalize_model_id(model: &str) -> std::borrow::Cow<'_, str> {
     if let Some(rest) = model.strip_prefix("codex_cli::") {
         return std::borrow::Cow::Owned(format!("codex-cli::{rest}"));
     }
+    if let Some(rest) = model.strip_prefix("agy_cli::") {
+        return std::borrow::Cow::Owned(format!("agy-cli::{rest}"));
+    }
     std::borrow::Cow::Borrowed(model)
 }
 
@@ -37,7 +40,7 @@ pub fn normalize_model_id(model: &str) -> std::borrow::Cow<'_, str> {
 /// it must NOT nudge it to "keep calling tools," which only re-runs the whole bridge in confusion.
 pub fn is_cli_bridge(model: &str) -> bool {
     let m = normalize_model_id(model);
-    m.starts_with("claude-cli::") || m.starts_with("codex-cli::")
+    m.starts_with("claude-cli::") || m.starts_with("codex-cli::") || m.starts_with("agy-cli::")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +168,11 @@ mod error_tests {
         assert!(
             is_cli_bridge("codex_cli::gpt-5.5"),
             "legacy underscore form"
+        );
+        assert!(is_cli_bridge("agy-cli::gemini-3.5-flash"), "antigravity");
+        assert!(
+            is_cli_bridge("agy_cli::gemini-3.1-pro"),
+            "antigravity legacy underscore form"
         );
         assert!(!is_cli_bridge("openrouter::google/gemini-3.5-flash"));
         assert!(!is_cli_bridge("gemini::gemini-3.5-flash"));
@@ -334,6 +342,8 @@ pub struct DispatchProvider {
     genai: GenAiProvider,
     claude_cli: CliProvider,
     codex_cli: CliProvider,
+    /// Google Antigravity (`agy`) — text-mode only (no MCP), so always built `with_harness(false)`.
+    agy_cli: CliProvider,
     /// One-time CLI-bridge ToS/discretion notice (FR-Part-B AC-B8).
     notice: std::sync::Once,
 }
@@ -346,6 +356,8 @@ impl DispatchProvider {
             genai: GenAiProvider::new(),
             claude_cli: CliProvider::claude_code().with_harness(harness),
             codex_cli: CliProvider::codex().with_harness(harness),
+            // agy has no MCP/`--tools` wiring → always text mode, never the Forge-MCP harness.
+            agy_cli: CliProvider::antigravity().with_harness(false),
             notice: std::sync::Once::new(),
         }
     }
@@ -396,6 +408,11 @@ impl Provider for DispatchProvider {
             self.codex_cli
                 .complete(model, messages, tools, on_event)
                 .await
+        } else if model.starts_with("agy-cli::") {
+            self.cli_notice();
+            self.agy_cli
+                .complete(model, messages, tools, on_event)
+                .await
         } else {
             self.genai.complete(model, messages, tools, on_event).await
         }
@@ -419,6 +436,11 @@ impl Provider for DispatchProvider {
         } else if model.starts_with("codex-cli::") {
             self.cli_notice();
             self.codex_cli
+                .complete(model, messages, tools, on_event)
+                .await
+        } else if model.starts_with("agy-cli::") {
+            self.cli_notice();
+            self.agy_cli
                 .complete(model, messages, tools, on_event)
                 .await
         } else {

@@ -26,7 +26,7 @@ pub fn provider_of(id: &str) -> &str {
 /// A $0-marginal subscription bridge (the locally-installed claude/codex CLI), as opposed to a
 /// metered or genuinely-free API. Kept separate from "free" in the overview counts.
 pub fn is_subscription(id: &str) -> bool {
-    id.starts_with("claude-cli::") || id.starts_with("codex-cli::")
+    id.starts_with("claude-cli::") || id.starts_with("codex-cli::") || id.starts_with("agy-cli::")
 }
 
 /// Whether a model is genuinely free to call. "Free" needs *positive* evidence, not just a missing

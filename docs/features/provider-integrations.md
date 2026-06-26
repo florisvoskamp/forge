@@ -232,6 +232,28 @@ official CLI as a subprocess and consumes its output. The credential stays insid
 sanctioned tool. Anthropic's 2026-06-15 note that programmatic `claude -p` usage draws from
 a metered "Agent SDK credit" is evidence they *expect* headless subscription use.
 
+### B-agy. Antigravity (`agy`) — free Gemini, third bridge
+
+`CliKind::Antigravity` adds a third subscription bridge for Google's **Antigravity** CLI
+(`agy`), exposing **free Gemini** (3.5 Flash / 3.1 Pro) plus Antigravity's proxied Claude/GPT.
+Selected by the `agy-cli::` model prefix (e.g. `agy-cli::gemini-3.5-flash`,
+`agy-cli::gemini-3.1-pro`, or bare `agy-cli::` for the CLI default).
+
+Mechanics, mirroring the claude/codex bridges: Forge pipes the flattened transcript to
+`agy -p --dangerously-skip-permissions [--model …]` over stdin and reads the printed answer.
+Unlike claude/codex, `agy` has **no MCP/`--tools` wiring**, so it runs **text-mode only** (its
+own agent with its own tools, `with_harness(false)` always) — it does not serve Forge's MCP
+tool gate. Its `-p` output is **plain text** (not a JSON event stream), so `parse_antigravity_line`
+treats each non-empty stdout line as answer text; there are no tool/usage events and usage is $0
+(free tier).
+
+Mesh integration is automatic via `CliKind::all()` + `provider_of`: `agy-cli` is discovered,
+counted as a **subscription** ($0 marginal), priced at a ~1M-token Gemini window, and
+rank-routed/failed-over exactly like the other bridges. Subscription tier (Free/Pro/Ultra) is set
+in `forge init` (→ `[mesh.subscriptions] agy-cli = "<plan>"`). Setup: install Antigravity and run
+`agy` once to log in. Verified end-to-end: `forge run --model agy-cli::gemini-3.5-flash` returns a
+real Gemini answer at $0.
+
 ## B-ToS. Honest ToS analysis (read before shipping)
 
 This is a **medium-low-confidence** compliance position and the spec says so plainly:
