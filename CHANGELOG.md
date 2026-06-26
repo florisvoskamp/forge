@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.36] - 2026-06-26
+
+### Changed
+- **`mesh.verify_completeness` now uses a bounded one-pass review — same resolve win, 39% cheaper.**
+  v0.4.35's completeness clause was open-ended ("re-verify every requirement") and cost ~3× tokens. The
+  clause is now a **single bounded final-diff review** (run `git diff` once, check it against the
+  request's listed requirements, make targeted fixes only — no re-exploration). Measured on the same
+  N=10 SWE-bench Lite set: it **holds the full 6/10 resolve** (still beats claude-cli's 4/10) at
+  **6.86M tokens vs 11.3M** — strictly better than the open-ended form it replaces. Honest remaining
+  cost: ~1.85× claude-cli's total tokens (~15% higher per *resolve*) — a real solve-rate win at a
+  modest premium, still default-off (`docs/benchmarks/results.md` updated with the numbers).
+
 ## [0.4.35] - 2026-06-26
 
 ### Added
