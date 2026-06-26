@@ -83,7 +83,7 @@ fn now() -> u64 {
 
 async fn fetch_latest_tag() -> Option<String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let resp = reqwest::Client::new()
+    let resp = forge_provider::bundled_http_client()
         .get(&url)
         .header("User-Agent", format!("forge/{CURRENT}"))
         .header("Accept", "application/vnd.github+json")

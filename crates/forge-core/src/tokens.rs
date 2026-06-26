@@ -41,11 +41,16 @@ pub fn count_text(text: &str) -> usize {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
     let key = h.finish();
-    if let Some(&n) = cache().lock().unwrap().get(&key) {
+    // Recover from a poisoned lock instead of cascading the panic: a panic elsewhere while holding
+    // this purely-advisory token cache must not take down every later `count_text` call.
+    if let Some(&n) = cache().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return n;
     }
     let n = bpe().encode_with_special_tokens(text).len();
-    cache().lock().unwrap().insert(key, n);
+    cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, n);
     n
 }
 

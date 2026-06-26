@@ -66,25 +66,25 @@ failure.
 
 **Status:** all three items shipped + tested.
 
-## Racy startup hang with a real provider in a minimal container (accepted / under investigation)
+## Racy startup hang with a real provider in a minimal container (fixed)
 
-**Symptom:** in a fresh/minimal container (Docker, no desktop), `forge run` with a REAL provider
-occasionally prints only `● session <id>` then hangs until killed. Does NOT reproduce with `--mock`
-(completes, rc=0), does NOT reproduce on a full host or a fresh-HOME host, and **vanishes under
-`strace`** (the run then exits 0).
+**Was:** in a fresh/minimal container (Docker, no desktop), `forge run` with a REAL provider
+occasionally printed only `● session <id>` then hung until killed. Did NOT reproduce with `--mock`
+(completes, rc=0), did NOT reproduce on a full host or a fresh-HOME host, and **vanished under
+`strace`** (the run then exited 0) — the classic signature of a CPU-scheduling-sensitive race.
 
-**What we know:** a timing-sensitive concurrency bug in turn startup, between `SessionStarted` and
-the first `route_hinted`. Ruled out: discovery (`FORGE_MESH_AUTO_DISCOVER=false` still hangs), the
-LLM classifier (`FORGE_MESH_CLASSIFIER=heuristic` still hangs), keyring (the mock path shares it and
-works), MCP (none in the container), the permission prompt (`--mode bypass </dev/null` doesn't fix
-it), ollama reachability (raw `curl /v1/chat/completions` returns in <1s from the same container).
-Likely a tokio/thread interaction sensitive to CPU scheduling / core count.
+**Root cause:** the background lattice auto-index at `forge-cli/src/cli/commands/run.rs` ran the
+**synchronous, CPU-bound** `Lattice::update()` (walks the repo, tree-sitter-parses every file,
+writes SQLite) inside a plain `tokio::spawn`. That occupies a tokio *worker* thread for the whole
+walk. On a machine with few cores the multi-thread runtime is sized to `num_cpus`, so the indexer
+starved the executor and the first turn's `route_hinted` never got scheduled → the hang right after
+`● session`. `strace` perturbed scheduling enough to let the tasks interleave, hence the "vanishes
+under strace" tell. Amplified by `forge-store`'s single blocking `Mutex<Connection>` (see
+[backlog](#deferred-store-connection-pool)).
 
-**Status: accepted, not a release blocker.** Edge environment only (minimal containers); real
-desktops, servers, CI runners, and WSL are unaffected. `scripts/e2e-docker.sh` keeps it as an
-opt-in probe (`E2E_REAL=1`) so the default e2e stays green on the mock smoke. **Next:** reproduce
-with `E2E_REAL=1`, bisect with tokio-console / a thread dump at the hang, or try `--cpus=1` and the
-`current_thread` vs multi-thread runtime.
+**Fixed:** the indexer now runs on the blocking pool via `tokio::task::spawn_blocking`, so worker
+threads stay free for the agent turn regardless of core count. `scripts/e2e-docker.sh` keeps the
+`E2E_REAL=1` probe to guard against regressions.
 
 ## Panic when the system has no CA certificates (fixed)
 
@@ -99,5 +99,26 @@ the system`. A user on such a system saw a raw panic, not a clear error.
 HTTPS no longer depends on the OS certificate store. Both `build_client()` (the main provider
 client) and `list_models()` (auto-discovery) use this path.
 
-**Status:** fixed + all 76 unit tests + 3 contract tests pass.
+Hardened further: (1) `GenAiProvider`'s derived `Default` was a latent landmine — it built
+genai's *own* default client (which calls `rustls-platform-verifier` and panics on a CA-less host);
+`Default` now routes through `GenAiProvider::new()` so every Forge-constructed genai client uses the
+bundled-roots path. (2) A reusable `forge_provider::bundled_http_client()` was exported and the
+remaining `reqwest::Client::new()` HTTPS sites in the CLI (update-check, balance, context-windows,
+benchmarks, MCP, remote, local) now use it, so secondary commands no longer panic on a bare system
+either.
+
+**Known gap:** `forge-mcp/src/oauth.rs` and `forge-index/src/embed.rs` still call
+`reqwest::Client::new()` (forge-mcp has no `forge-provider` dependency; embed.rs targets localhost
+Ollama). The MCP-OAuth path should get its own bundled-roots client (add `webpki-root-certs` to
+forge-mcp) before v1.0.0.
+
+<a id="deferred-store-connection-pool"></a>
+**Related backlog — store connection contention:** `forge-store` wraps a single SQLite connection
+in one blocking `std::sync::Mutex`, shared by the agent turn, the background indexer, and the file
+watcher. It serializes those actors and amplified the startup hang above. A small read/write
+connection pool (or moving store calls off the hot turn path) is tracked for the v1.0.0 reliability
+pass.
+
+**Status:** fixed + full workspace builds clean; clippy clean; 286 forge-core/forge-provider tests
+pass.
 </content>

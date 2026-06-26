@@ -96,7 +96,7 @@ fn openrouter_pricing(body: &serde_json::Value) -> Vec<(String, f64, f64, Option
 }
 
 async fn get_json(url: &str) -> Option<serde_json::Value> {
-    let resp = reqwest::Client::new()
+    let resp = forge_provider::bundled_http_client()
         .get(url)
         .timeout(FETCH_TIMEOUT)
         .send()

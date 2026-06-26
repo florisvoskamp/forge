@@ -20,12 +20,21 @@ use crate::{
     CompletionOptions, EventSink, ModelResponse, Provider, ProviderError, StreamEvent, ToolSpec,
 };
 
-#[derive(Default)]
 pub struct GenAiProvider {
     client: Client,
     /// Per-completion output cap (`mesh.max_output_tokens`). `None` → no cap (provider default,
     /// often a model's full 65k max — too much for a free/low-credit account, see the 402 churn).
     max_output_tokens: Option<u32>,
+}
+
+impl Default for GenAiProvider {
+    /// Route `Default` through [`GenAiProvider::new`] so the genai client is always built with our
+    /// bundled-CA reqwest client. The macro-derived `Default` would instead build `genai`'s own
+    /// default client, which calls `rustls-platform-verifier` and **panics** ("No CA certificates
+    /// were loaded from the system") on a host without an OS trust store. Closing that landmine.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GenAiProvider {
@@ -76,6 +85,14 @@ pub async fn list_models(namespace: &str) -> Result<Vec<String>, ProviderError> 
 /// Build a `reqwest::Client` with Mozilla's bundled root CAs (`webpki-root-certs`) as the sole
 /// trust store. This makes HTTPS independent of the OS certificate store so it works even on bare
 /// containers that have no `ca-certificates` package installed.
+/// A general-purpose `reqwest::Client` that trusts Mozilla's bundled root CAs, so outbound HTTPS
+/// works even on bare containers without the `ca-certificates` package. Use this instead of
+/// `reqwest::Client::new()` anywhere in Forge — `Client::new()` builds with the OS trust store and
+/// **panics** internally on a system that has none.
+pub fn bundled_http_client() -> reqwest::Client {
+    build_reqwest_client()
+}
+
 fn build_reqwest_client() -> reqwest::Client {
     let certs = webpki_root_certs::TLS_SERVER_ROOT_CERTS
         .iter()

@@ -186,6 +186,11 @@ pub enum CoreError {
     /// "block"` is set — the turn is aborted so the model can fix them before proceeding.
     #[error("auto-review gate blocked: {0}")]
     TurnBlocked(String),
+    /// An internal invariant was violated on a path that "can't happen". Surfaced as a clean error
+    /// instead of a `panic!`/`.expect()` so a logic/config drift fails the turn loudly rather than
+    /// aborting the whole process mid-turn.
+    #[error("internal invariant violated: {0}")]
+    Internal(String),
 }
 
 /// Result of a [`Session::rewind_to`] / [`Session::undo`]: what the file-restore did, plus the
@@ -2359,7 +2364,11 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                                 Err(e) => return Err(e),
                             }
                         }
-                        let d = decision.expect("failover_enabled implies decision is Some");
+                        let Some(d) = decision else {
+                            return Err(CoreError::Internal(
+                                "failover engaged without a routing decision".into(),
+                            ));
+                        };
                         match picked {
                             Some(next) => {
                                 self.presenter.emit(PresenterEvent::Routing {
@@ -3812,10 +3821,11 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         msg_id: &str,
         call: &forge_types::ToolCall,
     ) -> Result<String, CoreError> {
-        let mcp = self
-            .mcp
-            .clone()
-            .expect("invoke_mcp only called when mcp is Some");
+        let Some(mcp) = self.mcp.clone() else {
+            return Err(CoreError::Internal(
+                "invoke_mcp called without an MCP manager".into(),
+            ));
+        };
         let mut args_json = serde_json::to_string(&call.args)?;
         let mut effective_args = call.args.clone();
         let side_effect = mcp.side_effect_of(&call.name);

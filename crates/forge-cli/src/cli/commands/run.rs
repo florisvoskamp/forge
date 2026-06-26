@@ -206,7 +206,18 @@ pub(crate) async fn build_session_with(
         let lat_bg = Arc::clone(lat);
         let embeddings = config.lattice.embeddings.clone();
         tokio::spawn(async move {
-            if lat_bg.update().is_ok() {
+            // `Lattice::update()` is fully synchronous and CPU-bound (walks the repo, tree-sitter
+            // parses every file, writes SQLite). Running it inside a plain async task occupies a
+            // tokio *worker* thread for its whole duration — on a low-core machine (runtime sized
+            // to `num_cpus`) that starves the executor and the first turn's `route_hinted` never
+            // gets scheduled, so `forge run` hangs right after `● session`. Offload to the blocking
+            // pool so worker threads stay free. (`spawn_blocking` JoinError on panic → treat as
+            // "not updated" rather than propagating.)
+            let lat_update = Arc::clone(&lat_bg);
+            let updated = tokio::task::spawn_blocking(move || lat_update.update().is_ok())
+                .await
+                .unwrap_or(false);
+            if updated {
                 if let Some((embedder, _)) = forge_provider::select_embedder(&embeddings) {
                     let _ = lat_bg.embed_pending(embedder.as_ref(), 64).await;
                 }

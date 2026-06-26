@@ -145,7 +145,7 @@ fn save_cache(rows: &[Row], unrated: &[String]) {
 }
 
 async fn fetch_api(key: &str) -> Option<Vec<Row>> {
-    let resp = reqwest::Client::new()
+    let resp = forge_provider::bundled_http_client()
         .get(API_URL)
         .header("x-api-key", key)
         .timeout(Duration::from_secs(15))

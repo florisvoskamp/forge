@@ -66,7 +66,7 @@ async fn get_json(provider: &str, url: &str) -> Option<serde_json::Value> {
     let key = forge_config::api_key(provider)
         .ok()
         .filter(|k| !k.is_empty())?;
-    let resp = reqwest::Client::new()
+    let resp = forge_provider::bundled_http_client()
         .get(url)
         .bearer_auth(&key)
         .timeout(PROBE_TIMEOUT)

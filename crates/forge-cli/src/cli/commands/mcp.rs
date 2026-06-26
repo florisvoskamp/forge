@@ -263,7 +263,7 @@ pub(crate) async fn mcp_login(server: &str) -> Result<()> {
             )
         })?;
 
-    let http = reqwest::Client::new();
+    let http = forge_provider::bundled_http_client();
 
     // Discover the authorization server issuer.
     let issuer = if let Some(i) = &oauth_cfg.issuer {

@@ -1177,7 +1177,7 @@ mod tests {
             let token = rc.url.token.clone();
 
             // 1. The control page is served at the token URL.
-            let http = reqwest::Client::new();
+            let http = forge_provider::bundled_http_client();
             let page = http
                 .get(format!("http://127.0.0.1:{port}/{token}"))
                 .send()

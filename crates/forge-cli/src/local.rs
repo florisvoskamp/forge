@@ -525,7 +525,7 @@ fn family_of(slug: &str) -> String {
 
 /// Fetch + parse the Ollama library (best-effort; `None` on any network/parse failure).
 async fn fetch_library() -> Option<Vec<(String, Vec<String>)>> {
-    let body = reqwest::Client::new()
+    let body = forge_provider::bundled_http_client()
         .get("https://ollama.com/library?sort=newest")
         .timeout(Duration::from_secs(10))
         .send()
