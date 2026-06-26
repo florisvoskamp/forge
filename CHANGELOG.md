@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.24] - 2026-06-26
+
+### Added
+- **Deterministic adversarial fuzz for the bridge stdout parsers.** Every bridge turn streams the CLI
+  subprocess's stdout line-by-line through `parse_line` (claude/codex/antigravity) and, in harness
+  mode, `parse_sink_line` — UNTRUSTED input that drifts with each CLI version, where a panic crashes
+  the turn mid-stream (worse than a clean failure: partial/inconsistent state). A seeded-LCG fuzz test
+  throws 6000 pathological JSON-event lines (truncated/unbalanced JSON, wrong-typed fields, real event
+  `type`s with missing payloads, control chars, huge repeats, unicode) at all three bridge parsers +
+  the sink parser and asserts no panic + determinism on every one. No new dependency; identical corpus
+  on every CI box (pairs with 0.4.23's tool-recovery fuzz) (`crates/forge-provider/src/cli_provider.rs`).
+
 ## [0.4.23] - 2026-06-26
 
 ### Added
