@@ -2638,6 +2638,51 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// Deterministic fuzz for `clamp_to_chars` — the function that trims an over-long prompt to
+    /// `codex exec`'s `input_too_large` cap. It does raw char-index arithmetic on a `Vec<char>`
+    /// (`chars[..head]`, `chars[total - tail..]`), the exact shape that has produced char-boundary
+    /// panics before (v0.3.10). It carries a hard CONTRACT: the result must never EXCEED `max_chars`
+    /// (codex rejects the turn otherwise) and must stay valid UTF-8. Throw random multi-byte/emoji/
+    /// combining-char strings at random caps (including the degenerate 0/1/around-marker-length ones)
+    /// via a seeded LCG and assert the contract holds and nothing panics on ALL of them.
+    #[test]
+    fn clamp_to_chars_never_panics_and_never_exceeds_cap() {
+        const CHARS: &[char] = &[
+            'a', ' ', '\n', '你', '😀', 'é', '\u{0301}', 'A', '\t', '界', '\u{fffd}',
+        ];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..6000 {
+            let len = next() % 400;
+            let s: String = (0..len).map(|_| CHARS[next() % CHARS.len()]).collect();
+            // Bias caps toward the small/degenerate region where boundary bugs live.
+            let cap = match next() % 5 {
+                0 => 0,
+                1 => 1,
+                2 => next() % 70, // around the truncation-marker length
+                3 => next() % 200,
+                _ => next() % 800,
+            };
+            let out = clamp_to_chars(&s, cap);
+            // Contract 1: never exceed the cap (codex rejects an over-cap prompt).
+            assert!(
+                out.chars().count() <= cap,
+                "clamp exceeded cap {cap}: got {} chars (input {} chars)",
+                out.chars().count(),
+                s.chars().count()
+            );
+            // Contract 2: a prompt that already fits is returned unchanged.
+            if s.chars().count() <= cap {
+                assert_eq!(out, s, "clamp altered an already-fitting prompt");
+            }
+        }
+    }
+
     /// Deterministic adversarial fuzz for the bridge stdout parsers. Every bridge turn streams the
     /// CLI subprocess's stdout line-by-line through `parse_line` (claude/codex/antigravity) and, in
     /// harness mode, `parse_sink_line` — UNTRUSTED input that drifts with each CLI version. A panic

@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.25] - 2026-06-26
+
+### Added
+- **Deterministic fuzz for `clamp_to_chars` (prompt-cap boundary contract).** The function that trims
+  an over-long bridge prompt to `codex exec`'s `input_too_large` cap does raw char-index arithmetic on
+  a `Vec<char>` — the exact shape that produced char-boundary panics before (v0.3.10) — and carries a
+  hard contract: the result must never EXCEED `max_chars` (codex rejects the turn otherwise) and must
+  stay valid UTF-8. A seeded-LCG fuzz throws 6000 random multi-byte/emoji/combining-char strings at
+  random caps (biased toward the degenerate 0/1/around-marker-length region where boundary bugs live)
+  and asserts: no panic, result char-count ≤ cap, and an already-fitting prompt returned unchanged.
+  Completes the P0.1 fuzz triad with 0.4.23/0.4.24 (`crates/forge-provider/src/cli_provider.rs`).
+
 ## [0.4.24] - 2026-06-26
 
 ### Added
