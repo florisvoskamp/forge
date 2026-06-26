@@ -25,7 +25,7 @@ pub use embed::{parse_ollama_embeddings, Embedder, OllamaEmbedder};
 pub use extract::{extract, lang_for_path, supported_languages, Def, Parsed, Ref};
 pub use map::build_map;
 pub use retrieve::{BodyOpts, InjectedContext, RetrievedSnippet};
-pub use watch::{spawn_watcher, LatticeWatcher};
+pub use watch::{resolve_watch_root, spawn_watcher, LatticeWatcher};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LatticeError {

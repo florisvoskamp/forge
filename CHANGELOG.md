@@ -6,6 +6,21 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.29] - 2026-06-26
+
+### Changed
+- **The watch-&-reindex watcher now scopes to the project root and refuses to watch all of `$HOME`.**
+  Follow-up to 0.4.27's WSL fix: the recursive watch was rooted at the raw CWD, so launching `forge
+  chat` in a home directory tried to recursively `inotify` the entire `$HOME` tree — `.cargo`, cloned
+  `.git` repos, caches — thousands of watches and a slow initial walk even on a native filesystem
+  (the original bug report watched the user's whole home dir, pulling in `.cargo/.git`). Startup now
+  resolves the watch root to the nearest enclosing project marker (`.git`/`.forge`/`AGENTS.md`,
+  climbing no higher than `$HOME`) and, when that resolves to the home directory itself, skips the
+  watcher with a clear line ("launched in the home directory with no project root — open a project
+  folder…") instead of watching everything. A marker-less subdirectory still watches just that dir.
+  Pure resolver unit-tested (project-root climb, home refusal, dotfiles-`.git`-in-`$HOME`, fail-open
+  when `$HOME` is unknown) (`crates/forge-index/src/watch.rs`, `crates/forge-cli/src/cli/commands/run.rs`).
+
 ## [0.4.28] - 2026-06-26
 
 ### Security
