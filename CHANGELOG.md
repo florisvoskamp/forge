@@ -6,6 +6,13 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-06-26
+
+Make the direct-path completion-verification gate actually work.
+
+### Fixed
+- **The direct-API completion-verification gate now genuinely detects whether the model inspected real state**, where before it could not. Two root causes: (1) `inspect_ran`/`tools_ran` were only incremented from the provider's `ToolStarted` *stream events* — which the CLI bridge emits (its tool loop runs inside one `complete()`) but a direct genai provider does **not** (it returns tool calls in the response, executed separately), so the counters were always 0 on the direct path; (2) the gate read a step-local "inspected this step?" signal, but a direct model runs tools in steps *separate* from the text "done" claim, so that signal was always false at the gate. Result: a direct model that correctly verified could be wrongly flagged `UNVERIFIED`. Now the loop counts the tools a direct model runs, and the gate measures inspection **since the verification was requested**. Backed by two end-to-end conformance tests (inspect-during-verification → accepted; never-inspect → flagged `UNVERIFIED`) (`crates/forge-core/src/lib.rs`).
+
 ## [0.4.5] - 2026-06-26
 
 Harness reliability + import/export round-trip.

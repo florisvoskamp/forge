@@ -36,6 +36,13 @@ All in `forge-core` `run_model_loop` (the `is_cli_bridge` arm) + the `cli_provid
    This is **one shared completion authority** (`completion_gate` / `run_completion_gate`) used by the
    CLI-bridge arm *and* the direct-API arm of `run_model_loop`, so the two paths can't diverge — a
    direct API model that marks every task Done without inspecting is gated exactly like a bridge.
+   The two arms feed the gate the inspection signal differently, because they run tools differently:
+   a bridge runs its whole tool loop inside one `complete()` (tools surface as `ToolStarted` stream
+   events, counted live), whereas a direct model returns tool calls that the loop executes in
+   *separate* steps — so the loop counts the direct model's tools itself, and the gate measures
+   "did it inspect **since** the verify request" rather than "in this step". Without both, a direct
+   model that genuinely verified was wrongly flagged `UNVERIFIED` (fixed in 0.4.6, with end-to-end
+   conformance tests for the inspect-during-verification and never-inspect cases).
 4. **Inspection requirement.** A verification turn that just re-marks `update_tasks` without inspecting
    does **not** count (`inspect_ran` counts tools other than `update_tasks`/`present_plan`). Forge
    re-prompts up to `MAX_VERIFY_ATTEMPTS`; if the model still never inspects, the turn ends **flagged
