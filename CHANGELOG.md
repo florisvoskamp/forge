@@ -6,6 +6,21 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-06-26
+
+Bridge efficiency, part 2: codex session resume.
+
+### Added
+- **codex bridge session resume** — extends the 0.4.9 claude resume to the codex (ChatGPT) bridge, so
+  both major subscription bridges now send only the NEW messages per turn instead of re-streaming the
+  whole transcript. codex resumes via the `exec resume <id>` SUBCOMMAND (keyed by its `thread_id`),
+  which — unlike claude's `--resume` flag — **rejects `--sandbox`** on resume (the recorded session's
+  sandbox is inherited), so the codex arg path is rewritten `exec …` → `exec resume <id> …` with the
+  sandbox pair dropped and every other harness flag kept. The model-match gate prevents codex's
+  model-change warning. Verified with unit tests (the `exec resume` rewrite + `--sandbox` drop) and an
+  `#[ignore]` live e2e (`e2e_codex_resume_preserves_context_across_calls`) that drives two real `codex`
+  turns and asserts the resumed turn recalls a fact from turn 1 (`crates/forge-provider/src/cli_provider.rs`).
+
 ## [0.4.9] - 2026-06-26
 
 Bridge efficiency: claude session resume (the bridge-superiority lever).

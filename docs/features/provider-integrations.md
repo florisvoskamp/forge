@@ -517,8 +517,14 @@ Mechanics (`crates/forge-provider/src/cli_provider.rs`):
   keeps a resumed claude on the `mcp__forge__` tools); the large transcript is what's skipped.
 - **Safety:** a transcript shrink (compaction) or a **model change** (failover/re-route) forces a
   fresh session; any failed resumed turn optimistically forgets the session so the retry is fresh.
-- **Scope:** claude only (its `--resume <id>` + stable `stream-json` `session_id`). codex (`exec
-  resume`) and agy stay on the full-transcript path; `with_session_resume(false)` is the escape hatch.
-- **Verified:** unit tests for the delta/extraction/flag/gate, plus an `#[ignore]` live e2e
-  (`e2e_claude_resume_preserves_context_across_calls`) that drives two real `claude` turns and
+- **Scope:** claude (`--resume <id>`, session id from `stream-json` `session_id`) **and codex**
+  (`exec resume <id>`, id from its `thread_id`). codex resume rewrites `exec …` → `exec resume <id>
+  …` and **drops `--sandbox`** (rejected on resume; the recorded session's sandbox is inherited) —
+  the rest of the harness flags (`--json`/`--skip-git-repo-check`/`--ignore-user-config`/`-c …`/
+  `--model`) are accepted and kept. agy has no resume mechanism and stays on the full-transcript
+  path; `with_session_resume(false)` is the escape hatch for either bridge.
+- **Verified:** unit tests for the delta/extraction/flag/gate (incl. the codex `exec resume` rewrite
+  + `--sandbox` drop), plus `#[ignore]` live e2e tests for **both** bridges
+  (`e2e_claude_resume_preserves_context_across_calls`, `e2e_codex_resume_preserves_context_across_calls`)
+  that drive two real CLI turns and
   asserts the resumed turn recalls a fact established in turn 1 while only the delta was sent.

@@ -299,9 +299,10 @@ impl CliProvider {
         self
     }
 
-    /// Whether this bridge reuses the CLI session across calls (claude + enabled).
+    /// Whether this bridge reuses the CLI session across calls. claude (`--resume <id>`) and codex
+    /// (`exec resume <id>`) both support it; agy does not. Gated by the `with_session_resume` flag.
     fn resumes(&self) -> bool {
-        self.resume_enabled && self.kind == CliKind::ClaudeCode
+        self.resume_enabled && matches!(self.kind, CliKind::ClaudeCode | CliKind::Codex)
     }
 
     /// Record a live session after a successful turn so the next call can `--resume` it.
@@ -504,6 +505,19 @@ fn build_args(
     if let (CliKind::ClaudeCode, Some(id)) = (kind, resume_id) {
         args.push("--resume".into());
         args.push(id.into());
+    }
+    // Resume a prior codex session. Unlike claude's `--resume` flag, codex resumes via the
+    // `exec resume <id>` SUBCOMMAND — and it REJECTS `--sandbox` on resume (the recorded session's
+    // sandbox is inherited; verified live). So rewrite `exec …` → `exec resume <id> …` and drop the
+    // `--sandbox read-only` pair. Everything else (`--json`/`--skip-git-repo-check`/
+    // `--ignore-user-config`/`-c …`/`--model`) is accepted on resume and kept.
+    if let (CliKind::Codex, Some(id)) = (kind, resume_id) {
+        if let Some(p) = args.iter().position(|a| a == "--sandbox") {
+            args.drain(p..(p + 2).min(args.len())); // remove the flag + its "read-only" value
+        }
+        // `exec` is always args[0] for codex; turn it into `exec resume <id>`.
+        args.insert(1, "resume".into());
+        args.insert(2, id.into());
     }
     // The prompt is fed via stdin (see build_args doc), so no trailing positional: `codex exec`
     // with no PROMPT reads instructions from stdin.
@@ -1364,7 +1378,8 @@ impl Provider for CliProvider {
                     Ok(BridgeEvent::Line(line)) => {
                         let Some(line) = line? else { break };
                         // Capture claude's session id (present on every line) for the next `--resume`.
-                        if self.resumes() && captured_session.is_none() {
+                        // (codex's session id is its `thread_id`, captured via `Parsed::Thread` below.)
+                        if self.kind == CliKind::ClaudeCode && captured_session.is_none() {
                             captured_session = claude_session_id(&line);
                         }
                         for item in parse_line(self.kind, &line) {
@@ -1500,12 +1515,17 @@ impl Provider for CliProvider {
             }
         }
 
-        // Success: record the live session (claude only — `captured_session` is None otherwise) so
-        // the next turn can `--resume` it and send just the new messages. `sent = messages.len()`
-        // marks everything claude has now seen; the response Forge appends next becomes part of a
-        // later delta but is filtered out as an Assistant message (see `render_resume_delta`).
+        // Success: record the live session so the next turn can resume it and send just the new
+        // messages. claude's id is `captured_session` (its stream `session_id`); codex's is its
+        // `thread_id` (`codex_thread`). `sent = messages.len()` marks everything the CLI has now seen;
+        // the response Forge appends next becomes part of a later delta but is filtered out as an
+        // Assistant message (see `render_resume_delta`).
         if self.resumes() {
-            self.record_session(captured_session, messages.len(), bare_model(model));
+            let session = match self.kind {
+                CliKind::Codex => codex_thread.clone(),
+                _ => captured_session,
+            };
+            self.record_session(session, messages.len(), bare_model(model));
         }
 
         Ok(ModelResponse {
@@ -1843,8 +1863,28 @@ mod tests {
             &[],
             Some("sess-123"),
         );
+        // codex has no `--resume` FLAG; it resumes via the `exec resume <id>` subcommand and must
+        // DROP `--sandbox` (rejected on resume). Verify the rewrite.
         assert!(!codex.iter().any(|a| a == "--resume"));
-        // No resume id → no flag.
+        assert_eq!(
+            &codex[0..3],
+            &["exec", "resume", "sess-123"],
+            "exec resume <id>"
+        );
+        assert!(
+            !codex.iter().any(|a| a == "--sandbox"),
+            "--sandbox dropped on resume"
+        );
+        assert!(
+            codex.iter().any(|a| a == "--json"),
+            "other codex flags kept"
+        );
+        // A fresh codex turn keeps `exec` + `--sandbox` and has no resume subcommand.
+        let codex_fresh = build_args(CliKind::Codex, "", true, "/bin/forge", &[], None);
+        assert_eq!(codex_fresh[0], "exec");
+        assert!(codex_fresh.iter().any(|a| a == "--sandbox"));
+        assert!(!codex_fresh.iter().any(|a| a == "resume"));
+        // No resume id → no claude flag either.
         let fresh = build_args(CliKind::ClaudeCode, "sonnet", true, "/bin/forge", &[], None);
         assert!(!fresh.iter().any(|a| a == "--resume"));
     }
@@ -1919,18 +1959,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "spawns the real `codex` CLI (needs install + auth + network); run with --ignored"]
+    async fn e2e_codex_resume_preserves_context_across_calls() {
+        use forge_types::Message;
+        // Text mode (no MCP needed); explicit model so the recorded + resumed model match (codex
+        // warns on a model change, which our model-match gate also prevents in the harness).
+        let provider = CliProvider::codex().with_harness(false);
+        let model = "codex-cli::gpt-5.5";
+        let mut sink = |_e: StreamEvent| {};
+
+        let msgs1 = vec![Message::user(
+            "Remember this codeword: ORANGUTAN. Acknowledge briefly.",
+        )];
+        let r1 = provider
+            .complete(model, &msgs1, &[], &mut sink)
+            .await
+            .expect("codex turn 1 should succeed");
+        assert!(!r1.content.trim().is_empty());
+
+        // Turn 2 resumes via `codex exec resume <thread_id>`, sending only the new user message.
+        let msgs2 = vec![
+            msgs1[0].clone(),
+            Message::assistant(&r1.content),
+            Message::user("What was the codeword? Reply with just the word."),
+        ];
+        let r2 = provider
+            .complete(model, &msgs2, &[], &mut sink)
+            .await
+            .expect("codex turn 2 should succeed");
+        assert!(
+            r2.content.to_uppercase().contains("ORANGUTAN"),
+            "the resumed codex session must recall the codeword; got: {}",
+            r2.content
+        );
+    }
+
     #[test]
     fn only_claude_resumes_and_it_is_toggleable() {
         assert!(
             CliProvider::claude_code().resumes(),
             "claude resumes by default"
         );
-        assert!(!CliProvider::codex().resumes(), "codex does not");
-        assert!(!CliProvider::antigravity().resumes(), "agy does not");
+        assert!(CliProvider::codex().resumes(), "codex resumes too");
         assert!(
-            !CliProvider::claude_code()
-                .with_session_resume(false)
-                .resumes(),
+            !CliProvider::antigravity().resumes(),
+            "agy has no resume mechanism"
+        );
+        assert!(
+            !CliProvider::codex().with_session_resume(false).resumes(),
             "the escape hatch disables it"
         );
     }
