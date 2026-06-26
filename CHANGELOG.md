@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-06-26
+
+### Fixed
+- **MCP HTTPS no longer panics on a CA-less host.** `forge-mcp` built its OAuth-refresh client with
+  `reqwest::Client::new()` and its streamable-http transport client with a plain
+  `reqwest::Client::builder()` — both trust the OS certificate store and **panic internally** on a
+  bare container / minimal image that has none (the same landmine fixed for the API client in
+  0.4.1/#226, which `forge-mcp` didn't share because it can't depend on `forge-provider`). Added a
+  `bundled_client_builder()` seeded with Mozilla's `webpki-root-certs` and routed both the OAuth flow
+  and the transport through it, so connecting to a remote (HTTP/SSE) MCP server works without a system
+  trust store (`crates/forge-mcp/src/transport.rs`, `crates/forge-mcp/src/oauth.rs`).
+
 ## [0.4.12] - 2026-06-26
 
 ### Fixed

@@ -148,6 +148,17 @@ fn resolve_on_path(bin: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&paths).find_map(|dir| try_base(&dir.join(bin)))
 }
 
+/// A reqwest `ClientBuilder` pre-seeded with Mozilla's bundled root CAs, so MCP HTTPS (the
+/// streamable-http transport AND the OAuth flow) works on bare/CA-less hosts. Mirrors
+/// forge-provider's `build_reqwest_client`; forge-mcp can't depend on forge-provider, and a plain
+/// `reqwest::Client::new()`/`builder()` trusts the OS store and **panics** where there is none.
+pub(crate) fn bundled_client_builder() -> reqwest::ClientBuilder {
+    let certs = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .filter_map(|der| reqwest::Certificate::from_der(der.as_ref()).ok());
+    reqwest::Client::builder().tls_certs_only(certs)
+}
+
 /// A reqwest client carrying the server's static custom headers as defaults (the bearer token
 /// is applied separately via the transport's `auth_header`).
 fn build_http_client(
@@ -161,7 +172,7 @@ fn build_http_client(
         let val = HeaderValue::from_str(v).map_err(|e| format!("header '{k}' value: {e}"))?;
         map.insert(name, val);
     }
-    reqwest::Client::builder()
+    bundled_client_builder()
         .default_headers(map)
         .build()
         .map_err(|e| format!("http client: {e}"))
@@ -170,6 +181,28 @@ fn build_http_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_client_builder_builds_without_the_os_trust_store() {
+        // The whole point: building must succeed from the bundled CAs alone, so MCP HTTPS works on a
+        // bare/CA-less host where reqwest's default OS-trust-store path panics. Also assert it loaded
+        // a non-trivial cert set.
+        assert!(
+            !webpki_root_certs::TLS_SERVER_ROOT_CERTS.is_empty(),
+            "bundled root CAs present"
+        );
+        assert!(
+            bundled_client_builder().build().is_ok(),
+            "client builds from bundled CAs"
+        );
+    }
+
+    #[test]
+    fn build_http_client_uses_the_bundled_ca_path() {
+        // build_http_client routes through bundled_client_builder, so it too builds on a CA-less host.
+        let headers = std::collections::HashMap::from([("X-Test".to_string(), "1".to_string())]);
+        assert!(build_http_client(&headers).is_ok());
+    }
 
     #[test]
     fn resolve_on_path_handles_explicit_files() {

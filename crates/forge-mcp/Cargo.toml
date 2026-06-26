@@ -16,6 +16,10 @@ tracing.workspace = true
 tokio = { workspace = true }
 futures.workspace = true
 reqwest = { workspace = true }
+# Mozilla's bundled root CAs so MCP HTTPS works on bare/CA-less hosts (mirrors forge-provider;
+# forge-mcp can't depend on forge-provider). Without it reqwest builds against the OS trust store
+# and panics internally on a system that has none.
+webpki-root-certs = "1"
 rmcp = { version = "1.7.0", default-features = false, features = [
     "client",
     "server",

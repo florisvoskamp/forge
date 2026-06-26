@@ -148,7 +148,9 @@ pub async fn resolve_oauth_token_async(server_name: &str) -> Result<String, Stri
         return Ok(tokens.access_token.clone());
     }
 
-    let client = reqwest::Client::new();
+    let client = crate::transport::bundled_client_builder()
+        .build()
+        .map_err(|e| format!("http client for '{server_name}': {e}"))?;
     let new_tokens = refresh_token(&client, &tokens)
         .await
         .map_err(|e| format!("token refresh for '{server_name}' failed: {e}"))?;
