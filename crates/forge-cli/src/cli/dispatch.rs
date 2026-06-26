@@ -69,6 +69,7 @@ pub(crate) async fn dispatch(command: Command) -> Result<()> {
                 .await
             }
             BenchCmd::Passk { reports } => bench::passk(&reports),
+            BenchCmd::Report { metrics, evals } => bench::report(&metrics, &evals),
         },
         Command::Commands => commands_cmd(),
         Command::Models { probe, all, clear } => models(probe, all, clear).await,

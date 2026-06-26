@@ -60,6 +60,62 @@ pub struct Prediction {
     pub model_patch: String,
 }
 
+/// Per-instance resource accounting, written to a `<out>.metrics.jsonl` sidecar alongside the
+/// predictions. This is what powers the headline comparison: not just *resolved rate* but
+/// **tokens-per-success** and cost/wall — so "Forge bridging model X" can be shown to use fewer
+/// tokens (and equal-or-better resolve rate) than running model X's own CLI directly.
+///
+/// Token/cost capture is reliable for the in-process Forge agent (read from its own usage DB,
+/// which records bridge usage too). For an external CLI it is best-effort: parsed from the CLI's
+/// machine output where available (claude `--output-format json`), else left at 0 and flagged
+/// `metrics_complete = false` so the report can exclude it from token claims rather than lie.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstanceMetric {
+    pub instance_id: String,
+    pub agent: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+    pub wall_secs: f64,
+    /// Whether a non-empty patch was produced (a *submitted* attempt; not the same as *resolved*,
+    /// which only the official evaluator decides).
+    pub patched: bool,
+    /// False when token/cost numbers could not be captured (external CLI without machine output).
+    pub metrics_complete: bool,
+}
+
+/// Outcome of running one instance: the patch plus the resources it took.
+struct RunOutcome {
+    patch: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+    wall_secs: f64,
+    metrics_complete: bool,
+}
+
+/// Serialize per-instance metrics as JSONL (one object per line) for the `<out>.metrics.jsonl`
+/// sidecar.
+pub fn metrics_to_jsonl(metrics: &[InstanceMetric]) -> String {
+    let mut out = metrics
+        .iter()
+        .map(|m| serde_json::to_string(m).expect("InstanceMetric serializes"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// `predictions.jsonl` → `predictions.metrics.jsonl` (insert `.metrics` before the extension).
+fn metrics_path(out: &Path) -> PathBuf {
+    let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("preds");
+    let ext = out.extension().and_then(|s| s.to_str()).unwrap_or("jsonl");
+    out.with_file_name(format!("{stem}.metrics.{ext}"))
+}
+
 /// Parse a SWE-bench dataset: either JSONL (one object per line) or a top-level JSON array. Lines
 /// that fail to parse are surfaced with their position so a malformed dataset is easy to fix.
 pub fn load_instances(path: &Path) -> Result<Vec<SweInstance>> {
@@ -228,37 +284,73 @@ async fn run_one_sweep(
 
     let orig_cwd = std::env::current_dir().context("reading current dir")?;
     let mut preds = Vec::with_capacity(instances.len());
+    let mut metrics = Vec::with_capacity(instances.len());
     let total = instances.len();
     for (i, inst) in instances.iter().enumerate() {
         eprintln!("[{}/{}] {} ({})", i + 1, total, inst.instance_id, inst.repo);
-        let patch = match prepare_and_run(inst, workdir, model.clone(), agent, timeout_secs).await {
-            Ok(p) => {
-                let lines = p.lines().count();
-                eprintln!("  ✓ patch: {} lines", lines);
-                p
+        let outcome = match prepare_and_run(inst, workdir, model.clone(), agent, timeout_secs).await
+        {
+            Ok(o) => {
+                eprintln!(
+                    "  ✓ patch: {} lines · {} tok ({} in / {} out) · {:.1}s{}",
+                    o.patch.lines().count(),
+                    o.input_tokens + o.output_tokens,
+                    o.input_tokens,
+                    o.output_tokens,
+                    o.wall_secs,
+                    if o.metrics_complete {
+                        ""
+                    } else {
+                        " · tokens n/a"
+                    },
+                );
+                o
             }
             Err(e) => {
                 eprintln!("  ✗ skipped: {e:#}");
-                String::new()
+                RunOutcome {
+                    patch: String::new(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_usd: 0.0,
+                    wall_secs: 0.0,
+                    metrics_complete: false,
+                }
             }
         };
         // Always restore CWD so the next instance (and the final write) resolve correctly.
         let _ = std::env::set_current_dir(&orig_cwd);
+        let patched = !outcome.patch.is_empty();
+        metrics.push(InstanceMetric {
+            instance_id: inst.instance_id.clone(),
+            agent: agent.label().to_string(),
+            input_tokens: outcome.input_tokens,
+            output_tokens: outcome.output_tokens,
+            total_tokens: outcome.input_tokens + outcome.output_tokens,
+            cost_usd: outcome.cost_usd,
+            wall_secs: outcome.wall_secs,
+            patched,
+            metrics_complete: outcome.metrics_complete,
+        });
         preds.push(Prediction {
             instance_id: inst.instance_id.clone(),
             model_name_or_path: agent.label().to_string(),
-            model_patch: patch,
+            model_patch: outcome.patch,
         });
     }
 
     std::fs::write(out, predictions_to_jsonl(&preds))
         .with_context(|| format!("writing {}", out.display()))?;
+    let metrics_out = metrics_path(out);
+    std::fs::write(&metrics_out, metrics_to_jsonl(&metrics))
+        .with_context(|| format!("writing {}", metrics_out.display()))?;
     let nonempty = preds.iter().filter(|p| !p.model_patch.is_empty()).count();
     eprintln!(
-        "wrote {} prediction(s) ({} with a patch) to {}",
+        "wrote {} prediction(s) ({} with a patch) to {}; metrics → {}",
         preds.len(),
         nonempty,
-        out.display()
+        out.display(),
+        metrics_out.display(),
     );
     eprintln!("score with the official evaluator — see docs/benchmarks/swe-bench.md");
     Ok(())
@@ -312,18 +404,167 @@ pub fn passk(reports: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/// Prepare one instance's repo, run a single headless Forge turn in it, and return the diff. Sets
-/// the process CWD to the repo (the caller restores it).
+/// Load a `<out>.metrics.jsonl` sidecar (one [`InstanceMetric`] per line).
+pub fn load_metrics(path: &Path) -> Result<Vec<InstanceMetric>> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .enumerate()
+        .map(|(i, l)| {
+            serde_json::from_str::<InstanceMetric>(l)
+                .with_context(|| format!("parsing metrics line {}", i + 1))
+        })
+        .collect()
+}
+
+/// Read the set of resolved `instance_id`s from one official `swebench` evaluation report
+/// (the `*.json` from `run_evaluation`, which carries `resolved_ids`).
+fn resolved_ids_from_report(path: &Path) -> Result<Vec<String>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading report {}", path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(v.get("resolved_ids")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// One agent's aggregated numbers for the comparison table.
+struct AgentSummary {
+    agent: String,
+    instances: usize,
+    patched: usize,
+    resolved: usize,
+    total_tokens: u64,
+    total_cost: f64,
+    total_wall: f64,
+    complete: usize,
+}
+
+/// The headline comparison: join per-instance metrics with the official eval's `resolved_ids` and
+/// print, per agent, **both** the resolve rate AND tokens-per-success (+ cost/wall). This is how
+/// "Forge bridging model X beats running model X's own CLI" is shown — same instances, same scorer,
+/// fewer tokens per solved task. `metrics` files come from `bench swe`; `evals` are the official
+/// `run_evaluation` `*.json` reports (their resolved-id sets are unioned, then intersected with each
+/// agent's instances, so one combined report or per-agent reports both work).
+pub fn report(metrics: &[PathBuf], evals: &[PathBuf]) -> Result<()> {
+    use std::collections::BTreeSet;
+    if metrics.is_empty() {
+        anyhow::bail!("report needs at least one --metrics <file.metrics.jsonl>");
+    }
+    let mut resolved: BTreeSet<String> = BTreeSet::new();
+    for e in evals {
+        resolved.extend(resolved_ids_from_report(e)?);
+    }
+    let have_evals = !evals.is_empty();
+
+    let mut summaries = Vec::new();
+    for m in metrics {
+        let rows = load_metrics(m)?;
+        if rows.is_empty() {
+            continue;
+        }
+        let agent = rows[0].agent.clone();
+        let mut s = AgentSummary {
+            agent,
+            instances: rows.len(),
+            patched: 0,
+            resolved: 0,
+            total_tokens: 0,
+            total_cost: 0.0,
+            total_wall: 0.0,
+            complete: 0,
+        };
+        for r in &rows {
+            if r.patched {
+                s.patched += 1;
+            }
+            if resolved.contains(&r.instance_id) {
+                s.resolved += 1;
+            }
+            if r.metrics_complete {
+                s.complete += 1;
+                s.total_tokens += r.total_tokens;
+                s.total_cost += r.cost_usd;
+            }
+            s.total_wall += r.wall_secs;
+        }
+        summaries.push(s);
+    }
+    if summaries.is_empty() {
+        anyhow::bail!("no metrics rows found in the given files");
+    }
+
+    println!(
+        "{:<14} {:>5} {:>8} {:>9} {:>13} {:>11} {:>9}",
+        "agent", "n", "patched", "resolved", "tok/success", "mean cost", "mean s"
+    );
+    for s in &summaries {
+        let resolved_str = if have_evals {
+            format!("{} ({:.0}%)", s.resolved, pct(s.resolved, s.instances))
+        } else {
+            "n/a".to_string()
+        };
+        // tokens-per-success: total tokens spent (across all attempts) per resolved instance. The
+        // efficiency number — lower is better. Only honest when token capture was complete.
+        let tok_per_success = if have_evals && s.resolved > 0 && s.complete == s.instances {
+            format!("{}", s.total_tokens / s.resolved as u64)
+        } else if s.complete < s.instances {
+            "incomplete".to_string()
+        } else {
+            "n/a".to_string()
+        };
+        let mean_cost = if s.complete > 0 {
+            format!("${:.4}", s.total_cost / s.complete as f64)
+        } else {
+            "n/a".to_string()
+        };
+        println!(
+            "{:<14} {:>5} {:>8} {:>9} {:>13} {:>11} {:>9.1}",
+            s.agent,
+            s.instances,
+            s.patched,
+            resolved_str,
+            tok_per_success,
+            mean_cost,
+            s.total_wall / s.instances as f64,
+        );
+    }
+    if !have_evals {
+        eprintln!(
+            "\nnote: no --eval reports given → resolve rate + tok/success omitted. Score predictions\nwith the official evaluator, then re-run with --eval <report.json>."
+        );
+    }
+    Ok(())
+}
+
+fn pct(n: usize, d: usize) -> f64 {
+    if d == 0 {
+        0.0
+    } else {
+        n as f64 / d as f64 * 100.0
+    }
+}
+
+/// Prepare one instance's repo, run a single headless turn in it, and return the diff plus the
+/// resources it took. Sets the process CWD to the repo (the caller restores it).
 async fn prepare_and_run(
     inst: &SweInstance,
     workdir: &Path,
     model: Option<String>,
     agent: Agent,
     timeout_secs: u64,
-) -> Result<String> {
+) -> Result<RunOutcome> {
     let dir = prepare_repo(inst, workdir)?;
     std::env::set_current_dir(&dir).context("entering instance repo")?;
-    match agent {
+    let started = std::time::Instant::now();
+    let (input_tokens, output_tokens, cost_usd, metrics_complete) = match agent {
         Agent::Forge => {
             // Bypass mode: a benchmark turn runs unattended, so no permission prompts. The agent
             // edits the freshly-reset working tree; we read the diff back out afterwards.
@@ -334,9 +575,12 @@ async fn prepare_and_run(
                 .run_turn(&inst.problem_statement)
                 .await
                 .context("running the agent turn")?;
+            // Reliable even for bridge providers — read from Forge's own usage DB for THIS session.
+            let (inp, out, cost) = session.session_usage_db();
+            (inp, out, cost, true)
         }
         Agent::ClaudeCode | Agent::Codex => {
-            run_external_agent(
+            let usage = run_external_agent(
                 agent,
                 &inst.problem_statement,
                 &dir,
@@ -344,34 +588,55 @@ async fn prepare_and_run(
                 timeout_secs,
             )
             .await?;
+            (usage.0, usage.1, usage.2, usage.3)
         }
-    }
-    extract_patch(&dir)
+    };
+    let wall_secs = started.elapsed().as_secs_f64();
+    let patch = extract_patch(&dir)?;
+    Ok(RunOutcome {
+        patch,
+        input_tokens,
+        output_tokens,
+        cost_usd,
+        wall_secs,
+        metrics_complete,
+    })
 }
 
 /// Run an external agent CLI (Claude Code / Codex) as its OWN autonomous agent in `dir`, feeding the
 /// task on stdin. Both must run fully unattended (edit files + run commands without prompts) so they
 /// can actually solve the instance — the clone is disposable, so the broad autonomy is contained.
+/// Returns `(input_tokens, output_tokens, cost_usd, metrics_complete)` parsed from the CLI's machine
+/// output where available (claude `--output-format json`); `metrics_complete = false` when the CLI
+/// gave no parseable usage, so the report won't make token claims it can't back up.
 async fn run_external_agent(
     agent: Agent,
     problem: &str,
     dir: &Path,
     model: Option<&str>,
     timeout_secs: u64,
-) -> Result<()> {
+) -> Result<(u64, u64, f64, bool)> {
     use tokio::io::AsyncWriteExt;
 
     let (bin, mut args): (&str, Vec<String>) = match agent {
         // `-p` reads the prompt from stdin; skip-permissions so edits + shell run unattended.
+        // `--output-format json` makes claude emit a final result object with `usage` + cost.
         Agent::ClaudeCode => (
             "claude",
-            vec!["-p".into(), "--dangerously-skip-permissions".into()],
+            vec![
+                "-p".into(),
+                "--output-format".into(),
+                "json".into(),
+                "--dangerously-skip-permissions".into(),
+            ],
         ),
         // `exec` is codex's non-interactive mode; `--full-auto` = workspace-write + never-ask.
+        // `--json` emits a JSONL event stream we scan for a token-count event (best-effort).
         Agent::Codex => (
             "codex",
             vec![
                 "exec".into(),
+                "--json".into(),
                 "--skip-git-repo-check".into(),
                 "--full-auto".into(),
             ],
@@ -387,7 +652,7 @@ async fn run_external_agent(
         .args(&args)
         .current_dir(dir)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning `{bin}` — is it installed and on PATH?"))?;
@@ -397,21 +662,91 @@ async fn run_external_agent(
         stdin.shutdown().await.ok();
     }
 
-    let status =
-        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait()).await;
-    match status {
-        Ok(Ok(st)) if st.success() => Ok(()),
-        // A non-zero exit is common (the agent may "fail" yet still have edited files) — don't abort
-        // the instance; the diff (possibly empty) is captured by the caller either way.
-        Ok(Ok(st)) => {
-            eprintln!("  (note: {bin} exited {st})");
-            Ok(())
+    // Drain stdout concurrently on a separate task so the child can't block on a full pipe, while we
+    // wait on the process with a borrow (so we can still `start_kill` it on timeout — unlike
+    // `wait_with_output`, which consumes the child).
+    let stdout_pipe = child.stdout.take();
+    let reader = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        if let Some(mut so) = stdout_pipe {
+            let _ = so.read_to_end(&mut buf).await;
         }
-        Ok(Err(e)) => Err(anyhow::anyhow!("waiting on {bin}: {e}")),
+        buf
+    });
+
+    let waited =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait()).await;
+    match waited {
+        Ok(Ok(st)) => {
+            if !st.success() {
+                // A non-zero exit is common (the agent may "fail" yet still have edited files) —
+                // don't abort the instance; the diff (possibly empty) is captured by the caller.
+                eprintln!("  (note: {bin} exited {st})");
+            }
+            let buf = reader.await.unwrap_or_default();
+            let stdout = String::from_utf8_lossy(&buf);
+            Ok(parse_external_usage(agent, &stdout))
+        }
+        Ok(Err(e)) => {
+            reader.abort();
+            Err(anyhow::anyhow!("waiting on {bin}: {e}"))
+        }
         Err(_) => {
             let _ = child.start_kill();
+            reader.abort();
             anyhow::bail!("{bin} timed out after {timeout_secs}s")
         }
+    }
+}
+
+/// Best-effort token/cost extraction from an external agent's machine output.
+/// - claude (`--output-format json`): a single JSON object with `usage.{input_tokens,output_tokens,
+///   cache_read_input_tokens}` and `total_cost_usd`.
+/// - codex (`--json`): a JSONL event stream; we take the LAST object carrying token fields
+///   (`input_tokens`/`output_tokens`, possibly nested under `usage`/`token_usage`/`info`).
+///
+/// Returns `(input, output, cost, complete)`; `complete = false` when nothing parsed.
+fn parse_external_usage(agent: Agent, stdout: &str) -> (u64, u64, f64, bool) {
+    fn u(v: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+        keys.iter().find_map(|k| v.get(k).and_then(|x| x.as_u64()))
+    }
+    // Pull token/cost out of a single JSON object that may nest usage under a few known keys.
+    fn from_obj(v: &serde_json::Value) -> Option<(u64, u64, f64)> {
+        let usage = ["usage", "token_usage", "info", "tokens"]
+            .iter()
+            .find_map(|k| v.get(k))
+            .unwrap_or(v);
+        let inp = u(usage, &["input_tokens", "prompt_tokens", "input"]);
+        let out = u(usage, &["output_tokens", "completion_tokens", "output"]);
+        let (inp, out) = (inp?, out?);
+        let cache = u(usage, &["cache_read_input_tokens", "cached_input_tokens"]).unwrap_or(0);
+        let cost = ["total_cost_usd", "cost_usd", "cost"]
+            .iter()
+            .find_map(|k| v.get(k).and_then(|x| x.as_f64()))
+            .unwrap_or(0.0);
+        Some((inp + cache, out, cost))
+    }
+
+    match agent {
+        Agent::ClaudeCode => serde_json::from_str::<serde_json::Value>(stdout.trim())
+            .ok()
+            .and_then(|v| from_obj(&v))
+            .map(|(i, o, c)| (i, o, c, true))
+            .unwrap_or((0, 0, 0.0, false)),
+        Agent::Codex => {
+            // Last JSONL line that yields token numbers wins (codex prints a running/final tally).
+            let last = stdout
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+                .filter_map(|v| from_obj(&v))
+                .next_back();
+            match last {
+                Some((i, o, c)) => (i, o, c, true),
+                None => (0, 0, 0.0, false),
+            }
+        }
+        Agent::Forge => (0, 0, 0.0, false),
     }
 }
 
@@ -467,5 +802,80 @@ mod tests {
             assert!(v.get("model_patch").is_some());
         }
         assert!(jsonl.ends_with('\n'));
+    }
+
+    #[test]
+    fn metrics_roundtrip_jsonl() {
+        let m = vec![
+            InstanceMetric {
+                instance_id: "a-1".into(),
+                agent: "forge".into(),
+                input_tokens: 1000,
+                output_tokens: 200,
+                total_tokens: 1200,
+                cost_usd: 0.012,
+                wall_secs: 4.5,
+                patched: true,
+                metrics_complete: true,
+            },
+            InstanceMetric {
+                instance_id: "a-2".into(),
+                agent: "forge".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                cost_usd: 0.0,
+                wall_secs: 0.0,
+                patched: false,
+                metrics_complete: false,
+            },
+        ];
+        let jsonl = metrics_to_jsonl(&m);
+        assert_eq!(jsonl.lines().count(), 2);
+        assert!(jsonl.ends_with('\n'));
+        let dir = std::env::temp_dir().join(format!("forge-bench-m-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("preds.metrics.jsonl");
+        std::fs::write(&p, &jsonl).unwrap();
+        assert_eq!(load_metrics(&p).unwrap(), m);
+    }
+
+    #[test]
+    fn metrics_path_inserts_before_extension() {
+        assert_eq!(
+            metrics_path(Path::new("predictions.jsonl")),
+            PathBuf::from("predictions.metrics.jsonl")
+        );
+        assert_eq!(
+            metrics_path(Path::new("/tmp/run/preds.seed1.jsonl")),
+            PathBuf::from("/tmp/run/preds.seed1.metrics.jsonl")
+        );
+    }
+
+    #[test]
+    fn parse_claude_json_usage() {
+        let out = r#"{"type":"result","is_error":false,"result":"done","total_cost_usd":0.0345,"usage":{"input_tokens":1200,"output_tokens":340,"cache_read_input_tokens":800}}"#;
+        let (i, o, c, ok) = parse_external_usage(Agent::ClaudeCode, out);
+        assert!(ok);
+        assert_eq!(i, 2000, "input + cache_read folded in"); // 1200 + 800
+        assert_eq!(o, 340);
+        assert!((c - 0.0345).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_codex_jsonl_takes_last_token_event() {
+        let out = "{\"type\":\"start\"}\n{\"token_usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n{\"token_usage\":{\"input_tokens\":900,\"output_tokens\":120}}\n";
+        let (i, o, _c, ok) = parse_external_usage(Agent::Codex, out);
+        assert!(ok);
+        assert_eq!((i, o), (900, 120), "last tally wins");
+    }
+
+    #[test]
+    fn parse_external_usage_incomplete_on_garbage() {
+        let (_, _, _, ok) = parse_external_usage(Agent::ClaudeCode, "not json at all");
+        assert!(
+            !ok,
+            "unparseable output → metrics_complete=false, not a lie"
+        );
     }
 }
