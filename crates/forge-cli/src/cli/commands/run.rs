@@ -251,13 +251,26 @@ pub(crate) async fn build_session_with(
     if let Some(lat) = &lattice {
         if config_lattice_watch {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            match forge_index::spawn_watcher(
-                Arc::clone(lat),
-                &root,
-                std::time::Duration::from_millis(400),
-            ) {
-                Ok(w) => session.set_lattice_watcher(Some(w)),
-                Err(e) => session.notify_error(&format!("lattice watcher disabled: {e}")),
+            // Set up the watcher on a DETACHED thread with a short deadline so a slow/blocking
+            // filesystem can NEVER gate TUI startup (a recursive inotify registration on WSL2's 9p
+            // DrvFs blocks uninterruptibly in the 9p RPC — it used to hang `forge chat` on a blank
+            // screen). spawn_watcher already refuses known non-native filesystems fast; this timeout
+            // is the backstop for anything else (a locked dir, an exotic remote mount). If setup
+            // overruns the deadline we continue without a watcher — retrieval is unaffected.
+            let lat2 = Arc::clone(lat);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let res =
+                    forge_index::spawn_watcher(lat2, &root, std::time::Duration::from_millis(400));
+                let _ = tx.send(res);
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Ok(w)) => session.set_lattice_watcher(Some(w)),
+                Ok(Err(e)) => session.notify_error(&format!("lattice watcher disabled: {e}")),
+                Err(_) => session.notify_error(
+                    "lattice watcher setup is slow (remote/locked filesystem) — disabled; \
+                     retrieval still works",
+                ),
             }
         }
     }

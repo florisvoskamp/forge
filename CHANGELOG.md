@@ -6,6 +6,24 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.27] - 2026-06-26
+
+### Fixed
+- **`forge chat` no longer hangs on a blank screen in a WSL2 `/mnt/*` (9p/DrvFs) directory.** At
+  startup Forge sets up a recursive inotify watcher (watch-&-reindex) rooted at the working dir, and
+  the registration was on the TUI-init critical path. On a 9p mount (WSL2's Windows-drive DrvFs) the
+  recursive watch issues a per-entry RPC to the Windows host for the whole tree, some of which block
+  uninterruptibly (`D` state in `p9_client_rpc`) — so the TUI never rendered and the process hung
+  until Ctrl-C. `forge run` (no watcher) and projects on the Linux filesystem (ext4 `~`) were fine.
+  Two fixes: **(1)** the watcher now detects a non-native filesystem via `/proc/self/mountinfo`
+  (`9p`/`v9fs`, `fuse*`, `cifs`/`smb*`, `nfs*`) and skips the recursive watch with one clear line
+  ("working dir is on a Windows drive (9p/DrvFs) — file watching disabled … move the project onto the
+  Linux filesystem") instead of blocking — so it works for ALL WSL `/mnt/*` paths, not just the
+  reported one; **(2)** watcher setup now runs on a detached thread with a 5s deadline, so *no*
+  filesystem stall (remote mount, locked dir) can ever gate TUI startup again. Retrieval is
+  unaffected when the watcher is skipped — re-run `forge lattice update` to reindex after edits
+  (`crates/forge-index/src/watch.rs`, `crates/forge-cli/src/cli/commands/run.rs`).
+
 ## [0.4.26] - 2026-06-26
 
 ### Added
