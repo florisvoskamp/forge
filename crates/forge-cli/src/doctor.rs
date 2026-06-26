@@ -210,6 +210,9 @@ fn provider_checks() -> (Vec<Check>, bool) {
                     "install Claude Code + run `claude` once to log in (optional)"
                 }
                 forge_provider::CliKind::Codex => "install Codex + run `codex login` (optional)",
+                forge_provider::CliKind::Antigravity => {
+                    "install Antigravity + run `agy` once to log in (optional)"
+                }
             }),
         ));
     }
@@ -432,6 +435,9 @@ async fn bridge_roundtrip_checks() -> Vec<Check> {
                 "run `claude` once to log in; if it's a Windows .cmd shim, confirm it launches"
             }
             forge_provider::CliKind::Codex => "run `codex login`; confirm the binary launches",
+            forge_provider::CliKind::Antigravity => {
+                "run `agy` once to log in; confirm the binary launches"
+            }
         };
         let c = match tokio::time::timeout(BRIDGE_TIMEOUT + std::time::Duration::from_secs(2), fut)
             .await

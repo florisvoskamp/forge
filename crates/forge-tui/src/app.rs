@@ -3450,7 +3450,10 @@ pub fn render_usage_overlay(f: &mut Frame, app: &App) {
             } else {
                 model.clone()
             };
-            let style = if display.starts_with("claude-cli") || display.starts_with("codex-cli") {
+            let style = if display.starts_with("claude-cli")
+                || display.starts_with("codex-cli")
+                || display.starts_with("agy-cli")
+            {
                 Style::default().fg(TOOLCYAN)
             } else {
                 Style::default()
@@ -3483,7 +3486,10 @@ pub fn render_usage_overlay(f: &mut Frame, app: &App) {
 /// OpenCode Zen, OpenRouter pass-through) — it may still burn real credit, so we say "untracked"
 /// rather than lie that it's a subscription.
 fn cost_cell(model: &str, cost: f64) -> String {
-    if model.starts_with("claude-cli") || model.starts_with("codex-cli") {
+    if model.starts_with("claude-cli")
+        || model.starts_with("codex-cli")
+        || model.starts_with("agy-cli")
+    {
         "subscription".to_string()
     } else if cost > 0.0 {
         format!("${cost:.5}")

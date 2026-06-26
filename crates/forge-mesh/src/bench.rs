@@ -130,6 +130,7 @@ fn id_tokens(id: &str) -> Vec<String> {
     let mut toks = match provider {
         "claude-cli" | "anthropic" => vec!["claude".to_string()],
         "codex-cli" => vec!["gpt".to_string()],
+        "agy-cli" => vec!["gemini".to_string()],
         _ => Vec::new(),
     };
     toks.extend(tokens(model));

@@ -85,6 +85,12 @@ pub(crate) fn bridge_plans(
             ("Enterprise", "enterprise"),
             ("API credits / unsure", "unknown"),
         ],
+        forge_provider::CliKind::Antigravity => &[
+            ("Free", "free"),
+            ("Pro", "pro"),
+            ("Ultra", "ultra"),
+            ("API credits / unsure", "unknown"),
+        ],
     }
 }
 

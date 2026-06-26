@@ -227,6 +227,9 @@ pub fn context_limit(model: &str) -> Option<u32> {
         match provider {
             "claude-cli" => 200_000,
             "codex-cli" => 272_000,
+            // agy runs Gemini (≈1M-token window). The bare `agy-cli::` id is the CLI default;
+            // explicit `::gemini-3.1-pro`/`gemini-3.5-flash` aliases resolve via the name branches.
+            "agy-cli" => 1_000_000,
             _ => return None,
         }
     };
