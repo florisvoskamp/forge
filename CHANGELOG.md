@@ -6,6 +6,19 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.28] - 2026-06-26
+
+### Security
+- **Built-in secret-read denylist now covers the common non-`cat` read/exfil verbs.** The shell deny
+  rules blocked `cat`/`less`/`head`/`tail`/`type`/`more` on `.env`/keys/credentials, but an agent
+  could still read a secret by shelling out via the OTHER obvious verbs: text tools
+  (`grep`/`egrep`/`rg`/`awk`/`sed`/`nl`/`sort`/`cut`), binary dumps/encoders for exfil
+  (`xxd`/`od`/`strings`/`base64`), or `source`/`.` which executes a dotenv straight into the
+  environment. Those are now denied too (defense-in-depth on top of the `read_file`/`list_dir` tool
+  block, which already stops the non-shell path). Verified each is denied even under `bypass` while
+  ordinary uses of those verbs on non-secret files (`grep TODO src/main.rs`, `base64 logo.png`, …)
+  stay allowed (`crates/forge-config/src/lib.rs`, test in `crates/forge-core/src/permission.rs`).
+
 ## [0.4.27] - 2026-06-26
 
 ### Fixed

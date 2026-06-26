@@ -600,6 +600,67 @@ mod tests {
     }
 
     #[test]
+    fn builtin_shell_secret_reads_cover_non_cat_verbs() {
+        // The read_file tool blocks `.env`, but an agent can shell out to read it. `cat`/`less`/etc.
+        // were covered; these are the OTHER common non-interactive read/exfil verbs that used to slip
+        // through. Run the REAL builtin rules through decide() so the patterns are actually enforced.
+        let rules = forge_config::builtin_deny_rules();
+        for cmd in [
+            "grep SECRET .env",
+            "grep -i token .env.production",
+            "egrep . .env",
+            "rg key .env",
+            "awk '{print}' .env",
+            "sed -n 1p .env",
+            "nl .env",
+            "sort .env",
+            "cut -d= -f2 .env",
+            "xxd .env",
+            "od -c .env",
+            "strings .env",
+            "base64 .env",
+            "base64 config/.env.local",
+            "base64 secrets/tls.key",
+            "source .env",
+            ". .env",
+            ". ./.env.production",
+            "xxd /home/u/.ssh/id_rsa",
+            "strings /home/u/.ssh/id_ed25519",
+        ] {
+            assert_eq!(
+                decide(
+                    PermissionMode::Bypass,
+                    SideEffect::Shell,
+                    "shell",
+                    &shell(cmd),
+                    &rules
+                ),
+                Deny,
+                "shell secret read must be denied even in bypass: {cmd}"
+            );
+        }
+        // Ordinary uses of those verbs on non-secret files stay allowed (no over-block).
+        for cmd in [
+            "grep TODO src/main.rs",
+            "sort data.csv",
+            "base64 logo.png",
+            "sed -n 1p README.md",
+        ] {
+            assert_ne!(
+                decide(
+                    PermissionMode::Bypass,
+                    SideEffect::Shell,
+                    "shell",
+                    &shell(cmd),
+                    &rules
+                ),
+                Deny,
+                "ordinary use of a read verb must not be denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
     fn gwt6_deny_beats_allow_on_conflict() {
         let rules = [
             cfg("shell", Allow, &["git *"]),
