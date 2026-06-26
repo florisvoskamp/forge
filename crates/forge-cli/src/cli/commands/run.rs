@@ -304,7 +304,16 @@ pub(crate) async fn build_session_with(
     // whole listing once on a fresh session (resume suppresses it — the transcript separator
     // already orients the user, and the MCP panel is always reachable via `/mcp`).
     if !mock && config_has_mcp {
-        let manager = std::sync::Arc::new(forge_mcp::McpManager::connect_all(&mcp_config).await);
+        // Connect MCP servers in the BACKGROUND so a slow/unreachable server can't delay TUI startup
+        // by up to connect_timeout (20s default per server) — the same non-blocking pattern
+        // `mcp-serve` uses. `connecting()` marks every active server `Reconnecting` and advertises
+        // the MCP meta-tools immediately (so `is_empty()` is false and the tool surface is ready),
+        // then a detached task connects them; each flips to connected/failed in the `/mcp` panel as
+        // it resolves, and the first `mcp_call` lazily waits on its own server. No startup op should
+        // gate the UI (cf. the 9p watcher hang).
+        let manager = std::sync::Arc::new(forge_mcp::McpManager::connecting(&mcp_config));
+        let bg = std::sync::Arc::clone(&manager);
+        tokio::spawn(async move { bg.connect_active().await });
         session.set_mcp(Some(manager));
         if resume.is_none() {
             session.announce_mcp();

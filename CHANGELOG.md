@@ -6,6 +6,19 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.30] - 2026-06-26
+
+### Changed
+- **MCP servers now connect in the background instead of gating `forge chat` startup.** The interactive
+  path awaited `McpManager::connect_all` before the session was built, so a slow or unreachable MCP
+  server stalled TUI startup by up to the per-server connect timeout (20s default) — the same
+  "a startup op blocks the UI" class as the 9p watcher hang. It now uses the non-blocking pattern
+  `mcp-serve` already uses: `connecting()` marks every active server `Reconnecting` and advertises the
+  MCP meta-tools immediately (so the tool surface is ready at once), then a detached task connects them
+  — each flips to connected/failed in the `/mcp` panel as it resolves, and the first `mcp_call` lazily
+  waits on its own server. Reuses infrastructure already covered by
+  `connecting_advertises_meta_tools_without_any_network_io` (`crates/forge-cli/src/cli/commands/run.rs`).
+
 ## [0.4.29] - 2026-06-26
 
 ### Changed
