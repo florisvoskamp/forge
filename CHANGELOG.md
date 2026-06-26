@@ -6,6 +6,19 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-06-26
+
+More harness conformance tests — empty-response and tool-call-as-text guards.
+
+### Added
+- **End-to-end conformance tests for two more reliability guards:** the empty-response
+  nudge-then-stop guard (an `EmptyResponseProvider` that returns nothing must be nudged a bounded
+  number of times, then stop — never loop forever) and the tool-call-as-text honest-failure guard (a
+  `ToolCallAsTextProvider` that writes `<invoke …>` markup with no structured call must be nudged to
+  actually execute, then end LOUDLY rather than report a phantom success). With 0.4.6/0.4.7 this
+  brings end-to-end coverage to the full guard set — verification gate (direct + bridge), doom-loop,
+  failure-loop, empty-response, continue/stall, and tool-call-as-text (`crates/forge-core/src/lib.rs`).
+
 ## [0.4.7] - 2026-06-26
 
 Harness conformance tests for the runaway-prevention guards.
