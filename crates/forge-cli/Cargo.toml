@@ -23,6 +23,7 @@ forge-provider.workspace = true
 forge-skills.workspace = true
 forge-tools.workspace = true
 forge-store.workspace = true
+crossterm.workspace = true
 forge-tui.workspace = true
 clap.workspace = true
 tokio = { workspace = true }

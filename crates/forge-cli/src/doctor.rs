@@ -309,16 +309,31 @@ fn environment_checks() -> Vec<Check> {
     let tty = std::io::stdout().is_terminal();
     let term = std::env::var("TERM").ok().filter(|t| !t.is_empty());
     let term_usable = term.as_deref().is_some_and(|t| t != "dumb");
+    // Gold-standard viability: actually enter+exit raw mode, exactly what the TUI does on launch.
+    // More authoritative than the TERM heuristic — a box where this fails genuinely can't run the
+    // full-screen UI, while one where it succeeds can (even with an odd TERM). Only meaningful on an
+    // interactive stdout, so it's gated on `tty`.
+    let raw_probe = tty.then(raw_mode_probe);
     let (status, detail, fix) = if !tty {
         (Status::Info, "non-interactive (piped/CI)".to_string(), None)
+    } else if let Some(Err(e)) = &raw_probe {
+        (
+            Status::Warn,
+            format!("interactive but raw-mode probe failed ({e}) — the full-screen TUI won't work here"),
+            Some("use a different terminal emulator; ensure stdin+stdout are a real tty and TERM is set"),
+        )
     } else if cfg!(windows) {
         (
             Status::Ok,
-            "interactive (Windows console)".to_string(),
+            "interactive (Windows console, raw-mode OK)".to_string(),
             None,
         )
     } else if term_usable {
-        (Status::Ok, format!("interactive ({})", term.unwrap()), None)
+        (
+            Status::Ok,
+            format!("interactive ({}, raw-mode OK)", term.unwrap()),
+            None,
+        )
     } else {
         (
             Status::Warn,
@@ -337,6 +352,15 @@ fn environment_checks() -> Vec<Check> {
         out.push(check(Status::Info, "platform", "WSL detected", None));
     }
     out
+}
+
+/// Enter then exit raw mode — the exact terminal capability the full-screen TUI needs. Returns the
+/// error string if entering fails (a box that can't support the UI). Always attempts to restore
+/// cooked mode so `forge doctor` never leaves the terminal in raw mode.
+fn raw_mode_probe() -> Result<(), String> {
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    enable_raw_mode().map_err(|e| e.to_string())?;
+    disable_raw_mode().map_err(|e| e.to_string())
 }
 
 /// Best-effort WSL detection: the kernel release string carries "microsoft" under WSL1/2.
