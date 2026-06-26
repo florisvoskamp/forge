@@ -149,8 +149,20 @@ the resolve advantage is real but **modest** (+2 of 20). The direction is consis
 batches (Forge never behind on either), but a still-larger N would tighten the resolve margin.
 
 `forge bench swe` also bounds the in-process Forge turn by `--timeout-secs` (was unbounded → one
-instance ran 22 minutes). Remaining structural gap: median per-step MCP latency (Forge ~3× claude-code's
-in-process tool steps) — a coarser/batch-tool project, not a quick lever.
+instance ran 22 minutes).
+
+**Structural gap — per-step MCP latency — partially addressed (batch/context tools, v0.4.40–41).**
+The remaining gap was median per-step MCP latency (Forge ~3× claude-code's in-process tool steps),
+because every bridge tool call is a round-trip that re-processes the growing context. Two affordances
+attack it: batch `read_file` (a `paths` array — many files in one call) and `search context:N`
+(grep -C lines, so a hit needs no follow-up read), plus a harness-preamble nudge so the bridge model
+actually uses them. A small honest A/B (2 clean instances, same model, old vs new binary — a third was
+discarded after a mid-run rate-limit failover to a local model corrupted it) shows the nudge takes
+**context-search adoption 0% → 100%** and cuts **tool round-trips ~21% (23 → 18)**. **Tokens were
+flat** (617k → 619k): the context lines cost roughly what the saved round-trips would have, so this is
+a **latency improvement, not a token-efficiency win** at this sample. N=2 is a mechanism check, not a
+proof — the round-trip reduction is real and directly on the stated gap; the token-neutrality is the
+honest limit of what was measured.
 
 ---
 

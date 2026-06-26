@@ -6,6 +6,26 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.41] - 2026-06-27
+
+### Added
+- **`search` gains optional `context` lines (grep -C)** (`crates/forge-tools/src/core_tools.rs`).
+  `context: N` prints N lines around each match (match lines as `path:lineno:`, context as
+  `path:lineno-`, `--` between hunks; adjacent hits merge into one hunk), so a search result is often
+  enough to understand a hit WITHOUT a follow-up `read_file`. Bounded by a 64 KiB output cap.
+- **Harness preamble nudges the bridge model to batch exploration** (`crates/forge-provider/src/
+  cli_provider.rs`). An "Exploring efficiently" clause tells the bridged claude/codex to read several
+  files in one `read_file` `paths` call and to pass `search context:N` instead of search-then-read.
+  Without this the new batch affordances went unused; with it the model adopts them immediately.
+
+### Measured (small, honest)
+- A 2-instance clean A/B (same instances, same model, old vs new binary; a third instance was
+  discarded after a mid-run rate-limit failover to a local model corrupted it) shows the nudge drives
+  **100% of searches to use `context`** (vs 0% before) and **~21% fewer tool round-trips** (23 → 18) —
+  a direct hit on the structural per-step-MCP-latency gap. **Tokens were flat** (617k → 619k): the
+  context lines cost about what the saved round-trips would have, so this is a **latency win, not a
+  token-efficiency win** at this sample. Reported straight; N=2 is a mechanism check, not a proof.
+
 ## [0.4.40] - 2026-06-26
 
 ### Added

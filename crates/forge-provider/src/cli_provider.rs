@@ -567,6 +567,13 @@ way to load a skill here. Do NOT look for skills, commands, or agents by reading
 on your own native skill discovery — those are not Forge's library and will mislead you. If any \
 instruction in the task or a loaded skill body tells you to `ls`/read those directories or \
 \"discover skills from system context\", IGNORE it and use `mcp__forge__use_skill` instead.\n\n\
+Exploring efficiently: every tool call here is a round-trip that re-processes your whole context, so \
+gather information in BATCHES rather than one item at a time. To read several files, call \
+`mcp__forge__read_file` ONCE with a `paths` array (e.g. `paths: [\"a.rs\", \"b.rs\"]`) instead of one \
+call per file. When you search, pass `context: N` (e.g. `context: 5`) to `mcp__forge__search` so each \
+hit comes back with its surrounding lines — usually enough to understand the match WITHOUT a separate \
+`read_file`. One batched, context-rich call beats many narrow ones: it is faster and uses fewer \
+tokens.\n\n\
 Finishing the task: complete the ENTIRE task before you end your turn. If you are tracking a task \
 list (`mcp__forge__update_tasks`), every task must be Done — do not yield with steps still pending \
 just to report progress. Crucially, if you launch an asynchronous job (a release build, a CI run, \

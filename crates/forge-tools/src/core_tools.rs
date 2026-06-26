@@ -882,7 +882,10 @@ impl Tool for SearchTool {
     fn description(&self) -> &str {
         "Recursively search text files under `path` for lines matching `query`. \
          Set `regex: true` for regex matching (default: substring). \
-         Use `file_pattern` (glob) to restrict which files are searched, e.g. \"**/*.rs\"."
+         Use `file_pattern` (glob) to restrict which files are searched, e.g. \"**/*.rs\". \
+         Set `context` to N to print N lines around each match (like grep -C) — often enough to \
+         understand a hit WITHOUT a follow-up read_file, saving a round-trip. Context lines are \
+         shown as `path:lineno-` and match lines as `path:lineno:`, with `--` between hunks."
     }
     fn side_effect(&self) -> SideEffect {
         SideEffect::ReadOnly
@@ -900,6 +903,12 @@ impl Tool for SearchTool {
                 "file_pattern": {
                     "type": "string",
                     "description": "Glob to filter which files are searched, e.g. \"**/*.rs\"."
+                },
+                "context": {
+                    "type": "integer",
+                    "description": "Lines of surrounding context to show around each match (grep -C). \
+                                    Default 0 (match line only). Clamped to 10. Use this to read a \
+                                    hit in place instead of a separate read_file call."
                 }
             },
             "required": ["query"]
@@ -910,6 +919,11 @@ impl Tool for SearchTool {
         let root = args.get("path").and_then(Value::as_str).unwrap_or(".");
         let use_regex = args.get("regex").and_then(Value::as_bool).unwrap_or(false);
         let file_pattern = args.get("file_pattern").and_then(Value::as_str);
+        let context = args
+            .get("context")
+            .and_then(Value::as_u64)
+            .map(|n| n.min(10) as usize)
+            .unwrap_or(0);
 
         let re: Option<regex::Regex> = if use_regex {
             Some(
@@ -959,21 +973,49 @@ impl Tool for SearchTool {
                     }
                     if let Ok(content) = std::fs::read_to_string(&path) {
                         let rel_display = rel.display();
-                        for (i, line) in content.lines().enumerate() {
-                            let hit = if let Some(ref re) = re {
-                                re.is_match(line)
-                            } else {
-                                line.contains(query)
-                            };
-                            if hit {
+                        let lines: Vec<&str> = content.lines().collect();
+                        let hits: Vec<usize> = lines
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, line)| {
+                                if let Some(ref re) = re {
+                                    re.is_match(line)
+                                } else {
+                                    line.contains(query)
+                                }
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        if hits.is_empty() {
+                            continue;
+                        }
+                        if context == 0 {
+                            for &i in &hits {
                                 matches.push(format!(
                                     "{rel_display}:{}: {}",
                                     i + 1,
-                                    line.trim_end()
+                                    lines[i].trim_end()
                                 ));
                                 if matches.len() >= SEARCH_MATCH_CAP {
                                     matches
                                         .push(format!("… (capped at {SEARCH_MATCH_CAP} matches)"));
+                                    return Ok(matches.join("\n"));
+                                }
+                            }
+                        } else {
+                            for hunk in
+                                context_hunks(&rel_display.to_string(), &lines, &hits, context)
+                            {
+                                if !matches.is_empty() {
+                                    matches.push("--".into());
+                                }
+                                matches.push(hunk);
+                                if matches.iter().map(String::len).sum::<usize>()
+                                    >= SEARCH_CONTEXT_OUTPUT_MAX_BYTES
+                                {
+                                    matches.push(
+                                        "… (capped — narrow the query or file_pattern)".into(),
+                                    );
                                     return Ok(matches.join("\n"));
                                 }
                             }
@@ -988,6 +1030,40 @@ impl Tool for SearchTool {
             Ok(matches.join("\n"))
         }
     }
+}
+
+/// Total byte budget for a context-mode `search` result, so `context: N` over many hits can't flood
+/// the model's context window. Once exceeded, remaining hunks are dropped with a "narrow it" note.
+const SEARCH_CONTEXT_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+
+/// Build grep -C-style context hunks for one file: merge each match's `[i-ctx, i+ctx]` window with
+/// adjacent/overlapping windows so a cluster of nearby hits prints as ONE block, then render with
+/// ripgrep's convention — match lines as `path:lineno:`, context lines as `path:lineno-`, `--`
+/// between non-contiguous hunks. `hits` must be sorted ascending (it is, by construction).
+fn context_hunks(rel: &str, lines: &[&str], hits: &[usize], ctx: usize) -> Vec<String> {
+    let hit_set: std::collections::HashSet<usize> = hits.iter().copied().collect();
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    for &i in hits {
+        let lo = i.saturating_sub(ctx);
+        let hi = (i + ctx).min(lines.len().saturating_sub(1));
+        match windows.last_mut() {
+            // Merge when this window touches or overlaps the previous one.
+            Some((_, prev_hi)) if lo <= *prev_hi + 1 => *prev_hi = (*prev_hi).max(hi),
+            _ => windows.push((lo, hi)),
+        }
+    }
+    windows
+        .into_iter()
+        .map(|(lo, hi)| {
+            (lo..=hi)
+                .map(|n| {
+                    let sep = if hit_set.contains(&n) { ':' } else { '-' };
+                    format!("{rel}:{}{} {}", n + 1, sep, lines[n].trim_end())
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect()
 }
 
 /// List files matching a glob pattern, recursively. Skips hidden directories and `target/`.
@@ -1377,6 +1453,53 @@ mod tests {
 
         assert!(out.contains("a.txt:1:"), "got:\n{out}");
         assert!(out.contains("a.txt:2:"), "got:\n{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn search_context_shows_surrounding_lines() {
+        let dir = temp_dir("search-context");
+        std::fs::write(dir.join("a.txt"), "l1\nl2\nNEEDLE\nl4\nl5").unwrap();
+
+        let out = SearchTool
+            .run(&json!({
+                "query": "NEEDLE",
+                "path": dir.to_str().unwrap(),
+                "context": 1
+            }))
+            .await
+            .unwrap();
+
+        // match line uses `:`, context lines use `-`, only ±1 line shown
+        assert!(out.contains("a.txt:3: NEEDLE"), "got:\n{out}");
+        assert!(out.contains("a.txt:2- l2"), "got:\n{out}");
+        assert!(out.contains("a.txt:4- l4"), "got:\n{out}");
+        assert!(!out.contains("l1"), "context must not exceed N:\n{out}");
+        assert!(!out.contains("l5"), "context must not exceed N:\n{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn search_context_merges_adjacent_hits_into_one_hunk() {
+        let dir = temp_dir("search-context-merge");
+        std::fs::write(dir.join("a.txt"), "HIT\nmid\nHIT\nx\ny\nz\nHIT").unwrap();
+
+        let out = SearchTool
+            .run(&json!({
+                "query": "HIT",
+                "path": dir.to_str().unwrap(),
+                "context": 1
+            }))
+            .await
+            .unwrap();
+
+        // lines 1 and 3 (windows [1-2] and [2-4]) merge -> one hunk, no `--` between them;
+        // line 7 is separated by gap -> its own hunk after a `--`.
+        let sep_count = out.matches("\n--\n").count();
+        assert_eq!(
+            sep_count, 1,
+            "expected exactly one hunk separator, got:\n{out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
