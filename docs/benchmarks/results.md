@@ -2,49 +2,58 @@
 
 Forge's single most important job is the **harness**: be the best coding-agent harness, proven with
 metrics, on BOTH API and bridge/subscription models. This file records what has been **measured and
-reproduced** so far. Two kinds of evidence:
+reproduced** so far — honestly, including where the measurement turned out to contradict the goal.
 
-1. **Deterministic, in-repo proofs** (run in CI, no external setup) — locked down by tests.
-2. **SWE-bench resolve-rate** — the gold-standard external comparison; methodology in
-   [`swe-bench.md`](./swe-bench.md). Requires Docker + the `swebench` evaluator, so it is run
-   deliberately (see that doc) rather than in CI.
+> ## ⚠️ Correction (2026-06-26): the earlier "bridge token-efficiency superiority" claim was wrong
+> An initial measurement appeared to show Forge-through-the-bridge using **far fewer tokens** than the
+> raw `claude`/`codex` CLI. **That was an accounting bug**, not a real win: the bridge recorded only
+> claude's *uncached* `input_tokens` and dropped `cache_read`/`cache_creation` tokens, while the
+> raw-CLI metric counted them — so Forge looked ~10–150× cheaper purely from counting less.
+> Once **both** sides count input + cache-reads + cache-writes (fixed in this version), a fair
+> re-measure on a real SWE-bench instance (`psf__requests-1963`, same `sonnet` model) shows the
+> **opposite**:
+>
+> | | Forge-on-bridge (harness) | claude-cli direct |
+> |---|---|---|
+> | total tokens | **303,823** | **158,837** |
+> | wall time | 163s | **40s** |
+>
+> Forge's MCP-per-turn harness currently costs **~1.9× the tokens and ~4× the wall time** of the
+> native CLI loop (each MCP tool round-trip re-processes the growing context). On resolve rate it is
+> **tied** (1/3 vs 1/3 on a 3-instance Lite subset — too small to be conclusive either way).
+> **Conclusion: Forge does not yet beat the raw CLIs on efficiency or resolve rate.** Closing that gap
+> (fewer/batched MCP round-trips, aggressive context pruning, real per-turn resume during the loop) is
+> open work, not a settled result. Nothing below should be read as "bridge superiority is proven."
 
 ---
 
-## 1. Bridge subscription superiority — token efficiency ✓ MEASURED
+## 1. Bridge session-resume reduces *bytes streamed to the CLI* (an internal optimization)
 
-**Claim:** running a model *through Forge's bridge* sends far fewer tokens than the naive bridge
-would, by reusing the CLI's own session instead of re-streaming the whole transcript every turn.
+**What this is — and is NOT.** This measures the bytes Forge serializes to the CLI's stdin with
+session-resume on vs off. It is a **Forge-vs-Forge** optimization (don't re-stream the whole
+transcript each `complete()` call); it is **not** a token or subscription-usage comparison against
+the raw CLI, and it does **not** by itself mean Forge uses fewer billed tokens (claude prompt-caches
+the repeated transcript, so the byte saving largely does not translate to token savings — see the
+correction above).
 
-**Result:** for a realistic multi-step harness turn (a 4000-char system preamble + accumulating
-assistant/tool turns over **6 re-drives**), bridge session-resume sends:
-
-| | prompt bytes streamed to the CLI |
+| (4000-char preamble + accumulating turns over 6 re-drives) | prompt bytes streamed to the CLI |
 |---|---|
-| resume **off** (re-render full transcript each call) | **≈ 59,706** |
-| resume **on** (send only the new delta) | **≈ 4,221** |
-| **saving** | **≈ 92% fewer** |
-
-The gap **widens** as the transcript grows: resume-off is ~quadratic in turns (it re-sends
-everything each time), resume-on is ~linear in new content.
-
-**Why measured this way:** claude's own token accounting *hides* the saving — it prompt-caches the
-repeated transcript, so its reported `input_tokens` barely moves. The real, Forge-controlled cost is
-the bytes serialized + streamed to the CLI's stdin, which is what this measures.
+| resume **off** (re-render full transcript each call) | ≈ 59,706 |
+| resume **on** (send only the new delta) | ≈ 4,221 |
 
 **Reproduce (deterministic, no network):**
 ```bash
 cargo test -p forge-provider resume_sends_dramatically_fewer_prompt_bytes_over_a_turn -- --nocapture
 ```
 
-**Correctness, live-verified** (real CLIs, both bridges):
+**Correctness, live-verified** (real CLIs, both bridges) — resume preserves context end-to-end:
 ```bash
 cargo test -p forge-provider e2e_claude_resume_preserves_context_across_calls -- --ignored
 cargo test -p forge-provider e2e_codex_resume_preserves_context_across_calls  -- --ignored
 ```
-Each drives two real turns; the *resumed* turn recalls a fact established in turn 1 while only the
-delta was sent — proving context is preserved end-to-end. (Claude `--resume <id>`, Codex
-`exec resume <id>`; both ship in v0.4.9/v0.4.10.)
+Each drives two real turns; the *resumed* turn recalls a fact from turn 1 while only the delta was
+sent. (Claude `--resume <id>`, Codex `exec resume <id>`.) This is a real, working feature — it just
+isn't, on its own, evidence that Forge beats the raw CLI on tokens.
 
 ---
 
@@ -62,50 +71,40 @@ bug (the direct-path verification gate silently failing, fixed in v0.4.6).
 | Failure-loop halt | same error KIND across differing args → halt where the doom-loop can't see it | `failure_loop_halts_a_model_failing_the_same_way` |
 | Empty-response | bounded nudges then stop — never spin forever | `empty_response_is_nudged_then_stops_not_loops` |
 | Tool-call-as-text | narrated `<invoke>` that didn't execute → nudge, then end loudly (no phantom success) | `tool_call_written_as_text_never_silently_succeeds` |
-| Stall / no-progress | a stalled stream times out + fails over; a no-progress bridge halts loudly | `stalled_stream_*`, `cli_bridge_no_progress_stall_*` |
+| Untrusted-input fuzz | adversarial model output / bridge stdout / prompt-cap never panic + hold their contracts | `recovery_never_panics_*`, `bridge_line_parsers_never_panic_*`, `clamp_to_chars_never_*` |
 
-**Reproduce:** `cargo test -p forge-core` (all run in CI on every PR).
-
-The report tooling that produces the SWE-bench efficiency comparison is itself tested for arithmetic
-+ honesty (a partial token capture can never understate tok/success): `cargo test -p forge-cli
-summarize_agent tok_per_success`.
+**Reproduce:** `cargo test -p forge-core -p forge-provider` (all run in CI on every PR).
 
 ---
 
-## 3. SWE-bench resolve rate — methodology ready, run deliberately
+## 3. SWE-bench resolve rate — first real run (N=3, directional only)
 
-The external gold standard: same instances through `--agent forge` vs `--agent claude-code` /
-`--agent codex`, scored by the official evaluator, comparing **resolve rate AND tokens-per-success**.
-Full runbook in [`swe-bench.md`](./swe-bench.md) (`forge bench swe` → `swebench` evaluator → `forge
-bench report`). It needs Docker + multi-GB per-instance images + real model calls, so it is run as a
-deliberate, supervised session rather than in CI.
+Same instances through `--agent forge --model claude-cli::sonnet` (Forge harness on the claude bridge,
+harness mode, forced model — no mesh) vs `--agent claude-code --model sonnet` (claude's own CLI),
+scored by the official `swebench` Docker evaluator. Runbook: [`swe-bench.md`](./swe-bench.md).
 
-> Record the resulting numbers here (replace this note) once a run completes — the `forge bench
-> report` table for `--agent forge --model <bridge-id>` vs `--agent claude-code`, on the same model
-> family, is the headline bridge-superiority result.
+**First run — SWE-bench Lite, 3 instances (requests, flask, pylint):**
+
+| | resolved | tokens on the shared solve (pylint) | wall (pylint) |
+|---|---|---|---|
+| Forge-on-bridge | **1/3** | 11,718 out | 301s |
+| claude-cli direct | **1/3** | **2,405 out** | **49s** |
+
+Both solved `pylint-5859`; both failed `requests-1963` and `flask-4045` (incomplete fixes — the model
+under-scoped the issue; e.g. flask: got the blueprint-name dot check, missed the *endpoint* dot
+check). **Tied on resolve, and Forge was less efficient** (see the correction banner for the
+fair full-token numbers). N=3 is far too small to conclude — it is a directional baseline, not a
+verdict. A larger run (10–20+ instances) is needed before any resolve-rate claim.
 
 ---
 
-## Appendix — prediction-pipeline verified + a single-task token smoke
+## Appendix — the single-task token smoke was the source of the artifact (kept as a caution)
 
-The `forge bench swe` **prediction** pipeline (clone → real agent turn → capture patch) is verified
-end-to-end for **both** agent paths on a trivial real instance (`octocat/Hello-World`, "add a
-GREETING.txt"). Running it for the first time also **caught a real bug** — the patch was captured
-with a plain `git diff`, which drops untracked files, so any *new-file* solution scored as an empty
-patch (fixed in v0.4.19; now `git add -A` + `git diff --cached`).
-
-Observed token cost for that one task, **same underlying model (haiku)**:
-
-| agent | total tokens | patch |
-|---|---|---|
-| `--agent forge --model claude-cli::haiku` (Forge bridge) | **793** | ✓ 8 lines |
-| `--agent claude-code --model haiku` (Claude Code's own CLI) | **46,124** | ✓ 8 lines |
-
-**Read this honestly:** this is **one trivial task**, so the gap is dominated by *fixed
-per-invocation overhead* — Forge's harness disables claude's built-in tools (`--tools ""`) and
-serves a focused `mcp__forge` toolset, whereas `claude -p` ships its full system prompt + every
-built-in tool schema every run. On harder, multi-step tasks that overhead is amortized over more
-work, so the ratio **shrinks**. It is **not** a resolve-rate result and must not be quoted as a
-headline efficiency number. It *does* confirm (a) both comparison paths work end-to-end and (b) the
-direction of the bridge-efficiency thesis. The representative figure is the multi-instance
-`forge bench report` table from a full, Docker-scored run (see §3 / `swe-bench.md`).
+An earlier note here reported, for one trivial task (`octocat/Hello-World`), Forge-bridge **793**
+tokens vs claude-code **46,124** — and read it as evidence of the efficiency thesis. **That number is
+invalid** for the reason in the correction banner (the 793 dropped claude's cache-read tokens; the
+46,124 counted them). It is retained only as a documented caution: do not compare token totals across
+the bridge and the raw CLI unless both count cache reads + writes identically (now enforced in
+`cli_provider::usage_from` and `bench::parse_external_usage`). The smoke *did* legitimately catch a
+real bug — the patch was captured with a plain `git diff`, dropping new files, so any new-file
+solution scored empty (fixed in v0.4.19; now `git add -A` + `git diff --cached`).

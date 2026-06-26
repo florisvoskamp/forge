@@ -6,6 +6,22 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.33] - 2026-06-26
+
+### Fixed
+- **Bridge token accounting dropped cache-read/cache-write tokens — fixed (and corrected a false
+  "bridge is more efficient" claim).** The CLI bridge recorded only claude/codex's *uncached*
+  `input_tokens`, discarding `cache_read_input_tokens` + `cache_creation_input_tokens`. Forge's
+  `Usage.input_tokens` is defined as the *full* input the model processed (cached is a subset), so
+  this undercounted input **everywhere** — the statusline token gauge, cost display, and especially
+  the SWE-bench efficiency comparison, where the raw-CLI metric *did* count cache reads. That made
+  Forge-through-the-bridge look ~10–150× cheaper than the raw CLI purely as a counting artifact. Now
+  `cli_provider::usage_from` sums uncached + cache-read + cache-write, and `bench::parse_external_usage`
+  counts cache writes too, so both sides are apples-to-apples. A fair re-measure shows the *opposite*
+  of the old claim — Forge's MCP-per-turn harness currently costs **more** tokens than the native CLI
+  loop; `docs/benchmarks/results.md` is corrected accordingly with the real numbers
+  (`crates/forge-provider/src/cli_provider.rs`, `crates/forge-cli/src/bench.rs`).
+
 ## [0.4.32] - 2026-06-26
 
 ### Fixed
