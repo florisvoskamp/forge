@@ -3290,7 +3290,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                     .inject_bodies
                     .then_some(forge_index::BodyOpts {
                         max_tokens: self.config.lattice.body_max_tokens,
-                        max_hits: 3,
+                        max_hits: self.config.lattice.inject_body_hits,
                     });
                 // Hybrid: blend embedding neighbours of the prompt with structural hits. The
                 // backend is chosen by config (auto-picks the cheapest available); any backend

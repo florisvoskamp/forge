@@ -184,6 +184,11 @@ pub struct LatticeConfig {
     /// a signature line instead (injecting a huge body would cost more than the read it saves).
     #[serde(default = "default_body_max_tokens")]
     pub body_max_tokens: usize,
+    /// How many of the top-ranked symbols get their FULL body injected (the rest stay signature
+    /// lines). Higher = more aggressive front-loading: the model reads more from context up front
+    /// instead of `read_file`/`search`-ing for it. Capped further by `inject_token_budget`.
+    #[serde(default = "default_inject_body_hits")]
+    pub inject_body_hits: usize,
     /// Future hook for `forge lattice map`: when true, group the map output by importance tier
     /// (high / medium / low pagerank bands) rather than by file path. Not yet wired into the
     /// agent turn loop — present so it can be set in config ahead of the feature landing.
@@ -247,6 +252,7 @@ impl Default for LatticeConfig {
             embeddings: EmbeddingsConfig::default(),
             inject_bodies: default_inject_bodies(),
             body_max_tokens: default_body_max_tokens(),
+            inject_body_hits: default_inject_body_hits(),
             map_orientation: false,
         }
     }
@@ -254,6 +260,10 @@ impl Default for LatticeConfig {
 
 fn default_inject_bodies() -> bool {
     true
+}
+
+fn default_inject_body_hits() -> usize {
+    3
 }
 
 fn default_body_max_tokens() -> usize {
