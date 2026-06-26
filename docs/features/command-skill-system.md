@@ -507,11 +507,11 @@ exist** — the orchestrate skill's "survey available skills" step found the CLI
 - Attached at the composition root: `Session::set_skills(Arc<Catalog>)` (forge-cli
   `build_session_with`); only advertised when the catalog is non-empty.
 
-## Update — `forge skill export` (the inverse of import)
+## Update — `forge skill export` / `forge skill import` (the round-trip)
 
-`forge import <tool>` copies an external tool's commands/skills/agents *into* Forge. The export
-direction completes the round-trip so a user can move their Forge library to another machine or
-share it:
+`forge import <tool>` copies an external tool's commands/skills/agents *into* Forge. The export +
+bundle-import directions complete the round-trip so a user can move their Forge library to another
+machine or share it:
 
 - **`forge skill export <dir> [--scope user|project|all]`** (forge-cli `skills_export`) writes
   `<dir>/commands`, `<dir>/skills`, `<dir>/agents` — the **same on-disk layout** `forge import`
@@ -525,5 +525,12 @@ share it:
   `count_copy_md_files`.
 - Prints a tally (`N command(s), N skill(s), N agent(s)`), notes how many were already present, and
   surfaces any malformed sources — mirroring the import UX.
-- Tested end-to-end (project-scope round-trip of commands+skill+resources+agent, plus idempotent
-  re-run) and a hermetic unit test for the agent copy.
+- **`forge skill import <dir> [--scope user|project]`** (forge-cli `skills_import`) is the inverse:
+  it reads a bundle's `<dir>/{commands,skills,agents}` (as written by export) through the same
+  catalog readers + `copy_catalog_assets`/`count_copy_md_files`, merging into the chosen scope
+  (`user` default, or `project` → `./.forge`). Anything already present is kept; malformed files are
+  skipped + warned. So `forge skill export` on one machine → move the directory → `forge skill
+  import` on another fully round-trips a library.
+- Tested end-to-end (export → import round-trip across two project dirs, with a skill's resource file
+  surviving + an idempotent re-import) plus hermetic unit tests for the agent copy and the
+  skill-directory-with-resources copy.

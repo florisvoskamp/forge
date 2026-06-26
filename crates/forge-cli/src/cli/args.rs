@@ -437,6 +437,21 @@ pub(crate) enum SkillCmd {
         #[arg(long, default_value = "all")]
         scope: ExportScope,
     },
+    /// Import a Forge bundle (a directory produced by `forge skill export`) — the inverse of export,
+    /// closing the round-trip. Reads `<src>/{commands,skills,agents}` and merges them into your
+    /// skills via the real catalog readers (malformed files skipped + warned); anything already
+    /// present is kept, never overwritten.
+    ///
+    /// Examples:
+    ///   forge skill import ./my-forge-skills
+    ///   forge skill import /tmp/bundle --scope project
+    Import {
+        /// Source bundle directory (as written by `forge skill export`).
+        src: std::path::PathBuf,
+        /// Where to import: `user` (default) or `project` (`.forge/`).
+        #[arg(long, default_value = "user")]
+        scope: SkillScope,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]

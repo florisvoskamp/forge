@@ -142,6 +142,43 @@ fn copy_catalog_assets_imports_then_skips_existing() {
 }
 
 #[test]
+fn copy_catalog_assets_copies_skill_dir_with_resources() {
+    // A skill is a DIRECTORY (SKILL.md + declared resource files). The export/import round-trip must
+    // copy the whole directory, not just SKILL.md — otherwise a re-imported skill loses its
+    // resources. This backs both `forge skill export` and `forge skill import`.
+    let root = std::env::temp_dir().join(format!("forge-skdir-{}", forge_types::new_id()));
+    let skills_src = root.join("skills");
+    let cmd_dst = root.join("out/commands");
+    let skill_dst = root.join("out/skills");
+    std::fs::create_dir_all(skills_src.join("refactor")).unwrap();
+    std::fs::write(
+        skills_src.join("refactor/SKILL.md"),
+        "---\nname: refactor\ndescription: refactor methodology\nresources: [notes.md]\n---\n\nDo it.",
+    )
+    .unwrap();
+    std::fs::write(skills_src.join("refactor/notes.md"), "supporting notes\n").unwrap();
+
+    let sources = forge_skills::Sources {
+        commands: vec![],
+        skills: vec![forge_skills::ScopedDir {
+            scope: forge_skills::Scope::User,
+            path: skills_src.clone(),
+        }],
+    };
+    let cat = forge_skills::Catalog::load(&sources);
+
+    let counts = copy_catalog_assets(&cat, &cmd_dst, &skill_dst);
+    assert_eq!(counts.copied_skills, 1, "the skill directory was copied");
+    assert!(skill_dst.join("refactor/SKILL.md").exists());
+    assert!(
+        skill_dst.join("refactor/notes.md").exists(),
+        "the skill's resource file must round-trip, not just SKILL.md"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn export_copies_agent_md_files_then_skips_existing() {
     // `forge skill export` copies agents via count_copy_md_files (the catalog only tracks
     // commands+skills). Verify the agent copy: `.md` files are copied, non-md ignored, re-run skips.

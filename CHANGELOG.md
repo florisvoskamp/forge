@@ -6,6 +6,21 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-06-26
+
+Harness reliability + import/export round-trip.
+
+### Added
+- **`forge skill export <dir>` and `forge skill import <dir>`** — a portable bundle round-trip for your commands/skills/agents (the inverse of `forge import`), so a library can be moved to another machine or shared. Reuses the import copy machinery; idempotent (existing files kept) (`crates/forge-cli/src/cli/commands/skill.rs`).
+- **Structured hook directive protocol** — a `PreToolUse`/`PostToolUse` hook can emit `{action: rewrite|inject|block|allow}` on stdout. `inject` feeds model-visible context (lint output, "this file is generated") via `pending_hints` — the first way a hook can *teach* the model, not just gate it. Back-compatible with the bare-object rewrite (`crates/forge-core/src/hooks.rs`).
+- **Per-provider subagent fan-out cap** — `[mesh.subagents] max_per_provider` (default 2): each child also acquires a per-provider permit, so a burst routed to one subscription/key can't drain a single quota in parallel (`crates/forge-core/src/subagent.rs`).
+
+### Changed
+- **The objective completion-verification gate now guards the direct-API path too**, not just the CLI bridge — extracted into one shared `completion_gate` authority. A direct model that marks every task Done without a real tool-grounded state check is gated identically to a bridge (`crates/forge-core/src/lib.rs`).
+
+### Fixed
+- **Command namespace is preserved when copying** (import/export): a subdir command `git/commit.md` (name `git:commit`) no longer flattens to `commit.md`, which dropped the namespace and silently clobbered same-named commands from different namespaces (`crates/forge-cli/src/cli/commands/import.rs`).
+
 ## [0.4.4] - 2026-06-25
 
 Patch release: mesh routing now factors tool-call reliability to avoid auto-selecting tool-leaky models.
