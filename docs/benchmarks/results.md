@@ -77,7 +77,7 @@ bug (the direct-path verification gate silently failing, fixed in v0.4.6).
 
 ---
 
-## 3. SWE-bench resolve rate — Forge-on-bridge vs claude-cli (N=10, fair accounting)
+## 3. SWE-bench resolve rate — Forge-on-bridge vs claude-cli (N=10→20, fair accounting)
 
 `--agent forge --model claude-cli::sonnet` (Forge harness on the claude bridge, harness mode, forced
 model — no mesh) vs `--agent claude-code --model sonnet` (claude's own CLI), same instances, scored by
@@ -130,6 +130,23 @@ cheaper — while solving 50% more bugs (6 vs 4).** So Forge-on-bridge is genuin
 CLI on *both* axes that matter: more solved, *and* lower cost per solve. Total tokens are 1.39× because
 it does more total work (solving 6 vs 4). (N=10 — a clean fair-accounted signal, not a large-sample
 proof; the per-resolve edge is small and would firm up or soften with more instances.)
+
+**Firming run — N=20 (the N=10 above + 10 fresh instances).** Same arms, 10 new Lite instances
+(requests/flask/pylint/sphinx/pytest/scikit-learn/sympy/django/seaborn/xarray), scored by the same
+official evaluator:
+
+| (N=20, same model, loop-gated completeness) | resolved | total tokens | **tokens / resolve** |
+|---|---|---|---|
+| claude-cli direct | 9/20 | 12.16M | 1.35M |
+| **Forge loop-gated** | **11/20** | 13.18M | **1.20M** |
+
+The win **holds and gets cleaner at N=20**: Forge resolves **11 vs 9** (3 Forge-only solves —
+`pylint-5859`, `pytest-11148`, `pytest-5103`; 1 claude-cli-only — `requests-2317`), at **~11% lower
+cost per resolve** (1.20M vs 1.35M), and **total tokens fall to 1.08×** — near parity, down from the
+N=10 1.39× (the second batch's per-instance token use was more comparable). **Honest caveat:** on the
+*new* 10 instances alone, the two arms **tied 5/5** — the +2 net edge comes from the first batch, so
+the resolve advantage is real but **modest** (+2 of 20). The direction is consistent across both
+batches (Forge never behind on either), but a still-larger N would tighten the resolve margin.
 
 `forge bench swe` also bounds the in-process Forge turn by `--timeout-secs` (was unbounded → one
 instance ran 22 minutes). Remaining structural gap: median per-step MCP latency (Forge ~3× claude-code's

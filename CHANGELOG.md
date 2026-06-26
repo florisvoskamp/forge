@@ -6,6 +6,17 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.39] - 2026-06-26
+
+### Changed
+- **SWE-bench firming run extended to N=20** (`docs/benchmarks/results.md`). The N=10 Forge-on-bridge
+  vs claude-cli result was re-measured on 20 instances (the original 10 + 10 fresh Lite instances),
+  same model, same official evaluator. The win **holds and gets cleaner**: Forge loop-gated resolves
+  **11/20 vs claude-cli's 9/20** at **~11% lower cost per resolve** (1.20M vs 1.35M tokens/resolve),
+  and total tokens fall to **1.08×** (near parity, down from N=10's 1.39×). Reported straight,
+  including the honest caveat that the *new* 10 instances tied 5/5 — the +2 net edge comes from the
+  first batch, so the resolve advantage is real but modest.
+
 ## [0.4.38] - 2026-06-26
 
 ### Added
