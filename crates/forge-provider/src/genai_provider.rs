@@ -407,18 +407,42 @@ fn is_capability_failure(text: &str) -> bool {
     // Tool/function-calling unsupported, robust to punctuation/wording: a tool-or-function term
     // co-occurring with a "not supported / does not support" phrase. Catches e.g.
     // "`tool calling` is not supported with this model" and "model does not support tool use".
-    let mentions_tools = l.contains("tool calling")
-        || l.contains("tool use")
-        || l.contains("tool_use")
-        || l.contains("tool calls")
-        || l.contains("function calling")
-        || l.contains("function-calling")
-        || l.contains("function call");
-    let unsupported = l.contains("not supported")
-        || l.contains("does not support")
-        || l.contains("isn't supported")
-        || l.contains("unsupported");
-    mentions_tools && unsupported
+    //
+    // PROXIMITY-gated: the two terms must be NEAR each other (same clause), not merely both present
+    // somewhere in the body. Anywhere-co-occurrence produced false positives — e.g. "tool use works
+    // fine, but JSON/structured-output mode is not supported" would wrongly mark the model as
+    // permanently incapable of tool calling and exclude it for a week.
+    const TOOL_TERMS: &[&str] = &[
+        "tool calling",
+        "tool use",
+        "tool_use",
+        "tool calls",
+        "function calling",
+        "function-calling",
+        "function call",
+    ];
+    const UNSUPPORTED_TERMS: &[&str] = &[
+        "not supported",
+        "does not support",
+        "isn't supported",
+        "unsupported",
+    ];
+    const PROXIMITY: usize = 60;
+    let tool_positions: Vec<usize> = TOOL_TERMS
+        .iter()
+        .flat_map(|t| l.match_indices(t).map(|(i, _)| i))
+        .collect();
+    if tool_positions.is_empty() {
+        return false;
+    }
+    UNSUPPORTED_TERMS.iter().any(|u| {
+        l.match_indices(u).any(|(up, _)| {
+            tool_positions.iter().any(|&tp| {
+                let (lo, hi) = if tp <= up { (tp, up) } else { (up, tp) };
+                hi - lo <= PROXIMITY
+            })
+        })
+    })
 }
 
 /// Classify from an HTTP status code. `body` is the raw provider response (inspected for
@@ -1025,6 +1049,31 @@ mod tests {
         let dropped = classify_text("connection reset by peer", "stream dropped".into());
         assert!(matches!(dropped, ProviderError::Unavailable(_)));
         assert!(!dropped.is_permanent());
+    }
+
+    #[test]
+    fn capability_failure_requires_tool_and_unsupported_to_be_near() {
+        // Near each other (same clause) → genuine capability failure.
+        assert!(is_capability_failure(
+            "`tool calling` is not supported with this model"
+        ));
+        assert!(is_capability_failure(
+            "this model does not support tool use"
+        ));
+        assert!(is_capability_failure("unsupported: function calling"));
+
+        // Both terms present but FAR apart in unrelated clauses → NOT a capability failure (the old
+        // anywhere-match bug would have wrongly excluded the model for a week).
+        assert!(!is_capability_failure(
+            "Tool use works fine on this model. However, JSON / structured-output response_format \
+             mode is not supported for the requested configuration."
+        ));
+        // "unsupported" about something unrelated, with tools merely mentioned far earlier.
+        assert!(!is_capability_failure(
+            "Your tool calls executed successfully and were applied to the working tree without \
+             any error at all. As a separate and entirely unrelated note, the deprecated \
+             temperature override flag is unsupported."
+        ));
     }
 
     #[test]
