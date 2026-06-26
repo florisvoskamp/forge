@@ -6268,6 +6268,70 @@ mod tests {
         );
     }
 
+    /// Writes a tool call as TEXT (markup the provider didn't decode into a structured call) with NO
+    /// real tool_calls — so nothing executes. Models the phantom-release failure mode.
+    struct ToolCallAsTextProvider;
+    #[async_trait::async_trait]
+    impl Provider for ToolCallAsTextProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            Ok(forge_provider::ModelResponse {
+                // `<invoke …>` markup is detected by `looks_like_unexecuted_tool_call`, but with no
+                // structured `tool_calls` it never runs — the honest-failure guard must catch it.
+                content: "I'll do it now: <invoke name=\"shell\">git push</invoke>".into(),
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_written_as_text_never_silently_succeeds() {
+        // A model that writes a tool call as text (and the provider didn't recover it) did NOTHING —
+        // accepting that narration as a final answer is the phantom-success bug. The honest-failure
+        // guard must nudge it to actually call the tool, then — if it persists — end LOUDLY rather
+        // than report success.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(ToolCallAsTextProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        session.run_turn("push the commit").await.unwrap();
+
+        let warnings: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PresenterEvent::Warning(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            warnings.iter().any(|w| w.contains("tool call as text")),
+            "a narrated tool call should be nudged to actually execute; warnings: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("never executed")),
+            "if it persists, the turn must end loudly (not a phantom success); warnings: {warnings:?}"
+        );
+    }
+
     #[test]
     fn parse_plan_reads_fields_and_filters_empty_steps() {
         let v = serde_json::json!({
