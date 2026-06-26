@@ -577,7 +577,13 @@ Instead call `mcp__forge__shell` in POLL mode: pass `poll_until_exit_zero: true`
 status command (e.g. `gh run view <id> --json status,conclusion -q '.status'` returning non-zero \
 until complete, or `gh run watch <id> --exit-status` which exits 0 on success), and call it again \
 each time it returns \"not ready ... call again\" until it reports ready. Only end your turn once \
-the goal is fully achieved and every task is resolved.";
+the goal is fully achieved and every task is resolved.\n\n\
+Completeness — before you finish: RE-READ the original request/issue and check your change against \
+EVERY requirement and case it describes, not just the first. Requests routinely specify multiple \
+conditions (e.g. \"reject a dotted blueprint name AND a dotted endpoint\"); a fix that handles only \
+one of them is INCOMPLETE and will fail. List the distinct requirements the request states, confirm \
+each is handled by your change (verify with a real `mcp__forge__` read/shell check, not from \
+memory), and address any you missed before ending the turn.";
 
 /// Prepend the harness tool-preamble in harness mode; pass the prompt through unchanged
 /// otherwise (Phase-1 self-agent turns keep their own tools).
