@@ -303,6 +303,76 @@ fn tool_batch_signature(calls: &[forge_types::ToolCall]) -> u64 {
     h.finish()
 }
 
+/// Coarse class of a tool *failure*, used by the failure-loop guard. The point is to catch a model
+/// stuck repeating the same KIND of error across DIFFERENT arguments — which the identical-call
+/// doom-loop ([`tool_batch_signature`]) can't see (its signature changes when the args change).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FailureKind {
+    NotFound,
+    Permission,
+    Validation,
+    Timeout,
+    Other,
+}
+
+impl FailureKind {
+    fn label(self) -> &'static str {
+        match self {
+            FailureKind::NotFound => "not found",
+            FailureKind::Permission => "permission denied",
+            FailureKind::Validation => "invalid input",
+            FailureKind::Timeout => "timed out",
+            FailureKind::Other => "error",
+        }
+    }
+}
+
+/// Classify a tool RESULT string as a failure of a given kind, or `None` if it looks like a success.
+///
+/// Anchored on the markers Forge actually produces for failures (`invoke_tool` returns `"error: …"`
+/// for a tool `Err`, `"permission denied by policy"` for a blocked call, and [`shell_command_failed`]
+/// recognises a non-zero shell exit) — so a *successful* tool output that merely happens to contain a
+/// word like "invalid" is NOT misread as a failure. The category is then a keyword sniff of the
+/// message. Only consumed behind a ≥3 threshold, so the worst case of a misclassification is one
+/// early, still-helpful "change approach" nudge.
+fn classify_tool_failure(result: &str) -> Option<FailureKind> {
+    let lower = result.to_ascii_lowercase();
+    let is_failure = lower.starts_with("error:")
+        || lower.starts_with("permission denied")
+        || shell_command_failed(result);
+    if !is_failure {
+        return None;
+    }
+    let kind = if lower.contains("permission denied")
+        || lower.contains("forbidden")
+        || lower.contains("access is denied")
+        || lower.contains("eacces")
+    {
+        FailureKind::Permission
+    } else if lower.contains("no such file")
+        || lower.contains("not found")
+        || lower.contains("does not exist")
+        || lower.contains("cannot find")
+        || lower.contains("no matches found")
+    {
+        FailureKind::NotFound
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        FailureKind::Timeout
+    } else if lower.contains("invalid")
+        || lower.contains("no match")
+        || lower.contains("old_string")
+        || lower.contains("expected")
+        || lower.contains("malformed")
+        || lower.contains("could not parse")
+        || lower.contains("unexpected")
+    {
+        FailureKind::Validation
+    } else {
+        FailureKind::Other
+    };
+    Some(kind)
+}
+
 /// The live context-fill token count to report on the gauge for `model` after a call.
 ///
 /// For a direct API model the provider's reported `input_tokens` IS the request size, the truest
@@ -2140,6 +2210,13 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         // ever hard-stops, so a repeated call doesn't kill an otherwise-recoverable turn.
         let mut continue_nudges = 0usize;
         let mut doom_nudged = false;
+        // Failure-loop guard (complements the identical-call doom-loop): counts tool failures by
+        // (tool name, error kind) ACROSS the turn, so a model retrying the same KIND of error with
+        // different args (edits that never match, reads of paths that don't exist) is caught even
+        // though its call signature keeps changing. A success on a tool clears its streak.
+        let mut failure_counts: std::collections::HashMap<(String, FailureKind), usize> =
+            std::collections::HashMap::new();
+        let mut failure_nudged = false;
         // `toolcall_repair_nudges`: bounded retries when a direct model writes a tool call as TEXT
         // (`<invoke>` / `default_api:` markup) that the provider couldn't decode AND the text
         // recovery pass missed — so nothing executed. Without this the narration is accepted as a
@@ -2748,6 +2825,14 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                 // Execute each requested tool through the permission broker, serially.
                 for call in &resp.tool_calls {
                     let result = self.invoke_tool(&msg_id, call).await?;
+                    match classify_tool_failure(&result) {
+                        Some(kind) => {
+                            *failure_counts.entry((call.name.clone(), kind)).or_insert(0) += 1;
+                        }
+                        // A success on this tool means progress — clear its failure streaks so an
+                        // earlier rough patch doesn't later trip the guard after the model recovered.
+                        None => failure_counts.retain(|(nm, _), _| nm != &call.name),
+                    }
                     let seq = self.next_seq();
                     self.store.add_message_full(
                         &self.id,
@@ -2769,6 +2854,50 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                             .add_message(&self.id, hseq, Role::System, &hint, None);
                         self.transcript.push(Message::system(hint));
                     }
+                }
+            }
+
+            // Failure-loop guard: a tool that keeps failing the SAME way (across differing args) is
+            // making no progress and burning the step/token budget — invisible to the identical-call
+            // doom-loop above. Two-stage like that guard: nudge a change of approach once, then halt
+            // if it persists. (Only the serial path populates `failure_counts`; the concurrent
+            // read-only batch is cheap and already covered by the identical-call guard.)
+            const FAILURE_LOOP_THRESHOLD: usize = 3;
+            if let Some((tool, kind, n)) = failure_counts
+                .iter()
+                .filter(|(_, &c)| c >= FAILURE_LOOP_THRESHOLD)
+                .max_by_key(|(_, &c)| c)
+                .map(|((nm, k), &c)| (nm.clone(), *k, c))
+            {
+                if !failure_nudged {
+                    failure_nudged = true;
+                    self.presenter.emit(PresenterEvent::Warning(format!(
+                        "`{tool}` failed {n}× the same way ({}) — nudging a change of approach",
+                        kind.label()
+                    )));
+                    let nudge = format!(
+                        "Your `{tool}` calls keep failing with the same kind of error ({}). \
+                         Repeating the same approach won't change that. Diagnose the root cause \
+                         first (re-read the file / inspect the actual state), then take a DIFFERENT \
+                         approach — or if you're genuinely blocked, say so plainly. Do not keep \
+                         retrying the same way.",
+                        kind.label()
+                    );
+                    let nseq = self.next_seq();
+                    let _ = self
+                        .store
+                        .add_message(&self.id, nseq, Role::System, &nudge, None);
+                    self.transcript.push(Message::system(nudge));
+                    // Fresh slate after the nudge: only halt if it loops AGAIN, and don't let a
+                    // stale pre-nudge streak trip the halt when the model is now trying something new.
+                    failure_counts.clear();
+                } else {
+                    self.presenter.emit(PresenterEvent::Warning(format!(
+                        "`{tool}` kept failing ({}) after a nudge — stopping to avoid a wasted loop",
+                        kind.label()
+                    )));
+                    hit_step_cap = false;
+                    break;
                 }
             }
         }
@@ -8301,6 +8430,42 @@ mod tests {
         assert_eq!(tool_batch_signature(&a), tool_batch_signature(&a2));
         assert_ne!(tool_batch_signature(&a), tool_batch_signature(&b));
         assert_ne!(tool_batch_signature(&a), tool_batch_signature(&c));
+    }
+
+    #[test]
+    fn classify_tool_failure_detects_kinds_and_ignores_success() {
+        assert_eq!(
+            classify_tool_failure("error: No such file or directory (os error 2)"),
+            Some(FailureKind::NotFound)
+        );
+        assert_eq!(
+            classify_tool_failure("permission denied by policy"),
+            Some(FailureKind::Permission)
+        );
+        assert_eq!(
+            classify_tool_failure("error: no match for the given old_string"),
+            Some(FailureKind::Validation)
+        );
+        assert_eq!(
+            classify_tool_failure("error: the request timed out after 30s"),
+            Some(FailureKind::Timeout)
+        );
+        assert_eq!(
+            classify_tool_failure("error: the connection was reset by peer"),
+            Some(FailureKind::Other)
+        );
+        // "not found" wins over the validation hint when both appear — fine; the guard only needs a
+        // STABLE bucket so repeats of the same failure accumulate together.
+        assert_eq!(
+            classify_tool_failure("error: old_string not found in file"),
+            Some(FailureKind::NotFound)
+        );
+        // Successful output that merely mentions a scary word must NOT be read as a failure.
+        assert_eq!(
+            classify_tool_failure("fn validate() { /* reject invalid states */ }"),
+            None
+        );
+        assert_eq!(classify_tool_failure("file written"), None);
     }
 
     #[test]
