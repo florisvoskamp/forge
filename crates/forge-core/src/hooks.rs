@@ -393,6 +393,9 @@ mod tests {
 
     // --- Structured directive protocol (completes the hooks system: rewrite / inject / block) ---
 
+    // Windows cmd.exe preserves the single quotes in `echo '{…}'`, so the JSON directive can't be
+    // emitted from a hook this way; the directive parsing is pure Rust, exercised on Linux + macOS.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn inject_action_queues_context_not_a_note() {
         let hooks = vec![hook(
@@ -406,6 +409,7 @@ mod tests {
         assert_eq!(o.injected_context, vec!["this file is auto-generated"]);
     }
 
+    #[cfg(not(windows))] // Windows cmd echo keeps the single quotes around JSON (see note above).
     #[tokio::test]
     async fn inject_action_works_on_posttooluse_too() {
         let hooks = vec![hook(
@@ -417,6 +421,7 @@ mod tests {
         assert!(o.notes.is_empty());
     }
 
+    #[cfg(not(windows))] // Windows cmd echo keeps the single quotes around JSON (see note above).
     #[tokio::test]
     async fn rewrite_action_replaces_args() {
         let hooks = vec![hook(
@@ -429,6 +434,7 @@ mod tests {
         assert!(o.injected_context.is_empty());
     }
 
+    #[cfg(not(windows))] // Windows cmd echo keeps the single quotes around JSON (see note above).
     #[tokio::test]
     async fn block_action_blocks_pretooluse_with_reason() {
         let hooks = vec![hook(
@@ -454,6 +460,7 @@ mod tests {
         assert!(o.notes.iter().any(|n| n.contains("too late")));
     }
 
+    #[cfg(not(windows))] // Windows cmd echo keeps the single quotes around JSON (see note above).
     #[tokio::test]
     async fn allow_action_is_a_clean_noop() {
         let hooks = vec![hook(HookEvent::PreToolUse, "echo '{\"action\":\"allow\"}'")];
