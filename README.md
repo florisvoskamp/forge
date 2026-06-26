@@ -29,7 +29,7 @@ $ forge lattice query "UserRepository"
 | Category | Features |
 |----------|----------|
 | **Model Mesh** | Auto-discovery, cost-tiered routing, benchmark ranking, health-aware failover, subscription bridges, daily/weekly/monthly budget caps, credit-conservation modes |
-| **Providers** | Anthropic, OpenAI, Ollama, Claude Code CLI, Codex CLI, Groq, Gemini, DeepSeek, OpenRouter, xAI, Cerebras, and more |
+| **Providers** | Anthropic, OpenAI, Ollama, Claude Code CLI, Codex CLI, Antigravity CLI (free Gemini), Groq, Gemini, DeepSeek, OpenRouter, xAI, Cerebras, and more |
 | **Local LLMs** | `forge local` detects your hardware, recommends a Gemma model that fits, installs + runs it via Ollama (auto-installing Ollama if needed), opt-in autostart; animated picker menu |
 | **Planning mode** | `/plan` investigates read-only and proposes a plan; `/execute` approves it and carries it out |
 | **Code Intelligence** | Lattice: tree-sitter symbol graph (9 languages), semantic embeddings, hybrid retrieval, blast-radius, call-chain, git provenance |
@@ -164,6 +164,7 @@ Inspect any routing decision live with `/mesh [task]` or `forge mesh "<task>"`.
 | Ollama | Local (no key) | Any local model |
 | Claude Code CLI | Subscription bridge | Uses your Claude subscription |
 | Codex CLI | Subscription bridge | Uses your OpenAI subscription |
+| Antigravity CLI (`agy`) | Subscription bridge | **Free Gemini** (3.5 Flash / 3.1 Pro) + proxied Claude/GPT; $0 |
 | Groq | Direct (API key) | Free tier available |
 | Gemini | Direct (API key) | Free tier available |
 | DeepSeek | Direct (API key) | |
