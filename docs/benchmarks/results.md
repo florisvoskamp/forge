@@ -83,3 +83,29 @@ deliberate, supervised session rather than in CI.
 > Record the resulting numbers here (replace this note) once a run completes — the `forge bench
 > report` table for `--agent forge --model <bridge-id>` vs `--agent claude-code`, on the same model
 > family, is the headline bridge-superiority result.
+
+---
+
+## Appendix — prediction-pipeline verified + a single-task token smoke
+
+The `forge bench swe` **prediction** pipeline (clone → real agent turn → capture patch) is verified
+end-to-end for **both** agent paths on a trivial real instance (`octocat/Hello-World`, "add a
+GREETING.txt"). Running it for the first time also **caught a real bug** — the patch was captured
+with a plain `git diff`, which drops untracked files, so any *new-file* solution scored as an empty
+patch (fixed in v0.4.19; now `git add -A` + `git diff --cached`).
+
+Observed token cost for that one task, **same underlying model (haiku)**:
+
+| agent | total tokens | patch |
+|---|---|---|
+| `--agent forge --model claude-cli::haiku` (Forge bridge) | **793** | ✓ 8 lines |
+| `--agent claude-code --model haiku` (Claude Code's own CLI) | **46,124** | ✓ 8 lines |
+
+**Read this honestly:** this is **one trivial task**, so the gap is dominated by *fixed
+per-invocation overhead* — Forge's harness disables claude's built-in tools (`--tools ""`) and
+serves a focused `mcp__forge` toolset, whereas `claude -p` ships its full system prompt + every
+built-in tool schema every run. On harder, multi-step tasks that overhead is amortized over more
+work, so the ratio **shrinks**. It is **not** a resolve-rate result and must not be quoted as a
+headline efficiency number. It *does* confirm (a) both comparison paths work end-to-end and (b) the
+direction of the bridge-efficiency thesis. The representative figure is the multi-instance
+`forge bench report` table from a full, Docker-scored run (see §3 / `swe-bench.md`).

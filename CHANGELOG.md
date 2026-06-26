@@ -6,6 +6,16 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.20] - 2026-06-26
+
+### Added
+- **`docs/benchmarks/results.md`: recorded the verified prediction pipeline + a single-task token
+  smoke.** Both `forge bench swe` agent paths (`--agent forge`, `--agent claude-code`) are verified
+  end-to-end on a real instance. A single trivial task on the same model produced 793 tokens via the
+  Forge bridge vs 46,124 via Claude Code's own CLI — documented with explicit caveats (overhead-
+  dominated on a trivial task, NOT a resolve-rate result; the representative figure needs the full
+  Docker-scored run). Confirms the comparison harness works and the direction of the efficiency thesis.
+
 ## [0.4.19] - 2026-06-26
 
 ### Fixed
