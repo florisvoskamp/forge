@@ -92,6 +92,38 @@ done
 Use the **same model family** across agents (e.g. Forge pinned to `anthropic::claude-…` vs
 `--agent claude-code --model …`) to isolate the harness from the model.
 
+## Efficiency: resolve rate AND tokens-per-success
+
+Resolve rate alone doesn't capture the goal "Forge gets **more out of a subscription** than the
+native CLI". Every `bench swe` run also writes a metrics sidecar `<out>.metrics.jsonl` — one row
+per instance with `input_tokens`, `output_tokens`, `cost_usd`, `wall_secs`, `patched`, and
+`metrics_complete`:
+
+- **Forge agent:** tokens/cost are read from Forge's own usage DB (`session_usage_db`) — reliable,
+  and it captures **bridge** usage too (subscription turns).
+- **External CLI:** best-effort from the CLI's machine output (`claude --output-format json`;
+  `codex --json`). When nothing parseable comes back, the row is flagged `metrics_complete=false`
+  so the report never invents a number.
+
+Join the metrics with the official eval reports to get the headline table:
+
+```bash
+forge bench report \
+  --metrics preds-forge.metrics.jsonl --metrics preds-claude.metrics.jsonl \
+  --eval forge.forge.json            --eval claude.claude.json
+```
+
+```
+agent              n  patched  resolved   tok/success   mean cost    mean s
+forge             20       18  13 (65%)         48210     $0.0210      52.3
+claude-code       20       17  13 (65%)         71840     $0.0312      61.0
+```
+
+`tok/success` = total tokens spent across the run ÷ resolved instances (lower is better). The
+**bridge-superiority claim** is proven when, for the *same underlying model*, `--agent forge
+--model <bridge-id>` matches-or-beats `--agent claude-code`'s resolve rate at a **lower
+tok/success**. Omit `--eval` to print token/patch stats before you've scored.
+
 ## Multiple seeds / pass@k (smoothing model variance)
 
 The models are non-deterministic, so a single run jitters ±1 on a small set. Run several seeds and
