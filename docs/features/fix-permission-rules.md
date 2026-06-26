@@ -9,6 +9,15 @@
 > Built-in safety denies (e.g. `rm -rf /`, secret reads) ship on by default. No Rust here —
 > design + insertion points only.
 
+> **Built-in secret floor (shipped, `forge_config::builtin_deny_rules`).** `read_file`/`list_dir`
+> and the common shell read verbs (`cat`/`type`/`less`/`head`/`tail`/`cp`/`copy`) are denied for
+> dotenv files **including variants** (`.env`, `.env.local`, `.env.production`, …), private keys
+> (`*.pem`/`*.key`/`id_rsa`/`id_ed25519`/`id_ecdsa`/`id_dsa`, all of `~/.ssh`), cert bundles
+> (`*.p12`/`*.pfx`/`*.jks`/`*.keystore`), and cloud/registry/cluster credentials (`.aws/credentials`,
+> `.git-credentials`, `.netrc`, `.npmrc`, `.pypirc`, `.kube/config`, `.docker/config.json`,
+> `~/.config/gcloud/**`, `~/.gnupg/**`). This floor is unoverridable — it beats `bypass` and any
+> project `allow`.
+
 ---
 
 ## 1. Problem (JTBD)

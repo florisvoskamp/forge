@@ -558,6 +558,48 @@ mod tests {
     }
 
     #[test]
+    fn builtin_secret_denylist_covers_env_variants_and_keys() {
+        // Exercises the REAL forge_config::builtin_deny_rules() end-to-end through decide(), so the
+        // expanded secret list is actually enforced (not just present as strings).
+        let rules = forge_config::builtin_deny_rules();
+        for p in [
+            "./.env.local", // dotenv variant — the gap `**/.env` alone missed
+            "./.env.production",
+            "config/.env.staging",
+            "/home/u/.ssh/id_ecdsa",
+            "secrets/server.key",
+            "./.npmrc",
+            "./.netrc",
+            "/home/u/.kube/config",
+            "/home/u/.config/gcloud/credentials.db",
+        ] {
+            assert_eq!(
+                decide(
+                    PermissionMode::Bypass,
+                    SideEffect::ReadOnly,
+                    "read_file",
+                    &path(p),
+                    &rules
+                ),
+                Deny,
+                "secret read must be denied even in bypass: {p}"
+            );
+        }
+        // A normal source file is not swept up by the broadened globs.
+        assert_ne!(
+            decide(
+                PermissionMode::Default,
+                SideEffect::ReadOnly,
+                "read_file",
+                &path("./src/main.rs"),
+                &rules
+            ),
+            Deny,
+            "ordinary source must remain readable"
+        );
+    }
+
+    #[test]
     fn gwt6_deny_beats_allow_on_conflict() {
         let rules = [
             cfg("shell", Allow, &["git *"]),
