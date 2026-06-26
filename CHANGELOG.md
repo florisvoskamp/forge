@@ -6,6 +6,20 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.32] - 2026-06-26
+
+### Fixed
+- **Watcher setup no longer leaks a thread (and watcher) per `build_session`.** 0.4.31's fire-and-
+  forget watcher parked a thread holding the handle for the *process* lifetime — fine for `forge
+  chat` (one session per process) but a leak when `build_session` runs repeatedly in one process:
+  `forge bench swe` builds a session **per instance** (hundreds in a run), and `forge replay` too, so
+  each leaked a parked thread plus the watcher's own background thread + inotify/poll resources. The
+  watcher is now delivered to the session through an `mpsc` channel and **owned by the session** (the
+  held `Receiver` keeps it alive; it's dropped when the session ends), and the setup thread exits
+  after sending. Still fully non-blocking — no filesystem op gates startup. A test proves a watcher
+  held only through the channel (never received) still reindexes (`crates/forge-core/src/lib.rs`,
+  `crates/forge-cli/src/cli/commands/run.rs`, `crates/forge-index/src/watch.rs`).
+
 ## [0.4.31] - 2026-06-26
 
 ### Changed

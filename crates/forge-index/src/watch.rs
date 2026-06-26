@@ -295,6 +295,43 @@ mod tests {
     }
 
     #[test]
+    fn watcher_held_only_through_a_channel_still_reindexes() {
+        // Production never drains the watcher: it's sent into an mpsc channel and the Session holds
+        // the Receiver for keep-alive (so setup is off-thread + the watcher is owned per-session).
+        // Prove a watcher sitting UN-received in the channel buffer still runs and reindexes — and
+        // that dropping the Receiver tears it down.
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("forge-chan-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src/a.rs");
+        std::fs::write(&file, "pub fn alpha() {}\n").unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let lattice = Arc::new(Lattice::new(store, &root));
+        lattice.update().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watcher =
+            spawn_watcher(Arc::clone(&lattice), &root, Duration::from_millis(100)).expect("starts");
+        tx.send(watcher).unwrap(); // hand off to the channel; never received, kept alive by `rx`
+
+        std::fs::write(&file, "pub fn omega() {}\n").unwrap();
+        let mut reindexed = false;
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(100));
+            if lattice.query("omega", 5).unwrap().len() == 1 {
+                reindexed = true;
+                break;
+            }
+        }
+        drop(rx); // dropping the Receiver drops the buffered watcher → watching stops
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            reindexed,
+            "channel-held watcher did not reindex the external edit"
+        );
+    }
+
+    #[test]
     fn skips_build_dirs_and_unsupported_files() {
         assert!(should_reindex(Path::new("crates/forge-index/src/lib.rs")));
         assert!(!should_reindex(Path::new("target/debug/build.rs")));

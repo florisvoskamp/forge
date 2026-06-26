@@ -261,29 +261,27 @@ pub(crate) async fn build_session_with(
                      — open a project folder (one with a .git) to enable auto-reindex",
                 ),
                 Some(root) => {
-                    // Build the watcher on a FULLY detached thread that OWNS it for the process
-                    // lifetime, so NOTHING about watcher setup can gate TUI startup — not a recursive
+                    // Build the watcher on a detached thread and DELIVER it to the session through a
+                    // channel, so NOTHING about watcher setup gates TUI startup — not a recursive
                     // inotify registration (which blocks uninterruptibly on WSL2's 9p DrvFs and used
-                    // to hang `forge chat`), and not the polling backend's synchronous initial tree
-                    // scan (slow over a remote/9p link). On a non-native fs spawn_watcher transparently
-                    // uses polling so auto-reindex still works there. We don't hand the handle back to
-                    // the session: for `forge chat` the session IS the process, so a thread holding it
-                    // until exit is the same lifetime. A setup error is non-fatal (retrieval works) and
-                    // intentionally silent — no "watcher disabled" caveat for the user.
+                    // to hang `forge chat`), nor the polling backend's synchronous initial tree scan
+                    // (slow over a remote/9p link). On a non-native fs spawn_watcher transparently
+                    // uses polling so auto-reindex still works there. The session holds the receiver,
+                    // so the watcher is owned per-session and dropped when the session ends (no leak
+                    // across repeated build_session calls — bench/replay); the thread exits after the
+                    // send. A setup error is non-fatal and intentionally silent (no caveat).
                     let lat2 = Arc::clone(lat);
+                    let (tx, rx) = std::sync::mpsc::channel();
                     std::thread::spawn(move || {
-                        if let Ok(_watcher) = forge_index::spawn_watcher(
+                        if let Ok(watcher) = forge_index::spawn_watcher(
                             lat2,
                             &root,
                             std::time::Duration::from_millis(400),
                         ) {
-                            // Park forever, keeping `_watcher` alive (dropping it stops watching);
-                            // the OS reclaims the thread + handle on process exit.
-                            loop {
-                                std::thread::park();
-                            }
+                            let _ = tx.send(watcher);
                         }
                     });
+                    session.set_lattice_watcher(Some(rx));
                 }
             }
         }

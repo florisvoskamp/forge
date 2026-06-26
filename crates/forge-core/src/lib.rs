@@ -617,9 +617,12 @@ pub struct Session {
     /// retrieval then injects nothing and the turn runs exactly as before (additive guarantee).
     /// `Arc` so the model-facing `lattice` tool shares the same index.
     lattice: Option<Arc<Lattice>>,
-    /// Background file watcher that keeps the index fresh on external edits. Held only to keep the
-    /// watcher thread alive for the session's lifetime (dropped → watching stops).
-    lattice_watcher: Option<forge_index::LatticeWatcher>,
+    /// Background file watcher that keeps the index fresh on external edits. Held as the receiving
+    /// end of a channel: the watcher is built off-thread (so a slow filesystem can't gate startup)
+    /// and delivered here, where it lives in the channel buffer for the session's lifetime (this
+    /// Receiver dropped → channel + watcher drop → watching stops). Per-session ownership so repeated
+    /// `build_session` calls (bench, replay) don't leak watcher threads.
+    lattice_watcher: Option<std::sync::mpsc::Receiver<forge_index::LatticeWatcher>>,
     /// LSP registry for live diagnostics after writes. `None` when lsp.enabled = false.
     lsp: Option<Arc<forge_lsp::LspRegistry>>,
     /// The discovered command/skill catalog, so the model can find + load Forge's own skills via
@@ -848,9 +851,14 @@ impl Session {
         self.lattice = lattice;
     }
 
-    /// Attach the background reindex watcher (composition root); held for the session's lifetime.
-    pub fn set_lattice_watcher(&mut self, watcher: Option<forge_index::LatticeWatcher>) {
-        self.lattice_watcher = watcher;
+    /// Attach the background reindex watcher's delivery channel (composition root). The watcher is
+    /// built off-thread and sent through `rx`; holding the `Receiver` keeps it alive for the
+    /// session's lifetime without ever blocking on its (possibly slow) setup.
+    pub fn set_lattice_watcher(
+        &mut self,
+        rx: Option<std::sync::mpsc::Receiver<forge_index::LatticeWatcher>>,
+    ) {
+        self.lattice_watcher = rx;
     }
 
     /// Attach the LSP registry (composition root). No-op when `lsp.enabled = false`.
