@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.19] - 2026-06-26
+
+### Fixed
+- **SWE-bench predictions now capture NEW files (the harness was undercounting Forge).** `forge bench
+  swe` built the `model_patch` with a plain `git diff`, which **ignores untracked files** — so a
+  solution that *adds* a file (very common in SWE-bench: new modules, regression tests) produced an
+  **empty patch** and was scored *unresolved* even though the agent did the work. Now it stages
+  everything (`git add -A` with the same excludes) then `git diff --cached`, capturing additions,
+  modifications, and deletions alike. Found by running the prediction pipeline end-to-end on a real
+  instance for the first time (the agent created the file; the captured patch was empty); fixed +
+  regression-tested + re-run end-to-end (now an 8-line patch) (`crates/forge-cli/src/bench.rs`).
+
 ## [0.4.18] - 2026-06-26
 
 ### Added

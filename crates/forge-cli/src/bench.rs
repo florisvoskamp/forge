@@ -198,17 +198,24 @@ fn prepare_repo(inst: &SweInstance, root: &Path) -> Result<PathBuf> {
 /// what the evaluator expects; brand-new untracked files (rare) are intentionally excluded as the
 /// safe default. As a belt-and-braces guard, junk paths are excluded via pathspec too.
 fn extract_patch(dir: &Path) -> Result<String> {
-    run_git(
-        dir,
-        &[
-            "diff",
-            "--",
-            ".",
-            ":(exclude).forge/**",
-            ":(exclude)**/__pycache__/**",
-            ":(exclude)**/*.pyc",
-        ],
-    )
+    // STAGE everything first (including NEW files), then diff the index against HEAD. A plain
+    // `git diff` ignores untracked files, so a solution that ADDS a file (very common in SWE-bench —
+    // new modules, regression tests) produced an EMPTY patch and was scored unresolved even though
+    // the agent did the work. `git add -A` + `git diff --cached` captures additions, modifications,
+    // and deletions alike. Excludes keep Forge's own dir / pycache out of the patch.
+    let pathspec = [
+        "--",
+        ".",
+        ":(exclude).forge/**",
+        ":(exclude)**/__pycache__/**",
+        ":(exclude)**/*.pyc",
+    ];
+    let mut add = vec!["add", "-A"];
+    add.extend_from_slice(&pathspec);
+    run_git(dir, &add)?;
+    let mut diff = vec!["diff", "--cached"];
+    diff.extend_from_slice(&pathspec);
+    run_git(dir, &diff)
 }
 
 /// Insert `.seed<k>` before the extension of `out` (e.g. `preds.jsonl` → `preds.seed2.jsonl`), so
@@ -971,5 +978,35 @@ mod tests {
             !ok,
             "unparseable output → metrics_complete=false, not a lie"
         );
+    }
+
+    #[test]
+    fn extract_patch_includes_new_untracked_files() {
+        // The bug a live smoke caught: `git diff` ignores untracked files, so a solution that ADDS a
+        // file (common in SWE-bench: new modules / tests) produced an EMPTY patch and was scored
+        // unresolved even though the agent did the work. The patch must carry additions too.
+        let dir = std::env::temp_dir().join(format!("forge-bench-patch-{}", forge_types::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str]| run_git(&dir, args).expect("git");
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("tracked.txt"), "original\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-q", "-m", "base"]);
+        // The "solution": add a brand-new file AND modify the tracked one.
+        std::fs::write(dir.join("NEW.txt"), "added by the agent\n").unwrap();
+        std::fs::write(dir.join("tracked.txt"), "changed\n").unwrap();
+
+        let patch = extract_patch(&dir).expect("extract_patch");
+        assert!(
+            patch.contains("NEW.txt") && patch.contains("added by the agent"),
+            "the NEW (untracked) file must be in the patch — this was the bug:\n{patch}"
+        );
+        assert!(
+            patch.contains("tracked.txt"),
+            "the modified file is also present"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
