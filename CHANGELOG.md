@@ -6,6 +6,19 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.26] - 2026-06-26
+
+### Added
+- **Property test locking the permission broker's security invariants.** `permission::decide` is the
+  single chokepoint that gates every dangerous tool (shell, `.env`/secret reads, untrusted MCP), and
+  its layered ordering is easy to break in a refactor. A deterministic seeded-LCG property test runs
+  5000 random combinations of mode × side-effect × tool × args × rule-set and asserts the three
+  guarantees that must never regress: (1) ANY matching Deny rule wins over any allow, in every mode;
+  (2) a Builtin Deny holds even under `Bypass` (the unoverridable `.env`/secret floor); (3) with no
+  matching deny, `Plan` mode denies every non-ReadOnly side effect (the hard read-only contract no
+  allow rule can escape). Confirms no bypass hole exists today and guards the boundary going forward
+  (`crates/forge-core/src/permission.rs`).
+
 ## [0.4.25] - 2026-06-26
 
 ### Added

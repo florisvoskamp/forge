@@ -868,4 +868,98 @@ mod tests {
             Deny
         );
     }
+
+    /// Property test for the permission broker's SECURITY invariants — the layered ordering in
+    /// `decide` is the boundary that gates every dangerous tool (shell, `.env`/secret reads, untrusted
+    /// MCP), so its guarantees must hold under ANY combination of mode, side effect, tool, args, and
+    /// rule set. Deterministic seeded-LCG corpus (no dep). A matching rule is one with `tool="*"` and
+    /// no patterns (matches any call); noise rules use a tool name that never matches. Asserts the
+    /// three invariants a future refactor of the ordered logic must never break:
+    ///   1. ANY matching Deny rule (builtin or configured) ⟹ Deny — a deny is never outvoted by an
+    ///      allow, in any mode (steps 1–2 precede the most-specific-allow step).
+    ///   2. A matching BUILTIN Deny ⟹ Deny even under `Bypass` — the unoverridable safety floor
+    ///      (`.env`/secret denylist can't be bypassed or allow-ruled away).
+    ///   3. No matching Deny + `Plan` mode + a non-ReadOnly side effect ⟹ Deny — plan is a hard
+    ///      read-only contract no allow rule can escape (step 3).
+    #[test]
+    fn broker_security_invariants_hold_under_fuzz() {
+        use PermissionMode::*;
+        let modes = [Plan, Default, AcceptEdits, Bypass];
+        let effects = [
+            SideEffect::ReadOnly,
+            SideEffect::Write,
+            SideEffect::Shell,
+            SideEffect::Network,
+            SideEffect::External,
+        ];
+        let tools = ["shell", "edit", "read", "myserver__tool", "*"];
+        let args = [
+            shell("rm -rf /"),
+            path("/etc/passwd"),
+            json!({}),
+            shell("git status"),
+        ];
+
+        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..5000 {
+            let mode = modes[next() % modes.len()];
+            let eff = effects[next() % effects.len()];
+            let tool = tools[next() % tools.len()];
+            let arg = &args[next() % args.len()];
+
+            // Assemble a rule set: always some non-matching noise, plus each kind of MATCHING rule
+            // (tool="*", empty patterns ⇒ matches any call) flipped on independently at random.
+            let mut rules: Vec<PermissionRule> = vec![
+                cfg("__never__", Allow, &[]),
+                builtin_deny("__never__", &["x"]),
+            ];
+            let has_builtin_deny = next() % 3 == 0;
+            let has_cfg_deny = next() % 3 == 0;
+            let has_cfg_allow = next() % 2 == 0;
+            let has_cfg_ask = next() % 2 == 0;
+            if has_builtin_deny {
+                rules.push(builtin_deny("*", &[]));
+            }
+            if has_cfg_deny {
+                rules.push(cfg("*", Deny, &[]));
+            }
+            if has_cfg_allow {
+                rules.push(cfg("*", Allow, &[]));
+            }
+            if has_cfg_ask {
+                rules.push(cfg("*", Ask, &[]));
+            }
+
+            let got = decide(mode, eff, tool, arg, &rules);
+            let any_matching_deny = has_builtin_deny || has_cfg_deny;
+
+            // Invariant 1 & 2: any matching deny (incl. builtin under Bypass) ⟹ Deny.
+            if any_matching_deny {
+                assert_eq!(
+                    got, Deny,
+                    "deny must win: mode={mode:?} eff={eff:?} tool={tool} \
+                     builtin_deny={has_builtin_deny} cfg_deny={has_cfg_deny} \
+                     cfg_allow={has_cfg_allow}"
+                );
+            }
+            // Invariant 3: no matching deny + Plan + side effect ⟹ Deny.
+            if !any_matching_deny && mode == Plan && eff != SideEffect::ReadOnly {
+                assert_eq!(
+                    got, Deny,
+                    "plan must deny side effects: eff={eff:?} tool={tool} \
+                     cfg_allow={has_cfg_allow} cfg_ask={has_cfg_ask}"
+                );
+            }
+            // Bonus: a builtin matching deny is NEVER Allow even with a matching configured allow.
+            if has_builtin_deny {
+                assert_ne!(got, Allow, "builtin deny floor was overridden to Allow");
+            }
+        }
+    }
 }
