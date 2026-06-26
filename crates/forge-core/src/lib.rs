@@ -32,6 +32,16 @@ pub use llm_router::LlmRouter;
 /// rest. Only compact when there are at least `COMPACT_MIN_OLDER` older messages to fold.
 pub(crate) const COMPACT_KEEP_RECENT: usize = 6;
 pub(crate) const COMPACT_MIN_OLDER: usize = 4;
+/// Char length above which an OLD tool result is pruned from the model-facing transcript. Tool
+/// output (file dumps, command logs, search hits) dominates context but its bulk has little value
+/// once the turn has moved on — the model rarely needs the 30th file read verbatim. Pruning trims
+/// the in-memory transcript only; the full text stays in the store for replay.
+const PRUNE_TOOL_RESULT_MAX: usize = 3000;
+/// How much of a pruned tool result's head to keep (enough to see what the tool produced).
+const PRUNE_HEAD_KEEP: usize = 1500;
+/// Marker left in place of the dropped tail; also makes pruning idempotent (a result already ending
+/// with it is skipped).
+const PRUNE_MARKER: &str = "\n…[older tool output pruned to save context; full text in replay]…";
 const COMPACT_SYSTEM: &str = "You are compacting a coding-assistant conversation to save context. \
 Summarize the messages below concisely but preserve: decisions made, key facts, file paths, \
 function/type names, and any open threads or TODOs. Output only the summary.";
@@ -479,6 +489,39 @@ fn fit_messages(messages: &[Message], budget_tokens: usize) -> Vec<Message> {
         .filter(|(i, m)| m.role == Role::System || keep_idx.contains(i))
         .map(|(_, m)| m.clone())
         .collect()
+}
+
+/// Zero-LLM context reclaim: truncate large OLD tool results in place so a long conversation fits
+/// without paying for an LLM summarize round-trip. Protects the most recent `keep_recent` messages
+/// and only touches `Tool` results longer than [`PRUNE_TOOL_RESULT_MAX`], keeping a
+/// [`PRUNE_HEAD_KEEP`]-char head + a marker. Returns the number of chars reclaimed; idempotent (a
+/// result already ending with [`PRUNE_MARKER`] is skipped). The full text remains in the store for
+/// replay — only the model-facing transcript is trimmed.
+fn prune_tool_results(messages: &mut [Message], keep_recent: usize) -> usize {
+    let len = messages.len();
+    if len <= keep_recent {
+        return 0;
+    }
+    let protect_from = len - keep_recent;
+    let mut reclaimed = 0usize;
+    for m in &mut messages[..protect_from] {
+        if m.role != Role::Tool
+            || m.content.len() <= PRUNE_TOOL_RESULT_MAX
+            || m.content.ends_with(PRUNE_MARKER)
+        {
+            continue;
+        }
+        let before = m.content.len();
+        let mut head = PRUNE_HEAD_KEEP.min(m.content.len());
+        while !m.content.is_char_boundary(head) {
+            head -= 1;
+        }
+        let mut kept = m.content[..head].to_string();
+        kept.push_str(PRUNE_MARKER);
+        reclaimed += before - kept.len();
+        m.content = kept;
+    }
+    reclaimed
 }
 
 /// Output of one execution of the shared model↔tool loop ([`Session::run_model_loop`]).
@@ -1824,7 +1867,14 @@ Rules:\n\
     /// compact. Distinct from the failover consent path ([`admit_failover_model`]).
     async fn auto_compact_if_needed(&mut self, model: &str) {
         if !self.transcript_fits(model) {
-            let _ = self.compact(true).await;
+            // Cheap first: prune bulky OLD tool results in place (no model call). Often reclaims
+            // enough that the expensive LLM summarize below isn't needed at all.
+            if prune_tool_results(&mut self.transcript, COMPACT_KEEP_RECENT) > 0 {
+                self.emit_context_gauge(model);
+            }
+            if !self.transcript_fits(model) {
+                let _ = self.compact(true).await;
+            }
             // Refresh the gauge NOW so it reflects the reduced context immediately, instead of
             // showing the old (over-window) size until the turn's first model call returns.
             self.emit_context_gauge(model);
@@ -4887,6 +4937,37 @@ mod tests {
             Message::assistant("hello"),
         ];
         assert_eq!(fit_messages(&msgs, 10_000).len(), 3);
+    }
+
+    #[test]
+    fn prune_tool_results_trims_only_old_large_tool_output() {
+        let big = "x".repeat(PRUNE_TOOL_RESULT_MAX + 500);
+        let small = "ok".to_string();
+        let mut msgs = vec![
+            Message::user("do it"),                    // 0  (old)
+            Message::tool_result("c1", big.clone()),   // 1  old + large  → pruned
+            Message::tool_result("c2", small.clone()), // 2  old + small  → kept
+            Message::assistant("working"),             // 3  protected window starts here (last 6)
+            Message::tool_result("c3", big.clone()),   // 4  protected
+            Message::user("more"),                     // 5
+            Message::assistant("a"),                   // 6
+            Message::user("b"),                        // 7
+            Message::tool_result("c4", big.clone()),   // 8  recent + large → protected
+        ];
+        let reclaimed = prune_tool_results(&mut msgs, COMPACT_KEEP_RECENT);
+        assert!(reclaimed > 0);
+        assert!(msgs[1].content.ends_with(PRUNE_MARKER) && msgs[1].content.len() < big.len());
+        assert_eq!(msgs[2].content, small, "small old result untouched");
+        assert_eq!(
+            msgs[4].content, big,
+            "result inside the recent window protected"
+        );
+        assert_eq!(msgs[8].content, big, "most-recent result protected");
+        // The pruned result keeps its tool_call_id (valid round-trip) and its role.
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(msgs[1].role, Role::Tool);
+        // Idempotent: a second pass reclaims nothing.
+        assert_eq!(prune_tool_results(&mut msgs, COMPACT_KEEP_RECENT), 0);
     }
 
     #[test]

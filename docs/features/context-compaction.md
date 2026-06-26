@@ -46,6 +46,21 @@ When it runs
 Then it runs in the background (spinner animates) and emits a "compacted N → M" note
 ```
 
+## 3a. Zero-LLM prune pass (auto-compaction fast path)
+
+Before paying for an LLM summarize, auto-compaction first runs a **free** prune pass:
+`prune_tool_results()` (forge-core) truncates large **old** tool results in place — the file dumps,
+command logs, and search hits that dominate context but whose bulk has little value once the turn
+has moved on. It keeps a head (`PRUNE_HEAD_KEEP` chars) + a marker, protects the most recent
+`COMPACT_KEEP_RECENT` messages, only touches `Tool` results over `PRUNE_TOOL_RESULT_MAX`, and is
+idempotent. The full text stays in the store for replay — only the model-facing transcript is
+trimmed.
+
+`auto_compact_if_needed()` prunes first and re-checks `transcript_fits`; the expensive summarize
+only runs if pruning didn't reclaim enough. On a tool-output-heavy session this avoids the
+summarize round-trip (and its model cost) entirely. (Adopted from opencode's `compaction.prune`; see
+`docs/harness/competitor-gap-analysis.md`.)
+
 ## 4. Design
 `Session::compact()` (forge-core): splits the transcript at `len - COMPACT_KEEP_RECENT`, renders
 the older messages as `role: content` text, routes a trivial-tier model
