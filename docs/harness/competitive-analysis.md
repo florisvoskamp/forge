@@ -1,5 +1,10 @@
 # Harness Competitive Analysis — Tier 2 (v0.3.0)
 
+> **See also:** [competitor-gap-analysis.md](competitor-gap-analysis.md) — the v1.0.0 (P0.2) refresh
+> covering opencode / openclaude / pi with a ranked, no-defer adoption backlog (tool-failure loop
+> guard, `LoopOutcome` enum, compaction prune, direct-path goal verification, two-phase context
+> pipeline, headless/RPC embed mode).
+
 Goal: make Forge's agentic harness the best available. This captures a recon of two competing
 open-source coding-agent harnesses, what Forge already does better, and a prioritized backlog of
 techniques worth porting. Sources were read directly from their repos (2026-06-23):
