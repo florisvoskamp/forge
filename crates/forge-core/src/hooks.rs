@@ -21,6 +21,67 @@ pub struct HookOutcome {
     /// stdout. The core substitutes these args for the model's original args before running the
     /// tool. `None` means use the original args unchanged.
     pub rewritten_args: Option<serde_json::Value>,
+    /// Context strings a hook asked to inject into the transcript (`{"action":"inject",
+    /// "context":"…"}`). The core queues each as a model-visible system hint after the tool runs —
+    /// so a hook can feed the model extra context (lint output, "this file is generated", a policy
+    /// reminder) without blocking or rewriting. Works for both `PreToolUse` and `PostToolUse`.
+    pub injected_context: Vec<String>,
+}
+
+/// A structured directive a hook can emit on stdout as a JSON object with an `"action"` field.
+/// This is the richer protocol on top of the legacy "bare JSON object = rewritten args" behavior:
+/// a `PreToolUse` hook that emits a JSON object WITHOUT an `action` still rewrites args as before.
+enum HookDirective {
+    /// `{"action":"rewrite","args":{…}}` — replace the tool's args (PreToolUse).
+    Rewrite(serde_json::Value),
+    /// `{"action":"inject","context":"…"}` — add model-visible context after the call.
+    Inject(String),
+    /// `{"action":"block","reason":"…"}` — block the call (PreToolUse; downgraded to a note elsewhere).
+    Block(String),
+    /// `{"action":"allow"}` — explicit no-op (the hook approves without changing anything).
+    Noop,
+    /// Anything else (non-JSON, or a JSON object that isn't a recognised directive) → a user note.
+    Note(String),
+}
+
+/// Interpret a hook's exit-0 stdout. The structured `action` protocol takes precedence; a bare JSON
+/// object (no `action`) keeps the legacy meaning (rewrite args, but only for `PreToolUse`); anything
+/// else is a note. A malformed structured directive (missing `args`/`context`) degrades to a note so
+/// the author sees their output rather than it silently vanishing.
+fn parse_hook_directive(stdout: &str, event: HookEvent) -> HookDirective {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(stdout)
+    else {
+        return HookDirective::Note(stdout.to_string());
+    };
+    if let Some(action) = map.get("action").and_then(serde_json::Value::as_str) {
+        return match action {
+            "rewrite" => map
+                .get("args")
+                .cloned()
+                .map(HookDirective::Rewrite)
+                .unwrap_or_else(|| HookDirective::Note(stdout.to_string())),
+            "inject" => map
+                .get("context")
+                .and_then(serde_json::Value::as_str)
+                .filter(|c| !c.trim().is_empty())
+                .map(|c| HookDirective::Inject(c.to_string()))
+                .unwrap_or_else(|| HookDirective::Note(stdout.to_string())),
+            "block" => HookDirective::Block(
+                map.get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("blocked by hook")
+                    .to_string(),
+            ),
+            "allow" => HookDirective::Noop,
+            _ => HookDirective::Note(stdout.to_string()),
+        };
+    }
+    // Legacy: a bare JSON object rewrites args on PreToolUse; elsewhere it's just a note.
+    if event == HookEvent::PreToolUse {
+        HookDirective::Rewrite(serde_json::Value::Object(map))
+    } else {
+        HookDirective::Note(stdout.to_string())
+    }
 }
 
 /// Run every hook matching `event` + `tool`, in declaration order. The first `PreToolUse` hook
@@ -48,23 +109,26 @@ pub async fn run_hooks(
                     outcome.blocked = Some(reason);
                     break;
                 }
-                // exit 0 + non-empty stdout: if it's a JSON object, treat it as rewritten args;
-                // otherwise surface it as a note (same as PostToolUse observe output).
+                // exit 0 + non-empty stdout: interpret the structured directive protocol (rewrite /
+                // inject / block / allow), falling back to the legacy "bare object = rewrite" and to
+                // a plain note. `block` only blocks on PreToolUse (Post can't unwind a finished call).
                 if !trimmed.is_empty() {
-                    if event == HookEvent::PreToolUse {
-                        if let Ok(v @ serde_json::Value::Object(_)) =
-                            serde_json::from_str::<serde_json::Value>(trimmed)
-                        {
-                            outcome.rewritten_args = Some(v);
-                        } else {
+                    match parse_hook_directive(trimmed, event) {
+                        HookDirective::Rewrite(args) => outcome.rewritten_args = Some(args),
+                        HookDirective::Inject(ctx) => outcome.injected_context.push(ctx),
+                        HookDirective::Block(reason) => {
+                            if event == HookEvent::PreToolUse {
+                                outcome.blocked = Some(truncate(&reason, 800));
+                                break;
+                            }
                             outcome
                                 .notes
-                                .push(format!("⎇ hook: {}", truncate(trimmed, 800)));
+                                .push(format!("⎇ hook: {}", truncate(&reason, 800)));
                         }
-                    } else {
-                        outcome
+                        HookDirective::Noop => {}
+                        HookDirective::Note(text) => outcome
                             .notes
-                            .push(format!("⎇ hook: {}", truncate(trimmed, 800)));
+                            .push(format!("⎇ hook: {}", truncate(&text, 800))),
                     }
                 }
             }
@@ -325,5 +389,90 @@ mod tests {
         let hooks = vec![hook(HookEvent::PreToolUse, "exit 1")];
         let result = run_prompt_hooks(&hooks, "hello").await;
         assert_eq!(result.unwrap(), "hello"); // no hook matched → prompt unchanged
+    }
+
+    // --- Structured directive protocol (completes the hooks system: rewrite / inject / block) ---
+
+    #[tokio::test]
+    async fn inject_action_queues_context_not_a_note() {
+        let hooks = vec![hook(
+            HookEvent::PreToolUse,
+            "echo '{\"action\":\"inject\",\"context\":\"this file is auto-generated\"}'",
+        )];
+        let o = run_hooks(&hooks, HookEvent::PreToolUse, "shell", "{}").await;
+        assert!(o.blocked.is_none());
+        assert!(o.rewritten_args.is_none());
+        assert!(o.notes.is_empty(), "an inject directive is not a user note");
+        assert_eq!(o.injected_context, vec!["this file is auto-generated"]);
+    }
+
+    #[tokio::test]
+    async fn inject_action_works_on_posttooluse_too() {
+        let hooks = vec![hook(
+            HookEvent::PostToolUse,
+            "echo '{\"action\":\"inject\",\"context\":\"lint: 2 warnings\"}'",
+        )];
+        let o = run_hooks(&hooks, HookEvent::PostToolUse, "shell", "{}").await;
+        assert_eq!(o.injected_context, vec!["lint: 2 warnings"]);
+        assert!(o.notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rewrite_action_replaces_args() {
+        let hooks = vec![hook(
+            HookEvent::PreToolUse,
+            "echo '{\"action\":\"rewrite\",\"args\":{\"path\":\"safe.rs\"}}'",
+        )];
+        let o = run_hooks(&hooks, HookEvent::PreToolUse, "shell", "{}").await;
+        let rewritten = o.rewritten_args.expect("rewrite action sets args");
+        assert_eq!(rewritten["path"], "safe.rs");
+        assert!(o.injected_context.is_empty());
+    }
+
+    #[tokio::test]
+    async fn block_action_blocks_pretooluse_with_reason() {
+        let hooks = vec![hook(
+            HookEvent::PreToolUse,
+            "echo '{\"action\":\"block\",\"reason\":\"writes outside the project are denied\"}'",
+        )];
+        let o = run_hooks(&hooks, HookEvent::PreToolUse, "shell", "{}").await;
+        assert_eq!(
+            o.blocked.as_deref(),
+            Some("writes outside the project are denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn block_action_downgrades_to_note_on_posttooluse() {
+        // PostToolUse can't unwind a finished call, so a block directive becomes a note.
+        let hooks = vec![hook(
+            HookEvent::PostToolUse,
+            "echo '{\"action\":\"block\",\"reason\":\"too late\"}'",
+        )];
+        let o = run_hooks(&hooks, HookEvent::PostToolUse, "shell", "{}").await;
+        assert!(o.blocked.is_none());
+        assert!(o.notes.iter().any(|n| n.contains("too late")));
+    }
+
+    #[tokio::test]
+    async fn allow_action_is_a_clean_noop() {
+        let hooks = vec![hook(HookEvent::PreToolUse, "echo '{\"action\":\"allow\"}'")];
+        let o = run_hooks(&hooks, HookEvent::PreToolUse, "shell", "{}").await;
+        assert!(o.blocked.is_none());
+        assert!(o.rewritten_args.is_none());
+        assert!(o.injected_context.is_empty());
+        assert!(o.notes.is_empty(), "allow approves without any side effect");
+    }
+
+    #[tokio::test]
+    async fn unknown_action_falls_back_to_a_note() {
+        let hooks = vec![hook(
+            HookEvent::PreToolUse,
+            "echo '{\"action\":\"frobnicate\"}'",
+        )];
+        let o = run_hooks(&hooks, HookEvent::PreToolUse, "shell", "{}").await;
+        // Not a recognised directive AND has an `action` key → surfaced as a note, NOT rewritten args.
+        assert!(o.rewritten_args.is_none());
+        assert!(o.notes.iter().any(|n| n.contains("frobnicate")));
     }
 }

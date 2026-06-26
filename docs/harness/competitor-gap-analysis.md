@@ -80,16 +80,18 @@ Ranked by (leverage × certainty) ÷ effort. S/M/L = effort. Each maps to a v1.0
    tool-detail blocks stop polluting the prompt. Turns Forge's growing pile of injected context
    (lattice, MCP, gauge) into a disciplined, testable injection point.
 
-10. **Parallel tool execution** (S/M) — *pi, opencode.* Split `invoke_tool` into sequential
-    `preflight()` (validate + permission/temper gate + pre-hooks) then async `execute()`; `join_all`
-    the executes for a turn's independent read-only calls, keep `SideEffect`-bearing tools serialized
-    (Forge already tracks the side-effect class). Latency win on multi-read/grep turns.
+10. ~~**Parallel tool execution**~~ **ALREADY SHIPPED.** `run_model_loop` detects a batch of ≥2
+    independent `SideEffect::ReadOnly` calls (and no hooks configured) and runs them via
+    `run_readonly_batch`: serial preflight (announce + permission resolve, no prompt for ReadOnly),
+    then `join_all` the executes concurrently, then append results in original order. Side-effect /
+    hook-bearing batches stay on the serial `invoke_tool` path. Exactly the proposed design.
 
-11. **Finish hooks: rewrite/inject phases** (M) — *opencode/pi in-process hooks.* Extend the
-    `[[hooks]]` runner so a hook's stdout JSON can return `{action:"rewrite", args:{…}}` or
-    `{action:"inject", context:"…"}`, consumed in `invoke_tool` before/after execution — not just
-    allow/block. Keeps the shell-out model (no Rust plugin host); closes the deferred half of hooks.
-    This is the P3 "complete hooks" workstream.
+11. ~~**Finish hooks: rewrite/inject phases**~~ **DONE (#239).** The `[[hooks]]` runner now parses a
+    structured directive on a hook's exit-0 stdout: `{action:"rewrite",args}` / `{action:"inject",
+    context}` / `{action:"block",reason}` / `{action:"allow"}`, for both `PreToolUse` and
+    `PostToolUse`. `inject` queues model-visible context (via `pending_hints`) — the first way a hook
+    can *teach* the model, not just gate it. Back-compatible: a bare object still rewrites args,
+    plain text is a note, non-zero still blocks. Unit-tested; the P3 "complete hooks" workstream.
 
 ### Tier 3 — larger, differentiating (P1 → P4, stage later)
 

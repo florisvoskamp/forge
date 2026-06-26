@@ -38,6 +38,22 @@ load-bearing events.
 - `PreToolUse` exit 0 + JSON object on stdout → rewrites tool args before the tool runs.
   Exit 0 + plain text → note only (unchanged args). Exit non-zero → block.
 
+**Shipped (structured directive protocol)**
+- A hook can emit a JSON object with an explicit `"action"` field on stdout (exit 0) to do more
+  than rewrite — the same protocol works for `PreToolUse` **and** `PostToolUse`:
+  - `{"action":"rewrite","args":{…}}` — replace the tool's args (PreToolUse).
+  - `{"action":"inject","context":"…"}` — inject model-visible context: queued as a system hint and
+    shown to the model right after the tool result (e.g. lint output, "this file is generated", a
+    policy reminder). No block, no rewrite. The first capability that lets a hook *teach* the model,
+    not just gate it.
+  - `{"action":"block","reason":"…"}` — block the call (PreToolUse). On `PostToolUse` (the call has
+    already run, nothing to unwind) it degrades to a note.
+  - `{"action":"allow"}` — explicit no-op (approve without changing anything).
+  - An unrecognised `action`, or a malformed directive (missing `args`/`context`), degrades to a note
+    so the author sees their output instead of it vanishing.
+- **Back-compatible:** a bare JSON object with no `"action"` field keeps the legacy meaning
+  (rewrite args, PreToolUse only); plain text is still a note; exit non-zero is still a hard block.
+
 **Shipped (MCP tool hooks)**
 - `PreToolUse` and `PostToolUse` now fire for MCP tool calls too (e.g. `helm__get_today`,
   `test__echo`). Block, observe, and arg-rewrite all work identically to native tools.
