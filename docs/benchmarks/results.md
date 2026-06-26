@@ -151,18 +151,27 @@ batches (Forge never behind on either), but a still-larger N would tighten the r
 `forge bench swe` also bounds the in-process Forge turn by `--timeout-secs` (was unbounded → one
 instance ran 22 minutes).
 
-**Structural gap — per-step MCP latency — partially addressed (batch/context tools, v0.4.40–41).**
-The remaining gap was median per-step MCP latency (Forge ~3× claude-code's in-process tool steps),
+**Structural gap — per-step MCP latency — and the batch-tools experiment that backfired (v0.4.40–44).**
+The remaining gap is median per-step MCP latency (Forge ~3× claude-code's in-process tool steps),
 because every bridge tool call is a round-trip that re-processes the growing context. Two affordances
-attack it: batch `read_file` (a `paths` array — many files in one call) and `search context:N`
-(grep -C lines, so a hit needs no follow-up read), plus a harness-preamble nudge so the bridge model
-actually uses them. A small honest A/B (2 clean instances, same model, old vs new binary — a third was
-discarded after a mid-run rate-limit failover to a local model corrupted it) shows the nudge takes
-**context-search adoption 0% → 100%** and cuts **tool round-trips ~21% (23 → 18)**. **Tokens were
-flat** (617k → 619k): the context lines cost roughly what the saved round-trips would have, so this is
-a **latency improvement, not a token-efficiency win** at this sample. N=2 is a mechanism check, not a
-proof — the round-trip reduction is real and directly on the stated gap; the token-neutrality is the
-honest limit of what was measured.
+were added to attack it — batch `read_file` (a `paths` array) and `search context:N` (grep -C lines) —
+plus a harness-preamble nudge steering the bridge model to use them. A 2-instance A/B suggested the
+nudge cut tool round-trips ~21% (23 → 18) but left **total tokens flat** (617k → 619k): already only a
+latency, not a token, signal.
+
+**Then a 10-instance run exposed the real cost, and the experiment was reverted.** Steering the model
+toward `paths`/`context` calls measurably increased how often it emitted them as *prose*
+(`<function_calls><invoke>` text) instead of native `tool_use`. On the bridge those never execute, and
+the model — seeing no result — repeated them: **553 unexecuted `<function_calls>` on a single
+instance**, contaminating the run. Root cause: the bridge path never recovered prose tool calls (the
+direct path always had). Fix (v0.4.44): the bridge now runs `recover_text_tool_calls` so a prose call
+executes and the loop re-drives, and the nudge was reverted (unproven benefit, real spiral cost). The
+batch capabilities remain for native use; Forge no longer steers toward them. **Honest takeaway: the
+nudge was a net-negative experiment — reverted. The durable wins are the prose-fallback recovery and
+the v0.4.42 oscillation guard, which make Forge's bridge strictly more robust to malformed model
+output than a naive one-shot bridge** (both proven by deterministic tests:
+`recovers_prose_tool_call_the_bridge_did_not_execute`, `doom_loop_halts_a_model_oscillating_between_two_calls`).
+The per-step-latency gap itself remains open for the P1 persistent stream-json transport.
 
 ---
 

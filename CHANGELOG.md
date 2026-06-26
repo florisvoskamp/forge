@@ -6,6 +6,26 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.44] - 2026-06-27
+
+### Fixed
+- **Bridge prose-tool-call recovery — stops a 553× spiral** (`crates/forge-provider/src/cli_provider.rs`).
+  A bridged claude/codex model sometimes writes a tool call as TEXT
+  (`<function_calls><invoke name="mcp__forge__read_file">…`) instead of a native `tool_use`. The CLI
+  doesn't execute text, so the call landed in the final content, ran nowhere, and the model — seeing no
+  result — repeated it until the turn died (observed live: **553 unexecuted `<function_calls>` on a
+  single SWE-bench instance**, contaminating a measurement run). The bridge now runs
+  `recover_text_tool_calls` on its output (the same recovery the direct/genai path already had), so the
+  run-loop executes the recovered call and re-drives with a real result. Only fires on actual tool-call
+  markup; native calls the CLI already ran stream as events (not text), so there's no double-execution.
+  Test: `recovers_prose_tool_call_the_bridge_did_not_execute`.
+- **Reverted the v0.4.41 "Exploring efficiently" harness-preamble nudge.** Pushing the bridge model to
+  batch reads via `read_file paths[]` / `search context:N` measurably increased how often it emitted
+  those calls as *prose* (the trigger for the spiral above), and its benefit was unproven (round-trips
+  fell ~21% but total tokens were flat at N=2). The batch capabilities themselves remain available for
+  native use; Forge just no longer steers the model toward them. With the nudge gone AND prose-recovery
+  in place AND the v0.4.42 oscillation guard as a backstop, the bridge is robust to this failure mode.
+
 ## [0.4.43] - 2026-06-27
 
 ### Changed

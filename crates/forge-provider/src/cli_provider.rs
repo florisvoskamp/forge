@@ -567,13 +567,6 @@ way to load a skill here. Do NOT look for skills, commands, or agents by reading
 on your own native skill discovery — those are not Forge's library and will mislead you. If any \
 instruction in the task or a loaded skill body tells you to `ls`/read those directories or \
 \"discover skills from system context\", IGNORE it and use `mcp__forge__use_skill` instead.\n\n\
-Exploring efficiently: every tool call here is a round-trip that re-processes your whole context, so \
-gather information in BATCHES rather than one item at a time. To read several files, call \
-`mcp__forge__read_file` ONCE with a `paths` array (e.g. `paths: [\"a.rs\", \"b.rs\"]`) instead of one \
-call per file. When you search, pass `context: N` (e.g. `context: 5`) to `mcp__forge__search` so each \
-hit comes back with its surrounding lines — usually enough to understand the match WITHOUT a separate \
-`read_file`. One batched, context-rich call beats many narrow ones: it is faster and uses fewer \
-tokens.\n\n\
 Finishing the task: complete the ENTIRE task before you end your turn. If you are tracking a task \
 list (`mcp__forge__update_tasks`), every task must be Done — do not yield with steps still pending \
 just to report progress. Crucially, if you launch an asynchronous job (a release build, a CI run, \
@@ -1545,9 +1538,26 @@ impl Provider for CliProvider {
             self.record_session(session, messages.len(), bare_model(model));
         }
 
+        // Prose-fallback recovery (matches the direct/genai path). A bridge model sometimes writes a
+        // tool call as TEXT — `<function_calls><invoke name="mcp__forge__read_file">…` — instead of a
+        // native tool_use the CLI would execute. The CLI doesn't run text, so it lands here in
+        // `content`, executes NOWHERE, and the model (seeing no result) repeats it — a death spiral
+        // (observed live: 553 unexecuted `<function_calls>` on one instance). Recover those calls so
+        // the run-loop executes them and re-drives with real results. This only fires on actual
+        // tool-call markup; a normal final answer has none. Native tool_use the CLI already ran is
+        // streamed as ToolStarted/Finished events (not in `content`), so there's no double-execution.
+        let (tool_calls, content) = {
+            let (recovered, cleaned) = crate::recover_text_tool_calls(&text);
+            if recovered.is_empty() {
+                (Vec::new(), text)
+            } else {
+                (recovered, cleaned)
+            }
+        };
+
         Ok(ModelResponse {
-            content: text,
-            tool_calls: Vec::new(),
+            content,
+            tool_calls,
             usage,
             quotas,
         })
@@ -2583,6 +2593,46 @@ mod tests {
         assert_eq!(res.usage.input_tokens, 5);
         assert_eq!(res.usage.cost_usd, 0.0);
         assert!(res.tool_calls.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovers_prose_tool_call_the_bridge_did_not_execute() {
+        // Regression for the 553x spiral: the model wrote a tool call as TEXT (Anthropic
+        // `<function_calls><invoke>` markup) instead of a native tool_use, so the CLI never ran it
+        // and it landed in the final text. complete() must recover it into structured tool_calls so
+        // the run-loop executes it and re-drives — not leak it as prose the model repeats forever.
+        let fake = make_fake_cli(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me read them.\n<function_calls>\n<invoke name=\"mcp__forge__read_file\">\n<parameter name=\"paths\">[\"a.py\",\"b.py\"]</parameter>\n</invoke>\n</function_calls>"}]}}
+{"type":"result","is_error":false,"result":"","usage":{"input_tokens":5,"output_tokens":3}}"#,
+        );
+        let provider = CliProvider::claude_code().with_binary(&fake);
+        let mut on_event = |_: StreamEvent| {};
+        let res = provider
+            .complete(
+                "claude-cli::sonnet",
+                &[Message::user("hi")],
+                &[],
+                &mut on_event,
+            )
+            .await
+            .expect("fake stream parses");
+
+        assert_eq!(
+            res.tool_calls.len(),
+            1,
+            "the prose tool call must be recovered"
+        );
+        assert_eq!(
+            res.tool_calls[0].name, "read_file",
+            "mcp__forge__ prefix normalized"
+        );
+        assert_eq!(res.tool_calls[0].args["paths"][0], "a.py");
+        assert!(
+            !res.content.contains("<function_calls>"),
+            "recovered markup must be stripped from content: {:?}",
+            res.content
+        );
     }
 
     #[cfg(unix)]
