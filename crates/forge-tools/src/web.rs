@@ -22,6 +22,17 @@ const USER_AGENT: &str = concat!(
     " (+https://github.com/florisvoskamp/forge)"
 );
 
+/// A reqwest `ClientBuilder` pre-seeded with Mozilla's bundled root CAs, so web_fetch / web_search
+/// HTTPS works on a host with no OS trust store. A plain `reqwest::Client::builder().build()` trusts
+/// the OS store and **panics internally** where there is none (bare container / minimal image).
+/// Mirrors forge-provider's client; forge-tools can't depend on forge-provider.
+fn bundled_client_builder() -> reqwest::ClientBuilder {
+    let certs = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .filter_map(|der| reqwest::Certificate::from_der(der.as_ref()).ok());
+    reqwest::Client::builder().tls_certs_only(certs)
+}
+
 // ---------------------------------------------------------------------------
 // web_fetch
 // ---------------------------------------------------------------------------
@@ -60,7 +71,7 @@ impl Tool for WebFetchTool {
             .unwrap_or(DEFAULT_MAX_CHARS);
         is_safe_url(url)?;
 
-        let client = reqwest::Client::builder()
+        let client = bundled_client_builder()
             .user_agent(USER_AGENT)
             .timeout(FETCH_TIMEOUT)
             .build()
@@ -260,7 +271,7 @@ impl BraveSearch {
 #[async_trait]
 impl SearchBackend for BraveSearch {
     async fn search(&self, query: &str, count: u32) -> Result<Vec<SearchResult>, ToolError> {
-        let client = reqwest::Client::builder()
+        let client = bundled_client_builder()
             .user_agent(USER_AGENT)
             .timeout(FETCH_TIMEOUT)
             .build()
@@ -328,7 +339,7 @@ const DDG_UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 F
 #[async_trait]
 impl SearchBackend for DuckDuckGo {
     async fn search(&self, query: &str, count: u32) -> Result<Vec<SearchResult>, ToolError> {
-        let client = reqwest::Client::builder()
+        let client = bundled_client_builder()
             .user_agent(DDG_UA)
             .timeout(FETCH_TIMEOUT)
             .build()
