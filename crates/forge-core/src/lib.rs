@@ -2366,6 +2366,12 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         let mut empty_nudges = 0usize;
         let mut last_tool_sig: Option<u64> = None;
         let mut repeat_count = 0usize;
+        // `recent_sigs`: a short sliding window of recent tool-batch signatures. The consecutive
+        // `repeat_count` above misses an A,B,A,B,… oscillation (every step differs from the one
+        // before, so the counter keeps resetting) — e.g. a model alternating a failing/empty call
+        // with a trivial successful one, which ALSO clears the failure-loop streak (a success on a
+        // tool resets it). Counting how often a signature recurs in this window catches that.
+        let mut recent_sigs: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
         // `continue_nudges`: bounded retries when the model signs off with text but tracked tasks
         // are still unfinished (narrate-then-stall) — drive it to completion instead of ending the
         // turn mid-task. `doom_nudged`: the doom-loop fires a "change approach" nudge BEFORE it
@@ -2972,6 +2978,10 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             // args yield identical results, so halt with a clear message instead of burning the
             // remaining step budget + tokens.
             const DOOM_LOOP_THRESHOLD: usize = 3;
+            // Sliding-window size for the oscillation guard. 6 holds three full A,B cycles, so an
+            // A,B,A,B,A,B alternation surfaces the same signature THRESHOLD× and trips the guard,
+            // while leaving room for legitimate progress (distinct calls don't accumulate).
+            const DOOM_OSC_WINDOW: usize = 6;
             let sig = tool_batch_signature(&resp.tool_calls);
             if last_tool_sig == Some(sig) {
                 repeat_count += 1;
@@ -2979,7 +2989,14 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                 repeat_count = 0;
                 last_tool_sig = Some(sig);
             }
-            if repeat_count + 1 >= DOOM_LOOP_THRESHOLD {
+            // Oscillation count: how many of the last DOOM_OSC_WINDOW steps had THIS signature.
+            // Catches the non-consecutive loop the `repeat_count` reset blinds us to.
+            recent_sigs.push_back(sig);
+            if recent_sigs.len() > DOOM_OSC_WINDOW {
+                recent_sigs.pop_front();
+            }
+            let osc_count = recent_sigs.iter().filter(|&&s| s == sig).count();
+            if repeat_count + 1 >= DOOM_LOOP_THRESHOLD || osc_count >= DOOM_LOOP_THRESHOLD {
                 if !doom_nudged {
                     // First time: don't kill the turn. Tell it the identical call won't change
                     // anything and to switch approach — a weaker model usually breaks out of the
@@ -6056,6 +6073,86 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("kept repeating the same tool call")),
             "the doom-loop guard should halt a repeating model; warnings: {warnings:?}"
+        );
+    }
+
+    /// Alternates two DIFFERENT calls forever: a failing read of a missing path, then a succeeding
+    /// read of a real file. Neither the consecutive doom-loop (each step differs from the one before)
+    /// NOR the failure-loop (the interleaved success clears the read_file failure streak) can see it —
+    /// only the oscillation window catches the A,B,A,B cycle. Models the real bug where a model
+    /// alternated an empty failing `shell({})` with a trivial `ls -la`, looping until timeout.
+    struct OscillatingProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for OscillatingProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_types::{new_id, ToolCall, Usage};
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let args = if n % 2 == 0 {
+                serde_json::json!({"path": "does-not-exist-xyz.txt"}) // fails NotFound
+            } else {
+                serde_json::json!({"path": "Cargo.toml"}) // succeeds → clears failure streak
+            };
+            Ok(forge_provider::ModelResponse {
+                content: "still poking at it".into(),
+                tool_calls: vec![ToolCall {
+                    id: new_id(),
+                    name: "read_file".into(),
+                    args,
+                }],
+                usage: Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn doom_loop_halts_a_model_oscillating_between_two_calls() {
+        // Regression for the alternation-evasion bug: a model that ping-pongs between a failing call
+        // and a succeeding one evades BOTH the consecutive doom-loop (no two steps alike) and the
+        // failure-loop (the success clears the failure streak), so without the oscillation window it
+        // runs to the step cap / timeout. The guard must still halt it.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(OscillatingProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        session.run_turn("keep going").await.unwrap();
+
+        let warnings: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PresenterEvent::Warning(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("kept repeating the same tool call")),
+            "the oscillation guard should halt a model ping-ponging between two calls; warnings: {warnings:?}"
         );
     }
 

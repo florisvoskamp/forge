@@ -6,6 +6,24 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.42] - 2026-06-27
+
+### Fixed
+- **Doom-loop oscillation guard** (`crates/forge-core/src/lib.rs`). The consecutive doom-loop guard
+  missed an `A,B,A,B,…` ping-pong (every step differs from the one before, so its repeat counter kept
+  resetting), and the failure-loop missed it too (an interleaved *successful* call clears the per-tool
+  failure streak). So a model alternating a failing/empty call with a trivial successful one — observed
+  live: an empty `shell({})` alternating with `ls -la` after a mid-run failover to a local model — ran
+  to the step cap / timeout instead of halting. Added a sliding-window oscillation count: a signature
+  recurring ≥ threshold times within the last 6 steps trips the same two-stage nudge-then-halt.
+  Conformance test `doom_loop_halts_a_model_oscillating_between_two_calls`.
+- **Recover `<function=…>` tool calls that carry `<parameter>` sub-tags** (`crates/forge-provider/src/
+  tool_recovery.rs`). Some local models (observed: ollama qwen3-coder on failover) emit a mixed format
+  — a Llama-style `<function=NAME>` tag whose body is not JSON but Anthropic-style `<parameter …>`
+  sub-tags. Recovery extracted the name but returned empty args → an empty no-op call that looped.
+  Now parses the sub-tags as a fallback (both `<parameter=key>` and `<parameter name="key">`). Both
+  bugs were found during the v0.4.41 batch-tool measurement.
+
 ## [0.4.41] - 2026-06-27
 
 ### Added
