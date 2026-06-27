@@ -6,6 +6,22 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.52] - 2026-06-27
+
+### Fixed (bug-hunt batch 2 — verified logic bugs in mesh + provider)
+- **In-band CLI rate-limit errors now trigger failover.** A subscription that hit its quota mid-turn
+  emitted an in-band rate-limit error wrapped as a non-retryable `Request`, so the mesh surfaced a hard
+  failure instead of benching the model and failing over to a fallback. Now classified `RateLimited`/
+  `Auth` (retryable). Test: `in_band_rate_limit_is_retryable_for_failover`.
+- **`record_session(None)` no longer preserves a stale session id.** A fresh-transcript bridge turn that
+  produced no session handle left the prior id in place, so the NEXT turn `--resume`d the PRIOR session
+  and skipped the current turn's context. `None` now clears it.
+- **`/mesh` explain uses the routed tier, not the classified one.** `ranked_rows`/`spread_probability`
+  ran before `decide()` could downshift the tier, so the explanation showed the routed pick ranked among
+  the wrong tier's rows with the wrong conservation probability.
+- **Cross-tier fallback rationale reports the real reason** (no usable key / benched / quota exhausted)
+  instead of always "no usable key".
+
 ## [0.4.51] - 2026-06-27
 
 ### Fixed
