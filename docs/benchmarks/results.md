@@ -72,6 +72,7 @@ bug (the direct-path verification gate silently failing, fixed in v0.4.6).
 | Oscillation halt | a non-consecutive `A,B,A,B` tool-call ping-pong (evades the consecutive doom-loop AND the failure-loop) → halt | `doom_loop_halts_a_model_oscillating_between_two_calls` |
 | Failure-loop halt (serial **and** concurrent) | same error KIND across differing args → halt; now also when the calls run as a concurrent read-only batch | `failure_loop_halts_a_model_failing_the_same_way`, `concurrent_batch_failure_loop_is_caught` |
 | Step cap | a runaway turn that always wants another tool call stops at `max_steps`, never spins | `step_cap_halts_a_runaway_turn` |
+| Autofix self-heal cap | the lint/test self-heal loop stops at `max_iterations` when checks never pass, never spins | `autofix_iteration_cap_halts_the_self_heal_loop` |
 | Empty-response | bounded nudges then stop — never spin forever | `empty_response_is_nudged_then_stops_not_loops` |
 | Tool-call-as-text (direct) | narrated `<invoke>` that didn't execute → nudge, then end loudly (no phantom success) | `tool_call_written_as_text_never_silently_succeeds` |
 | Tool-call-as-text (**bridge**) | a bridge model that writes a tool call as prose → recovered + executed (no 553× spiral), and NOT double-executed if the CLI already ran it natively | `recovers_prose_tool_call_the_bridge_did_not_execute`, `prose_recovery_skipped_when_cli_ran_a_native_tool` |

@@ -6,6 +6,15 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.49] - 2026-06-27
+
+### Added (tests)
+- `autofix_iteration_cap_halts_the_self_heal_loop` — pins the last untested run-loop backstop: the
+  lint/test self-heal loop stops at `max_iterations` when checks never pass (drives a real turn that
+  edits a file to arm autofix, with a lint command that always fails). With this, **every reliability
+  guard in the run-loop now has a deterministic test**; the conformance table in `results.md` §2 gains
+  the row.
+
 ## [0.4.48] - 2026-06-27
 
 ### Docs

@@ -9475,6 +9475,100 @@ mod tests {
         );
     }
 
+    /// Call 0 writes a file (an edit → `edits_this_turn > 0`, arming autofix); every later call just
+    /// says "done" (no tools), so the only thing that can stop the self-heal loop is its iteration cap.
+    /// `cfg(unix)` because the only test using it relies on the `false` shell command.
+    #[cfg(unix)]
+    struct EditOnceThenDoneProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        path: String,
+    }
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl Provider for EditOnceThenDoneProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_types::{new_id, ToolCall, Usage};
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let tool_calls = if n == 0 {
+                vec![ToolCall {
+                    id: new_id(),
+                    name: "write_file".into(),
+                    args: serde_json::json!({"path": self.path, "content": "x = 1\n"}),
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(forge_provider::ModelResponse {
+                content: "done".into(),
+                tool_calls,
+                usage: Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autofix_iteration_cap_halts_the_self_heal_loop() {
+        // The autofix self-heal loop re-runs the model when lint/test fail. If they NEVER pass, only
+        // the `max_iterations` cap can stop it. Pin that: a turn makes one edit (arming autofix), the
+        // lint command always fails (`false`), and the loop must stop at the cap, not spin forever.
+        let dir = std::env::temp_dir().join(format!("forge-autofix-cap-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("f.py");
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        let config = Config {
+            permission_mode: forge_types::PermissionMode::AcceptEdits, // auto-allow the write
+            autofix: forge_config::AutofixConfig {
+                auto_lint: true,
+                auto_test: false,
+                lint_cmd: "false".to_string(), // always exits 1 → never "fixed"
+                test_cmd: String::new(),
+                max_iterations: 2,
+            },
+            ..Config::default()
+        };
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(EditOnceThenDoneProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                path: path.to_string_lossy().into_owned(),
+            }),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            config,
+            ".",
+        )
+        .unwrap();
+
+        // Must RETURN (the cap stops it), not loop forever.
+        session.run_turn("write the file").await.unwrap();
+
+        let warnings: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PresenterEvent::Warning(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            warnings.iter().any(|w| w.contains("reached iteration cap")),
+            "the autofix loop must stop at its iteration cap; warnings: {warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn autofix_stage_skipped_when_no_edits() {
