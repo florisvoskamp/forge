@@ -537,7 +537,9 @@ fn parse_secs(s: &str) -> Option<f64> {
             started = true;
         } else if started {
             break;
-        } else if c == '"' || c == ':' || c == ' ' || c == '=' {
+        } else if c == '"' || c == ':' || c == '=' || c.is_ascii_whitespace() {
+            // Skip whitespace too (incl. `\n`/`\t`) — pretty-printed JSON puts a newline between the
+            // key and value (`"retryDelay":\n  "37s"`), which used to abort the parse and drop the hint.
             continue;
         } else {
             // a non-numeric, non-separator char before any digit — give up.

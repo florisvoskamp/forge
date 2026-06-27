@@ -1527,6 +1527,15 @@ impl Provider for CliProvider {
                 }
             } else if lower.contains("auth") || lower.contains("401") || lower.contains("403") {
                 ProviderError::Auth(msg)
+            } else if lower.contains("overload")
+                || lower.contains("server_error")
+                || lower.contains("internal")
+                || lower.contains("503")
+                || lower.contains("500")
+            {
+                // Claude emits `overloaded` under API load — transient, so the mesh should bench +
+                // fail over, not surface a hard error. Mirrors genai_provider's Unavailable default.
+                ProviderError::Unavailable(msg)
             } else {
                 ProviderError::Request(msg)
             };
@@ -2806,6 +2815,30 @@ mod tests {
         assert!(
             matches!(err, ProviderError::RateLimited { .. }),
             "got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_band_overloaded_is_retryable_for_failover() {
+        // Claude emits `overloaded` under API load — transient, so it must be retryable (failover),
+        // not a hard `Request` that ends the turn. (Earlier the classifier only caught rate/auth.)
+        let fake =
+            make_fake_cli(r#"{"type":"result","is_error":true,"api_error_status":"overloaded"}"#);
+        let provider = CliProvider::claude_code().with_binary(&fake);
+        let mut on_event = |_: StreamEvent| {};
+        let err = provider
+            .complete(
+                "claude-cli::sonnet",
+                &[Message::user("hi")],
+                &[],
+                &mut on_event,
+            )
+            .await
+            .expect_err("in-band overloaded → error");
+        assert!(
+            err.is_retryable() && matches!(err, ProviderError::Unavailable(_)),
+            "overloaded must be retryable Unavailable; got {err:?}"
         );
     }
 

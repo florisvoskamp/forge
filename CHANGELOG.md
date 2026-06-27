@@ -6,6 +6,24 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.60] - 2026-06-27
+
+### Fixed (bug-hunt batch 5 — provider + store)
+- **Claude `overloaded` errors now trigger failover.** The in-band error classifier (v0.4.52) caught
+  rate-limit/auth but NOT `overloaded`/server errors, so a transient overload surfaced as a
+  non-retryable `Request` and the mesh wouldn't bench or fail over. Now mapped to `Unavailable`
+  (retryable). Test: `in_band_overloaded_is_retryable_for_failover`.
+- **Session message counts no longer include soft-deleted rows.** `message_count` and the
+  `list_sessions` count subquery omitted `AND active = 1`, so undone/compacted messages inflated the
+  counts in the session picker / `forge sessions`. Test extended:
+  `deactivate_excludes_messages_from_load_but_keeps_earlier_ones`.
+- **`load_findings` is actually ranked now.** The query had no `ORDER BY` despite the doc promising
+  (severity, confidence) ordering, so the assay UI showed the least-important finding first. Added the
+  ordering.
+- **`parse_secs` reads retry-after hints from pretty-printed JSON.** A newline/tab between key and
+  value (`"retryDelay":
+  "37s"`) aborted the parse; it now skips all whitespace.
+
 ## [0.4.59] - 2026-06-27
 
 ### Fixed (bug-hunt batch 4 — subagent routing)

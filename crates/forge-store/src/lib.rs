@@ -1020,7 +1020,9 @@ impl Store {
     /// Number of messages in a session.
     pub fn message_count(&self, session_id: &str) -> Result<i64> {
         Ok(self.lock()?.query_row(
-            "SELECT COUNT(*) FROM message WHERE session_id = ?1",
+            // `active = 1` only — soft-deleted (undone/compacted) rows must not inflate the count
+            // shown in the session picker / `forge sessions`, which `load_messages` also excludes.
+            "SELECT COUNT(*) FROM message WHERE session_id = ?1 AND active = 1",
             [session_id],
             |row| row.get(0),
         )?)
@@ -1053,9 +1055,9 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT s.id, s.cwd, s.permission_mode, s.created_at, s.total_cost_usd,
-                    (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id),
+                    (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id AND m.active = 1),
                     (SELECT content FROM message m WHERE m.session_id = s.id
-                       AND m.role = 'user' ORDER BY m.seq LIMIT 1),
+                       AND m.role = 'user' AND m.active = 1 ORDER BY m.seq LIMIT 1),
                     COALESCE((SELECT MAX(m.created_at) FROM message m WHERE m.session_id = s.id),
                              s.created_at) AS last_activity
              FROM session s WHERE s.parent_session_id IS NULL \
@@ -1308,9 +1310,13 @@ impl Store {
         use forge_types::{Confidence, Effort, FindingCategory, Severity};
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
+            // Actually rank by (severity, confidence) as the doc promises — the query had no ORDER BY,
+            // so SQLite returned insertion order and the UI showed the least-important finding first.
             "SELECT id, category, severity, confidence, file, line, title, rationale,
                     suggested_fix, effort, lens, verified
-             FROM finding WHERE run_id = ?1",
+             FROM finding WHERE run_id = ?1
+             ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                      CASE confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END",
         )?;
         let rows = stmt.query_map([run_id], |row| {
             let category: String = row.get(1)?;
@@ -2286,6 +2292,13 @@ mod tests {
             contents,
             vec!["turn 1", "reply 1"],
             "only the surviving turn loads"
+        );
+        // message_count must also exclude the soft-deleted rows (it used to count all 4, inflating
+        // the session picker).
+        assert_eq!(
+            store.message_count(&sid).unwrap(),
+            2,
+            "message_count excludes soft-deleted messages"
         );
     }
 
