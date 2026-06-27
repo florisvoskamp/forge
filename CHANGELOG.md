@@ -6,6 +6,21 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.70] - 2026-06-28
+
+### Docs (benchmark re-confirmation on the current build + stale-claim sweep)
+- **Re-confirmed the headline SWE-bench result on the current build (v0.4.65).** The standing
+  comparison was from v0.4.39 (~26 releases old); re-ran the same setup (10 SWE-bench Lite instances,
+  `claude sonnet`, same model both arms, loop-gated config, official `swebench` evaluator):
+  **Forge 6/10 vs raw claude-cli 4/10**, Forge **strictly dominating** (every CLI solve is also
+  Forge's, +2 Forge-only, 0 CLI-only) at **~21% lower tokens/resolve** (2.83M vs 3.57M). N=10 is
+  small and `requests-2317` hung on both arms (excluded fairly) — it confirms no regression, not a
+  fresh large-sample proof. Written up in `docs/benchmarks/results.md` + `why-forge-is-a-better-harness.md`.
+- **Corrected a stale claim** in `why-forge-is-a-better-harness.md` §3: the persistent stream-json
+  transport was described as "not a shipped result" — it **shipped in v0.4.63**. Now stated
+  accurately (ships the ~0.88s/turn spawn-cost saving; tokens unchanged; the deeper "Forge drives the
+  inner loop" variant is still open).
+
 ## [0.4.69] - 2026-06-28
 
 ### Fixed (release — Homebrew formula)

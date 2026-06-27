@@ -4,6 +4,30 @@ Forge's single most important job is the **harness**: be the best coding-agent h
 metrics, on BOTH API and bridge/subscription models. This file records what has been **measured and
 reproduced** so far — honestly, including where the measurement turned out to contradict the goal.
 
+## Re-confirmation on the CURRENT build (2026-06-28, v0.4.65)
+
+The headline comparison below (§ "Firming run — N=20") was measured on **v0.4.39** — ~26 releases
+old. Re-ran the same setup on the **current build** to check it still holds after all the session-5/6
+changes: 10 SWE-bench Lite instances (`sub10b`), `claude sonnet`, **same model both arms**, Forge's
+loop-gated-completeness config (`cfg-aggr`), scored by the official `swebench` Docker evaluator.
+
+| (current build, N=10, same `sonnet`) | resolved | total tokens | **tokens / resolve** |
+|---|---|---|---|
+| claude-cli direct | 4/10 | 14.28M | 3.57M |
+| **Forge (loop-gated)** | **6/10** | 16.96M | **2.83M** |
+
+**The win holds — and is cleaner here than at N=20.** Forge **strictly dominates**: every instance
+the raw CLI solved, Forge also solved (`django-10914`, `pytest-5103`, `scikit-learn-10297`,
+`sphinx-11445`), **plus two the CLI did not** (`seaborn-2848`, `pylint-7080`) — **0 CLI-only solves**.
+Forge is **~21% cheaper per resolve** (2.83M vs 3.57M); total tokens are 1.19× because it does more
+total work (6 solves vs 4).
+
+**Honest caveats:** N=10 is small (the ~21% per-resolve gap is noisier than the N=20 ~11%; the
+*direction* is consistent across both). `psf__requests-2317` hung in its test container on **both**
+arms and was excluded as an error on each side (so the comparison stays fair). One raw-CLI token
+metric was incomplete (the errored instance). This is a signal that the current build did **not
+regress** the headline, not a fresh large-sample proof.
+
 > ## ⚠️ Correction (2026-06-26): the earlier "bridge token-efficiency superiority" claim was wrong
 > An initial measurement appeared to show Forge-through-the-bridge using **far fewer tokens** than the
 > raw `claude`/`codex` CLI. **That was an accounting bug**, not a real win: the bridge recorded only

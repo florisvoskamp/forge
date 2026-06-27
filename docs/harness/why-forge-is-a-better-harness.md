@@ -58,14 +58,26 @@ Forge resolves **more** (the completeness re-drive catches under-scoped fixes th
 **lower cost per resolve**. Honest caveat: a second batch of 10 instances tied 5/5, so the +2 edge is
 modest — this is a real but not blowout result. Full method + caveats in `results.md` §3.
 
+**Re-confirmed on the current build (2026-06-28, v0.4.65)** — the N=20 above is from v0.4.39, ~26
+releases old, so the same setup was re-run on a fresh 10-instance batch: **Forge 6/10 vs raw CLI
+4/10**, Forge **strictly dominating** (every CLI solve is also Forge's, +2 Forge-only, 0 CLI-only) at
+**~21% lower tokens/resolve**. N=10 is small, but it confirms the headline did not regress. See
+`results.md` → "Re-confirmation on the CURRENT build".
+
 ## 3. Where Forge does NOT (yet) win — stated plainly
 
-- **Raw total-token efficiency / latency.** Each bridge tool call is an MCP round-trip that
-  re-processes the growing context, so Forge's harness takes more, smaller steps than the model's
-  in-process loop. On total tokens it's roughly **parity**, not a win. The structural fix (a persistent
-  stream-json transport where Forge owns the tool loop) is open work, not a shipped result. A
-  batch-tools experiment aimed at this **backfired** (it triggered the prose spiral) and was reverted —
-  documented honestly in `results.md` §3.
+- **Raw total-token efficiency.** Each bridge tool call is an MCP round-trip that re-processes the
+  growing context, so Forge's harness takes more, smaller steps than the model's in-process loop. On
+  total tokens it's roughly **parity**, not a win, and that has not changed. A batch-tools experiment
+  aimed at this **backfired** (it triggered the prose spiral) and was reverted — documented honestly
+  in `results.md` §3.
+- **Per-turn latency — partially addressed.** The persistent claude `--input-format stream-json`
+  transport **shipped (v0.4.63)**: one long-lived process across turns/re-drives removes the per-turn
+  process-spawn + session-reload cost (measured **~0.88s/turn**, saved on every re-drive). Honest
+  scope: it's a real per-re-drive saving that compounds, **not** a token change (both paths already
+  send deltas) and **not** a headline multiplier (model inference dominates). The deeper variant —
+  Forge driving the model's *inner* tool loop turn-by-turn instead of letting the CLI run it — is
+  still open.
 
 ## 4. Features the raw CLIs lack (real, not aspirational)
 
