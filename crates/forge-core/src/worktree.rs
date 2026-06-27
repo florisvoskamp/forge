@@ -58,6 +58,13 @@ impl WorktreeGuard {
             "worktree add",
         )?;
 
+        // Point cargo in the worktree at the PARENT repo's target dir, so a build inside the
+        // worktree shares the main build cache instead of compiling a fresh (multi-GB) `target/`
+        // per child — which both wasted disk/time AND leaked if the process was killed before the
+        // guard's Drop ran. Best-effort: a write failure just falls back to a private target.
+        // (`git diff HEAD..branch` drives merge-back, so this untracked file is never merged.)
+        write_shared_target_config(&worktree_path, repo_root);
+
         Ok(WorktreeGuard {
             path: worktree_path,
             branch,
@@ -89,6 +96,26 @@ impl Drop for WorktreeGuard {
             "branch -D",
         );
     }
+}
+
+/// Write `<worktree>/.cargo/config.toml` so cargo builds inside the worktree target the PARENT
+/// repo's `target/` dir (shared cache) rather than a private multi-GB one. Best-effort: any failure
+/// is ignored and the worktree just falls back to its own target.
+fn write_shared_target_config(worktree_path: &Path, repo_root: &Path) {
+    let cargo_dir = worktree_path.join(".cargo");
+    if std::fs::create_dir_all(&cargo_dir).is_err() {
+        return;
+    }
+    // TOML basic string: escape backslashes (Windows paths) and double-quotes.
+    let target_str = repo_root
+        .join("target")
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let _ = std::fs::write(
+        cargo_dir.join("config.toml"),
+        format!("[build]\ntarget-dir = \"{target_str}\"\n"),
+    );
 }
 
 /// Apply the child's changes (diff between HEAD and `branch`) to the main working tree using a
@@ -289,6 +316,15 @@ mod tests {
             assert!(
                 expected_path.exists(),
                 "worktree dir must exist after create"
+            );
+            // The worktree must build into the PARENT target dir, not a private one.
+            let cfg = std::fs::read_to_string(expected_path.join(".cargo").join("config.toml"))
+                .expect(".cargo/config.toml written into the worktree");
+            let shared = repo.join("target");
+            assert!(
+                cfg.contains("[build]")
+                    && cfg.contains(&shared.to_string_lossy().replace('\\', "\\\\")),
+                "config must point target-dir at the parent target: {cfg}"
             );
         }
         // After drop: directory and branch should be gone.

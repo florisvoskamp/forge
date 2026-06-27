@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.4.64"
+version = "0.4.65"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -79,3 +79,9 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 [profile.release]
 lto = "thin"
 strip = true
+
+# Full debuginfo made each debug/test binary ~480 MB; cargo writes a fresh one per build-hash and
+# never GCs the old ones, so a session of `cargo test` runs piled up hundreds of GB in target/deps.
+# Line-tables-only keeps file:line in backtraces/panics (enough for dev) at a fraction of the size.
+[profile.dev]
+debug = "line-tables-only"

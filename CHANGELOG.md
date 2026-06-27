@@ -6,6 +6,20 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.65] - 2026-06-27
+
+### Changed (disk hygiene)
+- **`[profile.dev] debug = "line-tables-only"`.** Full debuginfo made each debug/test binary
+  ~480 MB; cargo writes a fresh one per build-hash and never GCs the old ones, so a long session of
+  `cargo test` runs accumulated hundreds of GB in `target/debug/deps`. Line-tables-only keeps
+  file:line in backtraces/panics at ~⅓ the size (measured: forge-core test binary 484 MB → 163 MB).
+- **Subagent worktrees share the parent `target/`.** `WorktreeGuard::create` now writes
+  `<worktree>/.cargo/config.toml` pointing `build.target-dir` at the parent repo's `target/`, so a
+  build inside an isolated child worktree reuses the main build cache instead of compiling its own
+  multi-GB copy — which both wasted disk/time and leaked if the process was killed before the guard's
+  `Drop`. Best-effort (falls back to a private target on write failure); the untracked config is
+  never merged back (`git diff HEAD..branch` drives merge-back). Test extended.
+
 ## [0.4.64] - 2026-06-27
 
 ### Docs
