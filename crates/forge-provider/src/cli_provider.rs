@@ -308,9 +308,10 @@ impl CliProvider {
     /// Record a live session after a successful turn so the next call can `--resume` it.
     fn record_session(&self, id: Option<String>, sent: usize, model: &str) {
         if let Ok(mut st) = self.resume.lock() {
-            if let Some(id) = id {
-                st.session_id = Some(id);
-            }
+            // Always overwrite — `None` CLEARS a stale id. Keeping the old id on a turn that produced
+            // no session handle (e.g. a fresh-transcript turn where the CLI emitted no thread id) made
+            // the NEXT turn `--resume` the PRIOR session and skip this turn's context entirely.
+            st.session_id = id;
             st.sent = sent;
             st.model = model.to_string();
         }
@@ -1512,10 +1513,24 @@ impl Provider for CliProvider {
         }
 
         if let Some(e) = in_band_error {
-            return Err(ProviderError::Request(format!(
-                "{} error: {e}",
-                self.binary
-            )));
+            // Classify so the mesh can fail over instead of surfacing a hard error. A CLI that hits
+            // its quota mid-turn emits an in-band rate-limit error (claude: `rate_limit_error`); as a
+            // bare `Request` that's NOT retryable, so the model wouldn't be benched and no fallback
+            // ran. Map rate-limit → RateLimited and auth → Auth (both retryable / failover-eligible).
+            let lower = e.to_ascii_lowercase();
+            let msg = format!("{} error: {e}", self.binary);
+            let err = if lower.contains("rate") || lower.contains("429") || lower.contains("quota")
+            {
+                ProviderError::RateLimited {
+                    message: msg,
+                    retry_after: None,
+                }
+            } else if lower.contains("auth") || lower.contains("401") || lower.contains("403") {
+                ProviderError::Auth(msg)
+            } else {
+                ProviderError::Request(msg)
+            };
+            return Err(err);
         }
 
         let text = if content.is_empty() {
@@ -2761,6 +2776,36 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, StreamEvent::ToolStarted { name, .. } if name == "shell")),
             "the native shell tool_use should still have streamed as an event"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_band_rate_limit_is_retryable_for_failover() {
+        // A CLI that hits its quota mid-turn emits an in-band rate-limit result. It must surface as a
+        // RETRYABLE error so the mesh benches the model and fails over — not a hard `Request` that
+        // ends the turn.
+        let fake = make_fake_cli(
+            r#"{"type":"result","is_error":true,"api_error_status":"rate_limit_error"}"#,
+        );
+        let provider = CliProvider::claude_code().with_binary(&fake);
+        let mut on_event = |_: StreamEvent| {};
+        let err = provider
+            .complete(
+                "claude-cli::sonnet",
+                &[Message::user("hi")],
+                &[],
+                &mut on_event,
+            )
+            .await
+            .expect_err("in-band rate-limit → error");
+        assert!(
+            err.is_retryable(),
+            "in-band rate-limit must be retryable (failover-eligible); got {err:?}"
+        );
+        assert!(
+            matches!(err, ProviderError::RateLimited { .. }),
+            "got {err:?}"
         );
     }
 

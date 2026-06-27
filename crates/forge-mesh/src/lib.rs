@@ -722,8 +722,18 @@ impl HeuristicRouter {
                         .first()
                         .cloned()
                         .unwrap_or_else(|| "unknown".into());
+                    // Report WHY the primary was skipped — `is_usable` has three failure modes and
+                    // only one is a missing key; for a benched or quota-exhausted model the key IS
+                    // present, so "no usable key" was misleading.
+                    let reason = if !(self.model_available)(&original) {
+                        "no usable key"
+                    } else if health.is_benched(&original) {
+                        "model benched"
+                    } else {
+                        "quota exhausted"
+                    };
                     why.push_str(&format!(
-                        " — fell back to {model} (no usable key for {original})"
+                        " — fell back to {model} ({reason} for {original})"
                     ));
                 }
                 if self.config.mesh.prefer_subscription && is_subscription(&model) {
