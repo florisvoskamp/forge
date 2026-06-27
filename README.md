@@ -51,6 +51,13 @@ $ forge lattice query "UserRepository"
 | **Git** | Optional model-aware co-author attribution on commits + PR bodies |
 | **Safety** | Permission broker, per-tool rules, diff preview before write, shadow file snapshots, unoverridable denylist; opt-in OS shell sandbox (Linux Landlock, `[shell] sandbox`) |
 
+> **Why a harness, not just a CLI?** Forge can run the *same* model you'd run with `claude`/`codex`
+> directly — so the harness is the only difference. Real models loop, write tool calls as prose that
+> never execute, emit malformed output, and claim "done" without checking; a raw CLI loop mostly
+> spins, crashes, or phantom-succeeds on these. Forge turns each into a bounded, test-pinned outcome.
+> The honest, runnable case (with a `cargo test` behind every claim, and a clear note on where Forge
+> does *not* win): **[Why Forge is a better harness](docs/harness/why-forge-is-a-better-harness.md)**.
+
 ---
 
 ## Install
