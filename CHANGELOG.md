@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.54] - 2026-06-27
+
+### Fixed (bug-hunt batch 3 — mcp, index, skills)
+- **MCP lazy reconnect was permanently unreachable after a mid-session drop.** `classify_call_error`
+  marked the server `Reconnecting` but never cleared the dead peer, so `peer_for` kept returning the
+  stale handle and the `reconnect()` path never ran — every later call failed. The peer is now cleared.
+- **Dotfile source files were never refreshed by the watcher.** `should_reindex` applied the
+  skip-directory test to the FILENAME component, so `.eslintrc.js` / a hidden `.foo.rs` (which the
+  initial `update()` walk DOES index) were excluded. Only directory components are skip-tested now.
+- **Frontmatter split leaked a BOM into the prompt body.** `split()` stripped the BOM into `s` but
+  returned the raw (BOM-prefixed) string on the no-fence paths, so U+FEFF reached the model. Fixed.
+
 ## [0.4.53] - 2026-06-27
 
 ### Fixed (bug-hunt batch 3 — forge-tools)
