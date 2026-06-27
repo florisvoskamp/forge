@@ -79,8 +79,8 @@ writes SQLite) inside a plain `tokio::spawn`. That occupies a tokio *worker* thr
 walk. On a machine with few cores the multi-thread runtime is sized to `num_cpus`, so the indexer
 starved the executor and the first turn's `route_hinted` never got scheduled → the hang right after
 `● session`. `strace` perturbed scheduling enough to let the tasks interleave, hence the "vanishes
-under strace" tell. Amplified by `forge-store`'s single blocking `Mutex<Connection>` (see
-[backlog](#deferred-store-connection-pool)).
+under strace" tell. Amplified by `forge-store`'s then-single blocking `Mutex<Connection>` (since replaced by an
+`r2d2` pool, #308; see [backlog](#deferred-store-connection-pool)).
 
 **Fixed:** the indexer now runs on the blocking pool via `tokio::task::spawn_blocking`, so worker
 threads stay free for the agent turn regardless of core count. `scripts/e2e-docker.sh` keeps the
@@ -113,11 +113,12 @@ Ollama). The MCP-OAuth path should get its own bundled-roots client (add `webpki
 forge-mcp) before v1.0.0.
 
 <a id="deferred-store-connection-pool"></a>
-**Related backlog — store connection contention:** `forge-store` wraps a single SQLite connection
-in one blocking `std::sync::Mutex`, shared by the agent turn, the background indexer, and the file
-watcher. It serializes those actors and amplified the startup hang above. A small read/write
-connection pool (or moving store calls off the hot turn path) is tracked for the v1.0.0 reliability
-pass.
+**Related — store connection contention (RESOLVED, #308, v0.4.67):** `forge-store` used to wrap a
+single SQLite connection in one blocking `std::sync::Mutex`, shared by the agent turn, the background
+indexer, and the file watcher — serializing those actors and amplifying the startup hang above. It is
+now an **`r2d2` connection pool**: WAL-backed file DBs serve concurrent reads from separate pooled
+connections (writes still serialize on SQLite's one-writer rule, waiting on `busy_timeout`); the
+in-memory store is pinned to one connection. Covered by an 8-thread concurrency test.
 
 **Status:** fixed + full workspace builds clean; clippy clean; 286 forge-core/forge-provider tests
 pass.

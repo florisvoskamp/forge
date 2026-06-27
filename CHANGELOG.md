@@ -6,6 +6,27 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-28
+
+**Forge 1.0.** A model-agnostic AI coding agent for the terminal whose harness is *measurably* better
+than the raw vendor CLIs: on SWE-bench Lite, same `sonnet` model, **Forge fixes 6/10 vs the raw
+`claude` CLI's 4/10 at ~21% lower tokens per fix** — strictly dominating, re-confirmed on this build.
+
+### Docs (v1.0 marketing + currency pass)
+- **README rebuilt for v1.0:** new hero (proven harness + model freedom), a "same model, better
+  results" benchmark section, a head-to-head comparison vs Claude Code / Codex / Cursor / OpenCode /
+  Aider, a demo-GIF slot (`docs/assets/demo.tape` + recording guide), refreshed docs links, and the
+  stale `v0.1.0` Action example bumped.
+- **Docs currency sweep:** `known-issues.md` store-connection-pool backlog marked RESOLVED (#308);
+  `roadmap.md` "Road to v1.0.0" updated (must-haves done, post-1.0 Next); benchmark + persistent-transport
+  claims already corrected in `results.md` / `why-forge-is-a-better-harness.md` (#311).
+
+### The road here (v0.4.44 → 1.0.0)
+Robustness + correctness from 7 verify-first bug-hunts (28+ real bugs); the persistent
+subscription-bridge transport; `forge-store` connection pool; the two final TUI bugs; Homebrew
+auto-update; and the benchmark re-confirmation. Honest scope unchanged: Forge resolves more and is
+cheaper per resolve; total-token efficiency is parity (not a win) — stated plainly in the proof doc.
+
 ## [0.4.71] - 2026-06-28
 
 ### Fixed (release — Homebrew auto-update now works on protected main)

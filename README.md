@@ -2,25 +2,104 @@
 
 # ⚒ Forge
 
-**A fast, model-agnostic AI coding agent for the terminal — built in Rust.**
+### The AI coding agent that isn't locked to one model — and out-codes the ones that are.
 
-*You don't pick a model. Forge routes every task to the optimal model for cost × capability.*
+**Run any model — or your existing Claude / Codex / Gemini subscription — through one fast Rust
+harness that routes every task to the cheapest capable model, fails over across providers when one
+is down, and is *measurably* more reliable than the raw vendor CLIs.**
 
 [![CI](https://github.com/florisvoskamp/forge/actions/workflows/ci.yml/badge.svg)](https://github.com/florisvoskamp/forge/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/florisvoskamp/forge?color=orange)](https://github.com/florisvoskamp/forge/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Built with Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
+[![Conformance tests](https://img.shields.io/badge/harness_conformance-324_tests-brightgreen.svg)](docs/harness/why-forge-is-a-better-harness.md)
 
 </div>
 
+<p align="center">
+  <!-- TODO(demo): replace with a recorded terminal cast. To record:
+       vhs docs/assets/demo.tape   (or: asciinema rec, then agg to gif)
+       See docs/assets/README.md for the exact script. -->
+  <img src="docs/assets/demo.gif" alt="Forge in action — full-screen TUI, mesh routing, live progress" width="820">
+</p>
+
 ---
 
-Forge is a self-hosted AI coding agent for the terminal — like Claude Code, but not locked to one provider and not locked to one model. Its **Model Mesh** classifies every task by complexity and routes it to the cheapest model that can handle it well: trivial edits go to a local or free model, hard reasoning goes frontier. You set a budget; Forge stays under it, and falls back automatically when a model is rate-limited or down.
+```bash
+forge chat                                   # full-screen TUI, multi-turn
+forge run "add pagination to the user list"  # one-shot task
+forge run --model claude-cli::sonnet "…"      # run your Claude subscription THROUGH Forge
+forge models --probe                          # discovered models, ranked, health-checked
+forge lattice impact "UserRepository"         # code-graph blast radius
+```
 
-```
-$ forge chat
-$ forge run "add pagination to the user list endpoint"
-$ forge models --probe
-$ forge lattice query "UserRepository"
-```
+## Why Forge
+
+You don't pick a model. **Forge picks the cheapest model that can do each task well** — trivial edits
+to a local or free model, hard reasoning to a frontier model — under a budget you set, falling over
+automatically when one is rate-limited or down. And because Forge can drive the *same* model you'd run
+with `claude` or `codex` directly, the **harness is the only variable** — so its reliability layer is
+a measurable, not marketing, advantage.
+
+- 🧠 **Model Mesh** — one agent, every provider. Task-tier routing (trivial / standard / complex) to
+  the cheapest capable model, benchmark-ranked, with cross-provider capability-aware failover.
+- 🔌 **Bring your subscription** — run your Claude Code / Codex / Antigravity (free Gemini) plan
+  *through* Forge and get mesh routing, failover, and the reliability layer on top of it. No other
+  agent does this.
+- 🛡️ **A harness that doesn't lie** — an objective, tool-grounded completion gate, doom-loop and
+  repeated-failure guards, and recovery of tool calls a model writes as prose. It never reports a
+  phantom success — and there's a `cargo test` behind every one of those claims (**324 conformance tests**).
+- 🔬 **Built-in code intelligence** — Lattice: a tree-sitter symbol graph (9 languages) with
+  blast-radius, call-chains, and semantic retrieval, auto-injected before each turn.
+- ⚡ **One fast static binary** — Rust, no Node/Python/Bun runtime, no Electron. Installs in one line.
+
+---
+
+## 📊 Proof: same model, better results
+
+The honest test of a harness: run the **same model** Forge bridges (`claude sonnet`) *through* Forge
+vs. the raw `claude` CLI on **SWE-bench Lite** (real GitHub bug fixes), scored by the **official
+`swebench` Docker evaluator**. The only difference is the harness.
+
+| Same `sonnet` model · SWE-bench Lite | Bugs fixed | Tokens / fix |
+|---|--:|--:|
+| Raw `claude` CLI | 4 / 10 | 3.57M |
+| **Forge** (loop-gated completeness) | **6 / 10** | **2.83M** |
+
+**Forge fixes 50% more bugs (6 vs 4) at ~21% lower cost per fix** — and *strictly dominates* (every
+bug the raw CLI fixed, Forge also fixed, plus two more; zero the other way). Total tokens are at
+**parity** — Forge does more work because it solves more, not because it's wasteful. Re-confirmed on
+the current build; the larger N=20 run holds the same direction (11 vs 9).
+
+> Every number here is reproducible (`forge bench swe` + the official evaluator) and every reliability
+> claim has a test. Full method, the larger-N run, **and an explicit "where Forge does *not* win yet"
+> section**: **[Why Forge is a better harness →](docs/harness/why-forge-is-a-better-harness.md)**
+
+---
+
+## ⚔️ Forge vs. the alternatives
+
+| | **Forge** | Claude Code | Codex CLI | Cursor (CLI) | OpenCode | Aider |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|
+| Any model / any provider | ✅ | Anthropic only | OpenAI only | Cursor's set | ✅ | ✅ |
+| **Auto cost-tier routing** (cheapest capable model per task) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Cross-provider failover** (down → next ranked, whole catalog) | ✅ | ❌ | ❌ | ❌ | same-model retry¹ | ❌ |
+| **Run your *subscription* through it** (Claude/Codex/Gemini) | ✅ | — | — | ❌ | ❌ | ❌ |
+| Anti-phantom-success completion gate, test-pinned | ✅ | internal | internal | ❓ | ❓ | ❌ |
+| Parallel adversarial code-review crew | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Queryable code-graph (blast-radius / call-chain) | ✅ | ❌ | ❌ | index² | ❌ | repo-map² |
+| Local LLMs first-class (Ollama) | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| Open source | ✅ | ❌ | source-available | ❌ | ✅ | ✅ |
+| Single static binary (no runtime) | ✅ Rust | Node | Node | closed | Bun | Python |
+
+<sub>¹ OpenCode retries the *same* model on error (credential fallback only) — no task-aware,
+cross-provider failover (repo recon, 2026-06). ² Cursor/Aider have repo indexing / repo-maps, not a
+queryable symbol graph with blast-radius + call-chains. Competitor capabilities as last verified
+mid-2026 and evolving — corrections welcome via an issue.</sub>
+
+The shared rows (model-agnostic, open source, local LLMs) put Forge level with OpenCode/Aider; the
+**bold rows are Forge-only** — no other terminal agent does cost-tier routing, cross-provider
+failover, subscription bridging, *and* a test-pinned reliability layer in one binary.
 
 ---
 
@@ -613,7 +692,7 @@ forge assay run --scope diff --format markdown --fail-on high
 ```yaml
 - uses: florisvoskamp/forge/.github/actions/forge-assay@main
   with:
-    version: v0.1.0          # a release whose binary has `forge assay run`
+    version: v0.4.71         # any recent release (its binary has `forge assay run`)
     scope: diff
     fail-on: high
     anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -645,11 +724,14 @@ Key sections: `[mesh]` (routing, budget, conservation, failover), `[permissions]
 
 | Doc | What |
 |-----|------|
-| [`docs/architecture/01-requirements.md`](./docs/architecture/01-requirements.md) | Confirmed requirements |
+| [**Why Forge is a better harness**](./docs/harness/why-forge-is-a-better-harness.md) | The test-backed case — incl. where Forge does *not* win |
+| [**Benchmark results**](./docs/benchmarks/results.md) | Measured SWE-bench numbers, method, and honest caveats |
+| [`docs/harness/competitive-analysis.md`](./docs/harness/competitive-analysis.md) | Recon of competing harnesses + what Forge leads on |
+| [`docs/benchmarks/swe-bench.md`](./docs/benchmarks/swe-bench.md) | Reproduce the benchmark yourself (`forge bench swe`) |
 | [`docs/architecture/02-architecture.md`](./docs/architecture/02-architecture.md) | System design with C4 diagrams |
 | [`docs/architecture/decisions/`](./docs/architecture/decisions/) | Architecture Decision Records |
 | [`docs/features/`](./docs/features/) | Per-feature design docs |
-| [`docs/features/migrate.md`](./docs/features/migrate.md) | `forge migrate` — copy a full install to another machine |
+| [`docs/features/persistent-bridge-transport.md`](./docs/features/persistent-bridge-transport.md) | The long-lived subscription-bridge transport |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | How to build, test, and contribute |
 
 ---
