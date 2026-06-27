@@ -6,6 +6,23 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.50] - 2026-06-27
+
+### Fixed (diagnostics — clearer harness output, from a verified UX/observability audit)
+- **Direct-model continue-nudge exhaustion is no longer silent.** A model that narrates forever with a
+  task still open got nudged a bounded number of times, then the turn ended with NO warning (the
+  bridge path always warned). Now surfaces a "giving up — send `continue` to resume" warning. Test
+  `direct_continue_nudge_exhaustion_warns_when_giving_up`.
+- **Oscillation guard says "alternating", not "repeated".** An A,B,A,B oscillation emitted the same
+  "repeated the same tool call" message as a true A,A,A repeat; now distinguished.
+- **Bridge stdin-write failure surfaces its cause.** A failed prompt write (child died before reading)
+  was logged but not shown; the stall message now appends the real cause instead of reading as an
+  unexplained 300s timeout.
+- **Setup hint no longer printed twice** when a bridge CLI exits non-zero with empty stderr. Test
+  extended to assert no duplication.
+- **Plain-mode slash-command hint fixed** — said "use `forge chat`" when the user was already in
+  `forge chat`; now "run `forge chat` (without --plain)".
+
 ## [0.4.49] - 2026-06-27
 
 ### Added (tests)

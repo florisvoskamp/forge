@@ -1321,15 +1321,21 @@ impl Provider for CliProvider {
         // Feed the prompt to the child's stdin on a separate task so a large prompt can't deadlock
         // against the child filling its stdout pipe before it finishes reading stdin. Dropping the
         // handle after the write closes stdin (EOF), which both CLIs need to start processing.
+        // Shared so a prompt-write failure (child died before reading stdin → broken pipe) can be
+        // reported as the ROOT CAUSE instead of the generic "produced no output for 300s" stall the
+        // idle watchdog would otherwise show 5 minutes later.
+        let write_error: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         if let Some(mut stdin) = child.stdin.take() {
             let bytes = prompt.into_bytes();
+            let write_error = std::sync::Arc::clone(&write_error);
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
-                // Surface a write failure (broken pipe if the child died early, etc.) instead of
-                // dropping it — otherwise the child can wait forever for EOF and the turn only fails
-                // after the idle watchdog, with no clue why.
                 if let Err(e) = stdin.write_all(&bytes).await {
                     tracing::warn!("failed writing prompt to bridge stdin: {e}");
+                    if let Ok(mut slot) = write_error.lock() {
+                        *slot = Some(e.to_string());
+                    }
                 }
                 let _ = stdin.shutdown().await;
             });
@@ -1467,8 +1473,14 @@ impl Provider for CliProvider {
             // a bridge fails to start/run (e.g. a Windows launch problem), its error message is the
             // only clue to WHY it keeps benching — otherwise the user just sees "stalled".
             let stderr_text = err_task.await.unwrap_or_default();
+            // If the prompt write failed, THAT is why there was no output — report it as the cause
+            // instead of letting it read as an unexplained timeout.
+            let write_suffix = match write_error.lock().ok().and_then(|s| s.clone()) {
+                Some(e) => format!(" — prompt write also failed: {e}"),
+                None => String::new(),
+            };
             return Err(ProviderError::Unavailable(format!(
-                "`{}` produced no output for {}s — killed (stalled){}",
+                "`{}` produced no output for {}s — killed (stalled){write_suffix}{}",
                 self.binary,
                 idle.as_secs(),
                 stderr_suffix(&stderr_text)
@@ -1516,19 +1528,26 @@ impl Provider for CliProvider {
             let code = status.and_then(|s| s.code());
             if code != Some(0) {
                 let tail = stderr_text.trim();
-                let detail = if tail.is_empty() {
-                    self.kind.setup_hint().to_string()
+                let code_str = code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into());
+                // When there's no stderr, the only detail we have IS the setup hint — so don't also
+                // append it in the parenthetical (it used to print verbatim twice). With real stderr,
+                // show it as the detail and keep the hint as the actionable follow-up.
+                let msg = if tail.is_empty() {
+                    format!(
+                        "`{}` exited with {code_str} and no output — is it authenticated? {}",
+                        self.binary,
+                        self.kind.setup_hint(),
+                    )
                 } else {
-                    tail.to_string()
+                    format!(
+                        "`{}` exited with {code_str} and no output — {tail} (is it authenticated? {})",
+                        self.binary,
+                        self.kind.setup_hint(),
+                    )
                 };
-                return Err(ProviderError::Request(format!(
-                    "`{}` exited with {} and no output — {} (is it authenticated? {})",
-                    self.binary,
-                    code.map(|c| c.to_string())
-                        .unwrap_or_else(|| "signal".into()),
-                    detail,
-                    self.kind.setup_hint(),
-                )));
+                return Err(ProviderError::Request(msg));
             }
         }
 
@@ -2764,6 +2783,14 @@ mod tests {
             panic!("expected Request, got {err:?}");
         };
         assert!(msg.contains("authenticated"), "got: {msg}");
+        // With empty stderr the setup hint is the only detail — it must appear exactly ONCE, not
+        // duplicated verbatim (it used to print as both the `detail` and the parenthetical hint).
+        let hint = CliKind::Codex.setup_hint();
+        assert_eq!(
+            msg.matches(hint).count(),
+            1,
+            "setup hint duplicated in error: {msg}"
+        );
     }
 
     // Write an executable shell script that prints `stdout` then exits 0.

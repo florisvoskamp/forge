@@ -2937,6 +2937,14 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                             self.transcript.push(Message::system(nudge));
                             continue;
                         }
+                        // Nudge budget spent and work is STILL open — surface it. The bridge path
+                        // emits an equivalent warning; the direct path used to fall through here
+                        // silently, leaving the user to wonder why the turn stopped mid-plan.
+                        self.presenter.emit(PresenterEvent::Warning(format!(
+                            "model stopped with {unfinished} task(s) unfinished after \
+                             {MAX_CONTINUE_NUDGES} continue nudge(s) — giving up. Send `continue` \
+                             to resume."
+                        )));
                     } else if !self.tasks.is_empty() {
                         // Every tracked task reported Done — same completion authority as the bridge:
                         // don't accept the model's say-so, force ONE tool-grounded state check first.
@@ -2996,32 +3004,46 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                 recent_sigs.pop_front();
             }
             let osc_count = recent_sigs.iter().filter(|&&s| s == sig).count();
+            // Distinguish the two loop shapes so the warning isn't misleading: a true A,A,A repeat
+            // vs an A,B,A,B oscillation (where the model did NOT repeat the *same* call back-to-back).
+            let is_oscillation =
+                osc_count >= DOOM_LOOP_THRESHOLD && repeat_count + 1 < DOOM_LOOP_THRESHOLD;
             if repeat_count + 1 >= DOOM_LOOP_THRESHOLD || osc_count >= DOOM_LOOP_THRESHOLD {
                 if !doom_nudged {
-                    // First time: don't kill the turn. Tell it the identical call won't change
-                    // anything and to switch approach — a weaker model usually breaks out of the
-                    // rut. Queue the nudge so it lands AFTER this step's tool results (valid message
-                    // ordering); fall through to execute, then re-check next step.
+                    // First time: don't kill the turn. Tell it the loop won't make progress and to
+                    // switch approach — a weaker model usually breaks out of the rut. Queue the nudge
+                    // so it lands AFTER this step's tool results (valid message ordering); fall
+                    // through to execute, then re-check next step.
                     doom_nudged = true;
                     self.presenter.emit(PresenterEvent::Warning(
-                        "model repeated the same tool call — nudging it to change approach before \
-                         stopping"
-                            .to_string(),
+                        if is_oscillation {
+                            "model is alternating between the same tool calls in a loop (A→B→A \
+                             pattern) — nudging it to break out before stopping"
+                        } else {
+                            "model repeated the same tool call — nudging it to change approach \
+                             before stopping"
+                        }
+                        .to_string(),
                     ));
                     self.pending_hints.push(
-                        "You've now called the same tool with the same arguments several times — \
-                         the result will not change. Stop repeating it and take a DIFFERENT \
-                         approach (another tool, different arguments, or a different file). If the \
-                         task is genuinely complete, say so plainly or mark it Done with \
-                         update_tasks. Do not issue that identical call again."
+                        "You've now cycled through the same tool calls several times — the results \
+                         will not change. Stop repeating this pattern and take a DIFFERENT approach \
+                         (another tool, different arguments, or a different file). If the task is \
+                         genuinely complete, say so plainly or mark it Done with update_tasks. Do \
+                         not issue that same cycle of calls again."
                             .to_string(),
                     );
                 } else {
                     // Still looping after the nudge → truly stuck; halt with a clear message.
                     self.presenter.emit(PresenterEvent::Warning(
-                        "the model kept repeating the same tool call after a nudge — stopping to \
-                         avoid a loop"
-                            .to_string(),
+                        if is_oscillation {
+                            "the model kept alternating between the same tool calls after a nudge — \
+                             stopping to avoid a loop"
+                        } else {
+                            "the model kept repeating the same tool call after a nudge — stopping \
+                             to avoid a loop"
+                        }
+                        .to_string(),
                     ));
                     hit_step_cap = false;
                     break;
@@ -6165,8 +6187,9 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains("kept repeating the same tool call")),
-            "the oscillation guard should halt a model ping-ponging between two calls; warnings: {warnings:?}"
+                .any(|w| w.contains("kept alternating between the same tool calls")),
+            "the oscillation guard should halt a model ping-ponging between two calls with an \
+             ALTERNATING-specific message; warnings: {warnings:?}"
         );
     }
 
@@ -6497,6 +6520,81 @@ mod tests {
         assert!(
             nudged,
             "emitted a continue-nudge warning for the unfinished task"
+        );
+    }
+
+    /// Registers a task in_progress on call 0, then narrates with NO tool call forever — the task
+    /// never closes, so the continue-nudge budget is spent and the turn must give up (not loop).
+    struct NeverFinishesProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for NeverFinishesProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_types::{new_id, ToolCall, Usage};
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let tool_calls = if n == 0 {
+                vec![ToolCall {
+                    id: new_id(),
+                    name: "update_tasks".into(),
+                    args: serde_json::json!({"tasks": [{"title": "do the thing", "status": "in_progress"}]}),
+                }]
+            } else {
+                Vec::new() // narrate, never finish
+            };
+            Ok(forge_provider::ModelResponse {
+                content: "still working on it".into(),
+                tool_calls,
+                usage: Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_continue_nudge_exhaustion_warns_when_giving_up() {
+        // Regression for a SILENT exit: when a direct model narrates forever with a task still open,
+        // the harness nudges it a bounded number of times then GIVES UP. That give-up must be
+        // surfaced (the bridge path always warned; the direct path used to fall through silently,
+        // leaving the user to wonder why the turn stopped mid-plan).
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(NeverFinishesProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        session.run_turn("do the thing").await.unwrap();
+
+        let warnings: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PresenterEvent::Warning(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("giving up") && w.contains("unfinished")),
+            "exhausting the continue-nudge budget must surface a give-up warning; warnings: {warnings:?}"
         );
     }
 

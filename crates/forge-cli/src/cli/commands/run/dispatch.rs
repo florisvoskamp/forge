@@ -18,7 +18,7 @@ pub(crate) fn chat_action(line: &str) -> ChatAction {
         // Slash commands are TUI-only in plain mode; print a hint and skip.
         _ if t.starts_with('/') => {
             let cmd = t.split_whitespace().next().unwrap_or(t);
-            eprintln!("⚒ '{cmd}' is not supported in plain/headless mode — use `forge chat` for the interactive TUI.");
+            eprintln!("⚒ '{cmd}' is a TUI-only command — run `forge chat` (without --plain) for the interactive TUI.");
             ChatAction::Skip
         }
         task => ChatAction::Run(task.to_string()),
