@@ -626,8 +626,22 @@ fn strip_ansi(s: &str) -> String {
                         break;
                     }
                 }
+            } else if chars.peek() == Some(&']') {
+                // OSC: ESC ] ... terminated by BEL (0x07) or ST (ESC \). Color-enabled programs in
+                // PTY mode emit these constantly (window titles `ESC]0;…BEL`, hyperlinks `ESC]8;;…`).
+                // Consume the whole sequence so its payload doesn't leak into model-facing output.
+                chars.next();
+                while let Some(n) = chars.next() {
+                    if n == '\x07' {
+                        break;
+                    }
+                    if n == '\x1b' {
+                        chars.next(); // ST = ESC \ — drop the trailing backslash too
+                        break;
+                    }
+                }
             } else {
-                // other escape (e.g. ESC ] ...): drop the next char defensively
+                // other escape (e.g. ESC c, ESC =): drop the next char defensively
                 chars.next();
             }
         } else {
@@ -679,6 +693,13 @@ mod tests {
     fn strip_ansi_removes_color_codes() {
         let colored = "\x1b[31mred\x1b[0m plain";
         assert_eq!(strip_ansi(colored), "red plain");
+    }
+
+    #[test]
+    fn strip_ansi_consumes_whole_osc_sequence() {
+        // OSC (ESC ] … BEL/ST) used to leak its payload — only `]` was dropped.
+        assert_eq!(strip_ansi("\x1b]0;my title\x07hello"), "hello"); // BEL-terminated
+        assert_eq!(strip_ansi("\x1b]8;;http://x\x1b\\link"), "link"); // ST-terminated hyperlink
     }
 
     #[test]

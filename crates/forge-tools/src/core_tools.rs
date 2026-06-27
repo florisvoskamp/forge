@@ -98,7 +98,10 @@ impl Tool for ReadFileTool {
             let lines: Vec<&str> = content.lines().collect();
             let start = start_line.unwrap_or(1).saturating_sub(1); // 0-indexed
             let end = end_line.map(|e| e.min(lines.len())).unwrap_or(lines.len());
-            lines[start.min(lines.len())..end].join("\n")
+            // Clamp start to `end` so an inverted range (start_line > end_line) yields an empty
+            // slice instead of panicking `lines[7..3]` and crashing the whole turn on tool input.
+            let start = start.min(end);
+            lines[start..end].join("\n")
         };
         Ok(cap_read(out))
     }
@@ -1563,6 +1566,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(out, "line2\nline3\nline4");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_file_inverted_line_range_does_not_panic() {
+        // start_line > end_line used to panic `lines[7..3]` and crash the turn on tool input.
+        let dir = temp_dir("read-inverted");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9").unwrap();
+        let out = ReadFileTool
+            .run(&json!({ "path": path.to_str().unwrap(), "start_line": 8, "end_line": 3 }))
+            .await
+            .expect("inverted range must not panic");
+        assert_eq!(out, "", "inverted range yields an empty slice, not a panic");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

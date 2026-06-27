@@ -6,6 +6,17 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.53] - 2026-06-27
+
+### Fixed (bug-hunt batch 3 — forge-tools)
+- **`read_file` panicked on an inverted line range.** `start_line` > `end_line` (e.g. 8/3) sliced
+  `lines[7..3]` and crashed the whole turn on untrusted tool input. Start is now clamped to `end` (an
+  inverted range yields an empty result). Test: `read_file_inverted_line_range_does_not_panic`.
+- **`strip_ansi` leaked OSC escape payloads into model output.** A non-CSI escape dropped only one
+  char, so `ESC]0;title BEL` (window titles) and `ESC]8;;url ST` (hyperlinks) — emitted constantly by
+  color-enabled programs in PTY mode — leaked their content. OSC sequences are now consumed to their
+  BEL/ST terminator. Test: `strip_ansi_consumes_whole_osc_sequence`.
+
 ## [0.4.52] - 2026-06-27
 
 ### Fixed (bug-hunt batch 2 — verified logic bugs in mesh + provider)
