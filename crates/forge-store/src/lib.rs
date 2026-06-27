@@ -1859,11 +1859,20 @@ impl Store {
     /// All (src_id, dst_name) pairs from lattice_ref — the directed reference graph for PageRank.
     /// `src_id` is the referencing node's id; `dst_name` is the referenced identifier (resolved to
     /// node ids by name-join at call time). Returns (src_node_id, referenced_name) pairs.
-    pub fn lattice_ref_edges(&self) -> Result<Vec<(String, String)>> {
+    /// Scoped to `repo_root` — the store is global (one DB across every project), so an unscoped
+    /// scan would mix another project's refs into THIS repo's PageRank (cross-repo contamination).
+    pub fn lattice_ref_edges(&self, repo_root: &str) -> Result<Vec<(String, String)>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare("SELECT src_id, name FROM lattice_ref")?;
+        let mut stmt = conn.prepare(
+            "SELECT r.src_id, r.name FROM lattice_ref r
+             JOIN lattice_node n ON n.id = r.src_id
+             JOIN lattice_file f ON f.id = n.file_id
+             WHERE f.repo_root = ?1",
+        )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .query_map([repo_root], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1871,27 +1880,43 @@ impl Store {
     /// All nodes ordered by pagerank descending, capped at `limit` — the repo-map selection query.
     /// Returns the top-N most important symbols across all files in the index; the caller applies
     /// a token-budget cutoff. Use `usize::MAX` to retrieve every node (for small repos).
-    pub fn lattice_nodes_ranked(&self, limit: usize) -> Result<Vec<LatticeNodeRow>> {
+    pub fn lattice_nodes_ranked(
+        &self,
+        repo_root: &str,
+        limit: usize,
+    ) -> Result<Vec<LatticeNodeRow>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT n.id, n.file_id, n.kind, n.name, n.qualname, n.signature,
                     n.span_start, n.span_end, n.line_start, n.pagerank
              FROM lattice_node n
+             JOIN lattice_file f ON f.id = n.file_id
+             WHERE f.repo_root = ?1
              ORDER BY n.pagerank DESC
-             LIMIT ?1",
+             LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map([limit as i64], lattice_node_from_row)?
+            .query_map(
+                rusqlite::params![repo_root, limit as i64],
+                lattice_node_from_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    /// All (node_id, node_name) pairs — needed to resolve reference names to node ids for PageRank.
-    pub fn lattice_node_ids_and_names(&self) -> Result<Vec<(String, String)>> {
+    /// All (node_id, node_name) pairs for `repo_root` — needed to resolve reference names to node ids
+    /// for PageRank. Scoped so a sibling project's nodes don't absorb this repo's reference rank.
+    pub fn lattice_node_ids_and_names(&self, repo_root: &str) -> Result<Vec<(String, String)>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare("SELECT id, name FROM lattice_node")?;
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.name FROM lattice_node n
+             JOIN lattice_file f ON f.id = n.file_id
+             WHERE f.repo_root = ?1",
+        )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .query_map([repo_root], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

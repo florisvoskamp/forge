@@ -215,7 +215,7 @@ impl Lattice {
         use std::collections::HashMap;
 
         // Load all nodes and build an id→index map.
-        let node_pairs = self.store.lattice_node_ids_and_names()?;
+        let node_pairs = self.store.lattice_node_ids_and_names(&self.repo_root)?;
         if node_pairs.is_empty() {
             return Ok(());
         }
@@ -232,7 +232,7 @@ impl Lattice {
         }
 
         // Build adjacency: out_edges[src_idx] = list of dst_idx (resolved from lattice_ref).
-        let ref_edges = self.store.lattice_ref_edges()?;
+        let ref_edges = self.store.lattice_ref_edges(&self.repo_root)?;
         let mut out_edges: Vec<Vec<usize>> = vec![vec![]; n];
         for (src_id, dst_name) in &ref_edges {
             let Some(&src_idx) = id_to_idx.get(src_id.as_str()) else {
@@ -703,7 +703,7 @@ impl Lattice {
     /// select the most important symbols for the repo-map without needing to re-sort client-side.
     /// Pass `usize::MAX` to retrieve everything (the map applies its own token-budget cutoff).
     pub(crate) fn store_nodes_ranked(&self, limit: usize) -> Result<Vec<NodeHit>, LatticeError> {
-        let rows = self.store.lattice_nodes_ranked(limit)?;
+        let rows = self.store.lattice_nodes_ranked(&self.repo_root, limit)?;
         self.rows_to_hits(rows)
     }
 
@@ -1009,6 +1009,29 @@ mod tests {
         assert!(
             !dependents.contains(&"caller_b"),
             "must NOT see the other repo's caller: {dependents:?}"
+        );
+    }
+
+    #[test]
+    fn map_and_pagerank_are_scoped_to_their_own_repo_root() {
+        // Two repos sharing ONE global store. An unscoped `lattice_nodes_ranked` (map) or
+        // `lattice_node_ids_and_names`/`lattice_ref_edges` (PageRank) would mix the other project's
+        // symbols/rank into this repo's map. Scoping to repo_root must isolate them.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let a = Tmp::new();
+        a.write("src/a.rs", "pub fn alpha_only() {}\n");
+        let b = Tmp::new();
+        b.write("src/b.rs", "pub fn beta_only() {}\n");
+        let lat_a = Lattice::new(Arc::clone(&store), &a.root);
+        let lat_b = Lattice::new(Arc::clone(&store), &b.root);
+        lat_a.update().unwrap();
+        lat_b.update().unwrap();
+
+        let map_a = lat_a.map(100_000).unwrap();
+        assert!(map_a.contains("alpha_only"), "own symbol present: {map_a}");
+        assert!(
+            !map_a.contains("beta_only"),
+            "map must NOT include the other repo's symbol: {map_a}"
         );
     }
 
