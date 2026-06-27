@@ -271,6 +271,17 @@ pub struct CliProvider {
     /// Live `--resume` state (see [`ResumeState`]). Interior-mutable because [`Provider::complete`]
     /// takes `&self`; the lock is only ever held briefly to read/update, never across an `.await`.
     resume: std::sync::Mutex<ResumeState>,
+    /// P1 persistent transport (claude only): keep ONE long-lived `--input-format stream-json`
+    /// process alive across turns and write each turn's delta to its stdin, instead of re-spawning
+    /// (and re-`--resume`-ing) the CLI every turn/re-drive. Removes the per-turn process-spawn +
+    /// session-reload cost. Default on for claude; `FORGE_PERSISTENT_BRIDGE=0` or
+    /// [`with_persistent(false)`](Self::with_persistent) opts out. Falls back to the one-shot path
+    /// whenever the live session can't be (re)established BEFORE any turn output.
+    persistent: bool,
+    /// The live persistent session, if one is running (claude only). A `tokio` mutex because the
+    /// guard is held across the turn's stdout read (an `.await`); one turn at a time per provider,
+    /// which matches the single underlying process.
+    live: tokio::sync::Mutex<Option<LiveSession>>,
 }
 
 impl CliProvider {
@@ -284,7 +295,18 @@ impl CliProvider {
             // never consult it). Default on so the efficiency win applies without opt-in.
             resume_enabled: true,
             resume: std::sync::Mutex::new(ResumeState::default()),
+            // Persistent transport is claude-only (the one CLI with `--input-format stream-json`).
+            // On by default for claude; the env var is the operator escape hatch.
+            persistent: kind == CliKind::ClaudeCode
+                && std::env::var("FORGE_PERSISTENT_BRIDGE").as_deref() != Ok("0"),
+            live: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Toggle the P1 persistent transport (claude long-lived `--input-format stream-json`).
+    pub fn with_persistent(mut self, enabled: bool) -> Self {
+        self.persistent = enabled && self.kind == CliKind::ClaudeCode;
+        self
     }
 
     /// Toggle harness mode (Forge-tool MCP bridge) vs Phase-1 self-agent.
@@ -1179,6 +1201,33 @@ impl Provider for CliProvider {
         &self,
         model: &str,
         messages: &[Message],
+        tools: &[ToolSpec],
+        on_event: &mut EventSink<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        // P1 persistent transport (claude only, opt-out): drive the turn on a long-lived
+        // `--input-format stream-json` process. `Fallback` means the live session couldn't be
+        // established BEFORE any turn output ran, so retrying as one-shot can't double-execute a
+        // tool; `Failed` means the turn started (tools may have run) — propagate, don't re-run.
+        if self.persistent && self.kind == CliKind::ClaudeCode {
+            match self.complete_persistent(model, messages, on_event).await {
+                Ok(r) => return Ok(r),
+                Err(PersistentTurn::Fallback) => {}
+                Err(PersistentTurn::Failed(e)) => return Err(e),
+            }
+        }
+        self.complete_oneshot(model, messages, tools, on_event)
+            .await
+    }
+}
+
+impl CliProvider {
+    /// One spawn per turn: the original bridge transport. Sends the full transcript (or a
+    /// `--resume` delta) on a fresh CLI process and reads until it exits. Always available as the
+    /// fallback for the persistent path, and the only path for codex/agy.
+    async fn complete_oneshot(
+        &self,
+        model: &str,
+        messages: &[Message],
         _tools: &[ToolSpec], // harness mode serves Forge's tools via `forge mcp-serve`, which
         // builds its own registry — not from this param; text mode uses the CLI's own tools.
         on_event: &mut EventSink<'_>,
@@ -1513,33 +1562,7 @@ impl Provider for CliProvider {
         }
 
         if let Some(e) = in_band_error {
-            // Classify so the mesh can fail over instead of surfacing a hard error. A CLI that hits
-            // its quota mid-turn emits an in-band rate-limit error (claude: `rate_limit_error`); as a
-            // bare `Request` that's NOT retryable, so the model wouldn't be benched and no fallback
-            // ran. Map rate-limit → RateLimited and auth → Auth (both retryable / failover-eligible).
-            let lower = e.to_ascii_lowercase();
-            let msg = format!("{} error: {e}", self.binary);
-            let err = if lower.contains("rate") || lower.contains("429") || lower.contains("quota")
-            {
-                ProviderError::RateLimited {
-                    message: msg,
-                    retry_after: None,
-                }
-            } else if lower.contains("auth") || lower.contains("401") || lower.contains("403") {
-                ProviderError::Auth(msg)
-            } else if lower.contains("overload")
-                || lower.contains("server_error")
-                || lower.contains("internal")
-                || lower.contains("503")
-                || lower.contains("500")
-            {
-                // Claude emits `overloaded` under API load — transient, so the mesh should bench +
-                // fail over, not surface a hard error. Mirrors genai_provider's Unavailable default.
-                ProviderError::Unavailable(msg)
-            } else {
-                ProviderError::Request(msg)
-            };
-            return Err(err);
+            return Err(classify_in_band_error(&self.binary, &e));
         }
 
         let text = if content.is_empty() {
@@ -1619,6 +1642,455 @@ impl Provider for CliProvider {
             usage,
             quotas,
         })
+    }
+}
+
+/// Classify a CLI's in-band (streamed) error string into a [`ProviderError`] so the mesh can fail
+/// over instead of surfacing a hard error. Shared by the one-shot and persistent paths. A CLI that
+/// hits its quota mid-turn emits e.g. claude's `rate_limit_error`; as a bare `Request` that is NOT
+/// retryable, so the model wouldn't be benched and no fallback ran. Map rate-limit → RateLimited,
+/// auth → Auth, overload/5xx → Unavailable (all retryable / failover-eligible).
+fn classify_in_band_error(binary: &str, e: &str) -> ProviderError {
+    let lower = e.to_ascii_lowercase();
+    let msg = format!("{binary} error: {e}");
+    if lower.contains("rate") || lower.contains("429") || lower.contains("quota") {
+        ProviderError::RateLimited {
+            message: msg,
+            retry_after: None,
+        }
+    } else if lower.contains("auth") || lower.contains("401") || lower.contains("403") {
+        ProviderError::Auth(msg)
+    } else if lower.contains("overload")
+        || lower.contains("server_error")
+        || lower.contains("internal")
+        || lower.contains("503")
+        || lower.contains("500")
+    {
+        // Claude emits `overloaded` under API load — transient, so the mesh should bench + fail
+        // over, not surface a hard error. Mirrors genai_provider's Unavailable default.
+        ProviderError::Unavailable(msg)
+    } else {
+        ProviderError::Request(msg)
+    }
+}
+
+/// Outcome of a persistent-transport turn that did NOT yield a response.
+enum PersistentTurn {
+    /// The live session couldn't be (re)established BEFORE any turn output ran (spawn failure,
+    /// first-turn stdin-write failure, or an immediate exit with no tool executed). Safe to retry
+    /// the turn on the one-shot path — no tool can double-execute.
+    Fallback,
+    /// The turn started (tools may have run) and then failed. Propagate; do NOT re-run.
+    Failed(ProviderError),
+}
+
+/// What one persistent turn accumulated from the stream before its `result` event.
+#[derive(Default)]
+struct TurnData {
+    content: String,
+    final_text: Option<String>,
+    usage: Usage,
+    quotas: Vec<forge_types::QuotaHint>,
+    in_band_error: Option<String>,
+    /// Whether the CLI ran any NATIVE tool this turn (gates prose-fallback recovery, like one-shot).
+    tool_ran: bool,
+}
+
+/// Why a persistent turn's read loop ended without a `result`.
+enum TurnError {
+    /// No output for the whole idle window — the process is wedged.
+    Stall,
+    /// stdout read errored.
+    Read(std::io::Error),
+    /// The process closed stdout before emitting the turn's `result`.
+    Eof {
+        /// Whether a native tool had already run when the stream ended (blocks one-shot fallback,
+        /// which would re-execute it).
+        tool_ran: bool,
+    },
+}
+
+fn turn_error_to_provider(binary: &str, idle: Duration, e: TurnError) -> ProviderError {
+    match e {
+        // A stalled / prematurely-closed persistent turn is retryable (fail over), like a stalled
+        // one-shot bridge or genai stream.
+        TurnError::Stall => ProviderError::Unavailable(format!(
+            "`{binary}` produced no output for {}s — killed (stalled, persistent)",
+            idle.as_secs()
+        )),
+        TurnError::Read(io) => {
+            ProviderError::Request(format!("reading `{binary}` output failed: {io}"))
+        }
+        TurnError::Eof { .. } => ProviderError::Unavailable(format!(
+            "`{binary}` persistent session ended before completing the turn"
+        )),
+    }
+}
+
+/// Build the final [`ModelResponse`] from a completed persistent turn — classify any in-band error,
+/// then apply prose-fallback recovery exactly as the one-shot path does (only when no native tool
+/// ran, so a text-shaped fragment can't double-execute a tool the CLI already ran).
+fn finish_persistent_turn(binary: &str, turn: TurnData) -> Result<ModelResponse, ProviderError> {
+    if let Some(e) = turn.in_band_error {
+        return Err(classify_in_band_error(binary, &e));
+    }
+    let text = if turn.content.is_empty() {
+        turn.final_text.unwrap_or_default()
+    } else {
+        turn.content
+    };
+    let (tool_calls, content) = if !turn.tool_ran {
+        let (recovered, cleaned) = crate::recover_text_tool_calls(&text);
+        if recovered.is_empty() {
+            (Vec::new(), text)
+        } else {
+            (recovered, cleaned)
+        }
+    } else {
+        (Vec::new(), text)
+    };
+    Ok(ModelResponse {
+        content,
+        tool_calls,
+        usage: turn.usage,
+        quotas: turn.quotas,
+    })
+}
+
+/// JSON-encode one user turn as a Claude Code streaming-input line (`{"type":"user", …}`). Pulled
+/// out so the framing is unit-testable without a live process.
+fn stream_user_line(payload: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": payload },
+    })
+    .to_string()
+}
+
+/// A long-lived claude `--input-format stream-json` process driving multiple turns (P1). Holds the
+/// child's stdin open between turns; each turn writes one user line and reads stdout until the
+/// `result` event, leaving the process alive for the next turn.
+struct LiveSession {
+    child: Child,
+    stdin: tokio::process::ChildStdin,
+    lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr_task: Option<tokio::task::JoinHandle<String>>,
+    pgid: Option<i32>,
+    /// Bare model the session was started under; a model change forces a respawn.
+    model: String,
+    /// Transcript messages already consumed by the live process (the delta high-water mark).
+    sent: usize,
+    /// `FORGE_CHECKPOINT_SEQ` captured at spawn. A NEW user turn bumps it, and the served
+    /// `forge mcp-serve` snapshots edits against it — so a change forces a respawn to keep
+    /// bridge-edit `/undo` granularity correct. Re-drives WITHIN a turn keep the same seq and reuse
+    /// the process (where the per-step latency win is).
+    checkpoint_seq: Option<String>,
+    sink_path: Option<std::path::PathBuf>,
+    sub_rx: tokio::sync::mpsc::UnboundedReceiver<StreamEvent>,
+    tailer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl LiveSession {
+    /// Write one user turn to the live process's stdin (kept open afterwards).
+    async fn write_user(&mut self, payload: &str) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let line = stream_user_line(payload);
+        self.stdin.write_all(line.as_bytes()).await?;
+        self.stdin.write_all(b"\n").await?;
+        self.stdin.flush().await
+    }
+
+    /// Read the stream until this turn's `result` event, forwarding live events. Reuses the
+    /// idle-timeout / subagent-sink select of the one-shot path, but stops at `result` (the process
+    /// stays alive) instead of EOF.
+    async fn drive_turn(
+        &mut self,
+        idle: Duration,
+        kind: CliKind,
+        on_event: &mut EventSink<'_>,
+    ) -> Result<TurnData, TurnError> {
+        let mut data = TurnData::default();
+        let mut tool_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        enum Ev {
+            Line(std::io::Result<Option<String>>),
+            Sub(StreamEvent),
+        }
+        loop {
+            let tick = tokio::time::timeout(idle, async {
+                tokio::select! {
+                    biased;
+                    line = self.lines.next_line() => Ev::Line(line),
+                    Some(ev) = self.sub_rx.recv() => Ev::Sub(ev),
+                }
+            })
+            .await;
+            let line = match tick {
+                Err(_) => return Err(TurnError::Stall),
+                Ok(Ev::Sub(ev)) => {
+                    on_event(ev);
+                    continue;
+                }
+                Ok(Ev::Line(Ok(Some(l)))) => l,
+                Ok(Ev::Line(Ok(None))) => {
+                    return Err(TurnError::Eof {
+                        tool_ran: data.tool_ran,
+                    })
+                }
+                Ok(Ev::Line(Err(e))) => return Err(TurnError::Read(e)),
+            };
+            let mut turn_done = false;
+            for item in parse_line(kind, &line) {
+                match item {
+                    Parsed::Reasoning(t) => on_event(StreamEvent::Reasoning(t)),
+                    Parsed::Text(t) => {
+                        data.content.push_str(&t);
+                        on_event(StreamEvent::Text(t));
+                    }
+                    Parsed::ToolStarted { id, name, args } => {
+                        data.tool_ran = true;
+                        tool_names.insert(id, name.clone());
+                        on_event(StreamEvent::ToolStarted { name, args });
+                    }
+                    Parsed::ToolFinished { id, ok, summary } => {
+                        let name = tool_names.get(&id).cloned().unwrap_or_default();
+                        on_event(StreamEvent::ToolFinished { name, ok, summary });
+                    }
+                    Parsed::Usage(u) => data.usage = u,
+                    Parsed::Quota {
+                        window,
+                        status,
+                        resets_at,
+                        fraction,
+                    } => data.quotas.push(forge_types::QuotaHint {
+                        provider: kind.prefix().to_string(),
+                        window,
+                        status,
+                        resets_at,
+                        fraction_used: fraction,
+                    }),
+                    Parsed::Thread(_) => {}
+                    // `result` ends the turn; the process stays alive for the next one.
+                    Parsed::Final(f) => {
+                        data.final_text = Some(f);
+                        turn_done = true;
+                    }
+                    Parsed::Error(e) => data.in_band_error = Some(e),
+                }
+            }
+            if turn_done {
+                // Drain subagent events that landed just before the result line.
+                while let Ok(ev) = self.sub_rx.try_recv() {
+                    on_event(ev);
+                }
+                return Ok(data);
+            }
+        }
+    }
+
+    /// Stop the process and clean up (called on model change, error, or drop-equivalent).
+    async fn teardown(mut self) {
+        use tokio::io::AsyncWriteExt;
+        if let Some(t) = self.tailer.take() {
+            t.abort();
+        }
+        if let Some(t) = self.stderr_task.take() {
+            t.abort();
+        }
+        if let Some(p) = &self.sink_path {
+            let _ = std::fs::remove_file(p);
+        }
+        // Closing stdin (EOF) lets claude exit its input loop cleanly; then make sure it's gone.
+        let _ = self.stdin.shutdown().await;
+        terminate(&mut self.child, self.pgid).await;
+    }
+}
+
+impl CliProvider {
+    /// Current `FORGE_CHECKPOINT_SEQ` (set per user turn by the interactive run loop), used to decide
+    /// when a live session must respawn so bridge-edit snapshots stay turn-accurate.
+    fn current_checkpoint_seq() -> Option<String> {
+        std::env::var("FORGE_CHECKPOINT_SEQ").ok()
+    }
+
+    /// Spawn a long-lived claude `--input-format stream-json` process for the persistent transport.
+    async fn spawn_live(&self, bare: &str) -> std::io::Result<LiveSession> {
+        let forge_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| "forge".to_string());
+        let sink_path: Option<std::path::PathBuf> = {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "forge-subagents-{}-live{n}.jsonl",
+                std::process::id()
+            ));
+            std::fs::File::create(&p).ok().map(|_| p)
+        };
+        let mcp_env: Vec<(String, String)> = {
+            let mut env = Vec::new();
+            if let Some(p) = &sink_path {
+                if let Some(s) = p.to_str() {
+                    env.push((SUBAGENT_SINK_ENV.to_string(), s.to_string()));
+                }
+            }
+            for key in [
+                "FORGE_CHECKPOINT_SESSION",
+                "FORGE_CHECKPOINT_SEQ",
+                "FORGE_CHECKPOINT_ROOT",
+                "FORGE_SUBAGENT_DEPTH",
+                "FORGE_PERMISSION_MODE",
+            ] {
+                if let Ok(val) = std::env::var(key) {
+                    env.push((key.to_string(), val));
+                }
+            }
+            env
+        };
+
+        // No `--resume`: a persistent process holds its own context across turns. Add the
+        // streaming-input flag so it reads user turns from stdin instead of one prompt + EOF.
+        let mut args = build_args(self.kind, bare, self.harness, &forge_exe, &mcp_env, None);
+        args.push("--input-format".into());
+        args.push("stream-json".into());
+
+        let mut cmd = bridge_command(&self.binary, &args);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(p) = &sink_path {
+            cmd.env(SUBAGENT_SINK_ENV, p);
+        }
+        put_in_own_process_group(&mut cmd);
+
+        let mut child = cmd.spawn()?;
+        let pgid = child.id().map(|id| id as i32);
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        // Drain stderr in the background so a chatty hook can't fill the pipe and wedge the child.
+        let stderr_task = child.stderr.take().map(|s| tokio::spawn(read_to_cap(s)));
+        let lines = BufReader::new(stdout).lines();
+
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+        let tailer = match &sink_path {
+            Some(p) => Some(tokio::spawn(tail_subagent_sink(p.clone(), sub_tx))),
+            None => {
+                drop(sub_tx); // no sink → close the channel so its select arm is disabled
+                None
+            }
+        };
+
+        Ok(LiveSession {
+            child,
+            stdin,
+            lines,
+            stderr_task,
+            pgid,
+            model: bare.to_string(),
+            sent: 0,
+            checkpoint_seq: Self::current_checkpoint_seq(),
+            sink_path,
+            sub_rx,
+            tailer,
+        })
+    }
+
+    /// Drive one turn over the persistent transport (claude only). Reuses the live process across
+    /// re-drives within a user turn; respawns on model change, transcript shrink (compaction), or a
+    /// checkpoint-seq change (a new user turn). See [`PersistentTurn`] for the fallback contract.
+    async fn complete_persistent(
+        &self,
+        model: &str,
+        messages: &[Message],
+        on_event: &mut EventSink<'_>,
+    ) -> Result<ModelResponse, PersistentTurn> {
+        let bare = bare_model(model);
+        let checkpoint = Self::current_checkpoint_seq();
+        let mut guard = self.live.lock().await;
+
+        // Reuse only a session that matches the model, has strictly grown (a shrink → its in-process
+        // context is stale after a compaction/reset), and belongs to the same user turn (checkpoint).
+        let reuse = matches!(&*guard, Some(s)
+            if s.model == bare && s.sent > 0 && s.sent <= messages.len() && s.checkpoint_seq == checkpoint);
+        if !reuse {
+            if let Some(old) = guard.take() {
+                old.teardown().await;
+            }
+            match self.spawn_live(bare).await {
+                Ok(s) => *guard = Some(s),
+                Err(e) => {
+                    tracing::warn!("persistent bridge spawn failed, falling back to one-shot: {e}");
+                    return Err(PersistentTurn::Fallback);
+                }
+            }
+        }
+        let sess = guard
+            .as_mut()
+            .expect("live session present after (re)spawn");
+
+        // First turn on this process gets the full transcript; later turns (re-drives) get only the
+        // new messages — the live process already holds the prior context. This is the token win.
+        let payload = if sess.sent == 0 {
+            apply_harness_preamble(self.harness, render_prompt(messages))
+        } else {
+            let delta = render_resume_delta(&messages[sess.sent..]);
+            if delta.trim().is_empty() {
+                apply_harness_preamble(self.harness, render_prompt(messages))
+            } else {
+                apply_harness_preamble(self.harness, delta)
+            }
+        };
+
+        let first_turn = sess.sent == 0;
+        if let Err(e) = sess.write_user(&payload).await {
+            if let Some(old) = guard.take() {
+                old.teardown().await;
+            }
+            // First turn → nothing ran yet, safe to one-shot. Later turn → broken mid-conversation.
+            return if first_turn {
+                tracing::warn!(
+                    "persistent bridge stdin write failed on first turn, falling back: {e}"
+                );
+                Err(PersistentTurn::Fallback)
+            } else {
+                Err(PersistentTurn::Failed(ProviderError::Unavailable(format!(
+                    "`{}` persistent stdin write failed mid-session: {e}",
+                    self.binary
+                ))))
+            };
+        }
+
+        match sess.drive_turn(self.timeout, self.kind, on_event).await {
+            Ok(turn) => {
+                sess.sent = messages.len();
+                match finish_persistent_turn(&self.binary, turn) {
+                    Ok(resp) => Ok(resp),
+                    Err(e) => {
+                        if let Some(old) = guard.take() {
+                            old.teardown().await;
+                        }
+                        Err(PersistentTurn::Failed(e))
+                    }
+                }
+            }
+            // Fresh process exited before any turn output AND ran no tool → a startup/auth failure
+            // with nothing executed; one-shot reports those precisely, so fall back.
+            Err(TurnError::Eof { tool_ran: false }) if first_turn => {
+                if let Some(old) = guard.take() {
+                    old.teardown().await;
+                }
+                Err(PersistentTurn::Fallback)
+            }
+            Err(e) => {
+                let err = turn_error_to_provider(&self.binary, self.timeout, e);
+                if let Some(old) = guard.take() {
+                    old.teardown().await;
+                }
+                Err(PersistentTurn::Failed(err))
+            }
+        }
     }
 }
 
@@ -2012,7 +2484,11 @@ mod tests {
     #[ignore = "spawns the real `claude` CLI (needs install + auth + network); run with --ignored"]
     async fn e2e_claude_resume_preserves_context_across_calls() {
         use forge_types::Message;
-        let provider = CliProvider::claude_code().with_harness(false);
+        // Pinned to one-shot: this test validates `--resume` specifically, which the persistent
+        // transport bypasses (it holds context in-process instead).
+        let provider = CliProvider::claude_code()
+            .with_harness(false)
+            .with_persistent(false);
         let model = "claude-cli::haiku";
         let mut sink = |_e: StreamEvent| {};
 
@@ -2690,6 +3166,179 @@ mod tests {
             !res.content.contains("<function_calls>"),
             "recovered markup must be stripped from content: {:?}",
             res.content
+        );
+    }
+
+    #[test]
+    fn stream_user_line_is_a_valid_streaming_input_envelope() {
+        let line = stream_user_line("hello \"world\"\nline2");
+        let v: Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"], "hello \"world\"\nline2");
+        assert!(!line.contains('\n'), "the envelope itself is a single line");
+    }
+
+    #[test]
+    fn classify_in_band_error_maps_to_retryable_variants() {
+        assert!(matches!(
+            classify_in_band_error("claude", "rate_limit_error: slow down"),
+            ProviderError::RateLimited { .. }
+        ));
+        assert!(matches!(
+            classify_in_band_error("claude", "Overloaded (529)"),
+            ProviderError::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_in_band_error("claude", "401 unauthorized"),
+            ProviderError::Auth(_)
+        ));
+        assert!(matches!(
+            classify_in_band_error("claude", "weird unmapped thing"),
+            ProviderError::Request(_)
+        ));
+    }
+
+    /// A fake `claude --input-format stream-json`: loops reading user lines from stdin and emits one
+    /// assistant+result turn PER line, staying alive (exits only on stdin EOF). So a 2nd turn served
+    /// by the SAME process answers "reply 2"; a fresh one-shot spawn would always answer "reply 1".
+    #[cfg(unix)]
+    fn make_fake_persistent_cli() -> String {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("forge-fake-live-{}-{n}", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        // dash/bash `printf` is a builtin and writes unbuffered, so each turn's lines reach the
+        // reader immediately (the process never exits to flush).
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "i=0").unwrap();
+        writeln!(f, "while IFS= read -r line; do").unwrap();
+        writeln!(f, "  i=$((i+1))").unwrap();
+        writeln!(
+            f,
+            r#"  printf '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"reply %d"}}]}}}}\n' "$i""#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"  printf '{{"type":"result","is_error":false,"result":"reply %d","usage":{{"input_tokens":5,"output_tokens":3}}}}\n' "$i""#
+        )
+        .unwrap();
+        writeln!(f, "done").unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        // Probe-exec past any transient ETXTBSY (a concurrent fork briefly holding the write fd).
+        for _ in 0..200 {
+            match std::process::Command::new(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut c) => {
+                    let _ = c.wait();
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_transport_reuses_one_process_across_turns() {
+        // The decisive P1 test: one long-lived process serves BOTH turns. A fresh spawn per turn
+        // (the one-shot transport, or a silent fallback) would answer "reply 1" both times.
+        let fake = make_fake_persistent_cli();
+        let provider = CliProvider::claude_code()
+            .with_harness(false)
+            .with_persistent(true)
+            .with_binary(&fake)
+            .with_timeout(Duration::from_secs(10)); // fail fast if a turn ever stalls
+        let model = "claude-cli::sonnet";
+        let mut sink = |_e: StreamEvent| {};
+
+        let r1 = provider
+            .complete(model, &[Message::user("one")], &[], &mut sink)
+            .await
+            .expect("persistent turn 1");
+        assert_eq!(r1.content, "reply 1");
+
+        // Grow the transcript (assistant reply + a NEW user turn) so turn 2 sends only the delta to
+        // the SAME live process.
+        let msgs2 = vec![
+            Message::user("one"),
+            Message::assistant(&r1.content),
+            Message::user("two"),
+        ];
+        let r2 = provider
+            .complete(model, &msgs2, &[], &mut sink)
+            .await
+            .expect("persistent turn 2");
+        assert_eq!(
+            r2.content, "reply 2",
+            "the same persistent process must serve turn 2 (a fresh spawn would say 'reply 1')"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_falls_back_to_one_shot_when_binary_is_missing() {
+        // Spawn failure happens BEFORE any turn output, so the persistent path yields `Fallback` and
+        // complete() transparently runs the one-shot path — which surfaces the clean missing-binary
+        // error rather than a persistent-specific hang.
+        let provider = CliProvider::claude_code()
+            .with_persistent(true)
+            .with_binary("forge-no-such-cli-xyz");
+        let mut sink = |_: StreamEvent| {};
+        let err = provider
+            .complete("claude-cli::sonnet", &[Message::user("hi")], &[], &mut sink)
+            .await
+            .expect_err("missing binary must still error");
+        assert!(
+            matches!(&err, ProviderError::Request(m) if m.contains("not found")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns the real `claude` CLI in persistent mode (needs install + auth + network); run with --ignored"]
+    async fn e2e_claude_persistent_preserves_context_across_calls() {
+        use forge_types::Message;
+        let provider = CliProvider::claude_code()
+            .with_harness(false)
+            .with_persistent(true);
+        let model = "claude-cli::haiku";
+        let mut sink = |_e: StreamEvent| {};
+
+        let msgs1 = vec![Message::user(
+            "Remember this codeword: BANANA. Just acknowledge.",
+        )];
+        let r1 = provider
+            .complete(model, &msgs1, &[], &mut sink)
+            .await
+            .expect("persistent turn 1 should succeed");
+        assert!(!r1.content.trim().is_empty());
+
+        let msgs2 = vec![
+            msgs1[0].clone(),
+            Message::assistant(&r1.content),
+            Message::user("What was the codeword? Reply with just the word."),
+        ];
+        let r2 = provider
+            .complete(model, &msgs2, &[], &mut sink)
+            .await
+            .expect("persistent turn 2 should succeed");
+        assert!(
+            r2.content.to_uppercase().contains("BANANA"),
+            "the long-lived session must recall the codeword from turn 1; got: {}",
+            r2.content
         );
     }
 
