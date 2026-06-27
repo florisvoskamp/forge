@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.47] - 2026-06-27
+
+### Added
+- **Bridge stream-resilience tests** (`crates/forge-provider/src/cli_provider.rs`):
+  `truncated_stream_line_is_skipped_not_fatal` (a corrupt NDJSON line between valid lines is skipped,
+  not fatal) and `orphan_tool_result_without_started_does_not_panic_or_phantom` (a `tool_result` with
+  no preceding `tool_use` neither panics nor synthesizes a phantom call).
+
+### Docs
+- **forge-lsp public API documented** — module doc + `///` on `LspRegistry`, `from_config`,
+  `diagnostics_for`, `lang_from_ext`, `repo_root`, `which` (v1.0 surface polish).
+
 ## [0.4.46] - 2026-06-27
 
 ### Fixed
