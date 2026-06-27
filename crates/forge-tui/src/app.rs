@@ -3067,7 +3067,9 @@ fn input_text_rows(input: &str, box_width: u16) -> u16 {
     let inner = input_inner_width(box_width);
     let mut rows = 0usize;
     for (i, line) in input.split('\n').enumerate() {
-        let cols = line.chars().count() + if i == 0 { 2 } else { 0 }; // prompt on row 0
+        // Cell WIDTH, not char count — ratatui wraps on terminal columns, so a CJK/emoji glyph
+        // (2 cells) counted as 1 char under-counted rows and hid the cursor below the input box.
+        let cols = unicode_width::UnicodeWidthStr::width(line) + if i == 0 { 2 } else { 0 }; // prompt on row 0
         rows += cols.saturating_sub(1) / inner + 1; // ≥1 row per logical line
     }
     rows.max(1) as u16
@@ -4799,6 +4801,18 @@ mod tests {
         assert_eq!(input_box_height(&long, 80), INPUT_MAX_H);
         // A short line stays at the minimum.
         assert_eq!(input_box_height("hello", 80), INPUT_H);
+    }
+
+    #[test]
+    fn input_text_rows_counts_cell_width_not_chars() {
+        // 40 CJK glyphs are 80 terminal cells, so they wrap to more rows than 40 ascii chars (40
+        // cells) at the same width — counting `chars()` would tie them and hide the cursor.
+        let wide: String = "世".repeat(40);
+        let narrow = "x".repeat(40);
+        assert!(
+            input_text_rows(&wide, 80) > input_text_rows(&narrow, 80),
+            "wide glyphs must occupy more wrapped rows than the same count of ascii"
+        );
     }
 
     #[test]

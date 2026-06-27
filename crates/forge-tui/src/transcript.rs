@@ -51,7 +51,12 @@ fn browse<F: FnMut() -> Vec<TranscriptView>>(
         let views = refresh();
         let n = views.len().max(1);
         selected = selected.min(n - 1);
-        let width = term.size().map(|s| s.width).unwrap_or(80);
+        let size = term.size().unwrap_or_default();
+        let width = if size.width == 0 { 80 } else { size.width };
+        // Body window = terminal height minus the 2 header + 1 footer rows that `transcript_lines`
+        // reserves. The max usable scroll is `wrapped_len - body_h` (one full page from the tail);
+        // scrolling past that only reveals blank rows the render already clamps away.
+        let body_h = (size.height as usize).saturating_sub(3).max(1);
         let wrapped_len = views
             .get(selected)
             .map(|v| wrap_lines(&v.lines, width.saturating_sub(1) as usize).len())
@@ -59,7 +64,7 @@ fn browse<F: FnMut() -> Vec<TranscriptView>>(
         if follow {
             scroll = usize::MAX / 2;
         }
-        scroll = scroll.min(wrapped_len.saturating_sub(1));
+        scroll = scroll.min(wrapped_len.saturating_sub(body_h));
         term.draw(|f| {
             let a = f.area();
             f.render_widget(Clear, a);
@@ -88,7 +93,7 @@ fn browse<F: FnMut() -> Vec<TranscriptView>>(
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 scroll = scroll.saturating_add(1);
-                if scroll >= wrapped_len.saturating_sub(1) {
+                if scroll >= wrapped_len.saturating_sub(body_h) {
                     follow = true;
                 }
             }
@@ -98,7 +103,7 @@ fn browse<F: FnMut() -> Vec<TranscriptView>>(
             }
             KeyCode::PageDown | KeyCode::Char('d') | KeyCode::Char(' ') => {
                 scroll = scroll.saturating_add(10);
-                if scroll >= wrapped_len.saturating_sub(1) {
+                if scroll >= wrapped_len.saturating_sub(body_h) {
                     follow = true;
                 }
             }
