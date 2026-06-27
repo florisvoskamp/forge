@@ -6,6 +6,14 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-06-28
+
+### Fixed (release)
+- **The release's Homebrew-formula PR now actually opens.** `release.yml` granted only
+  `contents: write`, so the `gh pr create` in the formula-update step was denied (it pushed the
+  `brew/v<version>` branch but couldn't open the PR — masked by `continue-on-error`). Added
+  `pull-requests: write` so future releases self-open the brew bump PR.
+
 ## [1.0.0] - 2026-06-28
 
 **Forge 1.0.** A model-agnostic AI coding agent for the terminal whose harness is *measurably* better
