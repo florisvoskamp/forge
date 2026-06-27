@@ -6,6 +6,28 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.63] - 2026-06-27
+
+### Added (P1 — persistent bridge transport)
+- **Long-lived claude `--input-format stream-json` transport.** The claude bridge now keeps ONE
+  process alive across turns/re-drives and writes each turn's delta to its stdin, instead of
+  re-spawning (and re-`--resume`-ing) the CLI every turn. Removes the per-turn process-spawn +
+  session-reload cost that one-shot paid on every re-drive. On by default for claude;
+  `FORGE_PERSISTENT_BRIDGE=0` (or `CliProvider::with_persistent(false)`) opts out.
+  - **Safety:** falls back to the one-shot path whenever the live session can't be established
+    *before* any turn output ran (spawn failure, first-turn stdin-write failure, immediate exit with
+    no tool executed), so a tool can never double-execute. Once a turn has started, errors propagate
+    (retryable) rather than re-running.
+  - **Correctness:** respawns on model change, transcript shrink (compaction), and a
+    `FORGE_CHECKPOINT_SEQ` change (a new user turn) — so re-drives *within* a turn reuse the process
+    (the win) while bridge-edit `/undo` snapshots stay turn-accurate.
+  - **Proven:** deterministic test `persistent_transport_reuses_one_process_across_turns` (a 2nd turn
+    served by the same process answers "reply 2"; a fresh spawn would answer "reply 1"), live e2e
+    against real claude (recalls a codeword across two turns on one process), and a measured fixed
+    overhead of **≈0.88s spawn→init per one-shot turn** that persistent now pays once per session
+    instead of once per re-drive. Honest scope: model inference dominates total turn time, so this is
+    a real per-re-drive saving that compounds, not a headline multiplier.
+
 ## [0.4.62] - 2026-06-27
 
 ### Fixed (bug-hunt batch 7 — provider + store + tools)
