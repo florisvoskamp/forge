@@ -6,7 +6,9 @@ pricing table costs **$0** — so genuinely-free providers win automatically whe
 and the mesh falls back down the candidate list otherwise.
 
 These all work through Forge's `genai` backend; most are **native genai adapters** (just set the
-key), and **Cerebras** is wired via a custom OpenAI-compatible endpoint resolver.
+key). Providers genai has no SDK adapter for (Cerebras, **NVIDIA NIM**, **SambaNova**, **Mistral**)
+are wired via a custom OpenAI-compatible endpoint resolver — see
+[Adding a provider](#adding-an-openai-compatible-provider).
 
 ## Providers & keys
 
@@ -19,12 +21,40 @@ key), and **Cerebras** is wired via a custom OpenAI-compatible endpoint resolver
 | `github_copilot::` | free tier | `GITHUB_TOKEN` | GitHub Models inference gateway (`github_copilot::openai/gpt-4.1-mini`, …). |
 | `mimo::` | free tier | `MIMO_API_KEY` | Xiaomi MiMo. |
 | `minimax::` | free tier | `MINIMAX_API_KEY` | MiniMax. |
-| `cerebras::` | free tier | `CEREBRAS_API_KEY` | **No native genai adapter** — Forge retargets the OpenAI-compatible `api.cerebras.ai` endpoint via a service-target resolver. |
+| `cerebras::` | free tier | `CEREBRAS_API_KEY` | Custom endpoint. `llama-3.3-70b`, `gpt-oss-120b`, `qwen-3-coder-480b` — very fast. |
+| `nvidia::` | free dev tier | `NVIDIA_API_KEY` | **NVIDIA NIM** (`integrate.api.nvidia.com`). Seeds `deepseek-ai/deepseek-r1`, `meta/llama-3.1-405b-instruct`, `meta/llama-3.3-70b-instruct`, `qwen/qwen2.5-coder-32b-instruct`, `nvidia/llama-3.1-nemotron-70b-instruct`. ~40 RPM across 100+ models. |
+| `sambanova::` | free tier | `SAMBANOVA_API_KEY` | Custom endpoint. `DeepSeek-V3.1`, `DeepSeek-R1`, `Meta-Llama-3.3-70B-Instruct`, `Llama-4-Maverick-17B-128E-Instruct`. |
+| `mistral::` | free Experiment tier | `MISTRAL_API_KEY` | Custom endpoint. `mistral-large-latest`, `mistral-small-latest`, `codestral-latest`, `magistral-medium-latest`. |
+| `cohere::` | free trial | `COHERE_API_KEY` | Native adapter. Command A (218B), Command R+. |
 
 > **Model ids change over time** and free tiers shift month-to-month — treat the shipped defaults
 > and the ids above as a starting point and edit `[mesh.models]` to taste. **Tool/function-calling
 > support varies per free model**; route tool-heavy tiers to models documented to support tools
-> (Groq llama-3.3-70b, Gemini Flash, OpenCode Zen coding models).
+> (Groq llama-3.3-70b, Gemini Flash, OpenCode Zen coding models). The custom-endpoint providers
+> (`nvidia`/`sambanova`/`mistral`/`cerebras`) can't be model-listed live, so the ids above are
+> **seeded** into the mesh when their key is set — pin any other `provider::model` directly.
+
+## Adding an OpenAI-compatible provider
+
+Any provider exposing a standard `/chat/completions` endpoint is one row in
+`CUSTOM_OPENAI_PROVIDERS` (`crates/forge-config/src/lib.rs`):
+
+```rust
+CustomProvider {
+    namespace: "nvidia",
+    endpoint: "https://integrate.api.nvidia.com/v1/",  // trailing slash
+    env_var: "NVIDIA_API_KEY",
+    free: true,
+    label: "NVIDIA NIM — free developer tier (100+ models)",
+    seed_models: &["deepseek-ai/deepseek-r1", "meta/llama-3.1-405b-instruct", /* … */],
+},
+```
+
+That single row wires `forge auth nvidia`, env injection, mesh discovery (seeded ids), the
+free/paid flag, cost-tier routing, and cross-provider failover — no genai SDK adapter needed.
+The resolver in `forge-provider` retargets genai's OpenAI adapter at `endpoint` with the key from
+`env_var`. Slash-bearing ids (`meta/llama-3.1-405b-instruct`) work: the `provider::model` split is
+on the first `::` only.
 
 ## Default tiers (shipped)
 

@@ -116,7 +116,7 @@ failover, subscription bridging, *and* a test-pinned reliability layer in one bi
 | Category | Features |
 |----------|----------|
 | **Model Mesh** | Auto-discovery, cost-tiered routing, benchmark ranking, health-aware failover, subscription bridges, daily/weekly/monthly budget caps, credit-conservation modes |
-| **Providers** | Anthropic, OpenAI, Ollama, Claude Code CLI, Codex CLI, Antigravity CLI (free Gemini), Groq, Gemini, DeepSeek, OpenRouter, xAI, Cerebras, and more |
+| **Providers** | Anthropic, OpenAI, Ollama, Claude Code CLI, Codex CLI, Antigravity CLI (free Gemini), Groq, Gemini, DeepSeek, OpenRouter, NVIDIA NIM, SambaNova, Mistral, Cohere, xAI, Cerebras, and more — any OpenAI-compatible endpoint in one config row |
 | **Local LLMs** | `forge local` detects your hardware, recommends a Gemma model that fits, installs + runs it via Ollama (auto-installing Ollama if needed), opt-in autostart; animated picker menu |
 | **Planning mode** | `/plan` investigates read-only and proposes a plan; `/execute` approves it and carries it out |
 | **Code Intelligence** | Lattice: tree-sitter symbol graph (9 languages), semantic embeddings, hybrid retrieval, blast-radius, call-chain, git provenance |
@@ -261,18 +261,29 @@ Inspect any routing decision live with `/mesh [task]` or `forge mesh "<task>"`.
 | Codex CLI | Subscription bridge | Uses your OpenAI subscription |
 | Antigravity CLI (`agy`) | Subscription bridge | **Free Gemini** (3.5 Flash / 3.1 Pro) + proxied Claude/GPT; $0 |
 | Groq | Direct (API key) | Free tier available |
-| Gemini | Direct (API key) | Free tier available |
+| Gemini | Direct (API key) | Free tier (Flash) |
 | DeepSeek | Direct (API key) | |
-| OpenRouter | Direct (API key) | Routes to many providers |
-| xAI, MiniMax, MiMo, Cerebras | Direct (API key) | |
+| OpenRouter | Direct (API key) | Routes to many providers; `:free` models |
+| **NVIDIA NIM** | Direct (API key) | **Free dev tier** — DeepSeek-R1, Llama-3.1-405B, Nemotron-70B |
+| **SambaNova** | Direct (API key) | **Free tier** — DeepSeek-V3.1, Llama-3.3-70B, Llama-4 Maverick |
+| **Mistral** | Direct (API key) | **Free Experiment tier** — Mistral Large 3, Codestral |
+| Cohere | Direct (API key) | Command A (218B), free trial |
+| xAI, MiniMax, MiMo, Cerebras | Direct (API key) | Cerebras free tier (very fast) |
 
 Store keys in your OS keyring — never in plaintext config:
 
 ```bash
 forge auth anthropic    # reads from stdin
-forge auth openai
+forge auth nvidia       # free frontier models, instantly routable via the mesh
 forge auth --remove openai
 ```
+
+**Adding a new OpenAI-compatible provider is one row.** Any provider with a standard
+`/chat/completions` endpoint (NVIDIA NIM, SambaNova, Mistral, … and most "free LLM API"
+gateways) is wired by appending a `CustomProvider` entry to `CUSTOM_OPENAI_PROVIDERS` in
+`crates/forge-config/src/lib.rs` — namespace, endpoint, key env var, free flag, and a few
+seed model ids. That single row wires `forge auth`, env injection, mesh discovery, cost-tier
+routing, and cross-provider failover end-to-end. No native SDK adapter required.
 
 ---
 

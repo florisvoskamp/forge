@@ -59,8 +59,11 @@ pub(crate) fn provider_label(provider: &str) -> &'static str {
         "github_copilot" => "GitHub Models — free inference",
         "mimo" => "Xiaomi MiMo — free",
         "minimax" => "MiniMax — free tier",
-        "cerebras" => "Cerebras — free tier (fast)",
-        _ => "provider",
+        "cohere" => "Cohere — Command A (218B), free trial tier",
+        // Custom OpenAI-compatible providers carry their label in the registry.
+        other => forge_config::custom_provider(other)
+            .map(|p| p.label)
+            .unwrap_or("provider"),
     }
 }
 

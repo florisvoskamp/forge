@@ -119,23 +119,29 @@ fn build_reqwest_client() -> reqwest::Client {
         .expect("failed to build reqwest client with bundled CA certificates")
 }
 
-/// Build the genai client with a custom-endpoint resolver for providers genai has no native
-/// adapter for. Today that's **Cerebras** (`cerebras::<model>`): an OpenAI-compatible API at
-/// `api.cerebras.ai`, keyed by `CEREBRAS_API_KEY`. genai keeps the full `cerebras::…` string as
-/// the model name (unknown namespace → Ollama fallback), so the resolver detects the `cerebras`
-/// namespace, strips it, and retargets the OpenAI adapter + Cerebras endpoint + key. All native
-/// namespaces (groq/gemini/open_router/opencode_go/github_copilot/mimo/minimax/…) pass through
-/// unchanged.
+/// Build the genai client with a custom-endpoint resolver for OpenAI-compatible providers genai has
+/// no native adapter for — every entry in `forge_config::CUSTOM_OPENAI_PROVIDERS` (Cerebras, NVIDIA
+/// NIM, SambaNova, Mistral, …). genai keeps the full `provider::…` string as the model name (unknown
+/// namespace → Ollama fallback), so the resolver detects the namespace, strips it, and retargets the
+/// OpenAI adapter at the registered endpoint + key. All native namespaces
+/// (groq/gemini/cohere/open_router/opencode_go/github_copilot/mimo/minimax/…) pass through unchanged.
 pub(crate) fn build_client() -> Client {
     let resolver = ServiceTargetResolver::from_resolver_fn(
         |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-            if st.model.model_name.namespace_is("cerebras") {
-                let bare = st.model.model_name.namespace_and_name().1.to_string();
-                return Ok(ServiceTarget {
-                    endpoint: Endpoint::from_static("https://api.cerebras.ai/v1/"),
-                    auth: AuthData::from_env("CEREBRAS_API_KEY"),
-                    model: ModelIden::new(AdapterKind::OpenAI, bare),
-                });
+            // Custom OpenAI-compatible providers (no native genai adapter): genai keeps the full
+            // `provider::model` string as the model name (unknown namespace → Ollama fallback), so
+            // detect the namespace, strip it, and retarget the OpenAI adapter at the registered
+            // endpoint + key. One match drives Cerebras, NVIDIA NIM, SambaNova, Mistral, … — adding
+            // a provider is a row in `forge_config::CUSTOM_OPENAI_PROVIDERS`, no code change here.
+            for cp in forge_config::custom_providers() {
+                if st.model.model_name.namespace_is(cp.namespace) {
+                    let bare = st.model.model_name.namespace_and_name().1.to_string();
+                    return Ok(ServiceTarget {
+                        endpoint: Endpoint::from_owned(cp.endpoint.to_string()),
+                        auth: AuthData::from_env(cp.env_var),
+                        model: ModelIden::new(AdapterKind::OpenAI, bare),
+                    });
+                }
             }
             // Route `ollama::` through ollama's OpenAI-compatible endpoint instead of genai's
             // native Ollama adapter. The native path leaves tool calls from models that emit

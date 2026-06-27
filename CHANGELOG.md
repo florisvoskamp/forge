@@ -6,6 +6,21 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **NVIDIA NIM, SambaNova, and Mistral providers — free frontier models in the mesh.** Three new
+  OpenAI-compatible providers wired through a generalized custom-endpoint resolver: `nvidia::`
+  (DeepSeek-R1, Llama-3.1-405B, Nemotron-70B — free dev tier), `sambanova::` (DeepSeek-V3.1,
+  Llama-3.3-70B, Llama-4 Maverick), `mistral::` (Mistral Large 3, Codestral). Plus `cohere::` via
+  genai's native adapter (Command A 218B). Authenticate with `forge auth <provider>`; models are
+  seeded into discovery (these endpoints can't be model-listed live) and route + fail over like any
+  other free provider.
+- **One-row provider extensibility.** New `CUSTOM_OPENAI_PROVIDERS` registry in `forge-config` is the
+  single source of truth (namespace, endpoint, key env var, free flag, seed models) for every
+  OpenAI-compatible provider genai lacks an SDK adapter for. Adding a provider is a single struct
+  literal — it wires auth, env injection, mesh discovery, cost-tier routing, the free/paid flag, and
+  cross-provider failover end-to-end. The Cerebras integration was migrated onto it. See
+  [docs/features/free-models.md](docs/features/free-models.md#adding-an-openai-compatible-provider).
+
 ## [1.0.1] - 2026-06-28
 
 ### Fixed (release)

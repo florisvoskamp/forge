@@ -2050,9 +2050,10 @@ fn write_subscriptions_at(
 /// providers (e.g. ollama) need no key and are intentionally absent.
 // Provider prefix -> API-key env var. The prefix matches the `provider::` namespace in model
 // ids (and, except `openrouter`→`open_router`, the genai adapter namespace), and the env var
-// matches the name the genai adapter reads — so a key set here is picked up end-to-end. The
-// lower block is free / free-tier providers (genai 0.6 has native adapters for all of these
-// except Cerebras, which Forge wires via a custom endpoint resolver).
+// matches the name the genai adapter reads — so a key set here is picked up end-to-end. Every
+// provider here has a NATIVE genai adapter. Providers genai has no adapter for live in
+// [`CUSTOM_OPENAI_PROVIDERS`] (OpenAI-compatible endpoints Forge wires via a custom resolver);
+// the key/discovery accessors below chain both tables so adding either kind is one row.
 const PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("anthropic", "ANTHROPIC_API_KEY"),
     ("openai", "OPENAI_API_KEY"),
@@ -2066,8 +2067,100 @@ const PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("github_copilot", "GITHUB_TOKEN"),     // GitHub Models free inference
     ("mimo", "MIMO_API_KEY"),               // Xiaomi MiMo
     ("minimax", "MINIMAX_API_KEY"),
-    ("cerebras", "CEREBRAS_API_KEY"), // no native genai adapter — custom endpoint resolver
+    ("cohere", "COHERE_API_KEY"), // native adapter — Command A (218B), free trial tier
 ];
+
+/// An OpenAI-compatible API provider that genai has **no native adapter** for. Forge reaches it
+/// by retargeting genai's OpenAI adapter at `endpoint` with the key from `env_var` (see the
+/// service-target resolver in `forge-provider`). These providers expose a standard
+/// `/chat/completions` but cannot be model-LISTED through genai, so the mesh seeds `seed_models`
+/// for them at discovery instead of enumerating live.
+///
+/// Adding a new OpenAI-compatible provider is a single row here: that wires auth (`forge auth
+/// <namespace>`), env injection, routing, mesh discovery, and the free/paid flag end-to-end.
+#[derive(Debug, Clone, Copy)]
+pub struct CustomProvider {
+    /// The `provider::` namespace in model ids and the `forge auth` name.
+    pub namespace: &'static str,
+    /// Full base URL, trailing slash included (genai appends `chat/completions`).
+    pub endpoint: &'static str,
+    /// Environment variable holding the API key.
+    pub env_var: &'static str,
+    /// Whether the provider's models are genuinely free to call (standing free tier).
+    pub free: bool,
+    /// Human label + tier hint shown in `forge init` / `forge auth`.
+    pub label: &'static str,
+    /// Curated bare model ids (no namespace) seeded into the mesh when a key is present, since
+    /// these providers have no live model-listing API. Users can pin any `namespace::model`.
+    pub seed_models: &'static [&'static str],
+}
+
+/// OpenAI-compatible providers with no native genai adapter, reached via the custom endpoint
+/// resolver in `forge-provider`. Single source of truth for their endpoint, key env var, free
+/// flag, and curated seed models — every key/discovery accessor chains this with
+/// [`PROVIDER_ENV_VARS`]. Add a provider by appending one row.
+pub const CUSTOM_OPENAI_PROVIDERS: &[CustomProvider] = &[
+    CustomProvider {
+        namespace: "cerebras",
+        endpoint: "https://api.cerebras.ai/v1/",
+        env_var: "CEREBRAS_API_KEY",
+        free: true,
+        label: "Cerebras — free tier (very fast)",
+        seed_models: &["llama-3.3-70b", "gpt-oss-120b", "qwen-3-coder-480b"],
+    },
+    CustomProvider {
+        namespace: "nvidia",
+        endpoint: "https://integrate.api.nvidia.com/v1/",
+        env_var: "NVIDIA_API_KEY",
+        free: true,
+        label: "NVIDIA NIM — free developer tier (100+ models)",
+        seed_models: &[
+            "deepseek-ai/deepseek-r1",
+            "meta/llama-3.1-405b-instruct",
+            "meta/llama-3.3-70b-instruct",
+            "qwen/qwen2.5-coder-32b-instruct",
+            "nvidia/llama-3.1-nemotron-70b-instruct",
+        ],
+    },
+    CustomProvider {
+        namespace: "sambanova",
+        endpoint: "https://api.sambanova.ai/v1/",
+        env_var: "SAMBANOVA_API_KEY",
+        free: true,
+        label: "SambaNova — free tier (fast, frontier OSS)",
+        seed_models: &[
+            "DeepSeek-V3.1",
+            "DeepSeek-R1",
+            "Meta-Llama-3.3-70B-Instruct",
+            "Llama-4-Maverick-17B-128E-Instruct",
+        ],
+    },
+    CustomProvider {
+        namespace: "mistral",
+        endpoint: "https://api.mistral.ai/v1/",
+        env_var: "MISTRAL_API_KEY",
+        free: true,
+        label: "Mistral — free Experiment tier (La Plateforme)",
+        seed_models: &[
+            "mistral-large-latest",
+            "mistral-small-latest",
+            "codestral-latest",
+            "magistral-medium-latest",
+        ],
+    },
+];
+
+/// The custom OpenAI-compatible provider registered under `namespace`, if any.
+pub fn custom_provider(namespace: &str) -> Option<&'static CustomProvider> {
+    CUSTOM_OPENAI_PROVIDERS
+        .iter()
+        .find(|p| p.namespace == namespace)
+}
+
+/// All custom OpenAI-compatible providers (no native genai adapter).
+pub fn custom_providers() -> impl Iterator<Item = &'static CustomProvider> {
+    CUSTOM_OPENAI_PROVIDERS.iter()
+}
 
 // Search-API providers for the `web_search` tool. Kept separate from PROVIDER_ENV_VARS so
 // they never enter model discovery / the mesh — they authenticate a tool, not a model.
@@ -2114,17 +2207,23 @@ pub fn inject_search_keys() {
     }
 }
 
-/// The conventional environment variable for a provider's API key, if it needs one.
+/// The conventional environment variable for a provider's API key, if it needs one. Chains the
+/// native-adapter table and the custom OpenAI-compatible registry.
 fn env_var_for(provider: &str) -> Option<&'static str> {
     PROVIDER_ENV_VARS
         .iter()
         .find(|(name, _)| *name == provider)
         .map(|(_, var)| *var)
+        .or_else(|| custom_provider(provider).map(|p| p.env_var))
 }
 
-/// Provider names Forge knows how to authenticate (for `forge auth` validation/help).
+/// Provider names Forge knows how to authenticate (for `forge auth` validation/help). Includes
+/// both native-adapter providers and the custom OpenAI-compatible registry.
 pub fn known_key_providers() -> impl Iterator<Item = &'static str> {
-    PROVIDER_ENV_VARS.iter().map(|(name, _)| *name)
+    PROVIDER_ENV_VARS
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(CUSTOM_OPENAI_PROVIDERS.iter().map(|p| p.namespace))
 }
 
 /// Conventional / legacy env-var aliases accepted IN ADDITION to the canonical name in
@@ -2226,7 +2325,11 @@ pub fn load_secret(key: &str) -> Option<String> {
 /// each known provider with no env var set, inject the stored value. Best-effort — providers
 /// without a stored key are simply left unset.
 pub fn inject_provider_keys() {
-    for (provider, var) in PROVIDER_ENV_VARS {
+    let native = PROVIDER_ENV_VARS.iter().copied();
+    let custom = CUSTOM_OPENAI_PROVIDERS
+        .iter()
+        .map(|p| (p.namespace, p.env_var));
+    for (provider, var) in native.chain(custom) {
         if env_set(var) {
             continue;
         }
@@ -2485,9 +2588,36 @@ mod tests {
         assert_eq!(env_var_for("mimo"), Some("MIMO_API_KEY"));
         assert_eq!(env_var_for("minimax"), Some("MINIMAX_API_KEY"));
         assert_eq!(env_var_for("cerebras"), Some("CEREBRAS_API_KEY"));
+        assert_eq!(env_var_for("cohere"), Some("COHERE_API_KEY"));
+        // Custom OpenAI-compatible providers resolve their key env var via the registry chain.
+        assert_eq!(env_var_for("nvidia"), Some("NVIDIA_API_KEY"));
+        assert_eq!(env_var_for("sambanova"), Some("SAMBANOVA_API_KEY"));
+        assert_eq!(env_var_for("mistral"), Some("MISTRAL_API_KEY"));
         // provider_of pulls the right prefix from a namespaced model id.
         assert_eq!(provider_of("groq::llama-3.3-70b-versatile"), "groq");
         assert_eq!(provider_of("opencode_go::deepseek-v4-flash"), "opencode_go");
+        // Slash-bearing NIM ids still split on the FIRST `::` only.
+        assert_eq!(
+            provider_of("nvidia::meta/llama-3.1-405b-instruct"),
+            "nvidia"
+        );
+    }
+
+    #[test]
+    fn custom_providers_are_known_and_seed_models() {
+        let providers: Vec<_> = known_key_providers().collect();
+        for p in ["nvidia", "sambanova", "mistral", "cerebras"] {
+            assert!(providers.contains(&p), "{p} should be a known key provider");
+            let cp = custom_provider(p).unwrap_or_else(|| panic!("{p} registered"));
+            assert!(cp.free, "{p} seeded as free");
+            assert!(!cp.seed_models.is_empty(), "{p} has seed models");
+            assert!(
+                cp.endpoint.ends_with('/'),
+                "{p} endpoint has trailing slash"
+            );
+        }
+        // cohere is a native adapter, not a custom-endpoint provider.
+        assert!(custom_provider("cohere").is_none());
     }
 
     #[test]

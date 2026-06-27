@@ -43,9 +43,17 @@ fn is_free(id: &str, cost: f64, subscription: bool) -> bool {
     if subscription || cost > f64::EPSILON {
         return false;
     }
-    match provider_of(id) {
+    let provider = provider_of(id);
+    // Custom OpenAI-compatible providers (NVIDIA NIM, SambaNova, Mistral, Cerebras, …) carry their
+    // own free/paid flag in the registry — a standing free tier counts as genuinely free.
+    if let Some(cp) = forge_config::custom_provider(provider) {
+        if cp.free {
+            return true;
+        }
+    }
+    match provider {
         // Genuinely free: local inference, and free-tier API providers we know charge nothing.
-        "ollama" | "groq" | "cerebras" => true,
+        "ollama" | "groq" => true,
         // Gemini has a standing free tier (Google AI Studio, no card) — but only Flash / Flash-Lite
         // (and the open Gemma models); the Pro models were pulled from the free tier (Apr 2026) and
         // are paid-only. So an unpriced Gemini model is free UNLESS it's a Pro model. (Per Google's

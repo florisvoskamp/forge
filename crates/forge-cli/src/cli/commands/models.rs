@@ -135,6 +135,19 @@ pub(crate) async fn discover_catalog(config: &forge_config::Config) -> forge_mes
     for list in futures::future::join_all(probes).await {
         models.extend(list);
     }
+    // Custom OpenAI-compatible providers (NVIDIA NIM, SambaNova, Mistral, Cerebras) have no live
+    // model-listing API, so `discover_provider_models` skips them. Seed their curated model ids
+    // when a key is present so the mesh can route + fail over to them out of the box. Users can
+    // still pin any `provider::model` or add more under [mesh.models].
+    for cp in forge_config::custom_providers() {
+        if forge_config::has_api_key(cp.namespace) {
+            models.extend(
+                cp.seed_models
+                    .iter()
+                    .map(|m| format!("{}::{}", cp.namespace, m)),
+            );
+        }
+    }
     // Always-available subscription bridges (claude-cli/codex-cli) if their CLI is installed.
     // They don't rate-limit like the free API tiers, so the mesh can rely on them — and being
     // $0 subscriptions they rank first (prefer_subscription), so routing reaches a working model
