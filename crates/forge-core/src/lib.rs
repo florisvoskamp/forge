@@ -694,7 +694,10 @@ impl Session {
             return Err(CoreError::SessionNotFound(session_id.to_string()));
         }
         let stored = store.load_messages(session_id)?;
-        let seq = stored.len() as i64;
+        // The next seq is MAX(seq)+1 from the DB, NOT the loaded count — after compaction
+        // `load_messages` returns only the active tail (+ summary), so its length is far below the
+        // real max. Using the count would reuse low seqs and make `/undo` wipe pre-compaction history.
+        let seq = store.next_seq_for_session(session_id)?;
         let transcript = stored
             .into_iter()
             .map(|m| Message {
@@ -933,18 +936,24 @@ impl Session {
             .get(boundary as usize)
             .filter(|m| m.role == Role::User)
             .map(|m| m.content.clone());
+        // Transcript INDEX → DB SEQ. They're equal for a normal session, but after a COMPACTED
+        // resume the in-memory transcript is just the active tail (+ a synthetic summary) while the
+        // DB seqs start high — so `deactivate_messages_from(index)` would sweep the pre-compaction
+        // survivors (data loss). `offset` (0 when not compacted) maps the boundary to the real seq.
+        let offset = self.seq - self.transcript.len() as i64;
+        let db_boundary = boundary + offset;
         let mut restore = snapshot::RestoreReport::default();
         // Turns are keyed by their user-message seq. Restore every snapshotted turn at/after the
         // boundary, newest first so an earlier turn's blob (pre-turn bytes) wins the final state.
-        for seq in (boundary..self.seq).rev() {
+        for seq in (db_boundary..self.seq).rev() {
             if let Ok(r) = snapshot::restore_turn(&self.checkpoint_root, &self.id, seq) {
                 restore.restored.extend(r.restored);
                 restore.warnings.extend(r.warnings);
             }
         }
-        self.store.deactivate_messages_from(&self.id, boundary)?;
+        self.store.deactivate_messages_from(&self.id, db_boundary)?;
         self.transcript.truncate(boundary as usize);
-        self.seq = boundary;
+        self.seq = db_boundary;
         Ok(RewindOutcome {
             restore,
             rewound_prompt,
@@ -1080,7 +1089,9 @@ impl Session {
             return Err(CoreError::SessionNotFound(session_id.to_string()));
         }
         let stored = self.store.load_messages(session_id)?;
-        self.seq = stored.len() as i64;
+        // MAX(seq)+1, not the loaded count — see Session::resume (compaction makes them differ, and
+        // the mismatch lets `/undo` deactivate pre-compaction survivors).
+        self.seq = self.store.next_seq_for_session(session_id)?;
         self.transcript = stored
             .into_iter()
             .map(|m| Message {
@@ -3086,6 +3097,17 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                         Some(k) => *failure_counts.entry((name, k)).or_insert(0) += 1,
                         None => failure_counts.retain(|(nm, _), _| nm != &name),
                     }
+                }
+                // Deliver any queued system hints (e.g. the doom-loop "change approach" nudge) — the
+                // serial path does this per call; without it here the nudge sits undelivered and the
+                // model is halted next step "after a nudge" it never actually saw.
+                let hints: Vec<String> = self.pending_hints.drain(..).collect();
+                for hint in hints {
+                    let hseq = self.next_seq();
+                    let _ = self
+                        .store
+                        .add_message(&self.id, hseq, Role::System, &hint, None);
+                    self.transcript.push(Message::system(hint));
                 }
             } else {
                 // Execute each requested tool through the permission broker, serially.
@@ -6358,6 +6380,59 @@ mod tests {
         );
     }
 
+    /// Yields the SAME two successful read-only calls every step (a concurrent batch with a constant
+    /// signature) — trips the doom-loop, not the failure-loop. Used to prove the nudge is delivered.
+    struct ConcurrentRepeatProvider;
+    #[async_trait::async_trait]
+    impl Provider for ConcurrentRepeatProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            use forge_types::{new_id, ToolCall, Usage};
+            let mk = || ToolCall {
+                id: new_id(),
+                name: "read_file".into(),
+                args: serde_json::json!({"path": "Cargo.toml"}),
+            };
+            Ok(forge_provider::ModelResponse {
+                content: "reading again".into(),
+                tool_calls: vec![mk(), mk()],
+                usage: Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_batch_doom_nudge_is_delivered_to_the_model() {
+        // Regression: the doom-loop nudge is pushed to pending_hints, but the concurrent read-only
+        // batch path didn't drain them — so the model was halted "after a nudge" it never saw. The
+        // nudge must reach the transcript.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut session = Session::start(
+            Arc::clone(&store),
+            Arc::new(ConcurrentRepeatProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            Config::default(),
+            ".",
+        )
+        .unwrap();
+
+        session.run_turn("read it").await.unwrap();
+
+        assert!(
+            session.transcript.iter().any(|m| m.role == Role::System
+                && m.content.contains("cycled through the same tool calls")),
+            "the doom-loop nudge must be delivered to the transcript on the concurrent batch path"
+        );
+    }
+
     /// Yields a tool call every single step forever (unique args so no doom/failure guard fires) —
     /// only the step cap can stop it.
     struct EndlessToolProvider;
@@ -9135,6 +9210,56 @@ mod tests {
             "rewound turn is excluded from the active transcript"
         );
         assert!(session.undo().unwrap().is_none(), "nothing left to undo");
+    }
+
+    #[tokio::test]
+    async fn undo_after_compacted_resume_does_not_wipe_survivors() {
+        // P0 data-loss regression: after compaction the active tail starts at a HIGH db seq, but a
+        // resumed transcript is short. If `self.seq` were the loaded count (not MAX(seq)+1) and
+        // `rewind_to` used the transcript index directly as the db seq, an `/undo` of the next turn
+        // would `deactivate_messages_from(low_index)` and sweep the pre-compaction survivors.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let sid = store.create_session("/tmp", "default").unwrap();
+        for i in 0..16i64 {
+            store
+                .add_message(&sid, i, Role::User, &format!("msg {i}"), None)
+                .unwrap();
+        }
+        // Keep the last 6 (seq 10-15) active; summarize seq 0-9.
+        store
+            .compact_session_store(&sid, "summary of the first ten", 6)
+            .unwrap();
+        // Sanity: summary + 6 survivors.
+        assert_eq!(store.load_messages(&sid).unwrap().len(), 7);
+
+        let mut session = Session::resume(
+            Arc::clone(&store),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            Config::default(),
+            &sid,
+        )
+        .unwrap();
+
+        // A fresh turn after the compacted resume, then undo it.
+        session.run_turn("a brand new prompt").await.unwrap();
+        assert!(session.undo().unwrap().is_some(), "the new turn was undone");
+
+        // The six pre-compaction survivors (seq 10-15) MUST still be active — undo only removed the
+        // new turn. Pre-fix, load_messages would return just the summary (survivors wiped).
+        let after = store.load_messages(&sid).unwrap();
+        assert_eq!(
+            after.len(),
+            7,
+            "summary + 6 survivors must remain after undo; got {} msgs",
+            after.len()
+        );
+        assert!(
+            after.iter().any(|m| m.content == "msg 15"),
+            "survivor 'msg 15' must still be active"
+        );
     }
 
     #[tokio::test]

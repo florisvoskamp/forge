@@ -6,6 +6,26 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.51] - 2026-06-27
+
+### Fixed
+- **P0 data loss: `/undo` after a compacted resume wiped pre-compaction history**
+  (`crates/forge-core/src/lib.rs`, `crates/forge-store/src/lib.rs`). After compaction, a resumed
+  session's in-memory transcript is just the active tail (+ a synthetic summary), but the DB seqs
+  start high. `self.seq` was set to the loaded message COUNT (e.g. 7) instead of `MAX(seq)+1` (e.g.
+  16), and `rewind_to` used the transcript INDEX directly as the DB seq — so undoing the next turn ran
+  `deactivate_messages_from(low_index)` and soft-deleted the surviving pre-compaction messages. Fixed
+  with `Store::next_seq_for_session` (MAX+1) on resume and an index→seq offset in `rewind_to` (0 when
+  not compacted, so no behavior change for normal sessions). Test:
+  `undo_after_compacted_resume_does_not_wipe_survivors`.
+- **Doom-loop nudge was dropped on the concurrent read-only batch path.** The "change approach" nudge
+  is queued in `pending_hints`, but only the serial tool path drained them — so a model looping on a
+  concurrent batch was halted "after a nudge" it never actually received. The concurrent path now
+  drains the hints too. Test: `concurrent_batch_doom_nudge_is_delivered_to_the_model`.
+
+### Found by
+A verify-first multi-agent bug-hunt over the core run-loop, mesh, store, and provider paths.
+
 ## [0.4.50] - 2026-06-27
 
 ### Fixed (diagnostics — clearer harness output, from a verified UX/observability audit)

@@ -1359,6 +1359,19 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// The next `seq` to assign for a session: `MAX(seq) + 1` over ALL rows (active or soft-deleted),
+    /// or 0 for a fresh session. Must be used instead of an in-memory message COUNT when resuming a
+    /// session that may have been COMPACTED — `load_messages` returns only the active tail (+ a
+    /// synthetic summary), so its length is far below the real max seq, and reusing low seqs makes a
+    /// later `/undo` deactivate pre-compaction survivors (data loss).
+    pub fn next_seq_for_session(&self, session_id: &str) -> Result<i64> {
+        Ok(self.lock()?.query_row(
+            "SELECT COALESCE(MAX(seq), -1) + 1 FROM message WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?)
+    }
+
     // --- Conversation checkpoints / undo (RFC session-management-and-commands, PR2) ---
 
     /// Soft-delete every message of a session with `seq >= from_seq` (an `/undo` / checkpoint
