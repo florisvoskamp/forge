@@ -6,6 +6,15 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.71] - 2026-06-28
+
+### Fixed (release — Homebrew auto-update now works on protected main)
+- **The release's Homebrew-formula update opens a PR instead of pushing to `main`.** The v0.4.70
+  release proved the direct-push approach silently no-ops on a branch-protected `main` (the push is
+  rejected, and `continue-on-error` masked it as "success"). The step now pushes a `brew/v<version>`
+  branch and opens an auto-merge PR — which respects branch protection. Formula brought current to
+  **v0.4.70**.
+
 ## [0.4.70] - 2026-06-28
 
 ### Docs (benchmark re-confirmation on the current build + stale-claim sweep)
