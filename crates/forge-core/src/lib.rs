@@ -9477,10 +9477,13 @@ mod tests {
 
     /// Call 0 writes a file (an edit → `edits_this_turn > 0`, arming autofix); every later call just
     /// says "done" (no tools), so the only thing that can stop the self-heal loop is its iteration cap.
+    /// `cfg(unix)` because the only test using it relies on the `false` shell command.
+    #[cfg(unix)]
     struct EditOnceThenDoneProvider {
         calls: std::sync::atomic::AtomicUsize,
         path: String,
     }
+    #[cfg(unix)]
     #[async_trait::async_trait]
     impl Provider for EditOnceThenDoneProvider {
         async fn complete(
@@ -9522,14 +9525,16 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let capture = CapturePresenter::default();
         let events = capture.events.clone();
-        let mut config = Config::default();
-        config.permission_mode = forge_types::PermissionMode::AcceptEdits; // auto-allow the write
-        config.autofix = forge_config::AutofixConfig {
-            auto_lint: true,
-            auto_test: false,
-            lint_cmd: "false".to_string(), // always exits 1 → never "fixed"
-            test_cmd: String::new(),
-            max_iterations: 2,
+        let config = Config {
+            permission_mode: forge_types::PermissionMode::AcceptEdits, // auto-allow the write
+            autofix: forge_config::AutofixConfig {
+                auto_lint: true,
+                auto_test: false,
+                lint_cmd: "false".to_string(), // always exits 1 → never "fixed"
+                test_cmd: String::new(),
+                max_iterations: 2,
+            },
+            ..Config::default()
         };
         let mut session = Session::start(
             Arc::clone(&store),
