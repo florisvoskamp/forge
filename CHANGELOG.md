@@ -6,6 +6,17 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.69] - 2026-06-28
+
+### Fixed (release — Homebrew formula)
+- **The Homebrew formula auto-updates per release.** `homebrew/forge.rb` was pinned at **v0.4.4** —
+  `brew` users had been getting a months-old binary because the "update version + sha256 by hand
+  after the tag" step never happened. `release.yml` now runs `scripts/update-brew-formula.sh` after
+  publishing, reading the **just-built** `checksums.txt` (so there's no race against assets that
+  don't exist yet) and committing the bumped formula to `main` (best-effort — a protected branch or
+  push hiccup never fails the release; the script is also runnable by hand). Formula brought current
+  to v0.4.65 in this PR.
+
 ## [0.4.68] - 2026-06-27
 
 ### Tests (harness quality)

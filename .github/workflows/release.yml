@@ -102,3 +102,26 @@ jobs:
             dist/checksums.txt
           generate_release_notes: true
           fail_on_unmatched_files: false
+
+      # Keep the Homebrew formula's version + sha256 in step with the release, using THIS release's
+      # just-built checksums (no "sha race" against assets that don't exist yet). Best-effort: a
+      # protected `main` or a transient push failure must never fail the release — the same script
+      # (scripts/update-brew-formula.sh <version>) can always be run by hand as a fallback.
+      - name: Update Homebrew formula
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          git clone --depth 1 --branch main \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" brew-repo
+          cd brew-repo
+          bash scripts/update-brew-formula.sh "$VERSION" "$GITHUB_WORKSPACE/dist/checksums.txt"
+          if git diff --quiet homebrew/forge.rb; then
+            echo "formula already current"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add homebrew/forge.rb
+          git commit -m "chore(brew): update formula to v$VERSION [skip ci]"
+          git push origin main
