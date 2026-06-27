@@ -6,6 +6,22 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.58] - 2026-06-27
+
+### Fixed (bug-hunt batch 4 — worktree, subagent, assay, compaction)
+- **Subagent worktree merge-back silently dropped file deletions and renames.** `merge_worktree_back`
+  used `--diff-filter=ACM`, so a write-capable child that deleted or renamed a file produced no patch
+  entry and the change vanished with a clean-looking merge. Now `ACDMR`. Test:
+  `merge_worktree_back_applies_a_deletion`.
+- **A subagent that hit the step cap reported empty SUCCESS.** It returned `{final_text:"", ok:true}`,
+  so the parent assembled a blank `[agent N]` block and proceeded as if the child finished. Now
+  `ok=false` with a clear "hit the N-step limit" message.
+- **`assay --scope diff` silently dropped STAGED changes.** It ran `git diff` (working tree vs index),
+  so a fully-staged change looked like "no uncommitted changes". Now `git diff HEAD`.
+- **Compaction summary couldn't see tool calls.** Tool-call assistant messages (empty content) rendered
+  as blank lines, so the summarizer never knew which files/commands a turn touched. Tool calls (name +
+  args) are now included in the summary input.
+
 ## [0.4.57] - 2026-06-27
 
 ### Fixed (bug-hunt batch 4 — rewind/seq model)

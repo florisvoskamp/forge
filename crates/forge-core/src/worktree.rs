@@ -102,7 +102,10 @@ pub fn merge_worktree_back(repo_root: &Path, branch: &str) -> Result<MergeReport
             "-C",
             repo_root.to_str().unwrap_or("."),
             "diff",
-            "--diff-filter=ACM",
+            // Include D (deletions) and R (renames), not just Add/Copy/Modify — a child worktree
+            // that deletes or renames files would otherwise produce no patch entry and have those
+            // changes SILENTLY dropped from the merge-back (a clean-looking merge that lost work).
+            "--diff-filter=ACDMR",
             "HEAD",
             branch,
         ])
@@ -373,6 +376,56 @@ mod tests {
             &repo,
             &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
             "worktree remove",
+        )
+        .ok();
+        run_git(&repo, &["branch", "-D", branch], "branch -D").ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn merge_worktree_back_applies_a_deletion() {
+        // Regression: the `--diff-filter=ACM` excluded D, so a child that DELETED a file had the
+        // deletion silently dropped from the merge-back (the file stayed in the main tree).
+        if !git_available() {
+            return;
+        }
+        let repo = init_repo(); // has README committed
+        let wt_path = repo.join(".forge").join("worktrees").join("del-test");
+        let branch = "forge/subagent/del-test";
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                wt_path.to_str().unwrap(),
+                "-b",
+                branch,
+                "HEAD",
+            ],
+            "worktree add",
+        )
+        .unwrap();
+        run_git(&wt_path, &["config", "user.email", "t@f.local"], "e").unwrap();
+        run_git(&wt_path, &["config", "user.name", "F"], "n").unwrap();
+        run_git(&wt_path, &["rm", "README"], "rm").unwrap();
+        run_git(
+            &wt_path,
+            &["commit", "-m", "child delete", "--no-gpg-sign"],
+            "commit",
+        )
+        .unwrap();
+
+        let report = merge_worktree_back(&repo, branch).unwrap();
+        assert!(report.conflicted_files.is_empty(), "clean deletion");
+        assert!(
+            !repo.join("README").exists(),
+            "the child's deletion must be applied to the main worktree"
+        );
+
+        run_git(
+            &repo,
+            &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
+            "wt remove",
         )
         .ok();
         run_git(&repo, &["branch", "-D", branch], "branch -D").ok();

@@ -427,6 +427,16 @@ pub async fn run_subagent(
         }
     }
 
+    // The loop ended without the model producing a final answer (it kept calling tools until the
+    // step cap). Don't report that as an empty SUCCESS — the parent model would assemble a blank
+    // `[agent N]` block and proceed as if the child finished its task.
+    if final_text.is_empty() {
+        ok = false;
+        final_text = format!(
+            "error: subagent hit the {max_steps}-step limit without producing a final answer"
+        );
+    }
+
     Ok(SubagentOutcome { final_text, ok })
 }
 

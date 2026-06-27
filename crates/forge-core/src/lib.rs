@@ -2016,7 +2016,16 @@ Rules:\n\
         let older = &self.transcript[..split];
         let rendered = older
             .iter()
-            .map(|m| format!("{}: {}", m.role.as_str(), m.content))
+            .map(|m| {
+                // Include the assistant's tool calls — they're the only record of WHAT the turn did
+                // (tool name + args = the files touched / commands run). Without them an editing turn
+                // renders as a blank `assistant: ` line and the summary can't say what changed.
+                let mut line = format!("{}: {}", m.role.as_str(), m.content);
+                for tc in &m.tool_calls {
+                    line.push_str(&format!("\n  [call {} {}]", tc.name, tc.args));
+                }
+                line
+            })
             .collect::<Vec<_>>()
             .join("\n");
 

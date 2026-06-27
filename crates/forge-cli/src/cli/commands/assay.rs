@@ -468,10 +468,13 @@ pub(crate) fn bundle_scoped_source(
         Repo => Ok(bundle_source(std::path::Path::new("."), max_bytes)),
         Path(p) => Ok(bundle_source(std::path::Path::new(p), max_bytes)),
         Diff => {
-            let files = git_files(&["diff", "--name-only"])?;
+            // `diff HEAD` (not bare `diff`) so STAGED changes are included — a plain `git diff`
+            // compares the working tree to the index and silently drops anything already `git add`ed,
+            // so a fully-staged change looked like "no uncommitted changes".
+            let files = git_files(&["diff", "HEAD", "--name-only"])?;
             if files.is_empty() {
                 return Err(
-                    "no uncommitted changes (git diff --name-only returned nothing)".into(),
+                    "no uncommitted changes (git diff HEAD --name-only returned nothing)".into(),
                 );
             }
             Ok(bundle_file_list(&files, max_bytes))
