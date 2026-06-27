@@ -68,9 +68,17 @@ impl HeuristicRouter {
         let hints = RouteHints::from_prompt(prompt);
         let tier = cls.tier;
 
+        // The authoritative decision (pin / budget / fallback handling all live here). Compute it
+        // FIRST: `decide` can downshift the tier (e.g. budget exhausted → Trivial), and the candidate
+        // table + conservation data must describe the tier that ACTUALLY drove the pick, not the
+        // classified one — otherwise `/mesh` shows the Trivial pick ranked last among Complex rows
+        // with a Complex-tier conservation probability.
+        let decision = self.decide(tier, cls.reasons.join(", "), budget, health, hints, quota);
+        let routed_tier = decision.tier;
+
         let (conserve, rows) = if self.auto_active() {
             self.catalog.as_ref().unwrap().ranked_rows(
-                tier,
+                routed_tier,
                 &self.pricing,
                 hints.code_heavy,
                 hints.seed,
@@ -79,9 +87,6 @@ impl HeuristicRouter {
         } else {
             (ConserveDecision::default(), Vec::new())
         };
-
-        // The authoritative decision (pin / budget / fallback handling all live here).
-        let decision = self.decide(tier, cls.reasons.join(", "), budget, health, hints, quota);
 
         let candidates = rows
             .into_iter()
@@ -118,7 +123,7 @@ impl HeuristicRouter {
                 let plan = quota.plan_for(&p).to_string();
                 ProviderQuotaView {
                     spread_probability: crate::ModelCatalog::spread_probability(
-                        tier,
+                        routed_tier,
                         fraction,
                         &plan,
                         hints.code_heavy,
