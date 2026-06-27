@@ -13,7 +13,10 @@ All notable changes to Forge are documented here. The format follows
   Llama-3.3-70B, Llama-4 Maverick), `mistral::` (Mistral Large 3, Codestral). Plus `cohere::` via
   genai's native adapter (Command A 218B). Authenticate with `forge auth <provider>`; models are
   seeded into discovery (these endpoints can't be model-listed live) and route + fail over like any
-  other free provider.
+  other free provider. Their **full live catalog is listed** via the provider's OpenAI `/v1/models`
+  endpoint (`list_custom_models`) — generic over the registry, so NVIDIA NIM surfaces 100+ models,
+  not a hand-seeded few; the `seed_models` list is now only a fallback when the live call fails.
+  Embedding / reranking ids are filtered out (they can't serve chat).
 - **One-row provider extensibility.** New `CUSTOM_OPENAI_PROVIDERS` registry in `forge-config` is the
   single source of truth (namespace, endpoint, key env var, free flag, seed models) for every
   OpenAI-compatible provider genai lacks an SDK adapter for. Adding a provider is a single struct

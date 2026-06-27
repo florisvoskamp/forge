@@ -82,6 +82,55 @@ pub async fn list_models(namespace: &str) -> Result<Vec<String>, ProviderError> 
         .collect())
 }
 
+/// List a custom OpenAI-compatible provider's models **live** via its `/v1/models` endpoint (the
+/// standard OpenAI models route). Works for ANY provider in `forge_config::CUSTOM_OPENAI_PROVIDERS`
+/// — current or future — with no per-provider code: the endpoint and key env var come from the
+/// registry row. genai has no SDK adapter for these providers (so [`list_models`] can't enumerate
+/// them), but their OpenAI-compatible `models` endpoint returns the full catalog the key can reach,
+/// so the mesh sees every model instead of a hand-seeded few. Returns `provider::id` ids; clearly
+/// non-chat ids (embedding / reranking) are dropped — they can't serve chat completions and would
+/// only add dead weight and failover churn to routing.
+pub async fn list_custom_models(namespace: &str) -> Result<Vec<String>, ProviderError> {
+    let cp = forge_config::custom_provider(namespace)
+        .ok_or_else(|| ProviderError::Request(format!("`{namespace}` is not a custom provider")))?;
+    let key = forge_config::api_key(namespace).map_err(|e| ProviderError::Auth(e.to_string()))?;
+    let url = format!("{}models", cp.endpoint);
+    let resp = build_reqwest_client()
+        .get(&url)
+        .bearer_auth(&key)
+        .send()
+        .await
+        .map_err(|e| ProviderError::Request(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(ProviderError::Request(format!(
+            "{namespace} `/models` returned HTTP {}",
+            resp.status()
+        )));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| ProviderError::Request(e.to_string()))?;
+    let data = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| ProviderError::Request(format!("{namespace} `/models`: no `data` array")))?;
+    Ok(data
+        .iter()
+        .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+        .filter(|id| !is_non_chat_model_id(id))
+        .map(|id| format!("{namespace}::{id}"))
+        .collect())
+}
+
+/// Heuristic for ids that are clearly embedding / reranking / vision-encoder models (not chat
+/// completers), so they're excluded from the routable catalog. Conservative — only patterns that
+/// are unambiguously non-conversational.
+fn is_non_chat_model_id(id: &str) -> bool {
+    let l = id.to_ascii_lowercase();
+    l.contains("embed") || l.contains("rerank") || l.contains("/bge") || l.contains("embedqa")
+}
+
 /// Whether `namespace` has a genai adapter that can LIST its models (i.e. [`list_models`] can work).
 /// Some providers are completion-only: Cerebras has no native adapter and is reached via the
 /// custom service-target resolver in [`build_client`], so it answers completions fine but cannot be
@@ -897,6 +946,19 @@ mod tests {
         assert!(is_discoverable("groq"));
         // The OpenRouter alias normalizes to its adapter too.
         assert!(is_discoverable("openrouter"));
+    }
+
+    #[test]
+    fn non_chat_model_ids_are_filtered_from_live_listing() {
+        // Embedding / reranking ids can't serve chat completions — excluded from the routable catalog.
+        assert!(is_non_chat_model_id("baai/bge-m3"));
+        assert!(is_non_chat_model_id("nvidia/llama-3.2-nv-embedqa-1b-v2"));
+        assert!(is_non_chat_model_id("nvidia/llama-3.2-nv-rerankqa-1b-v2"));
+        assert!(is_non_chat_model_id("nvidia/nv-embed-v1"));
+        // Chat / coding / reasoning models are kept.
+        assert!(!is_non_chat_model_id("deepseek-ai/deepseek-v4-pro"));
+        assert!(!is_non_chat_model_id("openai/gpt-oss-120b"));
+        assert!(!is_non_chat_model_id("meta/llama-3.3-70b-instruct"));
     }
 
     #[test]

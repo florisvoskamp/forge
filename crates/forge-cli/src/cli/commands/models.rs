@@ -135,18 +135,42 @@ pub(crate) async fn discover_catalog(config: &forge_config::Config) -> forge_mes
     for list in futures::future::join_all(probes).await {
         models.extend(list);
     }
-    // Custom OpenAI-compatible providers (NVIDIA NIM, SambaNova, Mistral, Cerebras) have no live
-    // model-listing API, so `discover_provider_models` skips them. Seed their curated model ids
-    // when a key is present so the mesh can route + fail over to them out of the box. Users can
-    // still pin any `provider::model` or add more under [mesh.models].
-    for cp in forge_config::custom_providers() {
-        if forge_config::has_api_key(cp.namespace) {
-            models.extend(
-                cp.seed_models
-                    .iter()
-                    .map(|m| format!("{}::{}", cp.namespace, m)),
-            );
+    // Custom OpenAI-compatible providers (NVIDIA NIM, SambaNova, Mistral, Cerebras, …) have no genai
+    // SDK adapter, so the genai probe above skips them — but they DO expose an OpenAI `/v1/models`
+    // endpoint. List them LIVE (the full catalog the key can reach) so EVERY model is visible, not a
+    // hand-seeded few; fall back to the curated seed ids only if the live call fails (offline /
+    // endpoint down). Generic over the registry — future providers need no code here. Probed
+    // concurrently with an 8s budget each, like the genai providers above.
+    let custom: Vec<_> = forge_config::custom_providers()
+        .filter(|cp| forge_config::has_api_key(cp.namespace))
+        .collect();
+    let custom_lists = futures::future::join_all(custom.iter().map(|cp| async move {
+        let seeds = || {
+            cp.seed_models
+                .iter()
+                .map(|m| format!("{}::{}", cp.namespace, m))
+                .collect::<Vec<_>>()
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(8),
+            forge_provider::list_custom_models(cp.namespace),
+        )
+        .await
+        {
+            Ok(Ok(list)) if !list.is_empty() => list,
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    "{} live model list failed: {e} — using seed ids",
+                    cp.namespace
+                );
+                seeds()
+            }
+            _ => seeds(),
         }
+    }))
+    .await;
+    for list in custom_lists {
+        models.extend(list);
     }
     // Always-available subscription bridges (claude-cli/codex-cli) if their CLI is installed.
     // They don't rate-limit like the free API tiers, so the mesh can rely on them — and being

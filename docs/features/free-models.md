@@ -31,8 +31,11 @@ are wired via a custom OpenAI-compatible endpoint resolver — see
 > and the ids above as a starting point and edit `[mesh.models]` to taste. **Tool/function-calling
 > support varies per free model**; route tool-heavy tiers to models documented to support tools
 > (Groq llama-3.3-70b, Gemini Flash, OpenCode Zen coding models). The custom-endpoint providers
-> (`nvidia`/`sambanova`/`mistral`/`cerebras`) can't be model-listed live, so the ids above are
-> **seeded** into the mesh when their key is set — pin any other `provider::model` directly.
+> (`nvidia`/`sambanova`/`mistral`/`cerebras`) are **listed live** via their OpenAI `/v1/models`
+> endpoint when their key is set — the mesh sees the **full catalog** the key can reach (e.g. NIM
+> surfaces 100+ models), not just the `seed_models` above. The seed ids are only a fallback when the
+> live `/models` call fails (offline / endpoint down). Embedding & reranking ids are filtered out
+> (they can't serve chat completions).
 
 ## Adding an OpenAI-compatible provider
 
@@ -50,11 +53,12 @@ CustomProvider {
 },
 ```
 
-That single row wires `forge auth nvidia`, env injection, mesh discovery (seeded ids), the
-free/paid flag, cost-tier routing, and cross-provider failover — no genai SDK adapter needed.
-The resolver in `forge-provider` retargets genai's OpenAI adapter at `endpoint` with the key from
-`env_var`. Slash-bearing ids (`meta/llama-3.1-405b-instruct`) work: the `provider::model` split is
-on the first `::` only.
+That single row wires `forge auth nvidia`, env injection, mesh discovery, the free/paid flag,
+cost-tier routing, and cross-provider failover — no genai SDK adapter needed. The resolver in
+`forge-provider` retargets genai's OpenAI adapter at `endpoint` with the key from `env_var`, and
+discovery lists the provider's models live from `{endpoint}models` (`list_custom_models`),
+falling back to `seed_models` if that call fails. Slash-bearing ids
+(`meta/llama-3.1-405b-instruct`) work: the `provider::model` split is on the first `::` only.
 
 ## Default tiers (shipped)
 
