@@ -31,8 +31,15 @@ Helm note *Forge — Road to v1.0.0*; the competitor-derived adoption backlog is
 - **Security** — broadened the unoverridable secret-file denylist (dotenv variants, keys, cloud
   creds). **Diagnostics** — `forge doctor` now runs a real raw-mode viability probe.
 
-Next: bridge stream-json transport, direct-path goal verification, TUI upgrades, local-Whisper
-voice input, full docs pass.
+- **v1.0 must-haves (DONE, 2026-06)** — persistent subscription-bridge transport (long-lived
+  `--input-format stream-json`, #304); the two final deferred TUI bugs (#307); `forge-store` →
+  `r2d2` connection pool (#308); the headline benchmark **re-confirmed on the current build**
+  (Forge **6/10 vs raw CLI 4/10**, ~21% cheaper per fix, #311); Homebrew formula auto-update (#310);
+  full docs + README pass (this).
+
+Next (post-1.0): Forge driving the model's *inner* tool loop turn-by-turn; local-Whisper voice
+input; TUI animations + mouse phase-2; the hot-loop rework (`LoopOutcome` enum / token-budget
+continuation).
 
 ---
 
