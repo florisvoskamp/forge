@@ -927,33 +927,34 @@ impl Session {
     /// it, restore any files those turns wrote (PR3 shadow snapshots), and truncate the live
     /// transcript. Returns the file-restore result plus the prompt that started the rewound-to turn
     /// (so the UI can put it back in the input box). Powers `/undo` and `/checkpoints`.
-    pub fn rewind_to(&mut self, boundary: i64) -> Result<RewindOutcome, CoreError> {
-        let boundary = boundary.max(0);
+    /// `db_seq` is a DB **seq** (the stable identity checkpoints are keyed by), NOT a transcript
+    /// index — both `/undo` and the `/checkpoints` picker pass a seq. After a COMPACTED resume the
+    /// in-memory transcript is just the active tail while the DB seqs start high, so the two diverge;
+    /// `offset` (0 when not compacted) maps the seq back to the transcript index for truncation.
+    pub fn rewind_to(&mut self, db_seq: i64) -> Result<RewindOutcome, CoreError> {
+        let db_seq = db_seq.max(0);
+        // DB seq → transcript INDEX. Deactivation/snapshot work in DB seq; transcript ops in index.
+        let offset = self.seq - self.transcript.len() as i64;
+        let idx = (db_seq - offset).max(0) as usize;
         // The message AT the boundary is the user prompt of the rewound-to turn; capture it before
         // truncation so the UI can re-offer it for editing/resubmitting.
         let rewound_prompt = self
             .transcript
-            .get(boundary as usize)
+            .get(idx)
             .filter(|m| m.role == Role::User)
             .map(|m| m.content.clone());
-        // Transcript INDEX → DB SEQ. They're equal for a normal session, but after a COMPACTED
-        // resume the in-memory transcript is just the active tail (+ a synthetic summary) while the
-        // DB seqs start high — so `deactivate_messages_from(index)` would sweep the pre-compaction
-        // survivors (data loss). `offset` (0 when not compacted) maps the boundary to the real seq.
-        let offset = self.seq - self.transcript.len() as i64;
-        let db_boundary = boundary + offset;
         let mut restore = snapshot::RestoreReport::default();
         // Turns are keyed by their user-message seq. Restore every snapshotted turn at/after the
         // boundary, newest first so an earlier turn's blob (pre-turn bytes) wins the final state.
-        for seq in (db_boundary..self.seq).rev() {
+        for seq in (db_seq..self.seq).rev() {
             if let Ok(r) = snapshot::restore_turn(&self.checkpoint_root, &self.id, seq) {
                 restore.restored.extend(r.restored);
                 restore.warnings.extend(r.warnings);
             }
         }
-        self.store.deactivate_messages_from(&self.id, db_boundary)?;
-        self.transcript.truncate(boundary as usize);
-        self.seq = db_boundary;
+        self.store.deactivate_messages_from(&self.id, db_seq)?;
+        self.transcript.truncate(idx);
+        self.seq = db_seq;
         Ok(RewindOutcome {
             restore,
             rewound_prompt,
@@ -966,7 +967,9 @@ impl Session {
         let Some(idx) = self.transcript.iter().rposition(|m| m.role == Role::User) else {
             return Ok(None);
         };
-        Ok(Some(self.rewind_to(idx as i64)?))
+        // `rewind_to` takes a DB seq; map the transcript index to one (identity when not compacted).
+        let offset = self.seq - self.transcript.len() as i64;
+        Ok(Some(self.rewind_to(idx as i64 + offset)?))
     }
 
     /// Publish the current turn's snapshot context (session id, seq, absolute root) to the
@@ -1052,7 +1055,10 @@ impl Session {
     /// that token counting is precise.) The user-visible scrollback already shows everything.
     pub fn reload_full_context(&mut self) -> Result<(), CoreError> {
         let stored = self.store.load_all_messages(&self.id)?;
-        self.seq = stored.len() as i64;
+        // MAX(seq)+1, not the loaded count — `load_all_messages` includes soft-deleted rows from prior
+        // rewinds, so its length exceeds the real max seq and the count would reuse seqs / inflate the
+        // rewind offset (same class of bug as Session::resume, which is correctly scoped).
+        self.seq = self.store.next_seq_for_session(&self.id)?;
         self.transcript = stored
             .into_iter()
             .map(|m| Message {
@@ -9259,6 +9265,48 @@ mod tests {
         assert!(
             after.iter().any(|m| m.content == "msg 15"),
             "survivor 'msg 15' must still be active"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rewind_by_db_seq_after_compaction_targets_the_right_turn() {
+        // Regression: the /checkpoints picker passes a DB SEQ to rewind_to. After compaction the
+        // transcript index and DB seq diverge; rewind_to must interpret its argument as a DB seq
+        // (both undo and the picker pass seqs) — not a transcript index, which double-offset and
+        // rewound to the wrong turn (or no-op).
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let sid = store.create_session("/tmp", "default").unwrap();
+        for i in 0..16i64 {
+            store
+                .add_message(&sid, i, Role::User, &format!("msg {i}"), None)
+                .unwrap();
+        }
+        store
+            .compact_session_store(&sid, "summary of the first ten", 6)
+            .unwrap();
+        let mut session = Session::resume(
+            Arc::clone(&store),
+            Arc::new(MockProvider),
+            Arc::new(HeuristicRouter::new(Config::default())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            Config::default(),
+            &sid,
+        )
+        .unwrap();
+
+        session.checkpoint(Some("before the turn")).unwrap();
+        let cp_seq = session.checkpoints().unwrap()[0].seq; // a DB seq, as the picker passes
+        session.run_turn("a brand new prompt").await.unwrap();
+
+        // Picker-style rewind by DB seq must roll back exactly the new turn and keep the survivors.
+        session.rewind_to(cp_seq).unwrap();
+        let after = store.load_messages(&sid).unwrap();
+        assert_eq!(
+            after.len(),
+            7,
+            "summary + 6 survivors after rewinding the new turn by DB seq; got {}",
+            after.len()
         );
     }
 

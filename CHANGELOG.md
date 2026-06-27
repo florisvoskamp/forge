@@ -6,6 +6,20 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.57] - 2026-06-27
+
+### Fixed (bug-hunt batch 4 — rewind/seq model)
+- **`/checkpoints` picker rewound to the wrong turn after compaction** (regression from v0.4.51).
+  v0.4.51 made `rewind_to` take a transcript INDEX (to fix the `/undo` data-loss), but the checkpoint
+  picker passes a DB SEQ — so after compaction (where index and seq diverge) it double-offset and
+  rewound to the wrong turn or no-op'd. `rewind_to` now takes a DB seq (the stable identity both
+  `/undo` and the picker use); `undo()` maps its transcript index to a seq. Test:
+  `checkpoint_rewind_by_db_seq_after_compaction_targets_the_right_turn`.
+- **`reload_full_context` set `self.seq` to the loaded row count** (the same class of bug v0.4.51 fixed
+  in `resume`, but this spot was missed). `load_all_messages` includes soft-deleted rows from prior
+  rewinds, so the count exceeded `MAX(seq)+1`, reusing seqs / corrupting the rewind offset. Now uses
+  `next_seq_for_session`.
+
 ## [0.4.56] - 2026-06-27
 
 ### Fixed (bug-hunt batch 3 — config)
