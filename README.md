@@ -55,6 +55,9 @@ a measurable, not marketing, advantage.
   phantom success — and there's a `cargo test` behind every one of those claims (**324 conformance tests**).
 - 🔬 **Built-in code intelligence** — Lattice: a tree-sitter symbol graph (9 languages) with
   blast-radius, call-chains, and semantic retrieval, auto-injected before each turn.
+- 💭 **Cross-session memory** — Forge remembers durable, typed facts per project, auto-captured at
+  turn end and **relevance-ranked** back into context next session (keyword, or semantic when an
+  embedder is configured) — only the relevant ones, not a dump. Curate with `/remember` + `forge memory`.
 - ⚡ **One fast static binary** — Rust, no Node/Python/Bun runtime, no Electron. Installs in one line.
 
 ---
@@ -172,7 +175,7 @@ failover, subscription bridging, *and* a test-pinned reliability layer in one bi
 
 | Category | Features |
 |----------|----------|
-| **Model Mesh** | Auto-discovery, cost-tiered routing, benchmark ranking, health-aware failover, subscription bridges, daily/weekly/monthly budget caps, credit-conservation modes |
+| **Model Mesh** | Auto-discovery, cost-tiered routing, benchmark ranking, health-aware failover, subscription bridges, daily/weekly/monthly budget caps, credit-conservation modes (strict = free + subscription only), reset-aware rate-limit handling (waits out a short per-minute reset + retries the best model instead of degrading), multiple API keys per provider with round-robin rotation, `/effort` slider that steers the whole mesh route (benchmark-driven), not just the provider's reasoning param |
 | **Providers** | Anthropic, OpenAI, Ollama, Claude Code CLI, Codex CLI, Antigravity CLI (free Gemini), Groq, Gemini, DeepSeek, OpenRouter, NVIDIA NIM, SambaNova, Mistral, Cohere, xAI, Cerebras, and more — any OpenAI-compatible endpoint in one config row |
 | **Local LLMs** | `forge local` detects your hardware, recommends a Gemma model that fits, installs + runs it via Ollama (auto-installing Ollama if needed), opt-in autostart; animated picker menu |
 | **Planning mode** | `/plan` investigates read-only and proposes a plan; `/execute` approves it and carries it out |
@@ -181,7 +184,8 @@ failover, subscription bridging, *and* a test-pinned reliability layer in one bi
 | **Autofix loop** | Run lint/test after edits and self-heal on failure, up to N iterations (`[autofix]`, opt-in) |
 | **Architect mode** | Dual-model turns — strong planner drafts a plan, cheaper editor applies it (`[mesh] architect_mode`, opt-in) |
 | **Harness reliability** | Objective completion gate — a model can't claim "done" without a real tool-grounded state check (same authority on direct-API **and** subscription-bridge turns); doom-loop + repeated-failure guards; text-leaked tool-call recovery; never reports a phantom success |
-| **Context** | `@file` mentions inject file contents; project memory auto-loaded from `.forge/AGENTS.md` (scaffold with `/init`); Lattice auto-injection |
+| **Context** | `@file` mentions inject file contents; project file auto-loaded from `.forge/AGENTS.md` (scaffold with `/init`); Lattice auto-injection |
+| **Auto-memory** | Built-in cross-session memory: typed durable facts (preference/decision/fact/reference), per-project (or global), auto-captured at turn end + relevance-ranked recall at session start (keyword, or semantic when an embedder is configured), auto-dedup + salience; `/remember`, `/memories`, and the `forge memory` CLI (`[mesh] auto_memory`, on by default) |
 | **Vision** | Attach images by `/image <path>` or paste them straight into the input bar as inline blocks |
 | **Assay** | Parallel critic crew, adversarial verification, ranked findings, git scopes (diff/branch/since), lens selection, auto-diff vs prior run; opt-in auto-review gate over a turn's diff (`[assay] auto_review`, warn/block) |
 | **MCP** | Client for external MCP servers (stdio + HTTP/SSE), OAuth 2.0 + PKCE, deferred loading, allowlist gating |
@@ -271,7 +275,8 @@ forge local                 # animated menu; or: forge local install
 
 # Interactive chat (full-screen TUI; --inline for native scrollback)
 forge chat
-# In chat: /config edits any setting · /model picks a model · /init writes project memory
+# In chat: /config edits any setting · /model picks a model · /effort sets the reasoning/route knob
+#          /remember <fact> saves a memory · /memories lists them · /init writes .forge/AGENTS.md
 
 # One-shot task
 forge run "refactor the auth middleware to use tower layers"
@@ -304,6 +309,12 @@ Forge's routing engine classifies every task into a tier, then picks the cheapes
 | **Complex** | Architecture, deep debugging, new features | Frontier model |
 
 The mesh is **health-aware**: rate-limited or unavailable models are benched with a cooldown and the next fallback is tried automatically (down the full ranked catalog, not a fixed top-5). It is **benchmark-ranked** against real Artificial Analysis intelligence + coding scores, and **conservation-aware** — under budget pressure or to spare a metered subscription, it spreads work onto free frontier models.
+
+**Robust under real free-tier conditions:**
+- **Reset-aware rate limits** — a per-minute free-tier 429 (NVIDIA NIM / Groq / Gemini) is waited out and the *best* model retried, instead of immediately degrading to a worse one; transient 5xx/blips retry the same model before failover; permanent errors (no tool support / 402 payment-required) fail over at once.
+- **Multiple keys per provider** — run `forge auth <provider>` again to stack keys; the mesh round-robins across them to multiply a free tier's per-key rate limit.
+- **`credit_mode = "strict"`** keeps routing + failover to **free + subscription only** — a paid model is never silently used.
+- **`/effort`** (low / medium / high / xhigh) steers the *whole* route, benchmark-driven: higher effort biases toward stronger-benchmarked models (only when the score gap is real), lower toward cheaper; medium = unchanged.
 
 Inspect any routing decision live with `/mesh [task]` or `forge mesh "<task>"`.
 
@@ -466,6 +477,22 @@ forge models --probe --all  # re-ping every model (costs money on paid providers
 forge models --clear    # forget all benched/rate-limited marks
 ```
 
+### `forge memory`
+
+Cross-session auto-memory — durable facts Forge remembers per project.
+
+```bash
+forge memory                    # list this project's memories (id · kind · text · salience)
+forge memory add "use 4-space indent" --kind decision   # add a fact by hand
+forge memory search indent      # keyword search
+forge memory rm 19f07a65        # remove one (id prefix)
+forge memory clear              # delete all in this scope
+forge memory --global           # operate on the cross-project (global) scope
+```
+
+In chat: `/remember <text>` saves a memory on the spot; `/memories` lists them. Capture + recall are
+automatic (`[mesh] auto_memory`, on by default).
+
 ### `forge lattice`
 
 Code intelligence — tree-sitter symbol graph over your repo.
@@ -564,10 +591,32 @@ Forge switches to **Auto-edit** and carries out the plan it proposed, step by st
 
 ---
 
-## `@file` Context & Project Memory
+## `@file` Context & Memory
 
 - **`@file` mentions** — type `@` to fuzzy-pick a file; on submit the file's contents are read and injected into the turn as context (size- and binary-capped). The `@path` stays in your prompt; the contents ride along behind the scenes.
-- **Project memory** — `/init` scans the repo and writes `.forge/AGENTS.md` (overview, build/test/run, layout, conventions). On every future session Forge auto-loads `.forge/AGENTS.md` (or a top-level `AGENTS.md`) as a standing system prompt.
+- **Project file (AGENTS.md)** — `/init` scans the repo and writes `.forge/AGENTS.md` (overview, build/test/run, layout, conventions). On every future session Forge auto-loads `.forge/AGENTS.md` (or a top-level `AGENTS.md`) as a standing system prompt.
+
+### Built-in auto-memory
+
+A persistent, **cross-session** memory of durable facts, scoped per project (or `--global`), stored
+in the local DB.
+
+- **Auto-capture** — at the end of a turn, a cheap classify-tier call extracts up to a few *durable*
+  facts (preferences, decisions, conventions — not transient task detail) and stores them, **typed**
+  (`preference` / `decision` / `fact` / `reference`). Repeated facts de-duplicate and bump salience
+  instead of piling up.
+- **Recall** — at the start of a session, the **most relevant** memories are injected (ranked by
+  overlap with your prompt, then salience + recency — **not** a dump of every note). When an embedder
+  is configured (`[lattice.embeddings]`), recall ranks by **semantic similarity**; otherwise it falls
+  back to keyword overlap.
+- **You stay in control** — `/remember <text>` saves a fact on the spot, `/memories` lists what Forge
+  knows, and the `forge memory` CLI (`list` / `add` / `search` / `rm` / `clear`, `--global`) manages
+  it. On by default (`[mesh] auto_memory`); best-effort, never blocks a turn.
+
+> Honest scope: the capture→recall loop is verified end-to-end (a stated preference is captured + recalled
+> in a later session). Semantic recall and head-to-head comparisons vs other agents' memory are not yet
+> benchmarked — it's a differentiated design (typed, de-duped, relevance-ranked, semantic-capable), not a
+> measured "best".
 
 ---
 
@@ -768,7 +817,7 @@ forge assay run --scope diff --format markdown --fail-on high
 ```yaml
 - uses: florisvoskamp/forge/.github/actions/forge-assay@main
   with:
-    version: v0.4.71         # any recent release (its binary has `forge assay run`)
+    version: v1.6.1          # any recent release (its binary has `forge assay run`)
     scope: diff
     fail-on: high
     anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}

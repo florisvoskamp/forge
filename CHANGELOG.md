@@ -6,6 +6,12 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+### Docs
+- **README synced to the v1.6.x wave:** documented built-in auto-memory (capture/recall, `/remember`,
+  `/memories`, `forge memory` CLI — with an honest "differentiated design, not benchmarked-best" note),
+  the `/effort` mesh-wide slider, reset-aware rate-limit handling, multi-key rotation, and
+  `credit_mode=strict`; refreshed the stale Action `version:` example to v1.6.1.
+
 ## [1.6.1] - 2026-06-28
 
 ### Added
