@@ -6,7 +6,21 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
-## [1.5.1] - 2026-06-28
+## [1.6.0] - 2026-06-28
+
+### Added
+- **Semantic memory recall engine** (store layer). The auto-memory store now supports embedding-based
+  recall: `add_memory_with_embedding` persists a fact's f32 vector in the (already-reserved)
+  `embedding` column, and `recall_semantic` ranks a scope's memories by **cosine similarity** to a
+  query embedding (memories with no/empty/mismatched embedding sort last), with little-endian f32 ↔
+  blob helpers. Fully unit-tested (round-trip, cosine ranking, no-embedding fallback). *(Built by
+  Forge itself via the mesh — and the v1.5.1 truncation guard proved itself live: the same task that
+  corrupted the file last time landed as 175 purely-additive lines this time.)*
+
+  The end-of-turn capture + start-of-session recall still use keyword overlap; wiring this semantic
+  engine into them (best-effort, behind the existing embeddings config, keyword fallback) is the next
+  increment — it needs a `Send`-safe embed path, since calling the embedder directly in the turn loop
+  makes the turn future non-`Send`.
 
 ### Fixed
 - **`edit_file` now rejects a truncated replacement instead of corrupting the file.** When a model's

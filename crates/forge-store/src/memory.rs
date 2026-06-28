@@ -56,6 +56,42 @@ impl Store {
         Ok(id)
     }
 
+    /// Like `add_memory`, but also stores the embedding vector (little-endian f32 bytes) on the
+    /// row. An empty `embedding` delegates to `add_memory` (NULL embedding). On a dedup hit the
+    /// existing row's embedding is overwritten with the new one — the latest write wins.
+    pub fn add_memory_with_embedding(
+        &self,
+        scope: &str,
+        kind: &str,
+        text: &str,
+        source_session: &str,
+        embedding: &[f32],
+    ) -> Result<String> {
+        if embedding.is_empty() {
+            return self.add_memory(scope, kind, text, source_session);
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(StoreError::Pool("empty memory text".into()));
+        }
+        let bytes = f32_to_le_bytes(embedding);
+        if let Some(existing) = self.find_duplicate_memory(scope, text)? {
+            self.lock()?.execute(
+                "UPDATE memory SET salience = min(1.0, salience + 0.1), \
+                 updated_at = strftime('%s','now'), embedding = ?2 WHERE id = ?1",
+                rusqlite::params![&existing, &bytes],
+            )?;
+            return Ok(existing);
+        }
+        let id = forge_types::new_id();
+        self.lock()?.execute(
+            "INSERT INTO memory (id, scope, kind, text, source_session, embedding) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, scope, kind, text, source_session, &bytes],
+        )?;
+        Ok(id)
+    }
+
     /// The id of an existing memory in `scope` whose text is a near-duplicate of `text`, if any.
     fn find_duplicate_memory(&self, scope: &str, text: &str) -> Result<Option<String>> {
         let want = tokenize(text);
@@ -118,6 +154,44 @@ impl Store {
         Ok(hits)
     }
 
+    /// The `limit` memories in `scope` nearest to `query_embedding` by cosine similarity. Rows
+    /// with a NULL, empty, or length-mismatched embedding rank last (after all rankable rows).
+    pub fn recall_semantic(
+        &self,
+        scope: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<Memory>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, scope, kind, text, source_session, created_at, updated_at, salience, \
+             embedding FROM memory WHERE scope = ?1",
+        )?;
+        let rows = stmt.query_map([scope], |r| {
+            let mem = row_to_memory(r)?;
+            let blob: Option<Vec<u8>> = r.get(8)?;
+            Ok((mem, blob))
+        })?;
+        let mut scored: Vec<(f32, Memory)> = Vec::new();
+        for row in rows.flatten() {
+            let (mem, blob) = row;
+            let score = match blob {
+                Some(b) if !b.is_empty() => {
+                    let v = le_bytes_to_f32(&b);
+                    if v.len() != query_embedding.len() {
+                        f32::NEG_INFINITY
+                    } else {
+                        cosine_similarity(query_embedding, &v)
+                    }
+                }
+                _ => f32::NEG_INFINITY,
+            };
+            scored.push((score, mem));
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(scored.into_iter().map(|(_, m)| m).take(limit).collect())
+    }
+
     /// Delete one memory by id. `Ok(true)` if a row was removed.
     pub fn delete_memory(&self, id: &str) -> Result<bool> {
         Ok(self
@@ -178,8 +252,49 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
     }
 }
 
+/// Pack `v` as 4 little-endian bytes per f32 (matches the `embedding BLOB` column convention).
+fn f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
+/// Decode a little-endian f32 blob back into a vector. Trailing bytes that don't fill a 4-byte
+/// chunk are dropped (the column is always written by `f32_to_le_bytes`, so this is just a
+/// safety net for hand-edited rows).
+fn le_bytes_to_f32(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Cosine similarity in `[-1.0, 1.0]`. Returns `-1.0` when lengths differ or either vector has
+/// zero norm — callers can treat that as "not comparable" and rank such rows last.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return -1.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom == 0.0 {
+        -1.0
+    } else {
+        dot / denom
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::Store;
 
     fn store() -> Store {
@@ -257,5 +372,65 @@ mod tests {
             .unwrap();
         s.add_memory("p", "fact", "golf hotel india", "x").unwrap();
         assert_eq!(s.clear_memories("p").unwrap(), 2);
+    }
+
+    #[test]
+    fn f32_round_trips_through_bytes() {
+        let v = [1.0f32, -0.5, 0.25, 0.0, -std::f32::consts::PI];
+        let bytes = f32_to_le_bytes(&v);
+        assert_eq!(bytes.len(), v.len() * 4);
+        let back = le_bytes_to_f32(&bytes);
+        assert_eq!(back, v.to_vec());
+    }
+
+    #[test]
+    fn cosine_similarity_higher_for_nearer_vector() {
+        let q = [1.0f32, 0.0, 0.0];
+        let near = [0.99, 0.01, 0.0];
+        let far = [-1.0, 0.0, 0.0];
+        let s_near = cosine_similarity(&q, &near);
+        let s_far = cosine_similarity(&q, &far);
+        assert!(s_near > s_far, "near {s_near} should beat far {s_far}");
+        // Length mismatch and zero-norm both return -1.0.
+        assert_eq!(cosine_similarity(&q, &[1.0, 0.0]), -1.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[0.0, 0.0]), -1.0);
+    }
+
+    #[test]
+    fn recall_semantic_ranks_by_cosine_and_pushes_no_embedding_last() {
+        let s = store();
+        // Two memories with embeddings: one near the query, one orthogonal.
+        s.add_memory_with_embedding(
+            "p",
+            "fact",
+            "the database is postgres on port 5432",
+            "x",
+            &[1.0, 0.0, 0.0],
+        )
+        .unwrap();
+        s.add_memory_with_embedding(
+            "p",
+            "fact",
+            "the frontend uses react and vite",
+            "x",
+            &[0.0, 1.0, 0.0],
+        )
+        .unwrap();
+        // One memory with NO embedding — must rank last.
+        s.add_memory("p", "fact", "deploys happen on fridays", "x")
+            .unwrap();
+
+        let hits = s.recall_semantic("p", &[0.9, 0.1, 0.0], 3).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(
+            hits[0].text.contains("postgres"),
+            "nearest embedding first: got {:?}",
+            hits.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        assert!(
+            hits[2].text.contains("fridays"),
+            "no-embedding memory must rank last: got {:?}",
+            hits.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
     }
 }
