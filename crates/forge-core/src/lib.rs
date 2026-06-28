@@ -1049,7 +1049,7 @@ impl Session {
             Some(mgr) => mgr
                 .connect_one(&server)
                 .await
-                .map_err(|e| CoreError::Internal(e))?,
+                .map_err(CoreError::Internal)?,
             None => {
                 let mut cfg = forge_config::McpConfig::default();
                 cfg.servers.push(server);
