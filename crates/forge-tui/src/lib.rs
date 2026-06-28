@@ -5,7 +5,7 @@
 
 use std::io::{IsTerminal, Write};
 
-use forge_types::SideEffect;
+use forge_types::{SideEffect, StopReason};
 
 /// One choice in an [`Presenter::ask`] question (AskUserQuestion). `description` may be empty.
 #[derive(Debug, Clone)]
@@ -221,6 +221,7 @@ pub enum PresenterEvent {
     },
     Done {
         final_text: String,
+        stop_reason: StopReason,
     },
     /// A subscription quota observation arrived this turn (rate_limit_event / Codex rollout).
     /// Used to update the /usage overlay in real-time without waiting for the DB refresh cycle.

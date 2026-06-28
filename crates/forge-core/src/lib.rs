@@ -1485,6 +1485,7 @@ impl Session {
             }
             self.presenter.emit(PresenterEvent::Done {
                 final_text: String::new(),
+                stop_reason: StopReason::FinalAnswer,
             });
         }
         Ok(())
@@ -1502,6 +1503,7 @@ impl Session {
             .emit(PresenterEvent::Warning(msg.to_string()));
         self.presenter.emit(PresenterEvent::Done {
             final_text: String::new(),
+            stop_reason: StopReason::FinalAnswer,
         });
     }
 
@@ -3533,6 +3535,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             self.transcript.push(Message::system(&msg));
             self.presenter.emit(PresenterEvent::Done {
                 final_text: msg.clone(),
+                stop_reason: StopReason::BudgetExhausted,
             });
             return Ok(LoopOutcome::budget_exhausted(msg));
         }
@@ -3592,6 +3595,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             self.transcript.push(Message::system(&msg));
             self.presenter.emit(PresenterEvent::Done {
                 final_text: msg.clone(),
+                stop_reason: StopReason::FinalAnswer,
             });
             return Ok(LoopOutcome::final_answer(msg));
         }
@@ -4003,6 +4007,11 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         });
         self.presenter.emit(PresenterEvent::Done {
             final_text: final_text.clone(),
+            stop_reason: if hit_step_cap {
+                StopReason::MaxSteps
+            } else {
+                StopReason::FinalAnswer
+            },
         });
         self.generate_recap(prompt, &final_text).await;
         // Await the handle so one-shot (forge run) exits only after capture completes. In

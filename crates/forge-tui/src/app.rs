@@ -265,6 +265,8 @@ pub struct App {
     /// Set while compaction is running, driving the animated progress band. `None` otherwise.
     pub compaction: Option<CompactionState>,
     pub done: bool,
+    /// Why the last turn ended; `None` before any turn completes or for lifecycle-only Done events.
+    pub last_stop_reason: Option<forge_types::StopReason>,
     /// The active operating temper label (e.g. "Guarded"), shown in the statusline.
     pub temper: String,
     /// The active reasoning-effort pin, when set by config or `/effort`.
@@ -1076,9 +1078,10 @@ impl App {
                 ]));
                 self.flush.push(TextLine::default());
             }
-            PresenterEvent::Done { .. } => {
+            PresenterEvent::Done { stop_reason, .. } => {
                 self.model_search = None;
                 self.done = true;
+                self.last_stop_reason = Some(stop_reason);
             }
             PresenterEvent::QuotaUpdate {
                 provider,
@@ -4050,6 +4053,25 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
             format!("⏳ {} queued", app.queued.len()),
             Style::default().fg(WARNYEL).bold().bg(STATUSBG),
         ));
+    }
+    if app.done && w >= 50 {
+        match app.last_stop_reason {
+            Some(forge_types::StopReason::MaxSteps) => {
+                line1.push(sep());
+                line1.push(Span::styled(
+                    "⚠ step limit — send `continue`",
+                    Style::default().fg(WARNYEL).bold().bg(STATUSBG),
+                ));
+            }
+            Some(forge_types::StopReason::BudgetExhausted) => {
+                line1.push(sep());
+                line1.push(Span::styled(
+                    "✕ budget cap",
+                    Style::default().fg(ERRRED).bold().bg(STATUSBG),
+                ));
+            }
+            _ => {}
+        }
     }
 
     let version = concat!("v", env!("CARGO_PKG_VERSION"));
