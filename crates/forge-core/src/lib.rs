@@ -3894,7 +3894,25 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         // with at least one non-empty command, run lint/test and feed failures back into the
         // conversation so the model can fix them. Repeat up to `max_iterations`. When autofix is
         // off, or no edits happened, this block is a no-op (zero overhead).
-        let af = self.config.autofix.clone();
+        let mut af = self.config.autofix.clone();
+
+        // Auto-detect: fill in lint_cmd (and optionally test_cmd) from project structure when the
+        // user hasn't configured them. Activates on edits so there's no cost on read-only turns.
+        if af.auto_detect && self.edits_this_turn > 0 && af.lint_cmd.is_empty() {
+            if let Some((lint, test)) = Self::detect_project_commands() {
+                self.presenter.emit(PresenterEvent::Warning(format!(
+                    "autofix: auto-detected lint command from project structure: {lint}"
+                )));
+                af.lint_cmd = lint;
+                af.auto_lint = true;
+                if af.auto_test && af.test_cmd.is_empty() {
+                    if let Some(t) = test {
+                        af.test_cmd = t;
+                    }
+                }
+            }
+        }
+
         let autofix_active = self.edits_this_turn > 0
             && ((af.auto_lint && !af.lint_cmd.is_empty())
                 || (af.auto_test && !af.test_cmd.is_empty()));
@@ -4188,6 +4206,37 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
     /// combined output of failing commands is injected into the transcript as a synthetic user
     /// message so the model can fix it next iteration). Never returns `Err` from a non-zero
     /// command exit — only from infrastructure failures (transcript write, etc.).
+    /// Detect lint / test commands from project structure (zero-config autofix).
+    /// Checks the current working directory — the project root where `forge chat` launched.
+    /// Returns `(lint_cmd, test_cmd)` when a known project type is found; `test_cmd` is `None`
+    /// when the project type has no obvious cheap test command.
+    fn detect_project_commands() -> Option<(String, Option<String>)> {
+        if std::path::Path::new("Cargo.toml").exists() {
+            return Some((
+                "cargo check --all-targets 2>&1".to_string(),
+                Some("cargo test --workspace 2>&1".to_string()),
+            ));
+        }
+        if std::path::Path::new("package.json").exists() {
+            return Some((
+                "npm run lint 2>&1".to_string(),
+                Some("npm test 2>&1".to_string()),
+            ));
+        }
+        if std::path::Path::new("pyproject.toml").exists()
+            || std::path::Path::new("setup.py").exists()
+        {
+            return Some(("python -m pytest --tb=short -q 2>&1".to_string(), None));
+        }
+        if std::path::Path::new("go.mod").exists() {
+            return Some((
+                "go build ./... 2>&1".to_string(),
+                Some("go test ./... 2>&1".to_string()),
+            ));
+        }
+        None
+    }
+
     async fn run_autofix_stage(
         &mut self,
         af: &forge_config::AutofixConfig,
@@ -10318,6 +10367,7 @@ mod tests {
             lint_cmd: "true".to_string(), // always exits 0
             test_cmd: "true".to_string(), // always exits 0
             max_iterations: 3,
+            auto_detect: false, // explicit cmds set; no detection needed
         };
         // run_autofix_stage returns Ok(true) when all enabled commands pass.
         let passed = session.run_autofix_stage(&af).await.unwrap();
@@ -10353,6 +10403,7 @@ mod tests {
             lint_cmd: "false".to_string(), // always exits 1
             test_cmd: String::new(),
             max_iterations: 3,
+            auto_detect: false,
         };
         let passed = session.run_autofix_stage(&af).await.unwrap();
         assert!(!passed, "'false' exits 1 → stage should fail");
@@ -10429,6 +10480,7 @@ mod tests {
                 lint_cmd: "false".to_string(), // always exits 1 → never "fixed"
                 test_cmd: String::new(),
                 max_iterations: 2,
+                auto_detect: false,
             },
             ..Config::default()
         };
@@ -10562,6 +10614,7 @@ mod tests {
             lint_cmd: String::new(), // empty = disabled
             test_cmd: String::new(), // empty = disabled
             max_iterations: 3,
+            auto_detect: false,
         };
         // No commands run → stage trivially passes.
         let passed = session.run_autofix_stage(&af).await.unwrap();

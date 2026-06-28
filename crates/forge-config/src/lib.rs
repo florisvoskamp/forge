@@ -508,6 +508,11 @@ pub struct AutofixConfig {
     /// Max fix attempts per turn before giving up and surfacing the remaining failures.
     #[serde(default = "default_autofix_iterations")]
     pub max_iterations: u32,
+    /// Detect lint/test commands from project structure when lint_cmd/test_cmd are empty.
+    /// Cargo.toml → `cargo check --all-targets 2>&1`; package.json → `npm run lint 2>&1`.
+    /// auto_lint / auto_test must still be true; this only fills in the command.
+    #[serde(default = "default_true")]
+    pub auto_detect: bool,
 }
 
 impl Default for AutofixConfig {
@@ -518,12 +523,17 @@ impl Default for AutofixConfig {
             lint_cmd: String::new(),
             test_cmd: String::new(),
             max_iterations: default_autofix_iterations(),
+            auto_detect: true,
         }
     }
 }
 
 fn default_autofix_iterations() -> u32 {
     3
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Assay-gated auto-review: before a write turn finishes, run the Assay critic crew on the turn's
@@ -1718,6 +1728,7 @@ pub fn setting_group_and_label(path: &str) -> (String, String) {
         "lattice.embeddings.backend" => Some(("Code Intelligence", "Embeddings backend")),
         "autofix.enabled" => Some(("Autofix", "Enabled")),
         "autofix.max_iterations" => Some(("Autofix", "Max iterations")),
+        "autofix.auto_detect" => Some(("Autofix", "Auto-detect commands")),
         "assay.gate_enabled" => Some(("Assay", "Review gate")),
         "assay.max_cost_usd" => Some(("Assay", "Max cost (USD)")),
         "git.coauthor" => Some(("Git", "Co-author commits")),
@@ -1913,6 +1924,7 @@ pub fn setting_help(path: &str) -> Option<&'static str> {
         "lattice.watch" => "Reindex changed files automatically as you edit.",
         "autofix.enabled" => "After edits, run lint/test and feed failures back so the model self-heals.",
         "autofix.max_iterations" => "Max self-heal passes before giving up.",
+        "autofix.auto_detect" => "Detect lint/test commands from project structure when lint_cmd/test_cmd are empty (Cargo.toml → cargo check; package.json → npm run lint).",
         "assay.gate_enabled" => "Run an Assay review on write turns before they finish.",
         "assay.max_cost_usd" => "Per-run cost ceiling for the Assay critic crew.",
         "git.coauthor" => "Install a commit hook stamping Co-Authored-By: Forge and stripping CLI co-authors.",
