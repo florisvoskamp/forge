@@ -600,6 +600,39 @@ mod tests {
     }
 
     #[test]
+    fn builtin_deny_rules_cover_secret_writes_and_deletes() {
+        // write_file/edit_file/delete_file previously lacked .env protection — a model could
+        // overwrite or delete .env files even though reading was blocked.
+        let rules = forge_config::builtin_deny_rules();
+        for tool in ["write_file", "edit_file", "delete_file"] {
+            let side = SideEffect::Write;
+            for p in ["./.env", "./.env.local", "./.env.production", "**/id_rsa"] {
+                // skip glob patterns in path (that's a config thing, not a path arg)
+                if p.contains('*') {
+                    continue;
+                }
+                assert_eq!(
+                    decide(PermissionMode::Bypass, side, tool, &path(p), &rules),
+                    Deny,
+                    "{tool} must deny secret file {p} even in bypass"
+                );
+            }
+            // SSH keys and credentials must also be blocked.
+            assert_eq!(
+                decide(
+                    PermissionMode::Bypass,
+                    side,
+                    tool,
+                    &path("./.ssh/id_rsa"),
+                    &rules
+                ),
+                Deny,
+                "{tool} must deny SSH key writes even in bypass"
+            );
+        }
+    }
+
+    #[test]
     fn builtin_shell_secret_reads_cover_non_cat_verbs() {
         // The read_file tool blocks `.env`, but an agent can shell out to read it. `cat`/`less`/etc.
         // were covered; these are the OTHER common non-interactive read/exfil verbs that used to slip
