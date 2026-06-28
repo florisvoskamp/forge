@@ -6,6 +6,18 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-06-28
+
+### Fixed
+- **`edit_file` now rejects a truncated replacement instead of corrupting the file.** When a model's
+  `new` argument is cut off mid-string (its output got truncated), the edit used to apply and leave
+  the file with an unterminated string literal / unbalanced delimiters. `apply_edit` now detects a
+  likely-truncated replacement (an odd number of unescaped `"`) up front and returns an actionable
+  error — "looks truncated … make a smaller edit, or use write_file" — before touching the file.
+  New `looks_truncated` helper + tests. *(Built by Forge itself via the mesh — the deeper fix for
+  the edit-tool truncation that previously corrupted large edits during dogfooding; pairs with the
+  v1.4.1 error-message improvements.)*
+
 ## [1.5.0] - 2026-06-28
 
 ### Added

@@ -284,6 +284,21 @@ fn block_anchor_replace(content: &str, old: &str, new: &str) -> Option<String> {
     Some(out)
 }
 
+fn looks_truncated(new: &str) -> bool {
+    !new.is_empty()
+        && new
+            .chars()
+            .scan(false, |escaped, ch| {
+                let is_unescaped_quote = ch == '"' && !*escaped;
+                *escaped = ch == '\\';
+                Some(is_unescaped_quote)
+            })
+            .filter(|is_quote| *is_quote)
+            .count()
+            % 2
+            == 1
+}
+
 /// Hard cap on a single `read_file` result so one read can't flood the model's context. A whole
 /// file over this is truncated (head kept — imports/signatures live there) with a marker telling
 /// the model to request a specific line range instead.
@@ -427,6 +442,12 @@ impl Tool for EditFileTool {
 /// whitespace-insensitive fallback ([`flexible_replace`]). Returns `(updated, note)` or a
 /// human-readable error. Shared by [`EditFileTool`] and [`MultiEditTool`].
 fn apply_edit(content: &str, old: &str, new: &str) -> Result<(String, &'static str), String> {
+    if looks_truncated(new) {
+        return Err("the replacement text looks truncated (unbalanced quotes — it was probably cut off). Make a smaller, targeted edit, or use write_file for a brand-new file."
+            .to_string()
+        );
+    }
+
     match content.matches(old).count() {
         1 => Ok((content.replacen(old, new, 1), "")),
         0 => flexible_replace(content, old, new)
@@ -1341,6 +1362,20 @@ mod tests {
         .unwrap();
         assert_eq!(out, "fn g() {\n    new();\n}\n");
         assert_eq!(note, " (matched on block anchors)");
+    }
+
+    #[test]
+    fn looks_truncated_detects_odd_unescaped_quotes() {
+        assert!(looks_truncated("let s = \"hello;"));
+        assert!(!looks_truncated("let s = \"hello\";"));
+        assert!(!looks_truncated("fn x() {}"));
+    }
+
+    #[test]
+    fn apply_edit_rejects_truncated_replacement() {
+        let err =
+            apply_edit("let s = \"old\";\n", "let s = \"old\";", "let s = \"new;").unwrap_err();
+        assert!(err.contains("truncated"), "{err}");
     }
 
     #[test]
