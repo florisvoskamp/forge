@@ -8,7 +8,10 @@ use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone};
 use forge_types::{Role, TaskTier, ToolCall, Usage};
 use rusqlite::{Connection, OptionalExtension};
 
+mod memory;
 mod schema;
+
+pub use memory::Memory;
 
 /// How long a permanently-failed model (a [`Store::exclude_model`] capability exclusion) stays out
 /// of routing before it's re-probed: 24 hours. Long enough to stop the per-session churn of

@@ -94,6 +94,7 @@ pub(crate) async fn dispatch(command: Command) -> Result<()> {
         } => auth(&provider, remove, list, replace),
         Command::Setup | Command::Init => setup(),
         Command::Mcp { cmd } => mcp_cmd(cmd).await,
+        Command::Memory { cmd, global } => memory_cmd(cmd, global),
         Command::McpServe => mcp_serve::run().await,
         Command::Lattice { op } => lattice_cmd(op).await,
         Command::Import { source } => import_cmd(source),

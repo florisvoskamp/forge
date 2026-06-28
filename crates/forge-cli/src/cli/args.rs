@@ -324,6 +324,15 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: Option<McpCmd>,
     },
+    /// Auto-memory — durable facts Forge remembers across sessions, scoped to this project (or
+    /// `--global`). No subcommand lists them; otherwise add/search/remove/clear.
+    Memory {
+        #[command(subcommand)]
+        cmd: Option<MemoryCmd>,
+        /// Operate on the global scope instead of this project.
+        #[arg(long, global = true)]
+        global: bool,
+    },
     /// Lattice — native code-intelligence graph (tree-sitter + SQLite). Build it, then query.
     Lattice {
         #[command(subcommand)]
@@ -568,6 +577,30 @@ pub(crate) enum LatticeOp {
         #[arg(long, short = 'b')]
         budget: Option<usize>,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MemoryCmd {
+    /// Add a memory by hand.
+    Add {
+        /// The fact to remember.
+        text: Vec<String>,
+        /// Kind: preference | decision | fact | reference.
+        #[arg(long, default_value = "fact")]
+        kind: String,
+    },
+    /// Search memories by keyword.
+    Search {
+        /// Query words.
+        query: Vec<String>,
+    },
+    /// Remove one memory by id.
+    Rm {
+        /// Memory id (from `forge memory`).
+        id: String,
+    },
+    /// Delete every memory in the scope.
+    Clear,
 }
 
 #[derive(Subcommand)]

@@ -217,6 +217,14 @@ pub struct RewindOutcome {
 /// budget rather than overflowing.
 const CHARS_PER_TOKEN: usize = 3;
 
+/// Scope key for auto-memory: the current project directory's absolute path (memories are
+/// per-project). Matches the `forge memory` CLI so both see the same store.
+fn memory_scope() -> String {
+    std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "global".to_string())
+}
+
 /// Max same-model retries for a TRANSIENT provider failure (5xx / dropped stream / network blip)
 /// before benching the model and failing over. Small + backed off so a genuinely-down model still
 /// reaches failover quickly, but a one-off blip doesn't needlessly switch models.
@@ -2133,6 +2141,83 @@ Output ONLY that sentence — no preamble, no quotation marks.";
     /// After a turn completes, make one cheap trivial-tier call to generate a one-line recap,
     /// emitted via [`PresenterEvent::Recap`]. Best-effort: silently skipped on budget exhaustion
     /// or any model error so it can never derail the session.
+    const MEMORY_CAPTURE_SYSTEM: &'static str =
+        "You extract DURABLE facts worth remembering across FUTURE sessions in this project: user \
+         preferences, project decisions/conventions, key architecture or config, and stable \
+         constraints. Output 0 to 3 lines, each exactly `kind: fact`, where kind is one of \
+         preference, decision, fact, reference. Skip transient task details, one-off actions, and \
+         anything specific to only this turn. If nothing is durable, output NOTHING at all.";
+
+    /// After a turn, make one cheap trivial-tier call to extract 0-3 DURABLE facts and persist them
+    /// as project-scoped memories (dedup + salience handled by the store). Best-effort: any
+    /// budget/model failure is silently skipped so it can never derail the session. Recall of these
+    /// happens at the start of a later session (see `run_turn_with`).
+    async fn capture_memories(&mut self, prompt: &str, final_text: &str) {
+        if !self.config.mesh.auto_memory || final_text.trim().is_empty() {
+            return;
+        }
+        let budget = BudgetState {
+            spent_today_usd: self.store.spend_today_usd().unwrap_or(0.0),
+            daily_cap_usd: self.config.mesh.daily_budget_usd,
+            spent_week_usd: self.store.spend_this_week_usd().unwrap_or(0.0),
+            weekly_cap_usd: self.config.mesh.weekly_budget_usd,
+            spent_month_usd: self.store.spend_this_month_usd().unwrap_or(0.0),
+            monthly_cap_usd: self.config.mesh.monthly_cap_usd,
+            warn_fraction: self.config.mesh.warn_threshold,
+        };
+        if budget.status() == BudgetStatus::Exhausted {
+            return;
+        }
+        let health = self.store.current_benched().unwrap_or_default();
+        let quota = self.live_quota();
+        let decision = self
+            .router
+            .route_hinted(
+                "extract durable facts",
+                budget,
+                &health,
+                &quota,
+                Some(TaskTier::Trivial),
+                self.pinned_effort,
+            )
+            .await;
+        let user_snippet: String = prompt.chars().take(500).collect();
+        let assistant_snippet: String = final_text.chars().take(1200).collect();
+        let messages = vec![
+            Message::system(Self::MEMORY_CAPTURE_SYSTEM),
+            Message::user(format!(
+                "User request:\n{user_snippet}\n\nAssistant response:\n{assistant_snippet}"
+            )),
+        ];
+        let mut sink = |_: StreamEvent| {};
+        let Ok(r) = self
+            .provider
+            .complete(&decision.model, &messages, &[], &mut sink)
+            .await
+        else {
+            return;
+        };
+        let _ = self
+            .store
+            .record_side_call_usage(&self.id, "memory", &r.usage);
+        let scope = memory_scope();
+        for line in r.content.lines().take(3) {
+            let line = line.trim().trim_start_matches(['-', '*', '•']).trim();
+            let Some((kind, text)) = line.split_once(':') else {
+                continue;
+            };
+            let kind = kind.trim().to_lowercase();
+            let kind = match kind.as_str() {
+                "preference" | "decision" | "fact" | "reference" => kind.as_str(),
+                _ => "fact",
+            };
+            let text = text.trim();
+            if text.len() >= 4 {
+                let _ = self.store.add_memory(&scope, kind, text, &self.id);
+            }
+        }
+    }
+
     async fn generate_recap(&mut self, prompt: &str, final_text: &str) {
         if !self.config.recap.enabled {
             return;
@@ -3493,6 +3578,29 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                 }
             }
 
+            // Auto-memory RECALL: surface the few durable facts from past sessions in this project
+            // most relevant to the prompt (preferences/decisions/conventions). The edge over a
+            // dump-everything memory file: only the RELEVANT memories are injected, ranked by the
+            // prompt then salience + recency. Once per session, like AGENTS.md.
+            if self.config.mesh.auto_memory {
+                let scope = memory_scope();
+                if let Ok(mems) = self.store.recall_memories(&scope, prompt, 6) {
+                    if !mems.is_empty() {
+                        let mut block = String::from(
+                            "Remembered from earlier sessions in this project (durable facts — \
+                             use them, and don't re-ask what's already settled):\n",
+                        );
+                        for m in &mems {
+                            block.push_str(&format!("- [{}] {}\n", m.kind, m.text));
+                        }
+                        let mseq = self.next_seq();
+                        self.store
+                            .add_message(&self.id, mseq, Role::System, &block, None)?;
+                        self.transcript.push(Message::system(&block));
+                    }
+                }
+            }
+
             // When git co-authoring is on, prime the agent (once) to attribute its work to Forge.
             // Commit trailers are stamped deterministically by the prepare-commit-msg hook; this
             // covers the PR body (which no hook can reach) and tells the model not to add other
@@ -3824,6 +3932,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             final_text: final_text.clone(),
         });
         self.generate_recap(prompt, &final_text).await;
+        self.capture_memories(prompt, &final_text).await;
         Ok(final_text)
     }
 
@@ -9145,9 +9254,10 @@ mod tests {
             fallbacks: vec![],
         });
         let (store, mut session) = fixed_session(provider, router);
-        // Isolate the model loop: the end-of-turn recap is a separate provider call that would
-        // otherwise inflate the invocation count these tests assert on.
+        // Isolate the model loop: the end-of-turn recap + auto-memory capture are separate provider
+        // calls that would otherwise inflate the invocation count these tests assert on.
         session.config.recap.enabled = false;
+        session.config.mesh.auto_memory = false;
         (store, session)
     }
 
