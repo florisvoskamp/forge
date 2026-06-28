@@ -301,7 +301,7 @@ impl ServerHandler for ForgeAgentServer {
                 let tool_calls = notify_task.await.unwrap_or_default();
                 match outcome {
                     Some(Ok(response)) => {
-                        let mut out = response;
+                        let mut out = response.text;
                         if !tool_calls.is_empty() {
                             out.push_str(&format!(
                                 "\n\n<!-- forge: tools used: {} -->",

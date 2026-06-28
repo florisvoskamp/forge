@@ -14,7 +14,8 @@ use forge_store::Store;
 use forge_tools::ToolRegistry;
 use forge_tui::{Presenter, PresenterEvent};
 use forge_types::{
-    EffortLevel, Message, PermissionDecision, PermissionMode, PermissionRule, Role, TaskTier,
+    EffortLevel, LoopOutcome, Message, PermissionDecision, PermissionMode, PermissionRule, Role,
+    StopReason, TaskTier,
 };
 
 pub mod assay;
@@ -1562,8 +1563,8 @@ impl Session {
         specs
     }
 
-    /// Run one full turn: route -> (model -> tools)* -> final answer. Returns the answer.
-    pub async fn run_turn(&mut self, prompt: &str) -> Result<String, CoreError> {
+    /// Run one full turn: route -> (model -> tools)* -> final answer. Returns the outcome.
+    pub async fn run_turn(&mut self, prompt: &str) -> Result<LoopOutcome, CoreError> {
         self.run_turn_with(prompt, &[], None).await
     }
 
@@ -3497,7 +3498,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         prompt: &str,
         guidance: &[String],
         tier_override: Option<TaskTier>,
-    ) -> Result<String, CoreError> {
+    ) -> Result<LoopOutcome, CoreError> {
         // 1. Route the task (deterministic, no model call) and record why. The budget is
         // aggregated across ALL sessions for the current local day + week + month (FR-5), not one
         // session's running total.
@@ -3533,7 +3534,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             self.presenter.emit(PresenterEvent::Done {
                 final_text: msg.clone(),
             });
-            return Ok(msg);
+            return Ok(LoopOutcome::budget_exhausted(msg));
         }
 
         // Surface budget pressure before routing (FR-5).
@@ -3592,7 +3593,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             self.presenter.emit(PresenterEvent::Done {
                 final_text: msg.clone(),
             });
-            return Ok(msg);
+            return Ok(LoopOutcome::final_answer(msg));
         }
 
         self.presenter.emit(PresenterEvent::Routing {
@@ -3824,6 +3825,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         let mut final_text = outcome.final_text;
         let mut context_tokens = outcome.context_tokens;
         let mut active_model = outcome.active_model;
+        let mut hit_step_cap = outcome.hit_step_cap;
 
         // A CLI-bridge model proposed a plan (the sink already rendered the card). Seed tasks,
         // persist it, and stash it for the approval flow below — the in-process path did this in
@@ -3940,6 +3942,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                         final_text = fix_outcome.final_text;
                         context_tokens = fix_outcome.context_tokens;
                         active_model = fix_outcome.active_model;
+                        hit_step_cap = fix_outcome.hit_step_cap;
                         if fix_outcome.hit_step_cap {
                             self.presenter.emit(PresenterEvent::Warning(format!(
                                 "autofix: inner model loop hit the {max_steps}-step limit"
@@ -4007,7 +4010,11 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         if let Some(handle) = self.capture_memories(prompt, &final_text) {
             let _ = handle.await;
         }
-        Ok(final_text)
+        Ok(if hit_step_cap {
+            LoopOutcome::max_steps(final_text)
+        } else {
+            LoopOutcome::final_answer(final_text)
+        })
     }
 
     /// Build a unified diff of files written this turn (pre-turn blob vs current file), run the
