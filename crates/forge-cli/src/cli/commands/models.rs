@@ -3,12 +3,45 @@ use std::sync::Arc;
 
 use forge_config::ClassifierKind;
 use forge_core::LlmRouter;
-use forge_mesh::{HeuristicRouter, Router};
+use forge_mesh::{HeuristicRouter, ModelCatalog, Router};
 use forge_provider::{DispatchProvider, MockProvider, Provider};
 use forge_store::Store;
 use forge_types::TaskTier;
 
 use crate::*;
+
+/// Maximum age of a cached catalog before it is considered stale and re-discovered.
+const CATALOG_CACHE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Path to the on-disk catalog cache (`~/.local/share/forge/catalog.json`).
+fn catalog_cache_path() -> Option<std::path::PathBuf> {
+    forge_config::data_dir().map(|d| d.join("catalog.json"))
+}
+
+/// Load the on-disk catalog if it exists and is fresh (< 24 h old).
+pub(crate) fn load_cached_catalog() -> Option<ModelCatalog> {
+    let path = catalog_cache_path()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    let age = meta.modified().ok()?.elapsed().ok()?;
+    if age.as_secs() > CATALOG_CACHE_MAX_AGE_SECS {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Persist `catalog` to disk for the next startup to load instantly.
+pub(crate) fn save_catalog(catalog: &ModelCatalog) {
+    let Some(path) = catalog_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec(catalog) {
+        let _ = std::fs::write(&path, json);
+    }
+}
 
 /// Construct the model backend + router from config. Shared by interactive sessions and the
 /// `mcp-serve` subagent path (RFC subagent-orchestration Phase 3), so both route identically.

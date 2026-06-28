@@ -26,7 +26,8 @@ pub(crate) use cli::commands::mcp::mcp_cmd;
 pub(crate) use cli::commands::memory::memory_cmd;
 pub(crate) use cli::commands::migrate::migrate_cmd;
 pub(crate) use cli::commands::models::{
-    benchmarks_cmd, build_provider_and_router, discover_catalog, mesh_explain, models,
+    benchmarks_cmd, build_provider_and_router, discover_catalog, load_cached_catalog, mesh_explain,
+    models, save_catalog,
 };
 pub(crate) use cli::commands::replay::{
     open_store, replay_cmd, replay_rerun_cmd, resolve_resume_mode, resolve_session, sessions,

@@ -674,6 +674,26 @@ impl Store {
         self.spend_between(s, e)
     }
 
+    /// Today / week / month spend in a single query — 3× cheaper than calling the three
+    /// individual helpers. Uses conditional aggregation over the widest window (month) so
+    /// only one table scan runs; the `created_at` index makes it sub-millisecond.
+    pub fn spend_summary_usd(&self) -> Result<(f64, f64, f64)> {
+        let now = chrono::Local::now();
+        let (day_s, day_e) = day_bounds_local(now);
+        let (week_s, _) = week_bounds_local(now);
+        let (month_s, month_e) = month_bounds_local(now);
+        Ok(self.lock()?.query_row(
+            "SELECT
+               COALESCE(SUM(CASE WHEN created_at >= ?1 AND created_at < ?2 THEN cost_usd ELSE 0 END), 0.0),
+               COALESCE(SUM(CASE WHEN created_at >= ?3 THEN cost_usd ELSE 0 END), 0.0),
+               COALESCE(SUM(cost_usd), 0.0)
+             FROM usage
+             WHERE created_at >= ?4 AND created_at < ?5",
+            (day_s, day_e, week_s, month_s, month_e),
+            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?)),
+        )?)
+    }
+
     /// Per-model spend + token counts for the last 5 hours.
     pub fn spend_by_model_5h(&self) -> Result<Vec<(String, f64, u64, u64)>> {
         let (s, e) = rolling_hours_bounds(chrono::Local::now(), 5);

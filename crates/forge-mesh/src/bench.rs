@@ -12,8 +12,10 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 /// One model's measured performance — Artificial Analysis indices, each roughly 0–70 today.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BenchScore {
     /// Composite general-intelligence index (reasoning/knowledge/science/agentic/coding blend).
     pub intelligence: f64,
@@ -22,7 +24,7 @@ pub struct BenchScore {
 }
 
 /// Measured performance for the models a data source knew about, matchable to Forge ids.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BenchmarkScores {
     /// Exact lookup by sorted-token canonical key (fast path).
     by_canon: HashMap<String, BenchScore>,

@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS message (
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id, seq);
+-- Covers the common `WHERE session_id=? AND active=1 ORDER BY seq` pattern used by load_messages.
+CREATE INDEX IF NOT EXISTS idx_message_session_active ON message(session_id, active, seq);
 
 -- A labeled rewind point: messages with seq < this boundary are kept on restore
 -- (RFC session-management-and-commands, PR2). label NULL = an auto per-turn checkpoint.
@@ -70,6 +72,8 @@ CREATE TABLE IF NOT EXISTS usage (
     created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_usage_created_at ON usage(created_at);
+-- Speeds up spend-by-model JOINs: `JOIN message m ON m.id = u.message_id`.
+CREATE INDEX IF NOT EXISTS idx_usage_message ON usage(message_id);
 
 -- Assay (AI-slop / quality analysis) runs + their findings (docs/features/analysis-mode.md).
 CREATE TABLE IF NOT EXISTS assay_run (
