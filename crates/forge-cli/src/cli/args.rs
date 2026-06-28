@@ -296,14 +296,22 @@ pub(crate) enum Command {
     /// bridge so claude/codex use Forge's tools under Forge's permission gate). Not for direct use.
     #[command(hide = true)]
     McpServe,
-    /// Store a provider API key securely in the OS keyring (reads the key from stdin), or remove
-    /// it with `--remove`.
+    /// Store a provider API key securely in the OS keyring (reads the key from stdin). Runs ADD by
+    /// default — repeat to stack multiple keys that Forge rotates across (multiplies free rate
+    /// limits). `--replace` overwrites with a single key, `--list` shows how many are stored,
+    /// `--remove` deletes them all.
     Auth {
-        /// Provider: anthropic, openai, gemini, xai, deepseek, or openrouter.
+        /// Provider: anthropic, openai, gemini, groq, nvidia, sambanova, mistral, openrouter, …
         provider: String,
-        /// Delete the stored key for this provider instead of setting one.
+        /// Delete all stored keys for this provider instead of setting one.
         #[arg(long)]
         remove: bool,
+        /// Show how many keys are stored for this provider (masked), don't read a new one.
+        #[arg(long)]
+        list: bool,
+        /// Replace all stored keys with the single key read from stdin (instead of appending).
+        #[arg(long)]
+        replace: bool,
     },
     /// Guided first-run setup: enable providers (enter API keys), declare which subscription plan
     /// backs each installed CLI bridge, and optionally install a local LLM that fits this machine.

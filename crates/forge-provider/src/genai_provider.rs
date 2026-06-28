@@ -82,6 +82,55 @@ pub async fn list_models(namespace: &str) -> Result<Vec<String>, ProviderError> 
         .collect())
 }
 
+/// List a custom OpenAI-compatible provider's models **live** via its `/v1/models` endpoint (the
+/// standard OpenAI models route). Works for ANY provider in `forge_config::CUSTOM_OPENAI_PROVIDERS`
+/// — current or future — with no per-provider code: the endpoint and key env var come from the
+/// registry row. genai has no SDK adapter for these providers (so [`list_models`] can't enumerate
+/// them), but their OpenAI-compatible `models` endpoint returns the full catalog the key can reach,
+/// so the mesh sees every model instead of a hand-seeded few. Returns `provider::id` ids; clearly
+/// non-chat ids (embedding / reranking) are dropped — they can't serve chat completions and would
+/// only add dead weight and failover churn to routing.
+pub async fn list_custom_models(namespace: &str) -> Result<Vec<String>, ProviderError> {
+    let cp = forge_config::custom_provider(namespace)
+        .ok_or_else(|| ProviderError::Request(format!("`{namespace}` is not a custom provider")))?;
+    let key = forge_config::api_key(namespace).map_err(|e| ProviderError::Auth(e.to_string()))?;
+    let url = format!("{}models", cp.endpoint);
+    let resp = build_reqwest_client()
+        .get(&url)
+        .bearer_auth(&key)
+        .send()
+        .await
+        .map_err(|e| ProviderError::Request(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(ProviderError::Request(format!(
+            "{namespace} `/models` returned HTTP {}",
+            resp.status()
+        )));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| ProviderError::Request(e.to_string()))?;
+    let data = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| ProviderError::Request(format!("{namespace} `/models`: no `data` array")))?;
+    Ok(data
+        .iter()
+        .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+        .filter(|id| !is_non_chat_model_id(id))
+        .map(|id| format!("{namespace}::{id}"))
+        .collect())
+}
+
+/// Heuristic for ids that are clearly embedding / reranking / vision-encoder models (not chat
+/// completers), so they're excluded from the routable catalog. Conservative — only patterns that
+/// are unambiguously non-conversational.
+fn is_non_chat_model_id(id: &str) -> bool {
+    let l = id.to_ascii_lowercase();
+    l.contains("embed") || l.contains("rerank") || l.contains("/bge") || l.contains("embedqa")
+}
+
 /// Whether `namespace` has a genai adapter that can LIST its models (i.e. [`list_models`] can work).
 /// Some providers are completion-only: Cerebras has no native adapter and is reached via the
 /// custom service-target resolver in [`build_client`], so it answers completions fine but cannot be
@@ -125,20 +174,65 @@ fn build_reqwest_client() -> reqwest::Client {
 /// namespace → Ollama fallback), so the resolver detects the namespace, strips it, and retargets the
 /// OpenAI adapter at the registered endpoint + key. All native namespaces
 /// (groq/gemini/cohere/open_router/opencode_go/github_copilot/mimo/minimax/…) pass through unchanged.
+/// Round-robin pool of API keys per provider, snapshotted from config at client-build time. It
+/// powers multi-key rotation: with several keys for one provider, requests round-robin across them
+/// to multiply a free tier's per-key rate limit and to fail over within the provider on a 429 (the
+/// retry lands on the next key). Rotation engages ONLY for providers with ≥2 keys — with a single
+/// key [`KeyPool::next`] returns `None` and the genai env-resolved default is used unchanged, so
+/// single-key (and paid, cache-sensitive) providers are unaffected.
+#[derive(Default)]
+pub(crate) struct KeyPool {
+    providers: std::collections::HashMap<String, (Vec<String>, std::sync::atomic::AtomicUsize)>,
+}
+
+impl KeyPool {
+    /// Snapshot every keyed provider that has ≥2 configured keys.
+    fn from_config() -> Self {
+        let mut providers = std::collections::HashMap::new();
+        for p in forge_config::known_key_providers() {
+            let keys = forge_config::api_keys(p);
+            if keys.len() >= 2 {
+                providers.insert(
+                    p.to_string(),
+                    (keys, std::sync::atomic::AtomicUsize::new(0)),
+                );
+            }
+        }
+        Self { providers }
+    }
+
+    /// The next key for `provider` (round-robin), or `None` when it has <2 keys (no rotation).
+    fn next(&self, provider: &str) -> Option<String> {
+        let (keys, cursor) = self.providers.get(provider)?;
+        let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % keys.len();
+        Some(keys[i].clone())
+    }
+}
+
 pub(crate) fn build_client() -> Client {
+    build_client_with(std::sync::Arc::new(KeyPool::from_config()))
+}
+
+/// Build the genai client with a key-rotation `pool` captured by the service-target resolver.
+pub(crate) fn build_client_with(pool: std::sync::Arc<KeyPool>) -> Client {
     let resolver = ServiceTargetResolver::from_resolver_fn(
-        |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+        move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
             // Custom OpenAI-compatible providers (no native genai adapter): genai keeps the full
             // `provider::model` string as the model name (unknown namespace → Ollama fallback), so
             // detect the namespace, strip it, and retarget the OpenAI adapter at the registered
             // endpoint + key. One match drives Cerebras, NVIDIA NIM, SambaNova, Mistral, … — adding
             // a provider is a row in `forge_config::CUSTOM_OPENAI_PROVIDERS`, no code change here.
+            // A rotated key (≥2 configured) is substituted; otherwise the env default is used.
             for cp in forge_config::custom_providers() {
                 if st.model.model_name.namespace_is(cp.namespace) {
                     let bare = st.model.model_name.namespace_and_name().1.to_string();
+                    let auth = pool
+                        .next(cp.namespace)
+                        .map(AuthData::from_single)
+                        .unwrap_or_else(|| AuthData::from_env(cp.env_var));
                     return Ok(ServiceTarget {
                         endpoint: Endpoint::from_owned(cp.endpoint.to_string()),
-                        auth: AuthData::from_env(cp.env_var),
+                        auth,
                         model: ModelIden::new(AdapterKind::OpenAI, bare),
                     });
                 }
@@ -159,6 +253,22 @@ pub(crate) fn build_client() -> Client {
                     endpoint: Endpoint::from_owned(ollama_v1_endpoint(&host)),
                     auth: AuthData::from_single("ollama"),
                     model: ModelIden::new(AdapterKind::OpenAI, bare),
+                });
+            }
+            // Native-adapter providers (groq/gemini/openai/…): genai has already set
+            // `auth = FromEnv(<default var>)`. Recover the Forge provider from that env-var name and,
+            // if it has ≥2 keys, substitute the next rotated key. Single-key providers fall through
+            // unchanged (cache locality preserved).
+            let rotated = match &st.auth {
+                AuthData::FromEnv(var) => {
+                    forge_config::provider_for_env_var(var).and_then(|p| pool.next(p))
+                }
+                _ => None,
+            };
+            if let Some(key) = rotated {
+                return Ok(ServiceTarget {
+                    auth: AuthData::from_single(key),
+                    ..st
                 });
             }
             Ok(st)
@@ -897,6 +1007,40 @@ mod tests {
         assert!(is_discoverable("groq"));
         // The OpenRouter alias normalizes to its adapter too.
         assert!(is_discoverable("openrouter"));
+    }
+
+    #[test]
+    fn non_chat_model_ids_are_filtered_from_live_listing() {
+        // Embedding / reranking ids can't serve chat completions — excluded from the routable catalog.
+        assert!(is_non_chat_model_id("baai/bge-m3"));
+        assert!(is_non_chat_model_id("nvidia/llama-3.2-nv-embedqa-1b-v2"));
+        assert!(is_non_chat_model_id("nvidia/llama-3.2-nv-rerankqa-1b-v2"));
+        assert!(is_non_chat_model_id("nvidia/nv-embed-v1"));
+        // Chat / coding / reasoning models are kept.
+        assert!(!is_non_chat_model_id("deepseek-ai/deepseek-v4-pro"));
+        assert!(!is_non_chat_model_id("openai/gpt-oss-120b"));
+        assert!(!is_non_chat_model_id("meta/llama-3.3-70b-instruct"));
+    }
+
+    #[test]
+    fn key_pool_round_robins_and_skips_single_key_providers() {
+        use std::sync::atomic::AtomicUsize;
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "groq".to_string(),
+            (
+                vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                AtomicUsize::new(0),
+            ),
+        );
+        let pool = KeyPool { providers };
+        // Round-robins across the three keys and wraps.
+        assert_eq!(pool.next("groq").as_deref(), Some("a"));
+        assert_eq!(pool.next("groq").as_deref(), Some("b"));
+        assert_eq!(pool.next("groq").as_deref(), Some("c"));
+        assert_eq!(pool.next("groq").as_deref(), Some("a"));
+        // A provider not in the pool (≤1 key) yields None → genai env default is used unchanged.
+        assert_eq!(pool.next("gemini"), None);
     }
 
     #[test]

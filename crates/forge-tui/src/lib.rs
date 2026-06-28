@@ -259,6 +259,15 @@ pub trait Presenter: Send {
     fn ask(&mut self, question: &str, options: &[QChoice], allow_other: bool) -> String;
     /// Read the next prompt line from the user. `None` means quit / end-of-input.
     fn read_line(&mut self) -> Option<String>;
+    /// An owned, `Send` handle for emitting a late event from a detached task (the end-of-turn
+    /// recap), or `None` if this presenter can't be cloned onto a task. Channel-backed presenters
+    /// return a clone of their sender so the recap can run AFTER the turn returns — the spinner
+    /// stops and input frees the instant the response is done, and the recap streams in later
+    /// without blocking. Synchronous presenters (terminal/headless/tests) return `None`, so the
+    /// recap runs inline as before.
+    fn recap_sink(&self) -> Option<Box<dyn Presenter>> {
+        None
+    }
 }
 
 /// Plain line-based renderer for non-interactive use.

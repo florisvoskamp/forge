@@ -6,14 +6,38 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-28
+
+### Fixed
+- **The "working" spinner now stops the instant the response is done — it no longer waits on the
+  end-of-turn recap.** The recap (a separate trivial-tier summary call) was awaited inside the turn,
+  so the spinner kept ticking and the input/session stayed locked until it finished. The recap now
+  runs on a detached task (via a clonable presenter sink) after the turn returns: the spinner stops
+  and the next prompt is ready immediately, and the recap line streams in a moment later. Headless /
+  non-interactive runs keep the inline behaviour.
+
 ### Added
+- **Multiple API keys per provider, with round-robin rotation.** Every key-based provider (all except
+  the CLI bridges) can hold several keys — run `forge auth <provider>` again to stack another. The
+  provider client round-robins across them per request, multiplying a free tier's per-key rate limit
+  and landing a 429-retry on the next key. New `forge auth` flags: `--list` (masked count),
+  `--replace` (overwrite), and the default now APPENDS instead of overwriting. Keys also come from
+  the env as `VAR="k1,k2"` or numbered `VAR_2`/`VAR_3`/…. Rotation engages only at ≥2 keys, so
+  single-key (and cache-sensitive paid) providers are unchanged. See
+  [docs/features/free-models.md](docs/features/free-models.md#multiple-keys-per-provider-rotation).
+- **🆓 Recommended free providers** — a new README section (linked from the top nav) tiering every
+  free-tier provider with best models, rate limits, direct signup links, and the exact `forge auth`
+  command.
 - **NVIDIA NIM, SambaNova, and Mistral providers — free frontier models in the mesh.** Three new
   OpenAI-compatible providers wired through a generalized custom-endpoint resolver: `nvidia::`
   (DeepSeek-R1, Llama-3.1-405B, Nemotron-70B — free dev tier), `sambanova::` (DeepSeek-V3.1,
   Llama-3.3-70B, Llama-4 Maverick), `mistral::` (Mistral Large 3, Codestral). Plus `cohere::` via
   genai's native adapter (Command A 218B). Authenticate with `forge auth <provider>`; models are
   seeded into discovery (these endpoints can't be model-listed live) and route + fail over like any
-  other free provider.
+  other free provider. Their **full live catalog is listed** via the provider's OpenAI `/v1/models`
+  endpoint (`list_custom_models`) — generic over the registry, so NVIDIA NIM surfaces 100+ models,
+  not a hand-seeded few; the `seed_models` list is now only a fallback when the live call fails.
+  Embedding / reranking ids are filtered out (they can't serve chat).
 - **One-row provider extensibility.** New `CUSTOM_OPENAI_PROVIDERS` registry in `forge-config` is the
   single source of truth (namespace, endpoint, key env var, free flag, seed models) for every
   OpenAI-compatible provider genai lacks an SDK adapter for. Adding a provider is a single struct

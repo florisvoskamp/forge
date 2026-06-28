@@ -86,7 +86,12 @@ pub(crate) async fn dispatch(command: Command) -> Result<()> {
         Command::Update { check } => tokio::task::spawn_blocking(move || update::run(check))
             .await
             .context("update task")?,
-        Command::Auth { provider, remove } => auth(&provider, remove),
+        Command::Auth {
+            provider,
+            remove,
+            list,
+            replace,
+        } => auth(&provider, remove, list, replace),
         Command::Setup | Command::Init => setup(),
         Command::Mcp { cmd } => mcp_cmd(cmd).await,
         Command::McpServe => mcp_serve::run().await,

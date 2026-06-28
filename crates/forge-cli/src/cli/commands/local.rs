@@ -1,7 +1,7 @@
 use crate::*;
 use anyhow::{Context, Result};
 
-pub(crate) fn auth(provider: &str, remove: bool) -> Result<()> {
+pub(crate) fn auth(provider: &str, remove: bool, list: bool, replace: bool) -> Result<()> {
     let known_provider = forge_config::known_key_providers().any(|p| p == provider);
     let known_search = forge_config::known_search_providers().any(|p| p == provider);
     // `artificialanalysis` is the benchmark Data API key (ADR-0011), not a model/search provider,
@@ -16,11 +16,24 @@ pub(crate) fn auth(provider: &str, remove: bool) -> Result<()> {
             known.join(", ")
         );
     }
+    if list {
+        let fps = forge_config::api_key_fingerprints(provider);
+        if fps.is_empty() {
+            println!("no {provider} keys configured");
+        } else {
+            println!(
+                "{provider}: {} key(s) configured — {}",
+                fps.len(),
+                fps.join(", ")
+            );
+        }
+        return Ok(());
+    }
     if remove {
         let removed = forge_config::remove_api_key(provider)
-            .with_context(|| format!("removing {provider} key from the OS keyring"))?;
+            .with_context(|| format!("removing {provider} key(s) from the OS keyring"))?;
         if removed {
-            println!("removed {provider} key from the OS keyring");
+            println!("removed all stored {provider} key(s) from the OS keyring");
         } else {
             println!("no {provider} key was stored — nothing to remove");
         }
@@ -39,9 +52,22 @@ pub(crate) fn auth(provider: &str, remove: bool) -> Result<()> {
     if key.is_empty() {
         anyhow::bail!("no key provided");
     }
-    forge_config::store_api_key(provider, key)
-        .with_context(|| format!("storing {provider} key"))?;
-    println!("stored {provider} key (OS keyring, or encrypted file if no keyring is available)");
+    if replace {
+        forge_config::store_api_key(provider, key)
+            .with_context(|| format!("storing {provider} key"))?;
+        println!(
+            "stored {provider} key, replacing any previous key(s) (OS keyring / encrypted file)"
+        );
+    } else {
+        let n = forge_config::add_api_key(provider, key)
+            .with_context(|| format!("storing {provider} key"))?;
+        let note = if n > 1 {
+            format!(" — {n} keys now stored; Forge rotates across them")
+        } else {
+            String::new()
+        };
+        println!("stored {provider} key (OS keyring, or encrypted file if no keyring is available){note}");
+    }
     Ok(())
 }
 

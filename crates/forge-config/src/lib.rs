@@ -2269,41 +2269,124 @@ pub fn has_api_key(provider: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve an API key for a provider: environment variable first, then the OS keyring.
+/// Resolve a single API key for a provider (the first usable one). Environment first, then the OS
+/// keyring. Used wherever exactly one key is needed (model listing, balance probes); for rotation
+/// across all configured keys see [`api_keys`].
 pub fn api_key(provider: &str) -> Result<String, ConfigError> {
+    if let Some(first) = api_keys(provider).into_iter().next() {
+        return Ok(first);
+    }
+    // Keyless / unknown providers (e.g. local `ollama`) have no env var → not an error, just "".
     let Some(var) = env_var_for(provider) else {
         return Ok(String::new());
     };
-    if let Ok(key) = std::env::var(var) {
-        if !key.is_empty() {
-            return Ok(key);
-        }
-    }
-    for alias in env_aliases_for(provider) {
-        if let Ok(key) = std::env::var(alias) {
-            if !key.is_empty() {
-                return Ok(key);
-            }
-        }
-    }
-    // A stored-but-EMPTY keyring entry (corruption, a botched `forge auth`) must not count as a key:
-    // returning "" produces a cryptic provider 401 instead of the actionable MissingKey below. This
-    // mirrors has_api_key, which already requires non-empty.
-    if let Some(key) = secret_store::get(provider) {
-        if !key.is_empty() {
-            return Ok(key);
-        }
-    }
     Err(ConfigError::MissingKey(provider.into(), var.into()))
 }
 
-/// Securely store a provider API key (OS keyring, encrypted-file fallback).
-pub fn store_api_key(provider: &str, key: &str) -> Result<(), ConfigError> {
-    secret_store::set(provider, key)
+/// All usable API keys configured for a provider, in priority order, de-duplicated. Sources: the
+/// canonical env var and its numbered siblings (`VAR`, `VAR_2`, `VAR_3`, …), comma-separated values
+/// within any of those, accepted env aliases (+ their numbered siblings), and the OS keyring entry
+/// (a newline-separated list appended by repeated `forge auth`). Multiple keys let the provider
+/// client round-robin across them to multiply a free tier's per-key rate limit and fail over within
+/// one provider on a 429. Empty for keyless/unknown providers.
+pub fn api_keys(provider: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |raw: &str| {
+        for part in raw.split([',', '\n']) {
+            let k = part.trim();
+            if !k.is_empty() && !out.iter().any(|e| e == k) {
+                out.push(k.to_string());
+            }
+        }
+    };
+    if let Some(var) = env_var_for(provider) {
+        let vars =
+            std::iter::once(var.to_string()).chain(env_aliases_for(provider).map(str::to_string));
+        for base in vars {
+            if let Ok(v) = std::env::var(&base) {
+                push(&v);
+            }
+            for n in 2..=MAX_NUMBERED_KEY_ENV {
+                if let Ok(v) = std::env::var(format!("{base}_{n}")) {
+                    push(&v);
+                }
+            }
+        }
+    }
+    if let Some(stored) = secret_store::get(provider) {
+        push(&stored);
+    }
+    out
 }
 
-/// Delete a provider API key. Returns `Ok(true)` if an entry was removed, `Ok(false)` if there
-/// was nothing stored (so `forge auth --remove` is idempotent).
+/// Upper bound when scanning numbered env-var siblings (`VAR_2`..=`VAR_N`). Gaps are tolerated.
+const MAX_NUMBERED_KEY_ENV: u8 = 16;
+
+/// The Forge provider that authenticates with environment variable `var`, if any. Reverse of
+/// [`env_var_for`]; the provider client uses it to map a genai `AuthData::FromEnv` back to a
+/// provider so it can substitute a rotated key. Aliases canonicalize to the primary var.
+pub fn provider_for_env_var(var: &str) -> Option<&'static str> {
+    PROVIDER_ENV_VARS
+        .iter()
+        .find(|(_, v)| *v == var)
+        .map(|(p, _)| *p)
+        .or_else(|| {
+            CUSTOM_OPENAI_PROVIDERS
+                .iter()
+                .find(|p| p.env_var == var)
+                .map(|p| p.namespace)
+        })
+}
+
+/// Store a provider API key, REPLACING any existing key(s) with this single one
+/// (`forge auth <p> --replace`). For additive multi-key setup use [`add_api_key`].
+pub fn store_api_key(provider: &str, key: &str) -> Result<(), ConfigError> {
+    secret_store::set(provider, key.trim())
+}
+
+/// Append a key to a provider's keyring list (idempotent — a duplicate is ignored). Returns the
+/// number of keys in the keyring afterwards. Default `forge auth` behaviour, so repeated runs
+/// accumulate keys to rotate across.
+pub fn add_api_key(provider: &str, key: &str) -> Result<usize, ConfigError> {
+    let key = key.trim();
+    let mut keys: Vec<String> = secret_store::get(provider)
+        .map(|s| {
+            s.split('\n')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !keys.iter().any(|k| k == key) {
+        keys.push(key.to_string());
+    }
+    secret_store::set(provider, &keys.join("\n"))?;
+    Ok(keys.len())
+}
+
+/// Masked fingerprints (`…last4`) of every configured key for a provider, for `forge auth --list`.
+/// Never returns the keys themselves.
+pub fn api_key_fingerprints(provider: &str) -> Vec<String> {
+    api_keys(provider)
+        .iter()
+        .map(|k| {
+            let tail: String = k
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<char>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("…{tail}")
+        })
+        .collect()
+}
+
+/// Delete a provider's stored API key(s). `Ok(true)` if an entry was removed, `Ok(false)` if there
+/// was nothing stored (so `forge auth --remove` is idempotent). Removes the whole keyring list;
+/// env-var keys are not touched (Forge doesn't own the environment).
 pub fn remove_api_key(provider: &str) -> Result<bool, ConfigError> {
     secret_store::delete(provider)
 }
@@ -2322,8 +2405,10 @@ pub fn load_secret(key: &str) -> Option<String> {
 }
 
 /// Make stored keys visible to the provider client (genai reads keys from the environment): for
-/// each known provider with no env var set, inject the stored value. Best-effort — providers
-/// without a stored key are simply left unset.
+/// each known provider with no env var set, inject the PRIMARY stored key. Only the first key is
+/// injected — the keyring may hold a newline-separated list of several, and the env var must be a
+/// single key; the provider client rotates across the full list separately (see `api_keys`).
+/// Best-effort — providers without a stored key are simply left unset.
 pub fn inject_provider_keys() {
     let native = PROVIDER_ENV_VARS.iter().copied();
     let custom = CUSTOM_OPENAI_PROVIDERS
@@ -2342,7 +2427,10 @@ pub fn inject_provider_keys() {
             continue;
         }
         if let Some(key) = secret_store::get(provider) {
-            std::env::set_var(var, key);
+            let primary = key.split('\n').next().unwrap_or(&key).trim();
+            if !primary.is_empty() {
+                std::env::set_var(var, primary);
+            }
         }
     }
 }
@@ -2618,6 +2706,47 @@ mod tests {
         }
         // cohere is a native adapter, not a custom-endpoint provider.
         assert!(custom_provider("cohere").is_none());
+    }
+
+    #[test]
+    fn provider_for_env_var_reverses_the_mapping() {
+        assert_eq!(provider_for_env_var("GROQ_API_KEY"), Some("groq"));
+        assert_eq!(provider_for_env_var("NVIDIA_API_KEY"), Some("nvidia"));
+        assert_eq!(provider_for_env_var("MISTRAL_API_KEY"), Some("mistral"));
+        assert_eq!(
+            provider_for_env_var("OPEN_ROUTER_API_KEY"),
+            Some("openrouter")
+        );
+        assert_eq!(provider_for_env_var("NOT_A_KEY"), None);
+    }
+
+    #[test]
+    fn api_keys_reads_numbered_and_comma_separated_env_vars() {
+        // Unique provider for this test to avoid env races with other env-touching tests.
+        std::env::set_var("XAI_API_KEY", " k1 , k2 ");
+        std::env::set_var("XAI_API_KEY_2", "k3");
+        let keys = api_keys("xai");
+        std::env::remove_var("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY_2");
+        for k in ["k1", "k2", "k3"] {
+            assert!(
+                keys.contains(&k.to_string()),
+                "{k} should be parsed; got {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprints_mask_to_last_four_chars() {
+        std::env::set_var("DEEPSEEK_API_KEY", "supersecretKEY1,anotherKEY2");
+        let fps = api_key_fingerprints("deepseek");
+        std::env::remove_var("DEEPSEEK_API_KEY");
+        assert!(
+            fps.iter().all(|f| f.starts_with('…')),
+            "all masked: {fps:?}"
+        );
+        assert!(fps.contains(&"…KEY1".to_string()));
+        assert!(fps.contains(&"…KEY2".to_string()));
     }
 
     #[test]

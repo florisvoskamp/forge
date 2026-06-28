@@ -31,8 +31,36 @@ are wired via a custom OpenAI-compatible endpoint resolver — see
 > and the ids above as a starting point and edit `[mesh.models]` to taste. **Tool/function-calling
 > support varies per free model**; route tool-heavy tiers to models documented to support tools
 > (Groq llama-3.3-70b, Gemini Flash, OpenCode Zen coding models). The custom-endpoint providers
-> (`nvidia`/`sambanova`/`mistral`/`cerebras`) can't be model-listed live, so the ids above are
-> **seeded** into the mesh when their key is set — pin any other `provider::model` directly.
+> (`nvidia`/`sambanova`/`mistral`/`cerebras`) are **listed live** via their OpenAI `/v1/models`
+> endpoint when their key is set — the mesh sees the **full catalog** the key can reach (e.g. NIM
+> surfaces 100+ models), not just the `seed_models` above. The seed ids are only a fallback when the
+> live `/models` call fails (offline / endpoint down). Embedding & reranking ids are filtered out
+> (they can't serve chat completions).
+
+## Multiple keys per provider (rotation)
+
+Every key-based provider (all except the CLI bridges) supports **multiple API keys with round-robin
+rotation** — the simplest way to multiply a free tier's per-key rate limit and to survive a single
+key being throttled.
+
+```bash
+forge auth groq            # store a key
+forge auth groq            # run again to ADD another (keys accumulate)
+forge auth groq --list     # show count + masked fingerprints (…last4), never the keys
+forge auth groq --replace  # overwrite all stored keys with one
+forge auth --remove groq   # delete all stored keys
+```
+
+Keys can also come from the environment: a comma-separated `GROQ_API_KEY="k1,k2"`, or numbered
+siblings `GROQ_API_KEY_2`, `GROQ_API_KEY_3`, … (up to `_16`). Env + keyring keys are merged and
+de-duplicated.
+
+**Semantics:** rotation engages only when a provider has **≥2** keys — the provider client
+round-robins per request across the full list, so load spreads evenly and a 429-retry lands on the
+next key. With a single key nothing changes (the env-resolved key is used as-is, preserving
+prompt-cache locality). Note: rotating keys means requests hit different accounts, so providers that
+cache per-account (e.g. Anthropic prompt caching) won't share a cache across keys — only stack keys
+where the goal is throughput on a rate-limited free tier.
 
 ## Adding an OpenAI-compatible provider
 
@@ -50,11 +78,12 @@ CustomProvider {
 },
 ```
 
-That single row wires `forge auth nvidia`, env injection, mesh discovery (seeded ids), the
-free/paid flag, cost-tier routing, and cross-provider failover — no genai SDK adapter needed.
-The resolver in `forge-provider` retargets genai's OpenAI adapter at `endpoint` with the key from
-`env_var`. Slash-bearing ids (`meta/llama-3.1-405b-instruct`) work: the `provider::model` split is
-on the first `::` only.
+That single row wires `forge auth nvidia`, env injection, mesh discovery, the free/paid flag,
+cost-tier routing, and cross-provider failover — no genai SDK adapter needed. The resolver in
+`forge-provider` retargets genai's OpenAI adapter at `endpoint` with the key from `env_var`, and
+discovery lists the provider's models live from `{endpoint}models` (`list_custom_models`),
+falling back to `seed_models` if that call fails. Slash-bearing ids
+(`meta/llama-3.1-405b-instruct`) work: the `provider::model` split is on the first `::` only.
 
 ## Default tiers (shipped)
 

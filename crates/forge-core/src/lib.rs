@@ -2152,24 +2152,49 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             .await;
         let user_snippet: String = prompt.chars().take(400).collect();
         let assistant_snippet: String = final_text.chars().take(800).collect();
-        let messages = [
+        let messages = vec![
             Message::system(Self::RECAP_SYSTEM),
             Message::user(format!(
                 "User request:\n{user_snippet}\n\nAssistant response:\n{assistant_snippet}"
             )),
         ];
-        let mut sink = |_: StreamEvent| {};
-        if let Ok(r) = self
-            .provider
-            .complete(&decision.model, &messages, &[], &mut sink)
-            .await
-        {
-            let _ = self
-                .store
-                .record_side_call_usage(&self.id, "recap", &r.usage);
-            let text = r.content.trim().to_string();
-            if !text.is_empty() {
-                self.presenter.emit(PresenterEvent::Recap { text });
+        // Routing above is local/fast; the only slow part is the provider completion. If the
+        // presenter can hand out a Send sink (the channel-backed TUI), run that completion on a
+        // DETACHED task and return now — so the turn ends, the spinner stops, and input frees the
+        // instant the response is done; the recap streams in a moment later. Synchronous presenters
+        // (headless / tests) have no sink, so it runs inline exactly as before.
+        let provider = self.provider.clone();
+        let store = self.store.clone();
+        let id = self.id.clone();
+        let model = decision.model.clone();
+        match self.presenter.recap_sink() {
+            Some(mut sink) => {
+                tokio::spawn(async move {
+                    let mut on_event = |_: StreamEvent| {};
+                    if let Ok(r) = provider
+                        .complete(&model, &messages, &[], &mut on_event)
+                        .await
+                    {
+                        let _ = store.record_side_call_usage(&id, "recap", &r.usage);
+                        let text = r.content.trim().to_string();
+                        if !text.is_empty() {
+                            sink.emit(PresenterEvent::Recap { text });
+                        }
+                    }
+                });
+            }
+            None => {
+                let mut on_event = |_: StreamEvent| {};
+                if let Ok(r) = provider
+                    .complete(&model, &messages, &[], &mut on_event)
+                    .await
+                {
+                    let _ = store.record_side_call_usage(&id, "recap", &r.usage);
+                    let text = r.content.trim().to_string();
+                    if !text.is_empty() {
+                        self.presenter.emit(PresenterEvent::Recap { text });
+                    }
+                }
             }
         }
     }

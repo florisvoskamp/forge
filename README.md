@@ -16,7 +16,7 @@ is down, and is *measurably* more reliable than the raw vendor CLIs.**
 
 <br>
 
-**[🚀 Install](#install)** &nbsp;·&nbsp; **[⚡ Quickstart](#quick-start)** &nbsp;·&nbsp; **[🧠 Why Forge](#why-forge)** &nbsp;·&nbsp; **[📊 Benchmarks](#benchmarks)** &nbsp;·&nbsp; **[⚔️ vs. Others](#comparison)** &nbsp;·&nbsp; **[✨ Features](#feature-overview)** &nbsp;·&nbsp; **[📚 Docs](#documentation)**
+**[🚀 Install](#install)** &nbsp;·&nbsp; **[⚡ Quickstart](#quick-start)** &nbsp;·&nbsp; **[🆓 Free Setup](#free-providers)** &nbsp;·&nbsp; **[🧠 Why Forge](#why-forge)** &nbsp;·&nbsp; **[📊 Benchmarks](#benchmarks)** &nbsp;·&nbsp; **[⚔️ vs. Others](#comparison)** &nbsp;·&nbsp; **[✨ Features](#feature-overview)** &nbsp;·&nbsp; **[📚 Docs](#documentation)**
 
 </div>
 
@@ -56,6 +56,63 @@ a measurable, not marketing, advantage.
 - 🔬 **Built-in code intelligence** — Lattice: a tree-sitter symbol graph (9 languages) with
   blast-radius, call-chains, and semantic retrieval, auto-injected before each turn.
 - ⚡ **One fast static binary** — Rust, no Node/Python/Bun runtime, no Electron. Installs in one line.
+
+---
+
+<a id="free-providers"></a>
+
+## 🆓 Recommended free providers
+
+Forge is **free to run with zero paid keys.** These providers all offer a genuine free tier with
+high-quality models and usable rate limits — connect a few and the mesh routes across them, failing
+over automatically when one is throttled. Keys are stored in your **OS keyring**, never in config.
+
+> Connect each with `forge auth <name>` (reads the key from stdin). The model catalog is discovered
+> live, so new free models appear automatically.
+
+### Start here (fast + frontier, best limits)
+
+| Provider | Best free models | Free limits | Get a key | Connect |
+|----------|------------------|-------------|-----------|---------|
+| **Groq** | Llama-3.3-70B, Qwen3-32B, GPT-OSS-120B | ~30 RPM · 1K/day | [console.groq.com/keys](https://console.groq.com/keys) | `forge auth groq` |
+| **NVIDIA NIM** | DeepSeek-R1, Llama-3.1-405B, Nemotron-Ultra-550B, GPT-OSS-120B (100+ models) | ~40 RPM | [build.nvidia.com](https://build.nvidia.com/) | `forge auth nvidia` |
+| **Cerebras** | GPT-OSS-120B, Qwen-3-Coder-480B, Llama-3.3-70B | ~30 RPM · 14.4K/day | [cloud.cerebras.ai](https://cloud.cerebras.ai/) | `forge auth cerebras` |
+
+### Add for breadth (big context, more frontier models)
+
+| Provider | Best free models | Free limits | Get a key | Connect |
+|----------|------------------|-------------|-----------|---------|
+| **Google Gemini** (AI Studio) | Gemini Flash (1M context), Gemma | 15 RPM · 1.5K/day | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | `forge auth gemini` |
+| **SambaNova** | DeepSeek-V3.1, Llama-4 Maverick, Llama-3.3-70B | ~20 RPM | [cloud.sambanova.ai](https://cloud.sambanova.ai/) | `forge auth sambanova` |
+| **Mistral** | Mistral Large 3, Codestral, Magistral | ~1 RPS · 500K TPM | [console.mistral.ai/api-keys](https://console.mistral.ai/api-keys) | `forge auth mistral` |
+
+### Optional (aggregators + niche)
+
+| Provider | Best free models | Free limits | Get a key | Connect |
+|----------|------------------|-------------|-----------|---------|
+| **OpenRouter** | rotating `:free` models (Qwen3-Coder, DeepSeek-R1, Llama-3.3) | 20 RPM · 200/day | [openrouter.ai/keys](https://openrouter.ai/keys) | `forge auth openrouter` |
+| **GitHub Models** | GPT-4.1, o4-mini, Llama-4-Scout | 10 RPM · 50/day | [github.com/marketplace/models](https://github.com/marketplace/models) | `forge auth github_copilot` |
+| **Cohere** | Command A (218B), Command R+ | 20 RPM · 1K/month | [dashboard.cohere.com/api-keys](https://dashboard.cohere.com/api-keys) | `forge auth cohere` |
+
+**A solid all-free setup:** `groq` + `nvidia` + `gemini` — fast small-task routing, 100+ frontier
+models, and a 1M-context model, all at \$0. Add `cerebras`/`sambanova` for more headroom under load.
+
+**Stack multiple keys per provider to multiply free limits.** Run `forge auth <provider>` again to add
+another key — Forge round-robins across all of them, so two free Groq keys ≈ double the requests/min,
+and a throttled key's retry lands on the next one. Works for every provider (except CLI bridges).
+
+```bash
+forge auth groq            # add a key
+forge auth groq            # add another → Forge rotates across both
+forge auth groq --list     # "groq: 2 key(s) configured — …aB3x, …9kQ2"  (masked)
+forge auth groq --replace  # overwrite all with one key
+```
+
+You can also stack keys via env: `GROQ_API_KEY="k1,k2"` or numbered `GROQ_API_KEY_2`, `GROQ_API_KEY_3`.
+
+> Rate limits and free model lists shift month-to-month — these are mid-2026 figures; check each
+> provider's page for current terms. See [docs/features/free-models.md](docs/features/free-models.md)
+> for tier config and how to add any other OpenAI-compatible provider in one line.
 
 ---
 

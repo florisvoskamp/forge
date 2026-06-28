@@ -127,6 +127,14 @@ impl Presenter for ChannelPresenter {
         let _ = self.tx.send(UiMsg::Event(event));
     }
 
+    fn recap_sink(&self) -> Option<Box<dyn Presenter>> {
+        // The sender is clonable and forwards to the render loop, so a detached recap task can emit
+        // through it after the turn task has ended.
+        Some(Box::new(ChannelPresenter {
+            tx: self.tx.clone(),
+        }))
+    }
+
     fn confirm(&mut self, tool: &str, side_effect: SideEffect) -> bool {
         let (reply, answer) = std::sync::mpsc::channel();
         if self
