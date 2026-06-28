@@ -126,6 +126,117 @@ pub(crate) fn shell_command_failed(result: &str) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ErrorCategory {
+    Permission,
+    NotFound,
+    Schema,
+    Timeout,
+    Other,
+}
+
+impl ErrorCategory {
+    fn classify(err: &str) -> Self {
+        let e = err.to_lowercase();
+        if e.contains("permission") || e.contains("denied") || e.contains("forbidden") {
+            Self::Permission
+        } else if e.contains("not found") || e.contains("no such file") || e.contains("enoent") {
+            Self::NotFound
+        } else if e.contains("schema") || e.contains("invalid") || e.contains("parse") {
+            Self::Schema
+        } else if e.contains("timeout") || e.contains("timed out") {
+            Self::Timeout
+        } else {
+            Self::Other
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::NotFound => "not_found",
+            Self::Schema => "schema",
+            Self::Timeout => "timeout",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ToolFailureTracker {
+    /// (tool_name, error_category) -> consecutive failure count this turn.
+    failure_counts: std::collections::HashMap<(String, ErrorCategory), u32>,
+    /// Ring buffer of recent (tool_name, args_hash) calls for doom-loop detection.
+    recent_calls: std::collections::VecDeque<(String, u64)>,
+    failure_threshold: u32,
+    doom_loop_threshold: u32,
+}
+
+impl Default for ToolFailureTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolFailureTracker {
+    fn new() -> Self {
+        Self {
+            failure_counts: Default::default(),
+            recent_calls: std::collections::VecDeque::with_capacity(10),
+            failure_threshold: 3,
+            doom_loop_threshold: 3,
+        }
+    }
+
+    fn reset_turn(&mut self) {
+        self.failure_counts.clear();
+        self.recent_calls.clear();
+    }
+
+    fn record_call(&mut self, tool_name: &str, args_json: &str) -> Option<String> {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        args_json.hash(&mut hasher);
+        let h = hasher.finish();
+
+        let key = (tool_name.to_string(), h);
+        if self.recent_calls.len() >= 10 {
+            self.recent_calls.pop_front();
+        }
+        self.recent_calls.push_back(key.clone());
+
+        let consecutive = self
+            .recent_calls
+            .iter()
+            .rev()
+            .take_while(|k| *k == &key)
+            .count() as u32;
+
+        (consecutive >= self.doom_loop_threshold).then(|| {
+            format!(
+                "doom-loop: `{tool_name}` called identically {consecutive} times in a row — nudging model to try a different approach"
+            )
+        })
+    }
+
+    fn record_failure(&mut self, tool_name: &str, error: &str) -> Option<String> {
+        let cat = ErrorCategory::classify(error);
+        let key = (tool_name.to_string(), cat);
+        let count = self.failure_counts.entry(key).or_insert(0);
+        *count += 1;
+        (*count >= self.failure_threshold).then(|| {
+            format!(
+                "stuck: `{tool_name}` failed {count} times ({cat:?}) — check permissions/schema before retrying"
+            )
+        })
+    }
+
+    fn record_success(&mut self, tool_name: &str) {
+        self.failure_counts.retain(|(name, _), _| name != tool_name);
+    }
+}
+
 /// Match common, unambiguous failure patterns in the tool output and return a pre-canned
 /// diagnosis — skipping the model call entirely (free, instant). Returns `None` when the
 /// failure is unusual enough to need the model. Checked case-insensitively on the full result.
@@ -347,30 +458,6 @@ fn tool_batch_signature(calls: &[forge_types::ToolCall]) -> u64 {
     h.finish()
 }
 
-/// Coarse class of a tool *failure*, used by the failure-loop guard. The point is to catch a model
-/// stuck repeating the same KIND of error across DIFFERENT arguments — which the identical-call
-/// doom-loop ([`tool_batch_signature`]) can't see (its signature changes when the args change).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum FailureKind {
-    NotFound,
-    Permission,
-    Validation,
-    Timeout,
-    Other,
-}
-
-impl FailureKind {
-    fn label(self) -> &'static str {
-        match self {
-            FailureKind::NotFound => "not found",
-            FailureKind::Permission => "permission denied",
-            FailureKind::Validation => "invalid input",
-            FailureKind::Timeout => "timed out",
-            FailureKind::Other => "error",
-        }
-    }
-}
-
 /// Decision of the completion-verification gate for a turn that reported every tracked task Done.
 /// A self-reported "all done" is exactly what produced the phantom release (claimed merged + tagged
 /// while nothing ran), so completion must be PROVEN with a real state check, not asserted.
@@ -424,7 +511,7 @@ fn completion_gate(
 /// word like "invalid" is NOT misread as a failure. The category is then a keyword sniff of the
 /// message. Only consumed behind a ≥3 threshold, so the worst case of a misclassification is one
 /// early, still-helpful "change approach" nudge.
-fn classify_tool_failure(result: &str) -> Option<FailureKind> {
+fn classify_tool_failure(result: &str) -> Option<ErrorCategory> {
     let lower = result.to_ascii_lowercase();
     let is_failure = lower.starts_with("error:")
         || lower.starts_with("permission denied")
@@ -437,16 +524,16 @@ fn classify_tool_failure(result: &str) -> Option<FailureKind> {
         || lower.contains("access is denied")
         || lower.contains("eacces")
     {
-        FailureKind::Permission
+        ErrorCategory::Permission
     } else if lower.contains("no such file")
         || lower.contains("not found")
         || lower.contains("does not exist")
         || lower.contains("cannot find")
         || lower.contains("no matches found")
     {
-        FailureKind::NotFound
+        ErrorCategory::NotFound
     } else if lower.contains("timed out") || lower.contains("timeout") {
-        FailureKind::Timeout
+        ErrorCategory::Timeout
     } else if lower.contains("invalid")
         || lower.contains("no match")
         || lower.contains("old_string")
@@ -455,9 +542,9 @@ fn classify_tool_failure(result: &str) -> Option<FailureKind> {
         || lower.contains("could not parse")
         || lower.contains("unexpected")
     {
-        FailureKind::Validation
+        ErrorCategory::Schema
     } else {
-        FailureKind::Other
+        ErrorCategory::Other
     };
     Some(kind)
 }
@@ -686,6 +773,8 @@ pub struct Session {
     /// Count of successful writes made by `invoke_tool` in the current turn. Reset at the start
     /// of each turn; used to gate the autofix stage (skip it when nothing was edited).
     edits_this_turn: u32,
+    /// Per-turn guard against repeated failing tools and identical-call doom loops.
+    failure_tracker: ToolFailureTracker,
 }
 
 impl Session {
@@ -822,6 +911,7 @@ impl Session {
             project_prompt_injected,
             pending_images: Vec::new(),
             edits_this_turn: 0,
+            failure_tracker: ToolFailureTracker::new(),
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -2599,7 +2689,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         // (tool name, error kind) ACROSS the turn, so a model retrying the same KIND of error with
         // different args (edits that never match, reads of paths that don't exist) is caught even
         // though its call signature keeps changing. A success on a tool clears its streak.
-        let mut failure_counts: std::collections::HashMap<(String, FailureKind), usize> =
+        let mut failure_counts: std::collections::HashMap<(String, ErrorCategory), usize> =
             std::collections::HashMap::new();
         let mut failure_nudged = false;
         // `toolcall_repair_nudges`: bounded retries when a direct model writes a tool call as TEXT
@@ -3696,6 +3786,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         // Reset the per-turn edit counter so the autofix stage only fires when THIS turn wrote
         // something (not a carry-over from a prior turn).
         self.edits_this_turn = 0;
+        self.failure_tracker.reset_turn();
 
         // 2. Persist + record the user message. Its seq keys this turn's code-snapshot dir
         // (PR3): files written during the turn are restorable by rewinding to this boundary.
@@ -4265,7 +4356,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         &mut self,
         msg_id: &str,
         calls: &[forge_types::ToolCall],
-    ) -> Result<Vec<(String, Option<FailureKind>)>, CoreError> {
+    ) -> Result<Vec<(String, Option<ErrorCategory>)>, CoreError> {
         struct Pending {
             id: String,
             name: String,
@@ -4355,6 +4446,20 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         msg_id: &str,
         call: &forge_types::ToolCall,
     ) -> Result<String, CoreError> {
+        let call_args_json = serde_json::to_string(&call.args)?;
+        if let Some(warning) = self
+            .failure_tracker
+            .record_call(&call.name, &call_args_json)
+        {
+            self.presenter
+                .emit(PresenterEvent::Warning(warning.clone()));
+            self.pending_hints.push(format!(
+                "The `{}` call just repeated with identical arguments. Do not retry it unchanged; inspect the actual state or try a different tool/argument path.",
+                call.name
+            ));
+            return Ok(warning);
+        }
+
         // The subagent virtual tool is owned by core (it needs provider/router/store), not the
         // registry — intercept before the registry lookup (RFC subagent-orchestration).
         if call.name == subagent::SPAWN_AGENTS_TOOL {
@@ -4388,7 +4493,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             return self.invoke_mcp(msg_id, call).await;
         }
 
-        let mut args_json = serde_json::to_string(&call.args)?;
+        let mut args_json = call_args_json;
         // `effective_args` may be replaced by a PreToolUse hook that rewrites the args.
         let mut effective_args = call.args.clone();
 
@@ -4409,6 +4514,11 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             });
             self.store
                 .record_tool_call(msg_id, &call.name, &args_json, &result, "n/a", "error")?;
+            if let Some(warning) = self.failure_tracker.record_failure(&call.name, &result) {
+                self.presenter
+                    .emit(PresenterEvent::Warning(warning.clone()));
+                self.pending_hints.push(warning);
+            }
             return Ok(result);
         };
 
@@ -4469,6 +4579,11 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             });
             self.store
                 .record_tool_call(msg_id, &call.name, &args_json, &result, "n/a", "error")?;
+            if let Some(warning) = self.failure_tracker.record_failure(&call.name, &result) {
+                self.presenter
+                    .emit(PresenterEvent::Warning(warning.clone()));
+                self.pending_hints.push(warning);
+            }
             return Ok(result);
         }
 
@@ -4570,6 +4685,14 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             if ok { "ok" } else { "error" },
         )?;
 
+        if ok {
+            self.failure_tracker.record_success(&call.name);
+        } else if let Some(warning) = self.failure_tracker.record_failure(&call.name, &result) {
+            self.presenter
+                .emit(PresenterEvent::Warning(warning.clone()));
+            self.pending_hints.push(warning);
+        }
+
         // PostToolUse hooks (hooks.md): observe the completed call (e.g. re-index, notify). The
         // tool result is already final; post hooks only surface notes, they don't change it.
         if !self.config.hooks.is_empty() {
@@ -4658,6 +4781,11 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                 self.store.record_tool_call(
                     msg_id, &call.name, &args_json, &result, "blocked", "error",
                 )?;
+                if let Some(warning) = self.failure_tracker.record_failure(&call.name, &result) {
+                    self.presenter
+                        .emit(PresenterEvent::Warning(warning.clone()));
+                    self.pending_hints.push(warning);
+                }
                 return Ok(result);
             }
             if let Some(new_args) = outcome.rewritten_args {
@@ -5641,6 +5769,78 @@ mod tests {
     use forge_tui::HeadlessPresenter;
     use forge_types::SideEffect;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn tool_failure_tracker_trips_at_threshold() {
+        let mut tracker = ToolFailureTracker::new();
+
+        assert!(tracker
+            .record_failure("read_file", "permission denied")
+            .is_none());
+        assert!(tracker
+            .record_failure("read_file", "permission denied")
+            .is_none());
+        let warning = tracker
+            .record_failure("read_file", "permission denied")
+            .expect("third matching failure should trip");
+
+        assert!(warning.contains("stuck: `read_file` failed 3 times"));
+        assert!(warning.contains("Permission"));
+    }
+
+    #[test]
+    fn tool_failure_tracker_resets_on_success() {
+        let mut tracker = ToolFailureTracker::new();
+
+        assert!(tracker
+            .record_failure("edit_file", "invalid patch")
+            .is_none());
+        assert!(tracker
+            .record_failure("edit_file", "invalid patch")
+            .is_none());
+        tracker.record_success("edit_file");
+        assert!(tracker
+            .record_failure("edit_file", "invalid patch")
+            .is_none());
+        assert!(tracker
+            .record_failure("edit_file", "invalid patch")
+            .is_none());
+    }
+
+    #[test]
+    fn doom_loop_tracker_trips_consecutive() {
+        let mut tracker = ToolFailureTracker::new();
+
+        assert!(tracker
+            .record_call("shell", r#"{"command":"cargo check"}"#)
+            .is_none());
+        assert!(tracker
+            .record_call("shell", r#"{"command":"cargo check"}"#)
+            .is_none());
+        let warning = tracker
+            .record_call("shell", r#"{"command":"cargo check"}"#)
+            .expect("third identical call should trip");
+
+        assert!(warning.contains("doom-loop: `shell` called identically 3 times"));
+    }
+
+    #[test]
+    fn doom_loop_resets_on_different_call() {
+        let mut tracker = ToolFailureTracker::new();
+
+        assert!(tracker
+            .record_call("read_file", r#"{"path":"a"}"#)
+            .is_none());
+        assert!(tracker
+            .record_call("read_file", r#"{"path":"b"}"#)
+            .is_none());
+        assert!(tracker
+            .record_call("read_file", r#"{"path":"a"}"#)
+            .is_none());
+        assert!(tracker
+            .record_call("read_file", r#"{"path":"a"}"#)
+            .is_none());
+    }
 
     #[test]
     fn fit_messages_keeps_everything_when_it_fits() {
@@ -10592,29 +10792,29 @@ mod tests {
     fn classify_tool_failure_detects_kinds_and_ignores_success() {
         assert_eq!(
             classify_tool_failure("error: No such file or directory (os error 2)"),
-            Some(FailureKind::NotFound)
+            Some(ErrorCategory::NotFound)
         );
         assert_eq!(
             classify_tool_failure("permission denied by policy"),
-            Some(FailureKind::Permission)
+            Some(ErrorCategory::Permission)
         );
         assert_eq!(
             classify_tool_failure("error: no match for the given old_string"),
-            Some(FailureKind::Validation)
+            Some(ErrorCategory::Schema)
         );
         assert_eq!(
             classify_tool_failure("error: the request timed out after 30s"),
-            Some(FailureKind::Timeout)
+            Some(ErrorCategory::Timeout)
         );
         assert_eq!(
             classify_tool_failure("error: the connection was reset by peer"),
-            Some(FailureKind::Other)
+            Some(ErrorCategory::Other)
         );
         // "not found" wins over the validation hint when both appear — fine; the guard only needs a
         // STABLE bucket so repeats of the same failure accumulate together.
         assert_eq!(
             classify_tool_failure("error: old_string not found in file"),
-            Some(FailureKind::NotFound)
+            Some(ErrorCategory::NotFound)
         );
         // Successful output that merely mentions a scary word must NOT be read as a failure.
         assert_eq!(
