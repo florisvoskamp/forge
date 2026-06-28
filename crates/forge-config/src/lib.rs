@@ -838,8 +838,24 @@ pub fn builtin_deny_rules() -> Vec<PermissionRule> {
         ),
         deny("read_file", &secrets),
         deny("list_dir", &secrets),
-        deny("write_file", &["**/.ssh/**", "/etc/**"]),
-        deny("edit_file", &["**/.ssh/**", "/etc/**"]),
+        // Secrets must also be blocked for write/edit/delete — overwriting a .env or deleting an
+        // SSH key is as dangerous as reading it. Also block /etc writes (system config tampering).
+        deny("write_file", &{
+            let mut v = secrets.to_vec();
+            v.extend(["**/.ssh/**", "/etc/**"]);
+            v
+        }),
+        deny("edit_file", &{
+            let mut v = secrets.to_vec();
+            v.extend(["**/.ssh/**", "/etc/**"]);
+            v
+        }),
+        // delete_file had no deny rules at all — a model could delete .env, SSH keys, etc.
+        deny("delete_file", &{
+            let mut v = secrets.to_vec();
+            v.extend(["**/.ssh/**", "/etc/**"]);
+            v
+        }),
     ]
 }
 
@@ -2952,6 +2968,31 @@ mod tests {
                 .any(|r| r.tool == "read_file" && r.patterns.iter().any(|p| p == "**/.env")),
             "secret-read deny must ship by default"
         );
+    }
+
+    #[test]
+    fn builtin_denies_block_secret_writes_and_deletes() {
+        let rules = Config::default().permission_rules();
+        for tool in ["write_file", "edit_file", "delete_file"] {
+            assert!(
+                rules
+                    .iter()
+                    .any(|r| r.tool == tool && r.patterns.iter().any(|p| p == "**/.env")),
+                "{tool} must deny .env writes/deletes by default"
+            );
+            assert!(
+                rules
+                    .iter()
+                    .any(|r| r.tool == tool && r.patterns.iter().any(|p| p == "**/.env.*")),
+                "{tool} must deny .env.* writes/deletes by default"
+            );
+            assert!(
+                rules
+                    .iter()
+                    .any(|r| r.tool == tool && r.patterns.iter().any(|p| p == "**/id_rsa")),
+                "{tool} must deny SSH key writes/deletes by default"
+            );
+        }
     }
 
     #[test]
