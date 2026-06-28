@@ -6,6 +6,37 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-06-28
+
+### Added
+- **`forge mcp agent` — Forge-as-MCP-server.** Expose a persistent Forge session over stdio MCP so
+  any MCP-aware agent (Claude Code, another Forge instance) can drive it as a stateful coding agent.
+  Four tools: `forge_chat` (send prompt, stream progress notifications), `forge_status` (inspect
+  session), `forge_set_mode` (switch permission mode at runtime), `forge_interrupt` (abort an
+  in-flight turn mid-flight via `tokio::sync::Notify` without touching the session lock).
+  (`crates/forge-cli/src/mcp_agent.rs`)
+- **`LoopOutcome` — explicit turn stop reason.** `run_turn` / `run_turn_with` now return
+  `Result<LoopOutcome, CoreError>` instead of `Result<String, CoreError>`. `LoopOutcome` carries
+  `text: String` and `stop_reason: StopReason` (FinalAnswer / MaxSteps / BudgetExhausted /
+  Interrupted) so callers know why the turn ended without re-parsing warning text. Implements
+  `Deref<Target=str>`, `Display`, and `PartialEq<str/&str/String>` so existing test assertions
+  compile unchanged. (`crates/forge-types/src/lib.rs`, `crates/forge-core/src/lib.rs`)
+- **TUI statusline stop_reason indicator.** When a turn ends with `MaxSteps`, the statusline shows
+  an amber `⚠ step limit — send 'continue'`; `BudgetExhausted` shows a red `✕ budget cap`.
+  `PresenterEvent::Done` now carries `stop_reason` so the App stores and renders it.
+  (`crates/forge-tui/src/app.rs`, `crates/forge-tui/src/lib.rs`)
+- **`forge_interrupt` MCP tool.** Abort the in-flight `forge_chat` turn at its next await point via
+  `tokio::sync::Notify`; the session state is preserved and a partial result returned. The handler
+  never holds the session lock, so it runs concurrently with the ongoing turn.
+  (`crates/forge-cli/src/mcp_agent.rs`)
+- **`remember` virtual tool on MCP bridge path.** `mcp_serve.rs` now advertises and handles the
+  `remember` tool so bridge models (claude-cli, codex-cli) can write cross-session memories
+  mid-turn, at parity with the direct path. (`crates/forge-cli/src/mcp_serve.rs`)
+- **Embeddings default-on** with free Gemini `text-embedding-004` backend (falls back to OpenAI
+  then ollama then no-op). Fixed `#[serde(default)]` on `EmbeddingsConfig.enabled` that silently
+  kept embeddings off when the config section was partially specified.
+  (`crates/forge-config/src/lib.rs`)
+
 ### Docs
 - **README synced to the v1.6.x wave:** documented built-in auto-memory (capture/recall, `/remember`,
   `/memories`, `forge memory` CLI — with an honest "differentiated design, not benchmarked-best" note),
@@ -24,6 +55,8 @@ All notable changes to Forge are documented here. The format follows
   `.await` doesn't hold a `&Session` borrow — the fix for the non-`Send` turn future that blocked the
   v1.6.0 wiring.
 
+## [1.6.0] - 2026-06-28
+
 ### Added
 - **Semantic memory recall engine** (store layer). The auto-memory store now supports embedding-based
   recall: `add_memory_with_embedding` persists a fact's f32 vector in the (already-reserved)
@@ -37,6 +70,8 @@ All notable changes to Forge are documented here. The format follows
   engine into them (best-effort, behind the existing embeddings config, keyword fallback) is the next
   increment — it needs a `Send`-safe embed path, since calling the embedder directly in the turn loop
   makes the turn future non-`Send`.
+
+## [1.5.1] - 2026-06-28
 
 ### Fixed
 - **`edit_file` now rejects a truncated replacement instead of corrupting the file.** When a model's
@@ -57,6 +92,8 @@ All notable changes to Forge are documented here. The format follows
   one-line "💭 recalled N memories from past sessions" note so it's visible. Builds on the v1.4.0
   auto-memory system. *(Built by Forge itself via the mesh — dogfooding.)*
 
+## [1.4.1] - 2026-06-28
+
 ### Improved
 - **`edit_file` failures are now self-correcting instead of churning.** When `old` doesn't match
   after the whitespace + block-anchor fallbacks, the error now tells the model the file may have
@@ -66,6 +103,8 @@ All notable changes to Forge are documented here. The format follows
   ("matches N places — add surrounding context") instead of looking like a plain miss. New
   `flex_match_count` + 3 tests. *(Built by Forge itself via the mesh — the first of the
   dogfooding-friction fixes that make Forge better at building everything.)*
+
+## [1.4.0] - 2026-06-28
 
 ### Added
 - **Built-in auto-memory — Forge now remembers durable facts across sessions, per project.** A new
@@ -85,6 +124,8 @@ All notable changes to Forge are documented here. The format follows
   *(The schema + initial store layer were drafted by Forge itself via the mesh — dogfooding; Claude
   Code completed the store methods, CLI, capture/recall wiring, and tests after Forge hit edit-tool
   limits on the large files.)*
+
+## [1.3.1] - 2026-06-28
 
 ### Fixed (mesh robustness — surfaced by dogfooding)
 - **Empty-response models now fail over instead of dead-ending the turn.** A model that streams an
@@ -135,6 +176,8 @@ All notable changes to Forge are documented here. The format follows
   are shared across every project and refreshed once, not re-fetched per repo. The legacy project
   file is still read as a fallback so existing scores aren't lost on upgrade.
 
+## [1.1.2] - 2026-06-28
+
 ### Fixed
 - **Rate-limited free models come back in ~1 min, not 5.** The default bench cooldown when a 429
   carried no `Retry-After` was 300s, so a per-minute free tier (NVIDIA NIM, Groq, Gemini RPM) got
@@ -148,6 +191,8 @@ All notable changes to Forge are documented here. The format follows
   keeps failing. Rate-limits (respect the cooldown) and permanent incapabilities (no tool support /
   402) still fail over at once — no pointless retries.
 
+## [1.1.1] - 2026-06-28
+
 ### Fixed
 - **`credit_mode = "strict"` now actually keeps paid models out of routing and failover.** It was
   wired only to the output-token cap, so its documented "free + subscription only" promise was never
@@ -158,6 +203,8 @@ All notable changes to Forge are documented here. The format follows
   models remain. An explicit `--model` pin still overrides (it bypasses the auto path), so a
   deliberate paid choice works. Normal/Frugal are unchanged.
 
+## [1.1.0] - 2026-06-28
+
 ### Fixed
 - **The "working" spinner now stops the instant the response is done — it no longer waits on the
   end-of-turn recap.** The recap (a separate trivial-tier summary call) was awaited inside the turn,
@@ -165,6 +212,10 @@ All notable changes to Forge are documented here. The format follows
   runs on a detached task (via a clonable presenter sink) after the turn returns: the spinner stops
   and the next prompt is ready immediately, and the recap line streams in a moment later. Headless /
   non-interactive runs keep the inline behaviour.
+- **The release's Homebrew-formula PR now actually opens.** `release.yml` granted only
+  `contents: write`, so the `gh pr create` in the formula-update step was denied (it pushed the
+  `brew/v<version>` branch but couldn't open the PR — masked by `continue-on-error`). Added
+  `pull-requests: write` so future releases self-open the brew bump PR.
 
 ### Added
 - **Multiple API keys per provider, with round-robin rotation.** Every key-based provider (all except
@@ -194,14 +245,6 @@ All notable changes to Forge are documented here. The format follows
   literal — it wires auth, env injection, mesh discovery, cost-tier routing, the free/paid flag, and
   cross-provider failover end-to-end. The Cerebras integration was migrated onto it. See
   [docs/features/free-models.md](docs/features/free-models.md#adding-an-openai-compatible-provider).
-
-## [1.0.1] - 2026-06-28
-
-### Fixed (release)
-- **The release's Homebrew-formula PR now actually opens.** `release.yml` granted only
-  `contents: write`, so the `gh pr create` in the formula-update step was denied (it pushed the
-  `brew/v<version>` branch but couldn't open the PR — masked by `continue-on-error`). Added
-  `pull-requests: write` so future releases self-open the brew bump PR.
 
 ## [1.0.0] - 2026-06-28
 
@@ -1663,7 +1706,8 @@ Initial public release: Model Mesh routing, multi-provider support, cost/budget 
 inline TUI, session persistence + checkpoints, permission broker, subagents, Assay analysis,
 Lattice code intelligence, MCP client, web tools, hooks, skills/commands, and more.
 
-[Unreleased]: https://github.com/florisvoskamp/forge/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/florisvoskamp/forge/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/florisvoskamp/forge/compare/v1.6.1...v1.7.0
 [0.4.4]: https://github.com/florisvoskamp/forge/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/florisvoskamp/forge/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/florisvoskamp/forge/compare/v0.4.1...v0.4.2
