@@ -6,8 +6,11 @@ use crate::*;
 /// `forge mcp [tools <server> | import [path]]` — connect to the configured MCP servers and show
 /// their status, list one server's tools, or import servers from your installed AI CLIs.
 pub(crate) async fn mcp_cmd(cmd: Option<McpCmd>) -> Result<()> {
-    // Import / Login / Logout need no connection. Resolve to the listing path otherwise.
+    // Import / Login / Logout / Agent need no MCP connection. Resolve to the listing path otherwise.
     let tools_server = match cmd {
+        Some(McpCmd::Agent { session, cwd }) => {
+            return crate::mcp_agent::run(session, cwd).await;
+        }
         Some(McpCmd::Import { path }) => return mcp_import(path),
         Some(McpCmd::Login { server }) => return mcp_login(&server).await,
         Some(McpCmd::Logout { server }) => return mcp_logout(&server),

@@ -202,7 +202,9 @@ pub struct LatticeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingsConfig {
     /// Master switch. Off → no embeddings are computed or used; retrieval is structural/lexical.
-    #[serde(default)]
+    /// Defaults to `true`: the `auto` backend picks the cheapest available provider (Gemini
+    /// free-tier first) and gracefully no-ops if nothing is reachable — so it's safe always-on.
+    #[serde(default = "default_embed_enabled")]
     pub enabled: bool,
     /// Embedding backend: `"auto"` (default — pick the cheapest available, see below), `"ollama"`
     /// (local HTTP), or a provider namespace genai can embed with (`"openai"`, `"gemini"`). `auto`
@@ -228,6 +230,10 @@ impl Default for EmbeddingsConfig {
             endpoint: default_embed_endpoint(),
         }
     }
+}
+
+fn default_embed_enabled() -> bool {
+    true
 }
 
 fn default_embed_backend() -> String {

@@ -47,6 +47,7 @@ mod context_windows;
 mod doctor;
 mod image_input;
 mod local;
+mod mcp_agent;
 mod mcp_serve;
 mod remote;
 mod replay;

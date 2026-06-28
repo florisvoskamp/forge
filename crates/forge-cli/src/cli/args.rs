@@ -605,6 +605,17 @@ pub(crate) enum MemoryCmd {
 
 #[derive(Subcommand)]
 pub(crate) enum McpCmd {
+    /// Expose a persistent Forge session as an MCP server on stdio, so another agent
+    /// (Claude Code, another Forge) can drive it via `forge_chat` / `forge_status` /
+    /// `forge_set_mode`. Add to `.mcp.json`: `{"forge": {"type":"stdio","command":"forge","args":["mcp","agent"]}}`.
+    Agent {
+        /// Resume an existing session by ID prefix instead of starting a fresh one.
+        #[arg(long)]
+        session: Option<String>,
+        /// Change the working directory before starting (the session's tool calls operate here).
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+    },
     /// Show the full discovered tool list for one connected server.
     Tools {
         /// Server name (as declared in `.forge/mcp.toml`).

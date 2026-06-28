@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "forge": {
+      "type": "stdio",
+      "command": "/home/floris/Documents/Repositories/Personal/AI/forge/target/release/forge",
+      "args": [
+        "mcp",
+        "agent",
+        "--cwd",
+        "/home/floris/Documents/Repositories/Personal/AI/forge"
+      ]
+    }
+  }
+}

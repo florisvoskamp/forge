@@ -126,6 +126,10 @@ impl ServerHandler for ForgeMcp {
         let ts = forge_core::update_tasks_spec();
         let ts_schema: JsonObject = ts.schema.as_object().cloned().unwrap_or_default();
         tools.push(Tool::new(ts.name, ts.description, Arc::new(ts_schema)));
+        // Always advertise the on-demand memory tool so a bridge model can persist facts mid-turn.
+        let rs = forge_core::remember_spec();
+        let rs_schema: JsonObject = rs.schema.as_object().cloned().unwrap_or_default();
+        tools.push(Tool::new(rs.name, rs.description, Arc::new(rs_schema)));
         // Advertise plan presentation so a bridge model can propose a plan in planning mode. The
         // bridge can't see the parent's runtime temper, so it's advertised unconditionally; the
         // parent honors the plan only when it is actually in Plan mode (gated in run_model_loop).
@@ -183,6 +187,53 @@ impl ServerHandler for ForgeMcp {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "task list updated: {} task(s) — {done} done",
                 tasks.len()
+            ))]));
+        }
+
+        // On-demand memory write — bridge model can persist a durable fact mid-turn (parity with
+        // the direct path). No embedding here (bridge-side is sync); keyword recall still works.
+        if name == forge_core::REMEMBER_TOOL {
+            let kind_raw = args.get("kind").and_then(|v| v.as_str()).unwrap_or("fact");
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let kind_norm = kind_raw.trim().to_lowercase();
+            let kind_cat = match kind_norm.as_str() {
+                "preference" | "decision" | "fact" | "reference" => kind_norm.clone(),
+                _ => "fact".to_string(),
+            };
+            if text.len() < 4 {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "error: memory text too short (minimum 4 characters)",
+                )]));
+            }
+            let scope = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "global".to_string());
+            let session_id = std::env::var(forge_core::snapshot::ENV_SESSION)
+                .unwrap_or_else(|_| "bridge".to_string());
+            match forge_core::embed_one(&self.config.lattice.embeddings, &text).await {
+                Some(emb) => {
+                    let _ = self.tasks_store.add_memory_with_embedding(
+                        &scope,
+                        &kind_cat,
+                        &text,
+                        &session_id,
+                        &emb,
+                    );
+                }
+                None => {
+                    let _ = self
+                        .tasks_store
+                        .add_memory(&scope, &kind_cat, &text, &session_id);
+                }
+            }
+            report_to_sink(serde_json::json!({ "k": "memory", "kind": kind_cat, "text": text }));
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "memory saved: [{kind_cat}] {text}"
             ))]));
         }
 

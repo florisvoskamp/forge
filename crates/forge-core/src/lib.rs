@@ -222,7 +222,7 @@ const CHARS_PER_TOKEN: usize = 3;
 /// A FREE function taking `&EmbeddingsConfig` (which is `Sync`) — NOT a `&self` method — so the
 /// `.await` doesn't hold a `&Session` borrow (`Session` is `!Sync`, which would make the turn future
 /// non-`Send`).
-async fn embed_one(cfg: &forge_config::EmbeddingsConfig, text: &str) -> Option<Vec<f32>> {
+pub async fn embed_one(cfg: &forge_config::EmbeddingsConfig, text: &str) -> Option<Vec<f32>> {
     let (embedder, _) = forge_provider::select_embedder(cfg)?;
     embedder
         .embed(&[text.to_string()])
@@ -871,6 +871,17 @@ impl Session {
     /// The discovered model catalog, if auto-discovery ran for this session.
     pub fn catalog(&self) -> Option<&ModelCatalog> {
         self.catalog.as_ref()
+    }
+
+    /// Override the session's permission mode at runtime. Used by `forge mcp agent` so the
+    /// orchestrating agent can switch to bypass/accept-edits without restarting the session.
+    pub fn set_mode(&mut self, mode: PermissionMode) {
+        self.mode = mode;
+    }
+
+    /// The session's current permission mode.
+    pub fn mode(&self) -> PermissionMode {
+        self.mode
     }
 
     /// Attach connected MCP servers (composition root). Their tools become advertisable via
@@ -1523,6 +1534,9 @@ impl Session {
         specs.push(ask_user_spec());
         // The task-tracking tool — always advertised so the model can keep a live todo list.
         specs.push(update_tasks_spec());
+        // The on-demand memory tool — always advertised so the model can persist facts at any
+        // point during a turn, not just via end-of-turn auto-capture.
+        specs.push(remember_spec());
         // The plan-presentation tool — offered ONLY in planning mode, so the model proposes a plan
         // (rendered as an interactive card) instead of editing. Gating it to Plan mode also makes
         // the approve→Auto-edit→build flow non-recursive (the build turn can't re-propose a plan).
@@ -2167,11 +2181,16 @@ Output ONLY that sentence — no preamble, no quotation marks.";
     /// as project-scoped memories (dedup + salience handled by the store). Best-effort: any
     /// budget/model failure is silently skipped so it can never derail the session. Recall of these
     /// happens at the start of a later session (see `run_turn_with`).
-    // Spawns memory capture as a detached task so it doesn't block turn completion — the spinner
-    // clears when the AI response finishes, not when the background capture finishes.
-    fn capture_memories(&self, prompt: &str, final_text: &str) {
+    // Spawns memory capture so it doesn't block turn completion — the spinner clears when the AI
+    // response finishes. Returns a JoinHandle so the caller can await it in one-shot mode (forge
+    // run) before the process exits; interactive turns drop the handle and it runs in background.
+    fn capture_memories(
+        &self,
+        prompt: &str,
+        final_text: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         if !self.config.mesh.auto_memory || final_text.trim().is_empty() {
-            return;
+            return None;
         }
         let budget = BudgetState {
             spent_today_usd: self.store.spend_today_usd().unwrap_or(0.0),
@@ -2183,7 +2202,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             warn_fraction: self.config.mesh.warn_threshold,
         };
         if budget.status() == BudgetStatus::Exhausted {
-            return;
+            return None;
         }
         let health = self.store.current_benched().unwrap_or_default();
         let quota = self.live_quota();
@@ -2195,7 +2214,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         let pinned_effort = self.pinned_effort;
         let user_snippet: String = prompt.chars().take(500).collect();
         let assistant_snippet: String = final_text.chars().take(1200).collect();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let decision = router
                 .route_hinted(
                     "extract durable facts",
@@ -2247,7 +2266,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                     }
                 }
             }
-        });
+        }))
     }
 
     async fn generate_recap(&mut self, prompt: &str, final_text: &str) {
@@ -3983,7 +4002,11 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             final_text: final_text.clone(),
         });
         self.generate_recap(prompt, &final_text).await;
-        self.capture_memories(prompt, &final_text);
+        // Await the handle so one-shot (forge run) exits only after capture completes. In
+        // interactive mode the spinner is already cleared and this is a brief background wait.
+        if let Some(handle) = self.capture_memories(prompt, &final_text) {
+            let _ = handle.await;
+        }
         Ok(final_text)
     }
 
@@ -4199,6 +4222,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             || name == UPDATE_TASKS_TOOL
             || name == PRESENT_PLAN_TOOL
             || name == USE_SKILL_TOOL
+            || name == REMEMBER_TOOL
         {
             return false;
         }
@@ -4336,6 +4360,11 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         // methodology as the tool result so the model follows it; unknown name → a helpful error.
         if call.name == USE_SKILL_TOOL {
             return self.use_skill(msg_id, call);
+        }
+        // On-demand memory write — model calls this to persist a durable fact immediately,
+        // without waiting for end-of-turn auto-capture.
+        if call.name == REMEMBER_TOOL {
+            return self.remember(msg_id, call).await;
         }
         // External MCP tools (meta-tools + exposed server tools) are owned by the manager, not the
         // built-in registry. Route them here, still through the permission broker (mcp-client.md).
@@ -5025,6 +5054,62 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
 
     /// Load a Forge skill's methodology (the `use_skill` virtual tool) and return it as the tool
     /// result so the model applies it this turn. Unknown name → an error listing valid skills.
+    async fn remember(
+        &mut self,
+        msg_id: &str,
+        call: &forge_types::ToolCall,
+    ) -> Result<String, CoreError> {
+        let args_json = serde_json::to_string(&call.args)?;
+        let kind_raw = call
+            .args
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("fact");
+        let text = call
+            .args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let kind_norm = kind_raw.trim().to_lowercase();
+        let kind_cat = match kind_norm.as_str() {
+            "preference" | "decision" | "fact" | "reference" => kind_norm.clone(),
+            _ => "fact".to_string(),
+        };
+        let (result, ok) = if text.len() < 4 {
+            (
+                "error: memory text too short (minimum 4 characters)".to_string(),
+                false,
+            )
+        } else {
+            let scope = memory_scope();
+            let cfg = self.config.lattice.embeddings.clone();
+            match embed_one(&cfg, &text).await {
+                Some(emb) => {
+                    let _ = self
+                        .store
+                        .add_memory_with_embedding(&scope, &kind_cat, &text, &self.id, &emb);
+                }
+                None => {
+                    let _ = self.store.add_memory(&scope, &kind_cat, &text, &self.id);
+                }
+            }
+            self.presenter
+                .emit(PresenterEvent::Warning(format!("◈ memory · {kind_cat}")));
+            (format!("memory saved: [{kind_cat}] {text}"), true)
+        };
+        self.store.record_tool_call(
+            msg_id,
+            &call.name,
+            &args_json,
+            &result,
+            "allowed",
+            if ok { "ok" } else { "error" },
+        )?;
+        Ok(result)
+    }
+
     fn use_skill(
         &mut self,
         msg_id: &str,
@@ -5073,6 +5158,36 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             if ok { "ok" } else { "error" },
         )?;
         Ok(result)
+    }
+}
+
+/// The on-demand memory-write virtual tool name.
+pub const REMEMBER_TOOL: &str = "remember";
+
+/// The `ToolSpec` advertised to the model for [`REMEMBER_TOOL`].
+pub fn remember_spec() -> ToolSpec {
+    ToolSpec {
+        name: REMEMBER_TOOL.to_string(),
+        description: "Persist a durable fact to memory so it's available in future sessions. \
+            Use proactively when you learn something worth remembering: a project decision, user \
+            preference, key architecture fact, or stable reference. Kind must be one of \
+            `preference`, `decision`, `fact`, or `reference`."
+            .to_string(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["preference", "decision", "fact", "reference"],
+                    "description": "memory category"
+                },
+                "text": {
+                    "type": "string",
+                    "description": "the fact to remember (1–2 sentences max)"
+                }
+            },
+            "required": ["kind", "text"]
+        }),
     }
 }
 
