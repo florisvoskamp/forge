@@ -32,6 +32,7 @@ const TOOLCYAN: Color = Color::Rgb(75, 212, 218); // tools / lattice
                                                   // Surfaces
 const SELECT_BG: Color = Color::Rgb(40, 70, 132); // mouse text-selection
 const STATUSBG: Color = Color::Rgb(14, 15, 21); // deep status-bar bg
+const SEPCOL: Color = Color::Rgb(38, 42, 62); // status-bar separator tint
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -1071,7 +1072,7 @@ impl App {
             PresenterEvent::Recap { text } => {
                 self.flush.push(TextLine::from(vec![
                     Span::styled("  ※ recap  ", Style::default().fg(ACCENT).bold()),
-                    Span::styled(text, Style::default().fg(Color::Rgb(205, 205, 215))),
+                    Span::styled(text, Style::default().fg(TEXT)),
                 ]));
                 self.flush.push(TextLine::default());
             }
@@ -2890,10 +2891,7 @@ fn render_transcript_area(frame: &mut Frame, area: Rect, app: &App) {
         let y = area.y + area.height - 1;
         let bar = Paragraph::new(TextLine::from(Span::styled(
             label,
-            Style::default()
-                .fg(Color::Rgb(20, 22, 28))
-                .bg(ORANGE)
-                .bold(),
+            Style::default().fg(STATUSBG).bg(ORANGE).bold(),
         )));
         frame.render_widget(bar, Rect::new(x, y, w, 1));
         app.jump_bar_geom.set(Some((y, x, w)));
@@ -3607,14 +3605,13 @@ fn cost_cell(model: &str, cost: f64) -> String {
 
 /// A 14-cell colour-coded meter for a fraction, eased by `ease` (animation grow-in).
 fn mesh_meter(frac: f64, ease: f32, status: &str) -> Vec<Span<'static>> {
-    use ratatui::style::Color;
     let shown = (frac as f32 * ease).clamp(0.0, 1.0);
     let filled = (shown * 14.0).round() as usize;
     let col = match status {
-        "Exhausted" => Color::Red,
-        "Warning" => Color::Yellow,
-        _ if frac >= 0.6 => Color::Yellow,
-        _ => Color::Green,
+        "Exhausted" => ERRRED,
+        "Warning" => WARNYEL,
+        _ if frac >= 0.6 => WARNYEL,
+        _ => OKGREEN,
     };
     vec![
         Span::styled("█".repeat(filled), Style::default().fg(col)),
@@ -3638,7 +3635,7 @@ pub fn render_mesh_overlay(f: &mut Frame, app: &App) {
     if !app.mesh_overlay.open {
         return;
     }
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::Modifier;
     use ratatui::text::{Line, Text};
 
     let o = &app.mesh_overlay;
@@ -3704,10 +3701,7 @@ pub fn render_mesh_overlay(f: &mut Frame, app: &App) {
         } else {
             format!("tier  {}   ({})", o.classified, o.reasons)
         };
-        top.push(Line::from(Span::styled(
-            tier,
-            Style::default().fg(Color::Cyan),
-        )));
+        top.push(Line::from(Span::styled(tier, Style::default().fg(ACCENT))));
         if !o.classifier.is_empty() {
             top.push(Line::from(vec![
                 Span::styled("cls   ", Style::default().fg(DIM)),
@@ -3735,11 +3729,7 @@ pub fn render_mesh_overlay(f: &mut Frame, app: &App) {
         top.push(Line::from(spans));
     }
     if !o.conserve_line.is_empty() {
-        let col = if o.conserve_fired {
-            Color::Yellow
-        } else {
-            Color::Gray
-        };
+        let col = if o.conserve_fired { WARNYEL } else { DIM };
         top.push(Line::from(Span::styled(
             format!("  conserve  {}", o.conserve_line),
             Style::default().fg(col),
@@ -3770,9 +3760,7 @@ pub fn render_mesh_overlay(f: &mut Frame, app: &App) {
             if c.usable { "" } else { " · unusable" },
         );
         let base = if c.selected {
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(OKGREEN).add_modifier(Modifier::BOLD)
         } else if !c.usable {
             Style::default().fg(DIM)
         } else {
@@ -3804,9 +3792,7 @@ pub fn render_mesh_overlay(f: &mut Frame, app: &App) {
         Span::styled("pick  ", Style::default().fg(DIM)),
         Span::styled(
             o.pick.clone(),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(OKGREEN).add_modifier(Modifier::BOLD),
         ),
     ]));
     if !o.rationale.is_empty() {
@@ -3992,12 +3978,7 @@ fn effort_status(effort: forge_types::EffortLevel) -> (&'static str, Style) {
 fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
     let bg = Style::default().bg(STATUSBG);
     let w = area.width;
-    let sep = || {
-        Span::styled(
-            "  │  ",
-            Style::default().fg(Color::Rgb(38, 42, 62)).bg(STATUSBG),
-        )
-    };
+    let sep = || Span::styled("  │  ", Style::default().fg(SEPCOL).bg(STATUSBG));
 
     let model = app
         .routing

@@ -17,13 +17,17 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-// Palette — mirrors crate::app so rendered markdown belongs to the same TUI.
-const ORANGE: Color = Color::Rgb(255, 145, 60);
-const DIM: Color = Color::Rgb(110, 110, 120);
-const OKGREEN: Color = Color::Rgb(120, 210, 140);
-const ERRRED: Color = Color::Rgb(240, 110, 110);
-const CODEFG: Color = Color::Rgb(205, 205, 215);
-const CODEBG: Color = Color::Rgb(40, 40, 48);
+// Palette — exact values from crate::app so rendered markdown is pixel-consistent with the TUI.
+const ORANGE: Color = Color::Rgb(255, 138, 48); // forge brand — warm ember
+const ACCENT: Color = Color::Rgb(82, 162, 255); // electric blue (active/interactive)
+const DIM: Color = Color::Rgb(82, 87, 108); // muted / secondary
+const TEXT: Color = Color::Rgb(208, 213, 224); // primary body text
+const OKGREEN: Color = Color::Rgb(92, 208, 122); // success / ok
+const ERRRED: Color = Color::Rgb(243, 92, 92); // error
+const WARNYEL: Color = Color::Rgb(238, 188, 82); // warning
+const TOOLCYAN: Color = Color::Rgb(75, 212, 218); // tools / code / lattice
+const CODEFG: Color = TEXT; // code body text = primary body text
+const CODEBG: Color = Color::Rgb(40, 40, 48); // code block background
 
 /// Cap on rendered changed lines before truncating (keeps a huge diff from flooding scrollback).
 const MAX_DIFF_LINES: usize = 500;
@@ -130,7 +134,7 @@ pub fn diff_to_lines(diff: &FileDiff) -> Vec<Line<'static>> {
                 ns + 1,
                 ne - ns
             ),
-            Style::default().fg(ORANGE),
+            Style::default().fg(TOOLCYAN),
         )));
         for op in group {
             for change in td.iter_changes(&op) {
@@ -205,7 +209,7 @@ fn severity_color(sev: forge_types::Severity) -> Color {
     match sev {
         Severity::Critical => ERRRED,
         Severity::High => ORANGE,
-        Severity::Medium => Color::Rgb(235, 200, 110), // warn-yellow
+        Severity::Medium => WARNYEL,
         Severity::Low => DIM,
     }
 }
@@ -221,14 +225,14 @@ pub fn mcp_status_lines(servers: &[forge_types::McpServerLine]) -> Vec<Line<'sta
         ))];
     }
     let mut out = vec![Line::from(Span::styled(
-        format!("  ⚒ MCP servers  ({} configured)", servers.len()),
-        Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+        format!("  ◈ MCP servers  ({} configured)", servers.len()),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     ))];
     for s in servers {
         let (glyph, color) = match s.status.as_str() {
             "connected" => ("●", OKGREEN),
-            "slow" => ("●", ORANGE),
-            "reconnecting" => ("↻", ORANGE),
+            "slow" => ("●", WARNYEL),
+            "reconnecting" => ("↻", WARNYEL),
             "failed" | "unauthorized" => ("○", ERRRED),
             _ => ("○", DIM), // disabled / unknown
         };
@@ -287,10 +291,7 @@ pub fn assay_report_lines(r: &forge_types::AssayReport) -> Vec<Line<'static>> {
             ),
             Span::styled(format!("{crit} crit "), Style::default().fg(ERRRED)),
             Span::styled(format!("{high} high "), Style::default().fg(ORANGE)),
-            Span::styled(
-                format!("{med} med "),
-                Style::default().fg(Color::Rgb(235, 200, 110)),
-            ),
+            Span::styled(format!("{med} med "), Style::default().fg(WARNYEL)),
             Span::styled(format!("{low} low"), Style::default().fg(DIM)),
             Span::styled(
                 format!("  ·  ${:.4}", r.cost_usd),
@@ -551,7 +552,7 @@ impl Renderer {
                     _ => "• ".to_string(),
                 };
                 self.cur
-                    .push(Span::styled(marker, Style::default().fg(ORANGE)));
+                    .push(Span::styled(marker, Style::default().fg(ACCENT)));
             }
             Event::End(TagEnd::Item) => self.flush_line(),
             Event::Start(Tag::CodeBlock(kind)) => {
@@ -573,7 +574,7 @@ impl Renderer {
                 }
                 self.cur.push(Span::styled(
                     c.to_string(),
-                    Style::default().fg(ORANGE).bg(CODEBG),
+                    Style::default().fg(TOOLCYAN).bg(CODEBG),
                 ));
             }
             Event::SoftBreak => self.push_text(" "),
