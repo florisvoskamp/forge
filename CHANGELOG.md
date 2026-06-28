@@ -6,7 +6,17 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
-## [1.6.0] - 2026-06-28
+## [1.6.1] - 2026-06-28
+
+### Added
+- **Semantic memory recall is now live end-to-end.** The v1.6.0 engine is wired into the turn loop:
+  when an embedder is configured (`[lattice.embeddings]`), end-of-turn capture stores each fact's
+  embedding (`add_memory_with_embedding`) and start-of-session recall ranks memories by cosine
+  similarity to the prompt (`recall_semantic`) instead of keyword overlap. Falls back to keyword
+  recall transparently when no embedder is available — so it's a pure upgrade, never a regression.
+  Implemented as a free `embed_one(&EmbeddingsConfig, …)` function (not a `&self` method) so the
+  `.await` doesn't hold a `&Session` borrow — the fix for the non-`Send` turn future that blocked the
+  v1.6.0 wiring.
 
 ### Added
 - **Semantic memory recall engine** (store layer). The auto-memory store now supports embedding-based

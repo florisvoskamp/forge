@@ -217,6 +217,21 @@ pub struct RewindOutcome {
 /// budget rather than overflowing.
 const CHARS_PER_TOKEN: usize = 3;
 
+/// Best-effort single-text embedding via the configured embedder, for semantic memory capture +
+/// recall. `None` when no embedder is available or it errors → callers fall back to keyword recall.
+/// A FREE function taking `&EmbeddingsConfig` (which is `Sync`) — NOT a `&self` method — so the
+/// `.await` doesn't hold a `&Session` borrow (`Session` is `!Sync`, which would make the turn future
+/// non-`Send`).
+async fn embed_one(cfg: &forge_config::EmbeddingsConfig, text: &str) -> Option<Vec<f32>> {
+    let (embedder, _) = forge_provider::select_embedder(cfg)?;
+    embedder
+        .embed(&[text.to_string()])
+        .await
+        .ok()
+        .and_then(|mut v| v.drain(..).next())
+        .filter(|e| !e.is_empty())
+}
+
 /// Scope key for auto-memory: the current project directory's absolute path (memories are
 /// per-project). Matches the `forge memory` CLI so both see the same store.
 fn memory_scope() -> String {
@@ -2213,7 +2228,16 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             };
             let text = text.trim();
             if text.len() >= 4 {
-                let _ = self.store.add_memory(&scope, kind, text, &self.id);
+                match embed_one(&self.config.lattice.embeddings, text).await {
+                    Some(emb) => {
+                        let _ = self
+                            .store
+                            .add_memory_with_embedding(&scope, kind, text, &self.id, &emb);
+                    }
+                    None => {
+                        let _ = self.store.add_memory(&scope, kind, text, &self.id);
+                    }
+                }
             }
         }
     }
@@ -3584,7 +3608,11 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             // prompt then salience + recency. Once per session, like AGENTS.md.
             if self.config.mesh.auto_memory {
                 let scope = memory_scope();
-                if let Ok(mems) = self.store.recall_memories(&scope, prompt, 6) {
+                let recalled = match embed_one(&self.config.lattice.embeddings, prompt).await {
+                    Some(qemb) => self.store.recall_semantic(&scope, &qemb, 6),
+                    None => self.store.recall_memories(&scope, prompt, 6),
+                };
+                if let Ok(mems) = recalled {
                     if !mems.is_empty() {
                         let mut block = String::from(
                             "Remembered from earlier sessions in this project (durable facts — \
@@ -9958,6 +9986,11 @@ mod tests {
         // session stays usable (no deadlock / frozen UI).
         use std::time::Duration;
         let store = Arc::new(Store::open_in_memory().unwrap());
+        // Disable auto-memory: its start-of-turn recall can invoke the embedder (a network call on
+        // CI) before the user message is persisted, which would race the 100ms abort window below.
+        // This test is about lock release, not memory.
+        let mut config = Config::default();
+        config.mesh.auto_memory = false;
         let session = Arc::new(tokio::sync::Mutex::new(
             Session::start(
                 store,
@@ -9965,7 +9998,7 @@ mod tests {
                 Arc::new(HeuristicRouter::new(Config::default())),
                 ToolRegistry::with_core_tools(),
                 Box::new(HeadlessPresenter::new(false)),
-                Config::default(),
+                config,
                 ".",
             )
             .unwrap(),
