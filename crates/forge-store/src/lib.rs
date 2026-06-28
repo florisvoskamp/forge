@@ -159,6 +159,15 @@ impl r2d2::ManageConnection for SqliteManager {
         // the mcp-serve bridge, or now two pooled connections) hits SQLITE_BUSY immediately.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Performance pragmas — safe with WAL mode:
+        //   synchronous=NORMAL: WAL already guarantees crash recovery; FULL adds extra fsyncs
+        //   with no benefit here. Reduces write latency on every INSERT/UPDATE.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        //   32 MB page cache (default ~2 MB) — cuts disk reads for hot queries like spend_summary
+        //   and load_messages on large sessions.
+        conn.pragma_update(None, "cache_size", -32_000_i64)?;
+        //   Sort/group-by temp tables in memory — no tmp file for our aggregation queries.
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         Ok(conn)
     }
 
@@ -479,9 +488,11 @@ impl Store {
     }
 
     /// Record token usage/cost for a message and bump the session's running total.
+    /// Batched in one explicit transaction so the INSERT + UPDATE land in a single WAL commit.
     pub fn record_usage(&self, session_id: &str, message_id: &str, usage: &Usage) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO usage (id, message_id, input_tokens, output_tokens, cost_usd)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             (
@@ -492,11 +503,12 @@ impl Store {
                 usage.cost_usd,
             ),
         )?;
-        conn.execute(
+        tx.execute(
             "UPDATE session SET total_cost_usd = total_cost_usd + ?1,
              updated_at = strftime('%s','now') WHERE id = ?2",
             (usage.cost_usd, session_id),
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -509,21 +521,22 @@ impl Store {
         label: &str,
         usage: &Usage,
     ) -> Result<()> {
-        let conn = self.lock()?;
+        let mut conn = self.lock()?;
         let msg_id = forge_types::new_id();
-        let max_seq: i64 = conn
+        let tx = conn.transaction()?;
+        let max_seq: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(seq), 0) FROM message WHERE session_id = ?1",
                 [session_id],
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        conn.execute(
+        tx.execute(
             "INSERT INTO message (id, session_id, seq, role, content, active) \
              VALUES (?1, ?2, ?3, 'system', ?4, 0)",
             (msg_id.as_str(), session_id, max_seq + 1, label),
         )?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO usage (id, message_id, input_tokens, output_tokens, cost_usd) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             (
@@ -534,11 +547,12 @@ impl Store {
                 usage.cost_usd,
             ),
         )?;
-        conn.execute(
+        tx.execute(
             "UPDATE session SET total_cost_usd = total_cost_usd + ?1, \
              updated_at = strftime('%s','now') WHERE id = ?2",
             (usage.cost_usd, session_id),
         )?;
+        tx.commit()?;
         Ok(())
     }
 

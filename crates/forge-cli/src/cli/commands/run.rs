@@ -861,7 +861,7 @@ pub(crate) async fn run_chat_tui(
 
     while !quit {
         if let Some(obs) = &mut observer {
-            if obs.last_poll.elapsed() >= std::time::Duration::from_millis(150) {
+            if obs.last_poll.elapsed() >= std::time::Duration::from_millis(50) {
                 obs.last_poll = std::time::Instant::now();
                 if let Ok(events) = obs
                     .store
