@@ -825,7 +825,37 @@ pub(crate) async fn run_chat_tui(
     // arboard keeps the X11/Wayland selection alive and never logs a "dropped" warning to the TUI.
     let mut clipboard: Option<arboard::Clipboard> = arboard::Clipboard::new().ok();
 
+    struct ObserverState {
+        session_id: String,
+        store: std::sync::Arc<forge_store::Store>,
+        last_event_id: i64,
+        last_poll: std::time::Instant,
+    }
+    let mut observer: Option<ObserverState> = None;
+
     while !quit {
+        if let Some(obs) = &mut observer {
+            if obs.last_poll.elapsed() >= std::time::Duration::from_millis(150) {
+                obs.last_poll = std::time::Instant::now();
+                if let Ok(events) = obs
+                    .store
+                    .live_events_after(&obs.session_id, obs.last_event_id)
+                {
+                    for (id, json) in events {
+                        obs.last_event_id = id;
+                        if let Ok(ev) =
+                            serde_json::from_str::<crate::live_observer::LiveEvent>(&json)
+                        {
+                            if let Some(pe) = crate::live_observer::live_event_to_presenter(ev) {
+                                app.apply(pe);
+                                dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // While the in-loop activity viewer is open during a running turn, redraw every frame so
         // the selected entry's transcript tails live (subagent/critic output streams in).
         if app.viewer.is_some() && busy {
@@ -842,13 +872,67 @@ pub(crate) async fn run_chat_tui(
         }
 
         // Drain *all* buffered keystrokes this iteration. Reading one per frame throttled
-        // fast typing to the frame rate (~16 keys/sec) — the source of the input lag.
         while let Some(ev) = tui.poll_event().context("reading input")? {
             dirty = true;
             // Any input counts as activity: hold the cursor solid and restart the idle timer, so
             // the blink only resumes once typing pauses.
             last_input_at = std::time::Instant::now();
             app.cursor_hidden = false;
+
+            if observer.is_some() {
+                match ev {
+                    forge_tui::InputEvent::Focus(gained) => {
+                        app.unfocused = !gained;
+                        if gained {
+                            app.cursor_hidden = false;
+                        }
+                    }
+                    forge_tui::InputEvent::Scroll { up } => {
+                        const STEP: usize = 3;
+                        if app.viewer.is_some() {
+                            let key = if up { KeyKind::Up } else { KeyKind::Down };
+                            for _ in 0..STEP {
+                                app.viewer_key(key);
+                            }
+                        } else if app.fullscreen {
+                            if up {
+                                app.transcript_scroll_up(STEP);
+                            } else {
+                                let body = tui.height().saturating_sub(8).max(1);
+                                let (_, max_scroll) = app.transcript_metrics(tui.width(), body);
+                                app.transcript_scroll_down(STEP, max_scroll);
+                            }
+                        }
+                    }
+                    forge_tui::InputEvent::Key(key) => {
+                        if matches!(key, KeyKind::Esc) {
+                            observer = None;
+                            tui.clear_screen();
+                            app.clear_transcript();
+                            app.input.clear();
+                            let _ = open_sessions_picker(&mut app, "");
+                            dirty = true;
+                        } else if app.fullscreen
+                            && matches!(key, KeyKind::PageUp | KeyKind::PageDown)
+                        {
+                            let body = tui.height().saturating_sub(8).max(1);
+                            if matches!(key, KeyKind::PageUp) {
+                                app.transcript_scroll_up(body as usize);
+                            } else {
+                                let (_, max_scroll) = app.transcript_metrics(tui.width(), body);
+                                app.transcript_scroll_down(body as usize, max_scroll);
+                            }
+                            dirty = true;
+                        } else if app.fullscreen && matches!(key, KeyKind::JumpBottom) {
+                            app.transcript_to_bottom();
+                            dirty = true;
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             let key = match ev {
                 forge_tui::InputEvent::Paste(s) => {
                     // Pasting an image: terminals deliver an empty/whitespace bracketed-paste for
@@ -1298,6 +1382,37 @@ pub(crate) async fn run_chat_tui(
                                     app.note(&format!("✓ copied to clipboard ({chars} chars)"));
                                 }
                                 app.copy_candidates.clear();
+                            } else if kind == forge_tui::PickerKind::Sessions
+                                && row.id.starts_with("observe:")
+                            {
+                                let session_id = row.id.trim_start_matches("observe:").to_string();
+                                let obs_store = std::sync::Arc::new(crate::open_store()?);
+                                let start_event_id =
+                                    find_starting_event_id(&obs_store, &session_id);
+                                let (items, view) = {
+                                    let mut s = session.lock().await;
+                                    s.reset_resumed(&session_id)
+                                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                    (s.replay_items_full(), s.view_snapshot())
+                                };
+                                tui.clear_screen();
+                                app.clear_transcript();
+                                app.note(&format!(
+                                    "⚡ resumed live session {}",
+                                    session_id.chars().take(8).collect::<String>()
+                                ));
+                                app.replay_history(&items);
+                                if let Some(json) = view {
+                                    app.restore_view_json(&json);
+                                }
+                                app.input =
+                                    "⚡ Observing live MCP session — press Esc to stop".to_string();
+                                observer = Some(ObserverState {
+                                    session_id,
+                                    store: obs_store,
+                                    last_event_id: start_event_id,
+                                    last_poll: std::time::Instant::now(),
+                                });
                             } else {
                                 picker_accept(kind, &row, &session, &mut tui, &mut app).await?;
                             }
@@ -2501,4 +2616,17 @@ pub(crate) fn fmt_age(created_at: i64) -> String {
     } else {
         format!("{}d ago", secs / 86_400)
     }
+}
+
+fn find_starting_event_id(store: &forge_store::Store, session_id: &str) -> i64 {
+    if let Ok(events) = store.live_events_after(session_id, 0) {
+        for (id, json) in events.iter().rev() {
+            if let Ok(ev) = serde_json::from_str::<crate::live_observer::LiveEvent>(json) {
+                if matches!(ev, crate::live_observer::LiveEvent::AssistantDone) {
+                    return *id;
+                }
+            }
+        }
+    }
+    0
 }

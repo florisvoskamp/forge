@@ -264,6 +264,7 @@ impl Store {
                 "ALTER TABLE session ADD COLUMN parent_session_id TEXT",
                 "ALTER TABLE session ADD COLUMN view_snapshot TEXT",
                 "ALTER TABLE lattice_node ADD COLUMN pagerank REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE session ADD COLUMN agent_active INTEGER NOT NULL DEFAULT 0",
             ] {
                 let _ = conn.execute(stmt, []);
             }
@@ -2009,6 +2010,63 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    /// Write an event for an active MCP agent session. Keeps only the last 2000 events per
+    /// session (ring buffer) to bound disk usage on long runs.
+    pub fn append_live_event(&self, session_id: &str, payload_json: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO live_event (session_id, payload_json) VALUES (?1, ?2)",
+            (session_id, payload_json),
+        )?;
+        // Prune to last 2000 rows
+        conn.execute(
+            "DELETE FROM live_event WHERE session_id = ?1 AND id <= (
+                SELECT id FROM live_event WHERE session_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET 2000
+             )",
+            [session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch all events for `session_id` with `id > after_id`, in order.
+    pub fn live_events_after(&self, session_id: &str, after_id: i64) -> Result<Vec<(i64, String)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, payload_json FROM live_event WHERE session_id = ?1 AND id > ?2 ORDER BY id",
+        )?;
+        let rows = stmt.query_map((session_id, after_id), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut res = Vec::new();
+        for r in rows {
+            res.push(r?);
+        }
+        Ok(res)
+    }
+
+    /// Mark a session as having an active MCP agent.
+    pub fn set_session_agent_active(&self, session_id: &str, active: bool) -> Result<()> {
+        self.lock()?.execute(
+            "UPDATE session SET agent_active = ?1 WHERE id = ?2",
+            (active as i64, session_id),
+        )?;
+        Ok(())
+    }
+
+    /// Session IDs with agent_active = 1.
+    pub fn active_agent_session_ids(&self) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM session WHERE agent_active = 1 AND parent_session_id IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut res = Vec::new();
+        for r in rows {
+            res.push(r?);
+        }
+        Ok(res)
+    }
 }
 
 #[cfg(test)]
@@ -2851,5 +2909,44 @@ mod tests {
         let n = dst.import_portable_metadata(&tampered).unwrap();
         assert_eq!(n, 1, "only the allow-listed model_health row is imported");
         assert!(dst.benched_models(500).unwrap().is_benched("gemini::x"));
+    }
+
+    #[test]
+    fn mcp_live_observer_events() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("/tmp", "default").unwrap();
+
+        // Initially inactive
+        let active = store.active_agent_session_ids().unwrap();
+        assert!(active.is_empty());
+
+        // Make active
+        store.set_session_agent_active(&sid, true).unwrap();
+        let active = store.active_agent_session_ids().unwrap();
+        assert_eq!(active, vec![sid.clone()]);
+
+        // Append events
+        store
+            .append_live_event(&sid, "{\"type\":\"Text\",\"delta\":\"hello\"}")
+            .unwrap();
+        store
+            .append_live_event(&sid, "{\"type\":\"Done\"}")
+            .unwrap();
+
+        let events = store.live_events_after(&sid, 0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1, "{\"type\":\"Text\",\"delta\":\"hello\"}");
+        assert_eq!(events[1].1, "{\"type\":\"Done\"}");
+
+        // Test filtering by after_id
+        let last_id = events[0].0;
+        let events_filtered = store.live_events_after(&sid, last_id).unwrap();
+        assert_eq!(events_filtered.len(), 1);
+        assert_eq!(events_filtered[0].1, "{\"type\":\"Done\"}");
+
+        // Make inactive
+        store.set_session_agent_active(&sid, false).unwrap();
+        let active = store.active_agent_session_ids().unwrap();
+        assert!(active.is_empty());
     }
 }

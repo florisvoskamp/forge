@@ -46,6 +46,7 @@ mod cli;
 mod context_windows;
 mod doctor;
 mod image_input;
+pub(crate) mod live_observer;
 mod local;
 mod mcp_agent;
 mod mcp_serve;

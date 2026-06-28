@@ -239,4 +239,14 @@ CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope);
 CREATE INDEX IF NOT EXISTS idx_memory_kind ON memory(kind);
 CREATE INDEX IF NOT EXISTS idx_memory_salience ON memory(salience DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory(updated_at DESC);
+
+-- Live-event ring buffer: MCP agent sessions write events here so the TUI can
+-- observe them in real-time. Pruned to last 2000 rows per session.
+CREATE TABLE IF NOT EXISTS live_event (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    payload_json TEXT NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_live_event_session ON live_event(session_id, id);
 "#;

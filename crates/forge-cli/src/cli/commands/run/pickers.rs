@@ -30,24 +30,43 @@ pub(crate) fn open_sessions_picker(app: &mut forge_tui::App, query: &str) -> Res
         app.note("no past sessions yet");
         return Ok(());
     }
+    let active_ids = store.active_agent_session_ids().unwrap_or_default();
     let rows = list
         .into_iter()
         .take(50)
         .map(|s| {
+            let is_active = active_ids.contains(&s.id);
             let id8: String = s.id.chars().take(8).collect();
             // Title = a clean one-line snippet of the first user prompt (newlines/extra spaces
             // collapsed), so each row reads as a recognizable conversation rather than a hash.
-            let title = session_title(s.preview.as_deref());
-            forge_tui::PickerRow {
-                title,
-                // Subtitle = the metadata: short id · last-used age · message count · cost.
-                subtitle: format!(
+            let mut title = session_title(s.preview.as_deref());
+            if is_active {
+                title = format!("⚡ {}", title);
+            }
+            let subtitle = if is_active {
+                format!(
+                    "[LIVE] {id8} · {} · {} msgs · ${:.4}",
+                    fmt_age(s.last_activity),
+                    s.message_count,
+                    s.total_cost_usd,
+                )
+            } else {
+                format!(
                     "{id8} · {} · {} msgs · ${:.4}",
                     fmt_age(s.last_activity),
                     s.message_count,
                     s.total_cost_usd,
-                ),
-                id: s.id,
+                )
+            };
+            let id = if is_active {
+                format!("observe:{}", s.id)
+            } else {
+                s.id
+            };
+            forge_tui::PickerRow {
+                title,
+                subtitle,
+                id,
             }
         })
         .collect();

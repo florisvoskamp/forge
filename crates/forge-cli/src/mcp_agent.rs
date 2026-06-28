@@ -108,6 +108,8 @@ struct ForgeAgentServer {
     /// `Notify` (not the session lock) is deliberate: the interrupt handler must run while
     /// `forge_chat` still holds the session lock for the whole turn.
     interrupt: Arc<tokio::sync::Notify>,
+    store: Arc<forge_store::Store>,
+    session_id: String,
 }
 
 const TOOL_CHAT: &str = "forge_chat";
@@ -275,6 +277,8 @@ impl ServerHandler for ForgeAgentServer {
                 *self.event_tx.lock().unwrap() = Some(tx);
 
                 let peer = ctx.peer.clone();
+                let store = Arc::clone(&self.store);
+                let sid = self.session_id.clone();
                 let notify_task = tokio::spawn(async move {
                     let mut tool_calls = Vec::new();
                     while let Some(event) = rx.recv().await {
@@ -283,6 +287,11 @@ impl ServerHandler for ForgeAgentServer {
                         }
                         if let Some(notification) = event_notification(&event) {
                             let _ = peer.notify_logging_message(notification).await;
+                        }
+                        if let Some(le) = crate::live_observer::to_live_event(&event) {
+                            if let Ok(json) = serde_json::to_string(&le) {
+                                let _ = store.append_live_event(&sid, &json);
+                            }
                         }
                     }
                     tool_calls
@@ -414,11 +423,31 @@ pub async fn run(session_id: Option<String>, cwd: Option<std::path::PathBuf>) ->
     let mut session = session;
     session.set_mode(initial_mode);
 
+    let store = Arc::new(crate::open_store()?);
+    let sid = session.id().to_string();
+    let _ = store.set_session_agent_active(&sid, true);
+
+    struct ActiveGuard {
+        store: Arc<forge_store::Store>,
+        session_id: String,
+    }
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            let _ = self.store.set_session_agent_active(&self.session_id, false);
+        }
+    }
+    let _active_guard = ActiveGuard {
+        store: Arc::clone(&store),
+        session_id: sid.clone(),
+    };
+
     let server = ForgeAgentServer {
         session: Arc::new(tokio::sync::Mutex::new(session)),
         event_tx,
         mode,
         interrupt: Arc::new(tokio::sync::Notify::new()),
+        store,
+        session_id: sid,
     };
 
     let service = server.serve(stdio()).await?;
