@@ -6,7 +6,26 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
-## [1.3.1] - 2026-06-28
+## [1.4.0] - 2026-06-28
+
+### Added
+- **Built-in auto-memory — Forge now remembers durable facts across sessions, per project.** A new
+  `memory` table in the store holds typed facts (preference | decision | fact | reference) scoped to
+  each project (or `global`). At the end of a turn Forge makes one cheap trivial-tier call to extract
+  0–3 durable facts (preferences, project decisions/conventions, key constraints — not transient task
+  detail) and stores them; repeated facts auto-dedup (Jaccard) and bump salience instead of piling
+  up. At the start of a session it **recalls only the few most relevant** memories (keyword overlap
+  with the prompt, then salience + recency) and injects them into context — the edge over a
+  dump-everything memory file. On by default (`[mesh] auto_memory`).
+  - New `forge memory` command: list (no subcommand), `add <text> [--kind]`, `search <query>`,
+    `rm <id>`, `clear`; `--global` for the cross-project scope.
+  - Store API: `add_memory` / `list_memories` / `recall_memories` / `search_memories` /
+    `delete_memory` / `clear_memories`, fully unit-tested (dedup, relevance ranking, scope
+    isolation). Capture/recall are gated, best-effort, and never derail a turn.
+
+  *(The schema + initial store layer were drafted by Forge itself via the mesh — dogfooding; Claude
+  Code completed the store methods, CLI, capture/recall wiring, and tests after Forge hit edit-tool
+  limits on the large files.)*
 
 ### Fixed (mesh robustness — surfaced by dogfooding)
 - **Empty-response models now fail over instead of dead-ending the turn.** A model that streams an

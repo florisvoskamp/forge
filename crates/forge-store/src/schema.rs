@@ -212,10 +212,31 @@ CREATE TABLE IF NOT EXISTS lattice_embedding (
 
 -- Persisted compaction summary (/compact). When compact() runs, the older messages are
 -- soft-deleted and their model-generated summary is stored here. load_messages prepends
--- a synthetic System message with this summary so a resumed session loads the compacted view.
+-- a synthetic System message with this summary so a resumed session rehydrates the compacted view.
 CREATE TABLE IF NOT EXISTS session_compaction (
     session_id TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
     summary    TEXT NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
+
+-- Auto-memory: durable facts extracted from turns, scoped per project (or global).
+-- kind: preference | decision | fact | reference
+-- scope: global | <project-path>
+-- salience: 0.0-1.0, boosted on repeat hits; used for relevance ranking.
+-- embedding: optional f32 vector (little-endian) for semantic recall when forge-index is available.
+CREATE TABLE IF NOT EXISTS memory (
+    id            TEXT PRIMARY KEY,
+    scope         TEXT NOT NULL,          -- "global" or project path
+    kind          TEXT NOT NULL,          -- preference | decision | fact | reference
+    text          TEXT NOT NULL,          -- the durable fact
+    source_session TEXT NOT NULL,         -- session that produced this memory
+    created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    salience      REAL NOT NULL DEFAULT 0.5,
+    embedding     BLOB                    -- optional f32 vector (little-endian)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope);
+CREATE INDEX IF NOT EXISTS idx_memory_kind ON memory(kind);
+CREATE INDEX IF NOT EXISTS idx_memory_salience ON memory(salience DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory(updated_at DESC);
 "#;

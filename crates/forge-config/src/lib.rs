@@ -959,6 +959,12 @@ pub struct MeshConfig {
     /// pin. (Enforced in `HeuristicRouter::allowed_under_credit_mode`.)
     #[serde(default)]
     pub credit_mode: CreditMode,
+    /// Auto-memory: capture durable facts (preferences/decisions/conventions) at the end of a turn
+    /// and recall the most relevant ones into context at the start of a session, scoped per project.
+    /// On by default — the built-in cross-session memory. Set false to disable capture + recall (the
+    /// `forge memory` command still works for manual entries).
+    #[serde(default = "default_auto_memory")]
+    pub auto_memory: bool,
     /// Self-review pass (opt-in): after a turn makes edits, the SAME model re-examines its own
     /// changes against the task and may fix them — one bounded round, only on edit turns. OFF by
     /// default: a same-model SWE-bench A/B showed the always-on version REGRESSED (the extra round
@@ -1055,6 +1061,10 @@ fn default_self_review() -> bool {
 
 fn default_failover_cooldown_secs() -> u64 {
     60
+}
+
+fn default_auto_memory() -> bool {
+    true
 }
 
 fn default_rate_limit_wait_secs() -> u64 {
@@ -1260,6 +1270,7 @@ impl Default for Config {
                 disabled: Vec::new(),
                 max_output_tokens: default_max_output_tokens(),
                 credit_mode: CreditMode::Normal,
+                auto_memory: default_auto_memory(),
                 self_review: default_self_review(),
                 architect_mode: false,
                 architect_model: None,

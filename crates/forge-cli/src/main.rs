@@ -23,6 +23,7 @@ pub(crate) use cli::commands::local::{
     auth, local_cmd, maybe_autostart_local, needs_onboarding, prompt_line, provider_label, setup,
 };
 pub(crate) use cli::commands::mcp::mcp_cmd;
+pub(crate) use cli::commands::memory::memory_cmd;
 pub(crate) use cli::commands::migrate::migrate_cmd;
 pub(crate) use cli::commands::models::{
     benchmarks_cmd, build_provider_and_router, discover_catalog, mesh_explain, models,
