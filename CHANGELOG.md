@@ -6,7 +6,17 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-06-28
+## [1.1.1] - 2026-06-28
+
+### Fixed
+- **`credit_mode = "strict"` now actually keeps paid models out of routing and failover.** It was
+  wired only to the output-token cap, so its documented "free + subscription only" promise was never
+  enforced — a free pick that failed over (or a declined smaller-model fallback) could land on a
+  PAID model (e.g. `openrouter::google/gemini-2.5-pro`) and silently spend credit. Strict now drops
+  every paid/metered model (including priced "free-tier" models that could bill once their quota is
+  gone) from the auto-route candidate set and the whole failover chain; only free + subscription
+  models remain. An explicit `--model` pin still overrides (it bypasses the auto path), so a
+  deliberate paid choice works. Normal/Frugal are unchanged.
 
 ### Fixed
 - **The "working" spinner now stops the instant the response is done — it no longer waits on the

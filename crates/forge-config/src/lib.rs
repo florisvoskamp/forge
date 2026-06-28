@@ -943,7 +943,11 @@ pub struct MeshConfig {
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
     /// How aggressively to conserve metered API credits. Default = Normal (no restriction).
-    /// Frugal caps output tokens at 2048; Strict caps at 1024 and routes to free/sub only.
+    /// Frugal caps output tokens at 2048. Strict caps at 1024 AND restricts auto-routing + failover
+    /// to free + subscription models only — a paid, metered model (incl. a priced "free-tier" model
+    /// that could bill once its quota runs out) is dropped from the candidate set, so neither the
+    /// primary pick nor the failover chain can ever spend API credit without an explicit `--model`
+    /// pin. (Enforced in `HeuristicRouter::allowed_under_credit_mode`.)
     #[serde(default)]
     pub credit_mode: CreditMode,
     /// Self-review pass (opt-in): after a turn makes edits, the SAME model re-examines its own

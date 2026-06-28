@@ -515,6 +515,19 @@ impl HeuristicRouter {
             && !(is_subscription(m) && quota.is_exhausted(forge_config::provider_of(m)))
     }
 
+    /// Whether `m` may be auto-routed / failed-over to under the active credit mode. `Strict` means
+    /// "free + subscription only" (the doc contract): a paid, metered model is dropped from the
+    /// candidate set so neither the primary pick nor the failover chain can ever spend API credit
+    /// without the user asking. Normal/Frugal impose no model restriction (Frugal is a token cap).
+    /// This gates AUTO routing only — an explicit `--model` pin bypasses it (the pin path checks
+    /// [`is_usable`] directly), so a deliberate paid pin still works.
+    fn allowed_under_credit_mode(&self, m: &str) -> bool {
+        if self.config.mesh.credit_mode != forge_types::CreditMode::Strict {
+            return true;
+        }
+        is_subscription(m) || catalog::is_free(m, self.pricing.estimated_cost(m), false)
+    }
+
     /// Pick the cheapest *usable* model from `candidates` (L1). Ranking key:
     /// `(prefer_subscription && subscription ? 0 : 1, estimated_cost, config_order)` — so a
     /// paid subscription (the $0 CLI bridges) wins when preferred, then lowest est. cost, then
@@ -568,6 +581,7 @@ impl HeuristicRouter {
         let mut usable: Vec<String> = candidates
             .iter()
             .filter(|m| self.is_usable(m, health, quota))
+            .filter(|m| self.allowed_under_credit_mode(m))
             .cloned()
             .collect();
         if !self.auto_active() {
@@ -843,6 +857,48 @@ mod tests {
         // Treat every provider as available so tier-classification tests are deterministic
         // (no dependence on ambient env/keyring) and exercise no fallback.
         HeuristicRouter::new(Config::default()).with_availability(|_| true)
+    }
+
+    #[test]
+    fn strict_credit_mode_excludes_paid_models_from_routing_and_failover() {
+        // Regression: `credit_mode = "strict"` promises "free + subscription only", but it was wired
+        // only to the token cap — paid models stayed in the failover chain, so a free pick that
+        // failed over could land on a PAID model (e.g. openrouter/gemini-pro) without consent.
+        let strict = {
+            let mut c = Config::default();
+            c.mesh.credit_mode = forge_types::CreditMode::Strict;
+            HeuristicRouter::new(c)
+                .with_availability(|_| true)
+                .with_catalog(mixed_catalog())
+        };
+        let (health, quota, hints) = (
+            ModelHealth::default(),
+            SubscriptionQuota::default(),
+            RouteHints::default(),
+        );
+        let chain = strict.build_chain(TaskTier::Standard, &health, hints, &quota);
+        // Paid, metered model is gone from the WHOLE chain (primary + every failover step).
+        assert!(
+            !chain.iter().any(|m| m == "gemini::gemini-2.5-pro"),
+            "strict must drop paid gemini-pro; chain = {chain:?}"
+        );
+        // Subscription ($0 marginal) and unpriced-free local models remain routable.
+        assert!(
+            chain.iter().any(|m| m == "claude-cli::sonnet"),
+            "subscription stays under strict; chain = {chain:?}"
+        );
+        assert!(
+            chain.iter().any(|m| m == "ollama::llama3.2"),
+            "free local stays under strict; chain = {chain:?}"
+        );
+
+        // Control: under Normal (default) the paid model stays in the chain.
+        let normal = mixed_router();
+        let normal_chain = normal.build_chain(TaskTier::Standard, &health, hints, &quota);
+        assert!(
+            normal_chain.iter().any(|m| m == "gemini::gemini-2.5-pro"),
+            "normal mode keeps paid models routable"
+        );
     }
 
     /// A realistic mixed catalog mirroring a user with claude+codex CLIs, local ollama, and
