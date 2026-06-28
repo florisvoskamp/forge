@@ -3642,6 +3642,16 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                 }
             }
 
+            // Auto-orchestrate: inject the resource-routing framework once so the model surveys
+            // all available tools on every turn without requiring the user to /orchestrate.
+            if self.config.mesh.auto_orchestrate {
+                let guidance = forge_skills::orchestrate_system_guidance();
+                let oseq = self.next_seq();
+                self.store
+                    .add_message(&self.id, oseq, Role::System, guidance, None)?;
+                self.transcript.push(Message::system(guidance));
+            }
+
             // When git co-authoring is on, prime the agent (once) to attribute its work to Forge.
             // Commit trailers are stamped deterministically by the prepare-commit-msg hook; this
             // covers the PR body (which no hook can reach) and tells the model not to add other

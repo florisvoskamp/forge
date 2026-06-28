@@ -965,6 +965,12 @@ pub struct MeshConfig {
     /// `forge memory` command still works for manual entries).
     #[serde(default = "default_auto_memory")]
     pub auto_memory: bool,
+    /// Auto-orchestrate: inject the Forge orchestration framework as a standing system instruction
+    /// at the start of every session. The model is guided to check skills first, choose the
+    /// highest-level tool that fits, and use subagents/MCP/web/Lattice appropriately — without
+    /// requiring the user to type `/orchestrate` on each prompt. Off by default (opt-in).
+    #[serde(default)]
+    pub auto_orchestrate: bool,
     /// Self-review pass (opt-in): after a turn makes edits, the SAME model re-examines its own
     /// changes against the task and may fix them — one bounded round, only on edit turns. OFF by
     /// default: a same-model SWE-bench A/B showed the always-on version REGRESSED (the extra round
@@ -1271,6 +1277,7 @@ impl Default for Config {
                 max_output_tokens: default_max_output_tokens(),
                 credit_mode: CreditMode::Normal,
                 auto_memory: default_auto_memory(),
+                auto_orchestrate: false,
                 self_review: default_self_review(),
                 architect_mode: false,
                 architect_model: None,
@@ -1709,6 +1716,7 @@ pub fn setting_group_and_label(path: &str) -> (String, String) {
         "assay.max_cost_usd" => Some(("Assay", "Max cost (USD)")),
         "git.coauthor" => Some(("Git", "Co-author commits")),
         "lsp.enabled" => Some(("Code Intelligence", "LSP diagnostics")),
+        "mesh.auto_orchestrate" => Some(("Behaviour", "Auto-orchestrate")),
         _ => None,
     };
     if let Some((g, l)) = curated {
@@ -1903,6 +1911,7 @@ pub fn setting_help(path: &str) -> Option<&'static str> {
         "assay.max_cost_usd" => "Per-run cost ceiling for the Assay critic crew.",
         "git.coauthor" => "Install a commit hook stamping Co-Authored-By: Forge and stripping CLI co-authors.",
         "lsp.enabled" => "Feed language-server diagnostics back into the turn after edits.",
+        "mesh.auto_orchestrate" => "Inject the orchestration framework every session: skills first, highest-level tool, subagents/MCP/web/Lattice — no need to /orchestrate manually.",
         _ => return None,
     })
 }

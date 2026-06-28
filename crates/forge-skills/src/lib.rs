@@ -719,31 +719,63 @@ fn parse_skill_meta(raw: &str, stem: &str, scope: Scope, dir: &Path) -> Result<S
     })
 }
 
-/// Build the built-in `/orchestrate` command. Keep this prompt compact: the command's job is to
-/// route dynamically from the live tool surface, not to inject a full orchestration methodology on
-/// every invocation. User/project commands or skills named `orchestrate` take precedence.
+/// Build the built-in `/orchestrate` command. User/project commands or skills named `orchestrate`
+/// take precedence over this builtin.
 fn builtin_orchestrate_command() -> Command {
     Command {
         name: "orchestrate".to_string(),
-        description: "Dynamically route a task through the best available Forge resources."
-            .to_string(),
+        description: "Route a task through the best available Forge resources — skills, subagents, MCP, web, Lattice, or direct implementation.".to_string(),
         args: Vec::new(),
         tier: Some(TaskTier::Complex),
         model: None,
         body: concat!(
-            "Orchestrate this Forge task using the resources available in this turn.\n\n",
+            "Orchestrate this Forge task. Check ALL resource categories before deciding; ",
+            "never skip one that fits.\n\n",
             "Task: $ARGUMENTS\n\n",
-            "Decide whether the task needs a skill, subagent fan-out, MCP tool, web lookup, ",
-            "Lattice query, or direct implementation. Use the live tool descriptions as the ",
-            "authoritative resource list. If a Forge skill is the right fit, call `use_skill` ",
-            "with its exact name before applying it. Use `spawn_agents` for independent ",
-            "parallel investigation. Ask one clarifying question only when the task cannot ",
-            "be safely started without it; otherwise state a brief plan and execute."
+            "RESOURCE DECISION ORDER:\n\n",
+            "1. Skills (always first) — call `use_skill list` to see every available skill.\n",
+            "   A skill is a tested, project-aware methodology. If any skill covers this task\n",
+            "   (fully or partially) → invoke it via `use_skill <name>`. Don't implement from\n",
+            "   scratch what a skill already does well.\n\n",
+            "2. Subagents — use `spawn_agents` when 2+ subtasks are genuinely independent\n",
+            "   (can run in parallel). Not for sequential steps — those run in one turn.\n\n",
+            "3. MCP tools — check the live tool list for the right integration (GitHub, search,\n",
+            "   databases, calendars, etc.). Prefer the correct MCP tool over a shell workaround.\n\n",
+            "4. Web — use `web_search` or `web_fetch` for current docs, package versions, or\n",
+            "   any information that isn't in the project files.\n\n",
+            "5. Code intelligence — use `lattice_query` for symbol lookups and cross-file\n",
+            "   navigation (\"where is X defined\", \"what calls Y\"). More precise than grep.\n\n",
+            "6. Shell / file tools — direct edits, builds, tests — when no higher-level tool\n",
+            "   applies.\n\n",
+            "7. `ask_user` — only when a decision cannot be inferred and is genuinely the\n",
+            "   user's to make. One focused question; never a list.\n\n",
+            "RULES:\n",
+            "• Highest-level tool wins: skill > bare implementation, MCP > shell, subagent > sequential.\n",
+            "• Compose freely: a task may use a skill + MCP tool + shell together.\n",
+            "• State a one-sentence plan and execute — ask only when the task is ambiguous,\n",
+            "  destructive, or requires a decision only the user can make. Don't stall."
         )
         .to_string(),
         scope: Scope::Builtin,
         path: PathBuf::from("<builtin>/commands/orchestrate.md"),
     }
+}
+
+/// Standing orchestration guidance injected once per session when `mesh.auto_orchestrate = true`.
+/// Compact so it doesn't bloat context — the full decision tree is in the `/orchestrate` command.
+pub fn orchestrate_system_guidance() -> &'static str {
+    concat!(
+        "Forge auto-orchestrate is active. Before executing any task, survey all resource categories:\n\n",
+        "1. Skills first — call `use_skill list` to see all available skills. Use a matching skill\n",
+        "   rather than implementing from scratch. Call `use_skill <name>` to invoke it.\n",
+        "2. Subagents (`spawn_agents`) for 2+ independent parallel subtasks, not sequential steps.\n",
+        "3. MCP tools for external integrations — prefer the correct tool over shell workarounds.\n",
+        "4. Web (`web_search`/`web_fetch`) for current information not in the project.\n",
+        "5. Code intelligence (`lattice_query`) for symbol lookups and cross-file navigation.\n",
+        "6. `ask_user` only when the decision is genuinely the user's — one question, not a list.\n\n",
+        "Rule: use the highest-level tool that fits. Compose freely. Execute without asking unless\n",
+        "the task is ambiguous, destructive, or requires a decision only the user can make."
+    )
 }
 
 fn first_line(body: &str, max: usize) -> String {
