@@ -604,7 +604,7 @@ struct ModelLoopOutcome {
 /// One interactive session. Construct with [`Session::start`], then drive [`Session::run_turn`].
 pub struct Session {
     id: String,
-    store: Arc<Store>,
+    pub store: Arc<Store>,
     provider: Arc<dyn Provider>,
     router: Arc<dyn Router>,
     tools: ToolRegistry,
@@ -3597,6 +3597,11 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                         self.store
                             .add_message(&self.id, mseq, Role::System, &block, None)?;
                         self.transcript.push(Message::system(&block));
+                        // Emit a one-line presenter note so the user sees recall happened.
+                        self.presenter.emit(PresenterEvent::Warning(format!(
+                            "💭 recalled {} memories from past sessions",
+                            mems.len()
+                        )));
                     }
                 }
             }

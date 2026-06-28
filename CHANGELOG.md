@@ -6,7 +6,14 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
-## [1.4.1] - 2026-06-28
+## [1.5.0] - 2026-06-28
+
+### Added
+- **`/remember` and `/memories` in-session commands.** `/remember <text>` saves a durable memory for
+  the current project on the spot (explicit curation alongside the automatic end-of-turn capture);
+  `/memories` lists what Forge knows about the project. The start-of-session recall now also prints a
+  one-line "💭 recalled N memories from past sessions" note so it's visible. Builds on the v1.4.0
+  auto-memory system. *(Built by Forge itself via the mesh — dogfooding.)*
 
 ### Improved
 - **`edit_file` failures are now self-correcting instead of churning.** When `old` doesn't match

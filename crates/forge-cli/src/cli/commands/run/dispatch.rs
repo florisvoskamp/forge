@@ -690,6 +690,48 @@ and keep going."
             };
             return Ok(DispatchOutcome::ToggleRemote { exposure });
         }
+        // `/remember <text>` — save a durable memory for this project.
+        CommandAction::Remember(text) => {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                app.note("usage: /remember <text>");
+            } else {
+                let scope = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "global".to_string());
+                let session_id = {
+                    let s = session.lock().await;
+                    s.id().to_string()
+                };
+                let s = session.lock().await;
+                match s.store.add_memory(&scope, "fact", &text, &session_id) {
+                    Ok(_) => app.note(&format!("💭 remembered: {text}")),
+                    Err(e) => app.note(&format!("⚠ failed to remember: {e}")),
+                }
+            }
+        }
+        // `/memories` — list this project's memories.
+        CommandAction::Memories => {
+            let scope = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "global".to_string());
+            let s = session.lock().await;
+            match s.store.list_memories(&scope) {
+                Ok(mems) if mems.is_empty() => app.note("no memories yet"),
+                Ok(mems) => {
+                    app.note(&format!("{} memories:", mems.len()));
+                    for m in mems {
+                        app.note(&format!(
+                            "  {}  [{}] {}",
+                            &m.id[..m.id.len().min(8)],
+                            m.kind,
+                            m.text
+                        ));
+                    }
+                }
+                Err(e) => app.note(&format!("⚠ failed to list memories: {e}")),
+            }
+        }
         // Not a builtin → try the file-based command/skill catalog.
         CommandAction::Unknown(_) => {
             return dispatch_catalog(line, catalog, session, app, armed, trust_project, busy).await

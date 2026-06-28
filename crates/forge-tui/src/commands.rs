@@ -141,6 +141,16 @@ pub const COMMANDS: &[Command] = &[
         usage: "/effort [low|medium|high|xhigh]",
     },
     Command {
+        name: "remember",
+        desc: "save a durable memory for this project",
+        usage: "/remember <text>",
+    },
+    Command {
+        name: "memories",
+        desc: "list this project's memories",
+        usage: "/memories",
+    },
+    Command {
         name: "clear",
         desc: "clear the screen (keep the session)",
         usage: "/clear",
@@ -239,6 +249,10 @@ pub enum CommandAction {
     Copy {
         nth: usize,
     },
+    /// Save a durable memory for this project (`/remember <text>`).
+    Remember(String),
+    /// List this project's memories (`/memories`).
+    Memories,
     Quit,
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
@@ -512,6 +526,8 @@ pub fn parse_command(line: &str) -> CommandAction {
             CommandAction::Replay(id_a, id_b)
         }
         "effort" => CommandAction::SetEffort((!arg.is_empty()).then_some(arg)),
+        "remember" => CommandAction::Remember(arg.to_string()),
+        "memories" => CommandAction::Memories,
         "copy" | "yank" => {
             // `/copy` → last response; `/copy N` → Nth-latest. Non-numeric / <1 args fall back to 1.
             let nth = arg
@@ -867,6 +883,15 @@ mod tests {
         assert_eq!(parse_command("/execute"), CommandAction::Execute);
         assert_eq!(parse_command("/approve"), CommandAction::Execute);
         assert_eq!(parse_command("/go"), CommandAction::Execute);
+    }
+
+    #[test]
+    fn parses_remember_and_memories_commands() {
+        assert_eq!(
+            parse_command("/remember tabs not spaces"),
+            CommandAction::Remember("tabs not spaces".into())
+        );
+        assert_eq!(parse_command("/memories"), CommandAction::Memories);
     }
 
     #[test]
