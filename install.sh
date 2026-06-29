@@ -32,7 +32,8 @@ case "$os" in
   Linux)
     case "$arch" in
       x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
-      *) err "unsupported Linux arch: $arch (prebuilt binaries: x86_64). Build from source: cargo install --path crates/forge-cli" ;;
+      arm64|aarch64) target="aarch64-unknown-linux-gnu" ;;
+      *) err "unsupported Linux arch: $arch (prebuilt binaries: x86_64, aarch64). Build from source: cargo install --path crates/forge-cli" ;;
     esac ;;
   Darwin)
     case "$arch" in

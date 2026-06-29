@@ -6,6 +6,14 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.8.4] - 2026-06-30
+
+### Added
+- **Linux aarch64 (ARM64) prebuilt binary.** Release now ships `forge-aarch64-unknown-linux-gnu.tar.gz`
+  built on a native `ubuntu-24.04-arm` runner. The one-line installer (`curl … | sh`) now
+  auto-selects the ARM64 binary on Linux ARM hosts. (`install.sh`,
+  `.github/workflows/release.yml`)
+
 ## [1.8.3] - 2026-06-29
 
 ### Added
