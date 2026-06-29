@@ -910,6 +910,19 @@ impl Store {
         Ok(row.map(|w| w.max(0) as u32))
     }
 
+    /// Every known context-window size: `model -> tokens`. Fed into the mesh router so it can skip
+    /// models whose window is smaller than the current transcript.
+    pub fn all_model_contexts(&self) -> Result<std::collections::HashMap<String, u32>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT model, window FROM model_context")?;
+        let map = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .filter_map(|r| r.ok())
+            .map(|(model, w)| (model, w.max(0) as u32))
+            .collect();
+        Ok(map)
+    }
+
     /// Persist a model's fetched USD price (per 1k tokens), from a provider's model API. Upsert so a
     /// later discovery refreshes it. `cache_read_per_1k` is the discounted prompt-cache-read rate
     /// (None if the provider didn't report one).

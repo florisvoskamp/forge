@@ -302,7 +302,13 @@ fn models_provider_view_heading_has_counts_and_rows_per_provider() {
 fn models_for_provider_lists_models_with_badges() {
     let cat = models_catalog();
     let pricing = forge_mesh::pricing::Pricing::default();
-    let (heading, rows) = models_for_provider(&cat, &pricing, &Default::default(), "groq");
+    let (heading, rows) = models_for_provider(
+        &cat,
+        &pricing,
+        &Default::default(),
+        &Default::default(),
+        "groq",
+    );
     assert!(heading.contains("groq") && heading.contains("esc: back"));
     assert_eq!(rows.len(), 2);
     // model rows carry the full id (so Enter on them is a no-op, not a drill) + badges.
@@ -311,7 +317,13 @@ fn models_for_provider_lists_models_with_badges() {
     assert!(frontier.subtitle.contains("frontier") && frontier.subtitle.contains("free"));
     // The subscription bridge shows its named alias; the bare `claude-cli::` default-model
     // entry is hidden (it was confusingly empty in the browser).
-    let (_, sub) = models_for_provider(&cat, &pricing, &Default::default(), "claude-cli");
+    let (_, sub) = models_for_provider(
+        &cat,
+        &pricing,
+        &Default::default(),
+        &Default::default(),
+        "claude-cli",
+    );
     assert!(!sub.is_empty(), "named cli models shown");
     assert!(
         sub.iter().all(|r| r.id != "claude-cli::"),

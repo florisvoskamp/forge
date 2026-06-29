@@ -161,83 +161,29 @@ const NOMINAL_INPUT_TOKENS: u64 = 1000;
 const NOMINAL_OUTPUT_TOKENS: u64 = 500;
 
 /// A conservative context window (tokens) assumed for a model we have NO better figure for —
-/// neither a fetched window (provider API) nor a family match in [`context_limit`]. 32k is the
-/// common floor for modern chat models, so trimming a transcript to this rarely overflows an
+/// neither a fetched window (provider API) nor a hardcoded bridge value in [`context_limit`]. 32k
+/// is the common floor for modern chat models, so trimming a transcript to this rarely overflows an
 /// unknown model while still letting a real turn through. Used by the core to bound what it sends.
 pub const CONSERVATIVE_CONTEXT_WINDOW: u32 = 32_000;
 
 /// The context-window size (in tokens) for a model id, or `None` when we don't have a
-/// well-established figure. Matched by family substring on the id (after any `provider::`), with a
-/// provider fallback for the subscription bridges (whose bare ids carry no model name). This is the
-/// *heuristic* layer: a fetched per-model window (provider API, persisted in the store) should take
-/// precedence — see the core's effective-window lookup. Returns `None` for a truly unknown model so
-/// the statusline can omit a fabricated denominator; the core falls back to
+/// well-established figure. Only used as a last-resort fallback for subscription CLI bridges whose
+/// model list can't be queried via an API; all other models should have their windows fetched from
+/// the provider's model endpoint and persisted via `context_windows::fetch_and_persist`. Returns
+/// `None` for non-bridge models so the statusline omits a fabricated denominator; the core falls
+/// back to
 /// [`CONSERVATIVE_CONTEXT_WINDOW`] only when it must actually bound a request.
 pub fn context_limit(model: &str) -> Option<u32> {
-    let provider = model.split("::").next().unwrap_or("");
-    let m = model.rsplit("::").next().unwrap_or(model).to_lowercase();
-    let has = |s: &str| m.contains(s);
-    // GPT-5 generation (incl. Codex gpt-5.x) ships a 272k context window.
-    let gpt5 = has("gpt-5");
-    // Older OpenAI reasoning families at 256k.
-    let frontier_256k = has("o1") || has("o3") || has("o4");
-    // 128k is the modern default for most capable open / hosted models.
-    let mid_128k = has("gpt-4o")
-        || has("gpt-4.1")
-        || has("gpt-4")
-        || has("gpt-oss")
-        || has("llama-4")
-        || has("llama4")
-        || has("llama-3")
-        || has("llama3")
-        || has("glm")
-        || has("kimi")
-        || has("phi")
-        || has("command")
-        || has("cohere")
-        || has("nemotron")
-        || has("grok")
-        || has("nova")
-        || has("minimax")
-        || has("mimo");
-    let limit = if has("opus") {
-        // Claude Opus 4.x supports a 1M-token context window.
-        1_000_000
-    } else if has("sonnet") || has("haiku") || has("claude") {
-        // Sonnet / Haiku (and any other Claude) are 200k.
-        200_000
-    } else if has("gemini") {
-        1_000_000
-    } else if gpt5 {
-        // GPT-5 generation (incl. Codex gpt-5.x).
-        272_000
-    } else if frontier_256k {
-        256_000
-    } else if mid_128k {
-        128_000
-    } else if has("deepseek") {
-        // DeepSeek V2/V3/V4 all ship with a 128k context window.
-        128_000
-    } else if has("qwen") || has("mistral") || has("mixtral") {
-        32_000
-    } else if has("gemma") {
-        // Gemma 2/3/4 have a 128k context window (early Gemma 1 was 8k but is not in the mesh).
-        128_000
-    } else {
-        // The subscription bridges carry no model name in their bare id (`claude-cli::`), so match
-        // on the provider. The bare id is the CLI's default model; the mesh routes to the explicit
-        // `::opus` / `::sonnet` aliases (matched above) for sizing, so a conservative 200k for the
-        // ambiguous bare Claude id is safe. Codex runs GPT-5 (272k).
-        match provider {
-            "claude-cli" => 200_000,
-            "codex-cli" => 272_000,
-            // agy runs Gemini (≈1M-token window). The bare `agy-cli::` id is the CLI default;
-            // explicit `::gemini-3.1-pro`/`gemini-3.5-flash` aliases resolve via the name branches.
-            "agy-cli" => 1_000_000,
-            _ => return None,
-        }
-    };
-    Some(limit)
+    // Subscription CLI bridges carry no queryable API — their windows are hardcoded here.
+    // All other providers must have their windows fetched from the provider's model endpoint
+    // and persisted via `context_windows::fetch_and_persist`; `None` here tells the core to
+    // use the DB-stored fetched value or fall back to `CONSERVATIVE_CONTEXT_WINDOW`.
+    match model.split("::").next().unwrap_or("") {
+        "claude-cli" => Some(200_000),
+        "codex-cli" => Some(272_000),
+        "agy-cli" => Some(1_000_000),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -269,34 +215,20 @@ mod tests {
     }
 
     #[test]
-    fn context_limit_known_families_and_none_for_unknown() {
-        // Opus is 1M; Sonnet/Haiku stay at 200k.
-        assert_eq!(context_limit("anthropic::claude-opus-4-8"), Some(1_000_000));
-        assert_eq!(context_limit("anthropic::claude-sonnet-4-6"), Some(200_000));
-        assert_eq!(context_limit("anthropic::claude-haiku-4-5"), Some(200_000));
-        assert_eq!(context_limit("gemini::gemini-2.5-pro"), Some(1_000_000));
-        assert_eq!(context_limit("openai::gpt-4o"), Some(128_000));
-        assert_eq!(context_limit("openai::gpt-5.5"), Some(272_000));
-        // Common free families now have conservative figures so the core can bound a turn.
-        assert_eq!(
-            context_limit("openrouter::qwen/qwen3-coder:free"),
-            Some(32_000)
-        );
-        assert_eq!(
-            context_limit("openrouter::openai/gpt-oss-120b:free"),
-            Some(128_000)
-        );
-        assert_eq!(
-            context_limit("openrouter::nvidia/nemotron-3-nano-30b-a3b:free"),
-            Some(128_000)
-        );
-        // Explicit bridge aliases resolve by model name: opus → 1M, sonnet → 200k.
-        assert_eq!(context_limit("claude-cli::opus"), Some(1_000_000));
-        assert_eq!(context_limit("claude-cli::sonnet"), Some(200_000));
-        // Bare bridge id (no model name) → conservative provider default; Codex → GPT-5 (272k).
+    fn context_limit_only_cli_bridges_everything_else_none() {
+        // CLI bridges can't be queried via API — windows are hardcoded here only.
         assert_eq!(context_limit("claude-cli::"), Some(200_000));
+        assert_eq!(context_limit("claude-cli::opus"), Some(200_000));
+        assert_eq!(context_limit("codex-cli::"), Some(272_000));
         assert_eq!(context_limit("codex-cli::gpt-5.5"), Some(272_000));
-        // A truly unknown model → None (the gauge shows used tokens, no fake denominator).
+        assert_eq!(context_limit("agy-cli::"), Some(1_000_000));
+        // All non-bridge models return None — their windows come from DB (fetch_and_persist).
+        assert_eq!(context_limit("anthropic::claude-opus-4-8"), None);
+        assert_eq!(context_limit("gemini::gemini-2.5-pro"), None);
+        assert_eq!(context_limit("openai::gpt-4o"), None);
+        assert_eq!(context_limit("openrouter::qwen/qwen3-coder:free"), None);
+        assert_eq!(context_limit("nvidia::meta/llama-3.1-405b-instruct"), None);
+        assert_eq!(context_limit("groq::llama-3.3-70b-versatile"), None);
         assert_eq!(context_limit("ollama::some-local-model"), None);
     }
 

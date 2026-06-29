@@ -31,6 +31,9 @@ pub struct BudgetState {
     pub monthly_cap_usd: Option<f64>,
     /// Fraction of a cap at which to warn (e.g. 0.8 = 80%).
     pub warn_fraction: f64,
+    /// Minimum context window (in tokens) required for the selected model. When set, models whose
+    /// known window is smaller than this value are skipped during routing.
+    pub min_context_tokens: Option<u32>,
 }
 
 impl Default for BudgetState {
@@ -43,6 +46,7 @@ impl Default for BudgetState {
             spent_month_usd: 0.0,
             monthly_cap_usd: None,
             warn_fraction: DEFAULT_WARN_FRACTION,
+            min_context_tokens: None,
         }
     }
 }
@@ -266,6 +270,9 @@ pub struct HeuristicRouter {
     /// Live catalog of usable models (auto-discovery). When present and `mesh.auto_discover` is
     /// on, the router ranks the best discovered model per tier instead of the configured lists.
     catalog: Option<ModelCatalog>,
+    /// Known context-window sizes (model id → token count). Used to filter out models that
+    /// cannot fit the current transcript during routing.
+    context_windows: std::collections::HashMap<String, u32>,
 }
 
 fn default_model_available(model: &str) -> bool {
@@ -307,6 +314,16 @@ impl RouteHints {
             seed: catalog::stable_hash(prompt),
         }
     }
+}
+
+/// Scale the minimum required context window by the active effort level. HIGH effort inflates it
+/// by 1.5×, XHIGH by 2×. No adjustment for Low/Medium or when no minimum is set.
+fn effective_min_context(min_tokens: Option<u32>, effort: Option<EffortLevel>) -> Option<u32> {
+    min_tokens.map(|t| match effort {
+        Some(EffortLevel::High) => t.saturating_mul(3) / 2,
+        Some(EffortLevel::XHigh) => t.saturating_mul(2),
+        _ => t,
+    })
 }
 
 /// Whether a prompt reads as a coding task (code fences, code tokens, or a dev-action verb) — the
@@ -429,6 +446,7 @@ impl HeuristicRouter {
             model_available: default_model_available,
             pricing,
             catalog: None,
+            context_windows: std::collections::HashMap::new(),
         }
     }
 
@@ -442,6 +460,22 @@ impl HeuristicRouter {
     pub fn with_catalog(mut self, catalog: ModelCatalog) -> Self {
         self.catalog = Some(catalog);
         self
+    }
+
+    /// Attach known context-window sizes so the router can skip models that can't fit the
+    /// current transcript.
+    pub fn with_context_windows(mut self, windows: std::collections::HashMap<String, u32>) -> Self {
+        self.context_windows = windows;
+        self
+    }
+
+    /// Returns `true` when `model`'s known context window comfortably exceeds `min_tokens`.
+    /// Models with no recorded window are assumed to fit (fail-open).
+    fn context_fits(&self, model: &str, min_tokens: Option<u32>) -> bool {
+        let Some(min) = min_tokens else {
+            return true;
+        };
+        self.context_windows.get(model).is_none_or(|&w| w > min)
     }
 
     /// Whether auto-discovery routing is active (enabled + a non-empty catalog attached).
@@ -581,12 +615,15 @@ impl HeuristicRouter {
         hints: RouteHints,
         quota: &SubscriptionQuota,
         effort: Option<EffortLevel>,
+        min_context: Option<u32>,
     ) -> Vec<String> {
         let candidates = self.candidates_for_tier(tier, hints, quota, effort);
+        let min = effective_min_context(min_context, effort);
         let mut usable: Vec<String> = candidates
             .iter()
             .filter(|m| self.is_usable(m, health, quota))
             .filter(|m| self.allowed_under_credit_mode(m))
+            .filter(|m| self.context_fits(m, min))
             .cloned()
             .collect();
         if !self.auto_active() {
@@ -615,13 +652,15 @@ impl HeuristicRouter {
         hints: RouteHints,
         quota: &SubscriptionQuota,
         effort: Option<EffortLevel>,
+        min_context: Option<u32>,
     ) -> Vec<String> {
-        let mut chain = self.ordered_usable_for_tier(routed, health, hints, quota, effort);
+        let mut chain =
+            self.ordered_usable_for_tier(routed, health, hints, quota, effort, min_context);
         for tier in [TaskTier::Complex, TaskTier::Standard, TaskTier::Trivial] {
             if tier == routed {
                 continue;
             }
-            for m in self.ordered_usable_for_tier(tier, health, hints, quota, effort) {
+            for m in self.ordered_usable_for_tier(tier, health, hints, quota, effort, min_context) {
                 if !chain.contains(&m) {
                     chain.push(m);
                 }
@@ -664,6 +703,7 @@ impl HeuristicRouter {
     ) -> RoutingDecision {
         let exhausted = budget.status() == BudgetStatus::Exhausted;
         let bg_override_pin = self.config.mesh.budget.cap_overrides_pin;
+        let min_context = budget.min_context_tokens;
 
         // A pin bypasses classification unless an exhausted budget may override it.
         if let Some(pin) = self
@@ -674,7 +714,8 @@ impl HeuristicRouter {
             let mut why = "pinned via --model".to_string();
             // Fallbacks even for a pin: if the pinned model is rate-limited/down mid-turn we
             // still want to keep working.
-            let mut chain = self.build_chain(classified_tier, health, hints, quota, effort);
+            let mut chain =
+                self.build_chain(classified_tier, health, hints, quota, effort, min_context);
             let model = if self.is_usable(pin, health, quota) {
                 pin.clone()
             } else {
@@ -717,8 +758,9 @@ impl HeuristicRouter {
         // `routed_usable` lets us tell a same-tier pick (normal rationale) from a cross-tier
         // fallback ("fell back …") for the message.
         let auto = self.auto_active();
-        let routed_usable = self.ordered_usable_for_tier(tier, health, hints, quota, effort);
-        let mut chain = self.build_chain(tier, health, hints, quota, effort);
+        let routed_usable =
+            self.ordered_usable_for_tier(tier, health, hints, quota, effort, min_context);
+        let mut chain = self.build_chain(tier, health, hints, quota, effort, min_context);
         match chain.first().cloned() {
             Some(model) => {
                 if routed_usable.contains(&model) {
@@ -858,7 +900,7 @@ mod tests {
             .into_iter()
             .filter(|m| r.is_usable(m, &health, &quota))
             .collect();
-        let chain = r.ordered_usable_for_tier(tier, &health, hints, &quota, None);
+        let chain = r.ordered_usable_for_tier(tier, &health, hints, &quota, None, None);
         assert_eq!(
             chain, ranked_usable,
             "failover order must equal mesh rank order with no provider interleaving"
@@ -888,7 +930,7 @@ mod tests {
             SubscriptionQuota::default(),
             RouteHints::default(),
         );
-        let chain = strict.build_chain(TaskTier::Standard, &health, hints, &quota, None);
+        let chain = strict.build_chain(TaskTier::Standard, &health, hints, &quota, None, None);
         // Paid, metered model is gone from the WHOLE chain (primary + every failover step).
         assert!(
             !chain.iter().any(|m| m == "gemini::gemini-2.5-pro"),
@@ -906,7 +948,8 @@ mod tests {
 
         // Control: under Normal (default) the paid model stays in the chain.
         let normal = mixed_router();
-        let normal_chain = normal.build_chain(TaskTier::Standard, &health, hints, &quota, None);
+        let normal_chain =
+            normal.build_chain(TaskTier::Standard, &health, hints, &quota, None, None);
         assert!(
             normal_chain.iter().any(|m| m == "gemini::gemini-2.5-pro"),
             "normal mode keeps paid models routable"
@@ -1510,6 +1553,7 @@ mod tests {
             spent_month_usd: 80.0,
             monthly_cap_usd: Some(80.0),
             warn_fraction: DEFAULT_WARN_FRACTION,
+            min_context_tokens: None,
         };
         assert_eq!(b.status(), BudgetStatus::Exhausted);
     }

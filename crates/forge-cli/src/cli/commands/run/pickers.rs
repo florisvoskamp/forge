@@ -1,5 +1,14 @@
 use super::*;
 
+/// Format a context-window size as a human-readable badge (e.g. "128k ctx", "1M ctx").
+fn fmt_ctx(w: u32) -> String {
+    if w >= 1_000_000 {
+        format!("{}M ctx", w / 1_000_000)
+    } else {
+        format!("{}k ctx", w / 1_000)
+    }
+}
+
 /// Offer, on resuming a previously-compacted session, whether the MODEL should continue with the
 /// compacted context (fast, fits) or re-read the full original history. Either way the user already
 /// sees the full conversation in scrollback. Resolved in `picker_accept`.
@@ -159,6 +168,7 @@ pub(crate) fn models_for_provider(
     cat: &forge_mesh::ModelCatalog,
     pricing: &forge_mesh::pricing::Pricing,
     benched: &forge_types::ModelHealth,
+    ctx: &std::collections::HashMap<String, u32>,
     provider: &str,
 ) -> (String, Vec<forge_tui::PickerRow>) {
     let rows: Vec<forge_tui::PickerRow> = cat
@@ -192,6 +202,9 @@ pub(crate) fn models_for_provider(
                     if benched.is_benched(&m.id) {
                         badges.push("benched".into());
                     }
+                    if let Some(&w) = ctx.get(&m.id) {
+                        badges.push(fmt_ctx(w));
+                    }
                     forge_tui::PickerRow {
                         id: m.id.clone(),
                         title: name,
@@ -214,7 +227,9 @@ pub(crate) async fn open_model_pin_picker(
     app: &mut forge_tui::App,
     query: &str,
 ) -> Result<()> {
-    let benched = open_store()?.current_benched().unwrap_or_default();
+    let store = open_store()?;
+    let benched = store.current_benched().unwrap_or_default();
+    let ctx = store.all_model_contexts().unwrap_or_default();
     let rows_opt: Option<Vec<forge_tui::PickerRow>> = {
         let s = session.lock().await;
         s.catalog().map(|cat| {
@@ -260,6 +275,7 @@ pub(crate) async fn open_model_pin_picker(
                     badges.push("benched");
                 }
                 let cost_str;
+                let ctx_str;
                 let mut sub = badges.join(" · ");
                 if m.cost > 1e-9 {
                     cost_str = format!("~${:.4}/turn", m.cost);
@@ -267,6 +283,13 @@ pub(crate) async fn open_model_pin_picker(
                         sub.push_str(" · ");
                     }
                     sub.push_str(&cost_str);
+                }
+                if let Some(&w) = ctx.get(&m.id) {
+                    ctx_str = fmt_ctx(w);
+                    if !sub.is_empty() {
+                        sub.push_str(" · ");
+                    }
+                    sub.push_str(&ctx_str);
                 }
                 rows.push(forge_tui::PickerRow {
                     id: m.id,
@@ -345,11 +368,13 @@ pub(crate) async fn open_models_provider(
     app: &mut forge_tui::App,
     provider: &str,
 ) -> Result<()> {
-    let benched = open_store()?.current_benched().unwrap_or_default();
+    let store = open_store()?;
+    let benched = store.current_benched().unwrap_or_default();
+    let ctx = store.all_model_contexts().unwrap_or_default();
     let view = {
         let s = session.lock().await;
         s.catalog()
-            .map(|c| models_for_provider(c, s.pricing(), &benched, provider))
+            .map(|c| models_for_provider(c, s.pricing(), &benched, &ctx, provider))
     };
     if let Some((heading, rows)) = view {
         app.models_drilled = Some(provider.to_string());

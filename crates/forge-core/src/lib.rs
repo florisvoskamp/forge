@@ -1749,6 +1749,7 @@ impl Session {
             spent_month_usd: month,
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
+            min_context_tokens: None,
         }
     }
 
@@ -2248,6 +2249,7 @@ Rules:\n\
             spent_month_usd: self.store.spend_this_month_usd()?,
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
+            min_context_tokens: None,
         };
         let health = self.store.current_benched().unwrap_or_default();
         let quota = self.live_quota();
@@ -2356,6 +2358,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             spent_month_usd: self.store.spend_this_month_usd().unwrap_or(0.0),
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
+            min_context_tokens: None,
         };
         if budget.status() == BudgetStatus::Exhausted {
             return None;
@@ -2444,6 +2447,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             spent_month_usd: self.store.spend_this_month_usd().unwrap_or(0.0),
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
+            min_context_tokens: None,
         };
         if budget.status() == BudgetStatus::Exhausted {
             return;
@@ -2534,6 +2538,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             spent_month_usd: self.store.spend_this_month_usd().unwrap_or(0.0),
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
+            min_context_tokens: None,
         };
         if budget.status() == BudgetStatus::Exhausted {
             return;
@@ -3666,6 +3671,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             spent_month_usd: spent_month,
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
+            min_context_tokens: Some(self.estimated_transcript_tokens() as u32),
         };
         let status = budget.status();
 
@@ -5036,6 +5042,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             spent_month_usd: self.store.spend_this_month_usd()?,
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
+            min_context_tokens: None,
         };
 
         let agents = Arc::new(forge_config::load_agents(std::path::Path::new(

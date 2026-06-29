@@ -205,7 +205,12 @@ pub(crate) async fn build_session_with(
         }
     }
 
-    let (provider, router) = build_provider_and_router(&config, mock, pin, catalog.clone());
+    let ctx_windows = crate::open_store()
+        .ok()
+        .and_then(|s| s.all_model_contexts().ok())
+        .unwrap_or_default();
+    let (provider, router) =
+        build_provider_and_router(&config, mock, pin, catalog.clone(), ctx_windows);
 
     // Build the code-intelligence index up front so it can be shared between the model-facing
     // `lattice` tool and the turn's auto-injection (code-intelligence.md). Cheap to construct; it

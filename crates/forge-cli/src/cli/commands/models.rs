@@ -50,6 +50,7 @@ pub(crate) fn build_provider_and_router(
     mock: bool,
     pin: Option<String>,
     catalog: Option<forge_mesh::ModelCatalog>,
+    context_windows: std::collections::HashMap<String, u32>,
 ) -> (Arc<dyn Provider>, Arc<dyn Router>) {
     let provider: Arc<dyn Provider> = if mock {
         Arc::new(MockProvider)
@@ -62,7 +63,9 @@ pub(crate) fn build_provider_and_router(
                 .with_max_output_tokens(config.mesh.effective_max_output_tokens()),
         )
     };
-    let mut heuristic = HeuristicRouter::new(config.clone()).with_pin(pin);
+    let mut heuristic = HeuristicRouter::new(config.clone())
+        .with_pin(pin)
+        .with_context_windows(context_windows);
     if let Some(cat) = catalog {
         heuristic = heuristic.with_catalog(cat);
     }
@@ -491,6 +494,7 @@ pub(crate) async fn mesh_explain(prompt: String, json: bool) -> Result<()> {
         spent_month_usd: store.spend_this_month_usd().unwrap_or(0.0),
         monthly_cap_usd: config.mesh.monthly_cap_usd,
         warn_fraction: config.mesh.warn_threshold,
+        min_context_tokens: None,
     };
     let router = HeuristicRouter::new(config.clone()).with_catalog(cat.clone());
 
