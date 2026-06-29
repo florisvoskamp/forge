@@ -313,6 +313,7 @@ impl ServerHandler for ForgeAgentServer {
                             tool_calls.push(name.clone());
                         }
                         if let Some(notification) = event_notification(&event) {
+                            #[allow(deprecated)]
                             let _ = peer.notify_logging_message(notification).await;
                         }
                         if let Some(le) = crate::live_observer::to_live_event(&event) {
@@ -475,6 +476,7 @@ impl ServerHandler for ForgeAgentServer {
                 let notify_task = tokio::spawn(async move {
                     while let Some(event) = rx.recv().await {
                         if let Some(notification) = event_notification(&event) {
+                            #[allow(deprecated)]
                             let _ = peer.notify_logging_message(notification).await;
                         }
                         if let Some(le) = crate::live_observer::to_live_event(&event) {
