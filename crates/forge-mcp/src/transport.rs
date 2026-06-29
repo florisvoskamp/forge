@@ -27,8 +27,15 @@ pub async fn serve(server: &McpServerConfig) -> Result<RunningService<RoleClient
             ) {
                 cmd.env(var, token);
             }
-            let transport =
-                TokioChildProcess::new(cmd).map_err(|e| format!("spawn '{command}': {e}"))?;
+            // Use the builder so stderr is explicitly nulled. TokioChildProcess::new() routes
+            // through TokioChildProcessBuilder which defaults to Stdio::inherit() and overrides
+            // any cmd.stderr() we set before spawning — causing MCP server startup messages
+            // (written to stderr) to reach the raw-mode terminal and corrupt the TUI.
+            let transport = TokioChildProcess::builder(cmd)
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map(|(t, _)| t)
+                .map_err(|e| format!("spawn '{command}': {e}"))?;
             ().serve(transport)
                 .await
                 .map_err(|e| format!("initialize: {e}"))
@@ -101,9 +108,6 @@ fn stdio_command(command: &str, args: &[String]) -> tokio::process::Command {
     }
     let mut cmd = tokio::process::Command::new(command);
     cmd.args(args);
-    // MCP stdio protocol uses stdin/stdout only; null stderr so the child's startup
-    // output doesn't corrupt the TUI (raw mode + insert_before can't handle it).
-    cmd.stderr(std::process::Stdio::null());
     cmd
 }
 
