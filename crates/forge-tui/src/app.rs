@@ -4354,13 +4354,21 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
         // once it ends — like the per-response readout in Claude Code / Codex.
         let show_turn = app.busy || app.turn_ran;
         if show_turn {
-            line2.push(Span::styled(
+            // CLI bridge models (agy-cli, codex-cli, claude-cli) don't report API token usage;
+            // suppress the ↑/↓ counts when both are zero to avoid showing stale "↑0 ↓0".
+            let has_token_data = app.turn_in > 0 || app.turn_out > 0;
+            let turn_label = if has_token_data {
                 format!(
                     "⧖ {} ↑{} ↓{}",
                     fmt_dur(app.turn_elapsed_secs),
                     human(app.turn_in),
                     human(app.turn_out)
-                ),
+                )
+            } else {
+                format!("⧖ {}", fmt_dur(app.turn_elapsed_secs))
+            };
+            line2.push(Span::styled(
+                turn_label,
                 Style::default()
                     .fg(if app.busy { ACCENT } else { DIM })
                     .bg(STATUSBG),
@@ -4376,7 +4384,10 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
         }
         // Session running totals last (least critical — the per-turn figures are above): if the row
         // is too narrow this is what gets clipped, not the gauge.
-        if app.session_in > 0 || app.session_out > 0 {
+        // Only show when session differs from turn delta: on the first turn turn_base_in=0 so
+        // turn_in == session_in — showing both would be identical, useless duplication.
+        let session_differs = app.session_in != app.turn_in || app.session_out != app.turn_out;
+        if (app.session_in > 0 || app.session_out > 0) && (!show_turn || session_differs) {
             if line2.len() > 1 {
                 line2.push(sep());
             }
