@@ -6,6 +6,27 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-06-29
+
+### Added
+- **Context-window-aware mesh routing.** The router now filters models whose stored context
+  window is smaller than the current transcript token count, preventing routes to models that
+  would overflow mid-turn. Fail-open: models with no stored window pass through and the
+  conservative 32k floor still guards transcript trimming. (`crates/forge-mesh/src/lib.rs`,
+  `crates/forge-mesh/src/pricing.rs`)
+- **Effort multiplier for context-window selection.** HIGH effort inflates the minimum context
+  requirement by 1.5×; XHIGH/Max by 2×, so large-output turns prefer models with sufficient
+  headroom for extended thinking chains. (`crates/forge-mesh/src/lib.rs`)
+- **Dynamic context-window fetch for Groq + all custom providers.** Context windows are now
+  fetched from Groq's `/openai/v1/models` and every configured custom OpenAI-compatible
+  endpoint (NVIDIA NIM, Cerebras, SambaNova, …) at session start and persisted to the store.
+  All hardcoded family heuristics stripped from `context_limit()` — only CLI bridges remain
+  (no queryable API). (`crates/forge-cli/src/context_windows.rs`,
+  `crates/forge-mesh/src/pricing.rs`)
+- **Context-window badge in model pickers.** `/model` pin picker and `/models` provider
+  drill-in now show "128k ctx", "32k ctx" etc. per model row, read from the persisted store.
+  (`crates/forge-cli/src/cli/commands/run/pickers.rs`)
+
 ## [1.8.1] - 2026-06-29
 
 ### Added
