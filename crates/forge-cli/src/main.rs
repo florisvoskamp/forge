@@ -13,7 +13,8 @@ use forge_types::TaskTier;
 
 pub(crate) use cli::args::{
     AssayCmd, AssayFormat, BenchCmd, Cli, Command, ExportScope, FailOnSeverity, GitCmd,
-    ImportSource, LatticeOp, LocalCmd, McpCmd, Mode, SelfMcpAction, SkillCmd, SkillScope,
+    ImportSource, LatticeOp, LocalCmd, McpCmd, McpScopeArg, McpTransportArg, Mode, PluginCmd,
+    SelfMcpAction, SkillCmd, SkillScope,
 };
 pub(crate) use cli::commands::assay::{assay_cmd, spawn_assay};
 pub(crate) use cli::commands::git::{git_cmd, maybe_install_git_hook, write_active_model};
@@ -22,7 +23,7 @@ pub(crate) use cli::commands::lattice::lattice_cmd;
 pub(crate) use cli::commands::local::{
     auth, local_cmd, maybe_autostart_local, needs_onboarding, prompt_line, provider_label, setup,
 };
-pub(crate) use cli::commands::mcp::mcp_cmd;
+pub(crate) use cli::commands::mcp::{mcp_cmd, plugin_cmd};
 pub(crate) use cli::commands::memory::memory_cmd;
 pub(crate) use cli::commands::migrate::migrate_cmd;
 pub(crate) use cli::commands::models::{

@@ -373,6 +373,16 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: MigrateCmd,
     },
+    /// Manage Forge plugins (skill packs). Alias: `plugins`.
+    ///
+    /// Forge uses skills as its plugin model — `forge plugin install owner/repo` fetches all
+    /// `.md` skill files from a GitHub repository and installs them locally. The `list`
+    /// subcommand shows currently installed skill packs.
+    #[command(alias = "plugins")]
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
     /// Enable or disable Forge's self-MCP mode: a sub-Forge session started as an MCP server
     /// so the agent can call `forge_chat` / `forge_assay` as native tools (self-driving mode).
     #[command(name = "self")]
@@ -437,6 +447,18 @@ pub(crate) enum SelfMcpAction {
 
 #[derive(Subcommand)]
 pub(crate) enum SkillCmd {
+    /// Install a skill pack from a GitHub repository (owner/repo[@ref]) or HTTPS URL.
+    ///
+    /// Fetches every `.md` file from the repo root (or a `skills/` subdir if one exists) and
+    /// writes them into the user skills directory (`~/.config/forge/skills/`).
+    ///
+    /// Examples:
+    ///   forge skill install anthropics/forge-skills
+    ///   forge skill install anthropics/forge-skills@main
+    Install {
+        /// GitHub `owner/repo[@ref]` shorthand or a full HTTPS URL.
+        url: String,
+    },
     /// Distil a past session's transcript into a reusable Forge skill.
     ///
     /// Reads the persisted transcript of SESSION_ID, calls a cheap model to synthesise a
@@ -486,6 +508,18 @@ pub(crate) enum SkillCmd {
         /// Where to import: `user` (default) or `project` (`.forge/`).
         #[arg(long, default_value = "user")]
         scope: SkillScope,
+    },
+    /// Re-run path and binary normalization on all installed skills and commands in-place:
+    /// replaces legacy `~/.claude/` paths and `claude`/`codex` command references with their
+    /// Forge equivalents. Safe to run multiple times — only writes files that actually changed.
+    ///
+    /// Examples:
+    ///   forge skill normalize
+    ///   forge skill normalize --project
+    Normalize {
+        /// Normalize project-scope skills (`.forge/`) instead of the user config dir.
+        #[arg(long)]
+        project: bool,
     },
 }
 
@@ -623,6 +657,50 @@ pub(crate) enum MemoryCmd {
 
 #[derive(Subcommand)]
 pub(crate) enum McpCmd {
+    /// Add an MCP server to the config (compatible with `claude mcp add` / `codex mcp add`).
+    ///
+    /// Examples:
+    ///   forge mcp add myserver -- npx -y @scope/mcp-server
+    ///   forge mcp add myserver --transport http --url https://api.example.com/mcp
+    ///   forge mcp add myserver -e API_KEY=secret -- node server.js
+    Add {
+        /// Unique name for the server.
+        name: String,
+        /// Transport protocol.
+        #[arg(long, default_value = "stdio")]
+        transport: McpTransportArg,
+        /// Config scope: `local`/`project` → `.forge/mcp.toml`; `user` → `~/.config/forge/mcp.toml`.
+        #[arg(long, short = 's', default_value = "local")]
+        scope: McpScopeArg,
+        /// Environment variables to pass to the stdio process (KEY=VALUE).
+        #[arg(long, short = 'e', value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// HTTP headers to add to requests (KEY=VALUE).
+        #[arg(long, value_name = "KEY=VALUE")]
+        header: Vec<String>,
+        /// HTTP/SSE server URL (required for `--transport http` or `--transport sse`).
+        #[arg(long)]
+        url: Option<String>,
+        /// Environment variable holding the bearer token for auth.
+        #[arg(long, value_name = "ENV_VAR")]
+        bearer_token_env_var: Option<String>,
+        /// Command and arguments for stdio servers (everything after `--`).
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+    /// Remove an MCP server from the config.
+    Remove {
+        /// Server name to remove.
+        name: String,
+        /// Config scope to remove from.
+        #[arg(long, short = 's', default_value = "local")]
+        scope: McpScopeArg,
+    },
+    /// Show the config entry for one MCP server.
+    Get {
+        /// Server name to look up.
+        name: String,
+    },
     /// Expose a persistent Forge session as an MCP server on stdio, so another agent
     /// (Claude Code, another Forge) can drive it via `forge_chat` / `forge_status` /
     /// `forge_set_mode`. Add to `.mcp.json`: `{"forge": {"type":"stdio","command":"forge","args":["mcp","agent"]}}`.
@@ -653,6 +731,60 @@ pub(crate) enum McpCmd {
     Logout {
         /// Server name (as declared in `.forge/mcp.toml`).
         server: String,
+    },
+}
+
+#[derive(Clone, ValueEnum, Debug)]
+pub(crate) enum McpTransportArg {
+    Stdio,
+    Sse,
+    Http,
+}
+
+#[derive(Clone, ValueEnum, Debug)]
+pub(crate) enum McpScopeArg {
+    /// Current project's `.forge/mcp.toml` (same as `project`).
+    Local,
+    /// Current project's `.forge/mcp.toml`.
+    Project,
+    /// User-global config dir's `mcp.toml` (`~/.config/forge/mcp.toml`).
+    User,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum PluginMarketplaceCmd {
+    /// Add a marketplace source.
+    Add {
+        source: String,
+        #[arg(long, name = "ref")]
+        ref_: Option<String>,
+    },
+    /// List configured marketplace sources.
+    List,
+    /// Remove a marketplace source.
+    Remove { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum PluginCmd {
+    /// Install a skill pack from a GitHub repo or URL. Alias: `add`.
+    #[command(alias = "add")]
+    Install {
+        plugin: String,
+        #[arg(long)]
+        marketplace: Option<String>,
+    },
+    /// List installed skill packs.
+    List {
+        #[arg(long)]
+        available: bool,
+    },
+    /// Remove an installed skill pack.
+    Remove { plugin: String },
+    /// Manage plugin marketplaces.
+    Marketplace {
+        #[command(subcommand)]
+        cmd: PluginMarketplaceCmd,
     },
 }
 

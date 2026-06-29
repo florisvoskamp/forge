@@ -6,7 +6,7 @@ use crate::*;
 /// `forge mcp [tools <server> | import [path]]` — connect to the configured MCP servers and show
 /// their status, list one server's tools, or import servers from your installed AI CLIs.
 pub(crate) async fn mcp_cmd(cmd: Option<McpCmd>) -> Result<()> {
-    // Import / Login / Logout / Agent need no MCP connection. Resolve to the listing path otherwise.
+    // Most variants need no MCP connection. Resolve to the listing path otherwise.
     let tools_server = match cmd {
         Some(McpCmd::Agent { session, cwd }) => {
             return crate::mcp_agent::run(session, cwd).await;
@@ -14,6 +14,29 @@ pub(crate) async fn mcp_cmd(cmd: Option<McpCmd>) -> Result<()> {
         Some(McpCmd::Import { path }) => return mcp_import(path),
         Some(McpCmd::Login { server }) => return mcp_login(&server).await,
         Some(McpCmd::Logout { server }) => return mcp_logout(&server),
+        Some(McpCmd::Add {
+            name,
+            transport,
+            scope,
+            env,
+            header,
+            url,
+            bearer_token_env_var,
+            command,
+        }) => {
+            return mcp_add(
+                name,
+                transport,
+                scope,
+                env,
+                header,
+                url,
+                bearer_token_env_var,
+                command,
+            )
+        }
+        Some(McpCmd::Remove { name, scope }) => return mcp_remove(name, scope),
+        Some(McpCmd::Get { name }) => return mcp_get(name),
         Some(McpCmd::Tools { server }) => Some(server),
         None => None,
     };
@@ -437,6 +460,219 @@ pub(crate) fn url_decode(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// forge mcp add / remove / get
+// ---------------------------------------------------------------------------
+
+/// Resolve the mcp.toml path for a given scope.
+fn mcp_scope_path(scope: &McpScopeArg) -> Result<std::path::PathBuf> {
+    match scope {
+        McpScopeArg::Local | McpScopeArg::Project => {
+            Ok(std::path::PathBuf::from(".forge/mcp.toml"))
+        }
+        McpScopeArg::User => {
+            let dir = forge_config::config_dir()
+                .ok_or_else(|| anyhow::anyhow!("cannot resolve user config directory"))?;
+            Ok(dir.join("mcp.toml"))
+        }
+    }
+}
+
+/// `forge mcp add <name> [--transport stdio|sse|http] [--scope local|user|project] ...`
+///
+/// Adds a server entry to the chosen scope's `mcp.toml`. Secrets (bearer token env vars) are
+/// referenced by env-var name and never embedded in the TOML (ADR-0007).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mcp_add(
+    name: String,
+    transport: McpTransportArg,
+    scope: McpScopeArg,
+    env_vars: Vec<String>,
+    headers: Vec<String>,
+    url: Option<String>,
+    bearer_token_env_var: Option<String>,
+    command: Vec<String>,
+) -> Result<()> {
+    let path = mcp_scope_path(&scope)?;
+
+    // Parse KEY=VALUE env vars.
+    let mut env_map = std::collections::HashMap::new();
+    for kv in &env_vars {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--env must be KEY=VALUE, got: {kv}"))?;
+        env_map.insert(k.to_string(), v.to_string());
+    }
+
+    // Parse KEY=VALUE or KEY:VALUE headers.
+    let mut header_map = std::collections::HashMap::new();
+    for h in &headers {
+        let (k, v) = h
+            .split_once('=')
+            .or_else(|| h.split_once(':'))
+            .ok_or_else(|| anyhow::anyhow!("--header must be KEY=VALUE or KEY:VALUE, got: {h}"))?;
+        header_map.insert(k.to_string(), v.to_string());
+    }
+
+    let mcp_transport = match transport {
+        McpTransportArg::Stdio => {
+            let cmd = command
+                .first()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("stdio transport requires a COMMAND (pass it after --)")
+                })?
+                .clone();
+            let args = command[1..].to_vec();
+            forge_config::McpTransport::Stdio {
+                command: cmd,
+                args,
+                env: env_map,
+            }
+        }
+        McpTransportArg::Sse | McpTransportArg::Http => {
+            let u =
+                url.ok_or_else(|| anyhow::anyhow!("--url is required for HTTP/SSE transport"))?;
+            forge_config::McpTransport::Http {
+                url: u,
+                headers: header_map,
+            }
+        }
+    };
+
+    let auth = bearer_token_env_var.map(|env_var| forge_config::McpAuth {
+        token_env: Some(env_var),
+        token_keyring: None,
+        header: None,
+        oauth: None,
+    });
+
+    let server = forge_config::McpServerConfig {
+        name: name.clone(),
+        transport: mcp_transport,
+        auth,
+        enabled: true,
+    };
+
+    let mut config = forge_config::load_mcp_toml(&path);
+    if config.servers.iter().any(|s| s.name == name) {
+        anyhow::bail!(
+            "server '{name}' already exists in {}. Use `forge mcp remove {name} --scope {scope}` first.",
+            path.display(),
+            scope = match scope {
+                McpScopeArg::Local => "local",
+                McpScopeArg::Project => "project",
+                McpScopeArg::User => "user",
+            }
+        );
+    }
+    config.servers.push(server);
+    forge_config::write_mcp_toml(&path, &config)
+        .with_context(|| format!("writing {}", path.display()))?;
+    println!("✓ added server '{name}' to {}", path.display());
+    Ok(())
+}
+
+/// `forge mcp remove <name> [--scope local|user|project]`
+pub(crate) fn mcp_remove(name: String, scope: McpScopeArg) -> Result<()> {
+    let path = mcp_scope_path(&scope)?;
+    let mut config = forge_config::load_mcp_toml(&path);
+    let before = config.servers.len();
+    config.servers.retain(|s| s.name != name);
+    if config.servers.len() == before {
+        anyhow::bail!("no server '{name}' found in {}", path.display());
+    }
+    forge_config::write_mcp_toml(&path, &config)
+        .with_context(|| format!("writing {}", path.display()))?;
+    println!("✓ removed server '{name}' from {}", path.display());
+    Ok(())
+}
+
+/// `forge mcp get <name>` — prints the JSON config entry for a server found in any scope.
+pub(crate) fn mcp_get(name: String) -> Result<()> {
+    let mut paths = vec![std::path::PathBuf::from(".forge/mcp.toml")];
+    if let Some(dir) = forge_config::config_dir() {
+        paths.push(dir.join("mcp.toml"));
+    }
+
+    for path in &paths {
+        let config = forge_config::load_mcp_toml(path);
+        if let Some(server) = config.servers.iter().find(|s| s.name == name) {
+            let json = serde_json::to_string_pretty(server)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+            println!("{json}");
+            return Ok(());
+        }
+    }
+    anyhow::bail!("no server '{name}' found in local or user scope");
+}
+
+// ---------------------------------------------------------------------------
+// forge plugin
+// ---------------------------------------------------------------------------
+
+/// `forge plugin <install|list|remove|marketplace>` — plugin management (backed by skills).
+pub(crate) fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
+    match cmd {
+        PluginCmd::Install { plugin, .. } => {
+            println!(
+                "forge uses skills — run `forge skill install {plugin}` to install a skill pack."
+            );
+            println!("Plugin marketplace support coming soon.");
+        }
+        PluginCmd::List { available } => {
+            if available {
+                println!("Plugin marketplace support coming soon.");
+                return Ok(());
+            }
+            let skills_dir = forge_config::config_dir().map(|d| d.join("skills"));
+            match skills_dir.filter(|d| d.exists()) {
+                None => println!("no skills directory found"),
+                Some(d) => {
+                    let mut count = 0usize;
+                    if let Ok(entries) = std::fs::read_dir(&d) {
+                        let mut names: Vec<String> = entries
+                            .flatten()
+                            .filter_map(|e| e.file_name().into_string().ok())
+                            .collect();
+                        names.sort();
+                        for name in &names {
+                            println!("{name}");
+                            count += 1;
+                        }
+                    }
+                    if count == 0 {
+                        println!("no plugins (skill packs) installed");
+                    }
+                }
+            }
+        }
+        PluginCmd::Remove { plugin } => {
+            if let Some(dir) = forge_config::config_dir() {
+                let skill_dir = dir.join("skills").join(&plugin);
+                let skill_file = dir.join("skills").join(format!("{plugin}.md"));
+                if skill_dir.exists() {
+                    std::fs::remove_dir_all(&skill_dir)
+                        .with_context(|| format!("removing {}", skill_dir.display()))?;
+                    println!("✓ removed plugin '{plugin}'");
+                    return Ok(());
+                } else if skill_file.exists() {
+                    std::fs::remove_file(&skill_file)
+                        .with_context(|| format!("removing {}", skill_file.display()))?;
+                    println!("✓ removed plugin '{plugin}'");
+                    return Ok(());
+                }
+            }
+            println!(
+                "plugin '{plugin}' not found. Use `forge plugin list` to see installed plugins."
+            );
+        }
+        PluginCmd::Marketplace { .. } => {
+            println!("Plugin marketplace support coming soon.");
+        }
+    }
+    Ok(())
 }
 
 /// Open `url` in the default system browser (cross-platform best-effort).

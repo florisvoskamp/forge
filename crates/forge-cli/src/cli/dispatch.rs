@@ -102,6 +102,7 @@ pub(crate) async fn dispatch(command: Command) -> Result<()> {
         Command::Nl { query, mode } => nl_cmd(query.join(" "), mode).await,
         Command::Skill { sub } => skill_cmd(sub).await,
         Command::Migrate { cmd } => migrate_cmd(cmd).await,
+        Command::Plugin { cmd } => plugin_cmd(cmd),
         Command::SelfMcp { action } => self_mcp_cmd(action),
     }
 }
