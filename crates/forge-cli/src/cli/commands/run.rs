@@ -508,11 +508,15 @@ pub(crate) async fn chat(
 ) -> Result<()> {
     maybe_first_run_setup(mock)?;
     maybe_autostart_local();
-    update_check::maybe_notify(&forge_config::load().unwrap_or_default()).await;
     // Default to the interactive (animated) TUI on a real terminal.
     if !plain && std::io::stdout().is_terminal() {
+        // Update check happens in background inside run_chat_tui (via the UiMsg channel) so it
+        // never delays TUI startup. The check has a 3s network timeout — blocking here would
+        // freeze the terminal for up to 3s once per day.
         return run_chat_tui(mock, mode, resume_mode, fullscreen, pin).await;
     }
+    // Plain path: blocking update check is fine (no TUI to corrupt).
+    update_check::maybe_notify(&forge_config::load().unwrap_or_default()).await;
 
     // Plain line mode: read prompts from stdin.
     // Picker is already ruled out by resolve_resume_mode for headless/plain.
@@ -664,6 +668,13 @@ pub(crate) async fn run_chat_tui(
 
     let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<u64>();
+
+    // Load config once — shared between update check, session build, and TUI config below.
+    let tui_config = forge_config::load().unwrap_or_default();
+    // Fire the update check in the background so it never blocks TUI startup.
+    // The notification arrives as a Warning in the TUI instead of blocking on a 3s HTTP call.
+    update_check::maybe_notify_background(&tui_config, tx.clone());
+
     // For Picker mode we start a fresh session; the picker fires on the first frame.
     let open_picker_on_start = matches!(resume_mode, ResumeMode::Picker);
     let resume_id = match &resume_mode {
@@ -708,8 +719,6 @@ pub(crate) async fn run_chat_tui(
         });
     }
 
-    // Load config once here; reuse below rather than re-parsing TOML on each call site.
-    let tui_config = forge_config::load().unwrap_or_default();
     // Mouse capture (full-screen wheel scroll) is opt-in: it disables native click-drag text
     // selection, so it stays off unless the user enables `[tui] mouse_capture`.
     let mouse_capture = tui_config.tui.mouse_capture;
@@ -733,9 +742,15 @@ pub(crate) async fn run_chat_tui(
         app.effort = s.pinned_effort();
     }
 
-    // Discover file-based slash commands + skills (command-skill-system.md). Feed them into the
-    // palette alongside the builtins; surface any malformed-file warnings once.
-    let catalog = forge_skills::Catalog::load(&forge_config::command_sources());
+    // Populate the command palette from the skill catalog the session already loaded in
+    // build_session_with — avoids a second disk scan of all skill/command dirs.
+    let catalog: Arc<forge_skills::Catalog> = {
+        let s = session.lock().await;
+        // Reuse the Arc the session holds; fall back to a fresh load only if missing.
+        s.skills().cloned().unwrap_or_else(|| {
+            Arc::new(forge_skills::Catalog::load(&forge_config::command_sources()))
+        })
+    };
     app.palette.extra = catalog
         .entries()
         .iter()

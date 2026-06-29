@@ -1010,6 +1010,10 @@ impl Session {
         self.skills = skills;
     }
 
+    pub fn skills(&self) -> Option<&Arc<forge_skills::Catalog>> {
+        self.skills.as_ref()
+    }
+
     /// Scoped subgraph for `symbol` from the session's live index (the `/lattice` view). `Ok(None)`
     /// when no index is attached.
     pub fn lattice_view(
