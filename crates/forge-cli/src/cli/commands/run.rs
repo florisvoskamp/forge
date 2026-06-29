@@ -146,21 +146,35 @@ pub(crate) async fn build_session_with(
 
     // Auto-discovery: build a live model catalog so the mesh routes to the best usable model
     // (docs/features/auto-discovery-mesh.md). Skipped for the offline mock and when disabled.
-    // Bounded by an overall deadline: individual provider list calls already time out (4s/8s), but
-    // a pile of unreachable providers on a slow network could still sum to a long stall that LOOKS
-    // like a hang. Cap the whole phase — on timeout, fall back to the built-in catalog and tell the
-    // user, so startup always completes and the error is visible rather than an infinite load.
+    //
+    // Cache-first: if a catalog from the last 24 h exists on disk, use it instantly and kick off
+    // a background refresh so the NEXT startup is also fast. On first run (or stale cache) we
+    // do the full network discovery (bounded at 15 s) and save it for next time.
     let catalog = if !mock && config.mesh.auto_discover {
-        const DISCOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
-        match tokio::time::timeout(DISCOVERY_BUDGET, discover_catalog(&config)).await {
-            Ok(cat) => Some(cat),
-            Err(_) => {
-                presenter.emit(forge_tui::PresenterEvent::Warning(format!(
-                    "model auto-discovery exceeded {}s — using built-in defaults for now; run \
-                     `forge models` to refresh once your network/providers respond",
-                    DISCOVERY_BUDGET.as_secs()
-                )));
-                None
+        if let Some(cached) = load_cached_catalog() {
+            // Fast path — instant startup. Refresh in background for the next run.
+            let cfg = config.clone();
+            tokio::spawn(async move {
+                let fresh = discover_catalog(&cfg).await;
+                save_catalog(&fresh);
+            });
+            Some(cached)
+        } else {
+            // First run or stale cache — block on discovery, then persist the result.
+            const DISCOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+            match tokio::time::timeout(DISCOVERY_BUDGET, discover_catalog(&config)).await {
+                Ok(cat) => {
+                    save_catalog(&cat);
+                    Some(cat)
+                }
+                Err(_) => {
+                    presenter.emit(forge_tui::PresenterEvent::Warning(format!(
+                        "model auto-discovery exceeded {}s — using built-in defaults for now; run \
+                         `forge models` to refresh once your network/providers respond",
+                        DISCOVERY_BUDGET.as_secs()
+                    )));
+                    None
+                }
             }
         }
     } else {
@@ -672,23 +686,20 @@ pub(crate) async fn run_chat_tui(
     // (via the `claude --debug` rate-limit headers) so the store is live within a few seconds.
     {
         // bridge_stats::fetch recursively scans ~/.claude/projects/**/*.jsonl — on a slow FS (WSL
-        // /mnt, a huge history) that can stall the first frame. It only seeds non-essential quota
-        // percentages, so bound it; the background refresh below fills live numbers in shortly. A
-        // timeout leaves the blocking task to finish detached rather than blocking startup.
-        let bstats = match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            tokio::task::spawn_blocking(bridge_stats::fetch),
-        )
-        .await
-        {
-            Ok(Ok(b)) => b,
-            _ => Default::default(),
-        };
-        let s = session.lock().await;
-        s.seed_subscription_quota("codex-cli", "five_hour", bstats.codex_5h_pct);
-        s.seed_subscription_quota("codex-cli", "weekly", bstats.codex_weekly_pct);
-        s.seed_subscription_quota("claude-cli", "five_hour", bstats.claude_5h_pct);
-        s.seed_subscription_quota("claude-cli", "weekly", bstats.claude_weekly_pct);
+        // /mnt, a huge history) that can stall the first frame. Run it in a background task;
+        // the quota overlay refreshes on its own cadence so the numbers fill in within seconds.
+        tokio::spawn({
+            let s = session.clone();
+            async move {
+                if let Ok(bstats) = tokio::task::spawn_blocking(bridge_stats::fetch).await {
+                    let sess = s.lock().await;
+                    sess.seed_subscription_quota("codex-cli", "five_hour", bstats.codex_5h_pct);
+                    sess.seed_subscription_quota("codex-cli", "weekly", bstats.codex_weekly_pct);
+                    sess.seed_subscription_quota("claude-cli", "five_hour", bstats.claude_5h_pct);
+                    sess.seed_subscription_quota("claude-cli", "weekly", bstats.claude_weekly_pct);
+                }
+            }
+        });
     }
     if claude_quota_is_stale(&session, 300).await {
         tokio::spawn({
@@ -697,12 +708,11 @@ pub(crate) async fn run_chat_tui(
         });
     }
 
+    // Load config once here; reuse below rather than re-parsing TOML on each call site.
+    let tui_config = forge_config::load().unwrap_or_default();
     // Mouse capture (full-screen wheel scroll) is opt-in: it disables native click-drag text
     // selection, so it stays off unless the user enables `[tui] mouse_capture`.
-    let mouse_capture = forge_config::load()
-        .ok()
-        .map(|c| c.tui.mouse_capture)
-        .unwrap_or(false);
+    let mouse_capture = tui_config.tui.mouse_capture;
     let mut tui = Tui::new(fullscreen, mouse_capture).context("initializing TUI")?;
     let mut app = App::default();
     app.fullscreen = fullscreen;
@@ -744,11 +754,9 @@ pub(crate) async fn run_chat_tui(
     let trust_project = session.lock().await.commands_trust_project();
     // Git attribution: auto-install the model-aware commit hook when enabled, and remember the
     // flag so each turn's routed model is written where the hook can stamp it.
-    let git_coauthor = forge_config::load()
-        .map(|c| c.git.coauthor)
-        .unwrap_or(false);
+    let git_coauthor = tui_config.git.coauthor;
     if git_coauthor {
-        maybe_install_git_hook(&forge_config::load().unwrap_or_default());
+        maybe_install_git_hook(&tui_config);
     }
     {
         let (hooks, sid) = {
@@ -853,7 +861,7 @@ pub(crate) async fn run_chat_tui(
 
     while !quit {
         if let Some(obs) = &mut observer {
-            if obs.last_poll.elapsed() >= std::time::Duration::from_millis(150) {
+            if obs.last_poll.elapsed() >= std::time::Duration::from_millis(50) {
                 obs.last_poll = std::time::Instant::now();
                 if let Ok(events) = obs
                     .store
@@ -874,14 +882,17 @@ pub(crate) async fn run_chat_tui(
             }
         }
 
-        // While the in-loop activity viewer is open during a running turn, redraw every frame so
-        // the selected entry's transcript tails live (subagent/critic output streams in).
+        // While the in-loop activity viewer is open during a running turn, tick the elapsed-time
+        // counter at 1 Hz (it shows whole seconds) and redraw only when it changes, instead of
+        // forcing a full repaint every 16 ms.
         if app.viewer.is_some() && busy {
-            dirty = true;
+            let new_elapsed = busy_since.elapsed().as_secs();
+            if new_elapsed != app.turn_elapsed_secs {
+                dirty = true;
+            }
         }
         if dirty {
             app.busy = busy;
-            // Tick the turn timer live while a turn runs; the last value stays frozen once it ends.
             if busy {
                 app.turn_elapsed_secs = busy_since.elapsed().as_secs();
             }
@@ -2238,7 +2249,6 @@ pub(crate) async fn run_chat_tui(
                         by_model,
                         by_model_week,
                         (daily_cap, monthly_cap, weekly_cap),
-                        bridge_fracs,
                     ),
                     (session_in, session_out, session_usd),
                 ) = {
@@ -2250,14 +2260,10 @@ pub(crate) async fn run_chat_tui(
                             s.spend_by_model_today(),
                             s.spend_by_model_week(),
                             s.budget_caps(),
-                            s.bridge_fractions(),
                         ),
                         s.session_usage_db(),
                     )
                 };
-                let bstats = tokio::task::spawn_blocking(bridge_stats::fetch)
-                    .await
-                    .unwrap_or_default();
                 app.usage_overlay.month_usd = month_usd;
                 app.usage_overlay.session_usd = session_usd;
                 app.usage_overlay.session_in = session_in;
@@ -2268,11 +2274,16 @@ pub(crate) async fn run_chat_tui(
                 app.usage_overlay.daily_cap = daily_cap;
                 app.usage_overlay.weekly_cap = weekly_cap;
                 app.usage_overlay.monthly_cap = monthly_cap;
-                app.usage_overlay.claude_5h_in = bstats.claude_5h_in;
-                app.usage_overlay.claude_5h_out = bstats.claude_5h_out;
-                app.usage_overlay.claude_weekly_in = bstats.claude_weekly_in;
-                app.usage_overlay.claude_weekly_out = bstats.claude_weekly_out;
-                fill_subscription_pcts(&mut app.usage_overlay, &bridge_fracs, &bstats);
+                // bridge_stats scan can take seconds on large histories — fire it in the
+                // background and let the existing usage_load_rx receiver fill in the
+                // claude quota fields without stalling the event loop.
+                if usage_load_rx.is_none() {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = tx.send(bridge_stats::fetch());
+                    });
+                    usage_load_rx = Some(rx);
+                }
             }
         }
 

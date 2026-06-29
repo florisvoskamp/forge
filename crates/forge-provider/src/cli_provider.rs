@@ -1558,11 +1558,15 @@ impl CliProvider {
 
         // Codex doesn't stream its quota (unlike Claude's `rate_limit_event`); read the snapshot
         // from the session rollout file it just wrote, keyed by the thread id (L3, ToS-safe).
+        // The recursive directory walk is synchronous I/O — offload to the blocking pool.
         if self.kind == CliKind::Codex && quotas.is_empty() {
-            if let Some(tid) = &codex_thread {
-                if let Some(path) = find_codex_rollout(tid) {
-                    if let Ok(text) = std::fs::read_to_string(&path) {
-                        quotas = codex_quota_from_rollout(&text, self.kind.prefix());
+            if let Some(tid) = codex_thread.clone() {
+                let prefix = self.kind.prefix().to_string();
+                if let Ok(Some(path)) =
+                    tokio::task::spawn_blocking(move || find_codex_rollout(&tid)).await
+                {
+                    if let Ok(text) = tokio::fs::read_to_string(&path).await {
+                        quotas = codex_quota_from_rollout(&text, &prefix);
                     }
                 }
             }

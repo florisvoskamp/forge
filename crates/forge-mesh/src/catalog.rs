@@ -3,6 +3,8 @@
 //! ranking; the async *discovery* (querying each provider's model list) lives in the binary
 //! (forge-cli), which has the provider client — forge-mesh stays free of that dependency.
 
+use serde::{Deserialize, Serialize};
+
 use forge_types::{EffortLevel, TaskTier};
 
 use crate::bench::BenchmarkScores;
@@ -10,7 +12,7 @@ use crate::capability::{capability_score_b, is_frontier_b, CAPABLE_BENCH_THRESHO
 use crate::pricing::Pricing;
 
 /// Discovered `provider::model` ids the user can actually use right now.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelCatalog {
     models: Vec<String>,
     /// Measured performance scores (ADR-0011), attached at discovery. When present the router ranks

@@ -1453,8 +1453,7 @@ impl Session {
 
         // U8 — budget pre-estimate: scope down lenses to fit within remaining daily/monthly cap.
         let remaining_usd = {
-            let spent_today = self.store.spend_today_usd().unwrap_or(0.0);
-            let spent_month = self.store.spend_this_month_usd().unwrap_or(0.0);
+            let (spent_today, _, spent_month) = self.store.spend_summary_usd().unwrap_or_default();
             let daily = self
                 .config
                 .mesh
@@ -1706,12 +1705,13 @@ impl Session {
 
     /// The current budget snapshot (spend vs caps) used for routing decisions.
     fn budget_snapshot(&self) -> BudgetState {
+        let (today, week, month) = self.store.spend_summary_usd().unwrap_or_default();
         BudgetState {
-            spent_today_usd: self.store.spend_today_usd().unwrap_or(0.0),
+            spent_today_usd: today,
             daily_cap_usd: self.config.mesh.daily_budget_usd,
-            spent_week_usd: self.store.spend_this_week_usd().unwrap_or(0.0),
+            spent_week_usd: week,
             weekly_cap_usd: self.config.mesh.weekly_budget_usd,
-            spent_month_usd: self.store.spend_this_month_usd().unwrap_or(0.0),
+            spent_month_usd: month,
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
         }
@@ -3621,13 +3621,14 @@ Output ONLY that sentence — no preamble, no quotation marks.";
     ) -> Result<LoopOutcome, CoreError> {
         // 1. Route the task (deterministic, no model call) and record why. The budget is
         // aggregated across ALL sessions for the current local day + week + month (FR-5), not one
-        // session's running total.
+        // session's running total. One combined query instead of three separate ones.
+        let (spent_today, spent_week, spent_month) = self.store.spend_summary_usd()?;
         let budget = BudgetState {
-            spent_today_usd: self.store.spend_today_usd()?,
+            spent_today_usd: spent_today,
             daily_cap_usd: self.config.mesh.daily_budget_usd,
-            spent_week_usd: self.store.spend_this_week_usd()?,
+            spent_week_usd: spent_week,
             weekly_cap_usd: self.config.mesh.weekly_budget_usd,
-            spent_month_usd: self.store.spend_this_month_usd()?,
+            spent_month_usd: spent_month,
             monthly_cap_usd: self.config.mesh.monthly_cap_usd,
             warn_fraction: self.config.mesh.warn_threshold,
         };
