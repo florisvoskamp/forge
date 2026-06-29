@@ -205,6 +205,113 @@ pub(crate) fn models_for_provider(
     (heading, rows)
 }
 
+/// Open the flat ranked model pin-picker (`/model <partial>` or Ctrl+M).
+/// Shows "mesh (auto)" at top, then all known models ranked by tier:
+/// subscription → frontier → paid → free. Each row's subtitle encodes the tier so the
+/// render loop can color-code it. An optional pre-filled `query` narrows the list.
+pub(crate) async fn open_model_pin_picker(
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    app: &mut forge_tui::App,
+    query: &str,
+) -> Result<()> {
+    let benched = open_store()?.current_benched().unwrap_or_default();
+    let rows_opt: Option<Vec<forge_tui::PickerRow>> = {
+        let s = session.lock().await;
+        s.catalog().map(|cat| {
+            let pricing = s.pricing();
+            // Collect all models flat from all providers.
+            let mut models: Vec<forge_mesh::ModelInfo> = cat
+                .by_provider(pricing)
+                .into_iter()
+                .flat_map(|g| g.models)
+                .collect();
+            // Sort by tier priority: subscription first, then frontier, then paid, then free.
+            // Within same tier, alphabetical by id.
+            models.sort_by(|a, b| {
+                tier_priority(a)
+                    .cmp(&tier_priority(b))
+                    .then(a.id.cmp(&b.id))
+            });
+            let mut rows = vec![forge_tui::PickerRow {
+                id: "mesh".into(),
+                title: "⊞ mesh (auto-route)".into(),
+                subtitle: "let forge pick the best model for each task".into(),
+            }];
+            for m in models {
+                let display_name = if m.name.is_empty() {
+                    m.id.clone()
+                } else {
+                    format!("{} ({})", m.name, m.provider)
+                };
+                let mut badges: Vec<&str> = Vec::new();
+                if m.subscription {
+                    badges.push("subscription");
+                }
+                if m.frontier {
+                    badges.push("frontier");
+                }
+                if m.free {
+                    badges.push("free");
+                }
+                if m.paid && !m.free {
+                    badges.push("paid");
+                }
+                if benched.is_benched(&m.id) {
+                    badges.push("benched");
+                }
+                let cost_str;
+                let mut sub = badges.join(" · ");
+                if m.cost > 1e-9 {
+                    cost_str = format!("~${:.4}/turn", m.cost);
+                    if !sub.is_empty() {
+                        sub.push_str(" · ");
+                    }
+                    sub.push_str(&cost_str);
+                }
+                rows.push(forge_tui::PickerRow {
+                    id: m.id,
+                    title: display_name,
+                    subtitle: sub,
+                });
+            }
+            rows
+        })
+    };
+    match rows_opt {
+        Some(rows) if !rows.is_empty() => {
+            app.picker.open_with(
+                forge_tui::PickerKind::ModelPin,
+                "⊕ pin model — Enter to select · Esc cancel · /model clears pin",
+                rows,
+            );
+            if !query.is_empty() {
+                app.picker.query = query.to_string();
+                app.picker.clamp();
+            }
+        }
+        Some(_) => {
+            app.note(
+                "no models discovered — set a provider key (`forge auth <provider>`) or run ollama",
+            );
+        }
+        None => app.note("model discovery is off (mock/offline) — nothing to pick"),
+    }
+    Ok(())
+}
+
+/// Tier sort priority: lower = shown first.
+fn tier_priority(m: &forge_mesh::ModelInfo) -> u8 {
+    if m.subscription {
+        0
+    } else if m.frontier {
+        1
+    } else if m.paid {
+        2
+    } else {
+        3
+    } // free
+}
+
 /// Open the `/models` browser at the top-level provider list (also the Esc target from a drill-in).
 pub(crate) async fn open_models_root(
     session: &Arc<tokio::sync::Mutex<Session>>,
@@ -232,16 +339,6 @@ pub(crate) async fn open_models_root(
 
 /// Open the model picker for `/model` (bare): shows the same provider browser as `/models`,
 /// but selecting a leaf model row pins it (closes the picker + shows a confirmation note).
-/// We reuse the same `PickerKind::Models` infrastructure; the render-loop Enter handler
-/// distinguishes "pin mode" from "browse mode" via `app.models_pin_mode`.
-pub(crate) async fn open_models_pin_picker(
-    session: &Arc<tokio::sync::Mutex<Session>>,
-    app: &mut forge_tui::App,
-) -> Result<()> {
-    app.models_pin_mode = true;
-    open_models_root(session, app).await
-}
-
 /// Drill the `/models` browser into one provider's models.
 pub(crate) async fn open_models_provider(
     session: &Arc<tokio::sync::Mutex<Session>>,
@@ -330,6 +427,17 @@ pub(crate) async fn picker_accept(
         forge_tui::PickerKind::Models => {}
         // The copy picker resolves in the render loop (it needs the clipboard); never here.
         forge_tui::PickerKind::CopyBlocks => {}
+        // Flat model pin picker: "mesh" → clear pin, any other row → pin it.
+        forge_tui::PickerKind::ModelPin => {
+            if row.id == "mesh" {
+                session.lock().await.pin_model(None);
+                app.note("⊕ model pin cleared — mesh auto-routing restored");
+            } else {
+                let model_id = forge_provider::normalize_model_id(&row.id).into_owned();
+                session.lock().await.pin_model(Some(model_id.clone()));
+                app.note(&format!("⊕ model pinned: {model_id} (clear with /model)"));
+            }
+        }
         forge_tui::PickerKind::ResumeMode => {
             if row.id == "full" {
                 let n = {

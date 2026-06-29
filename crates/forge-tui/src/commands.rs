@@ -734,6 +734,10 @@ pub enum PickerKind {
     /// the full response or an individual fenced block. Enter → clipboard, `w` → write to a file.
     /// Each row's `id` is the index into [`App::copy_candidates`](crate::App::copy_candidates).
     CopyBlocks,
+    /// Flat ranked model picker for `/model` (bare): "mesh (auto)" first, then all known models
+    /// sorted by tier (subscription → frontier → paid → free). Enter pins the selected model;
+    /// selecting "mesh" clears the pin. Esc closes without changing anything.
+    ModelPin,
 }
 
 /// One row in an interactive picker: an opaque `id` the loop acts on, plus two display strings.

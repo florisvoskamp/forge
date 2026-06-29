@@ -349,6 +349,9 @@ impl Tui {
                     KeyCode::Char('e') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         KeyKind::End
                     }
+                    KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyKind::ToggleEffortSlider
+                    }
                     KeyCode::Char(c) => KeyKind::Char(c),
                     KeyCode::Backspace => KeyKind::Backspace,
                     KeyCode::Delete => KeyKind::DeleteForward,

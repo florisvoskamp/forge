@@ -868,6 +868,9 @@ pub(crate) async fn run_chat_tui(
     // Baseline for the spinner: deriving the tick from elapsed time keeps the animation
     // speed independent of the loop frequency (one frame per 60ms, exactly as before).
     let mut busy_since = Instant::now();
+    // Fixed epoch for idle animations (effort slider rainbow, etc.): unlike busy_since this
+    // never resets, so idle animations always have a monotonically increasing tick.
+    let anim_epoch = Instant::now();
     // Receivers for overlay background loads (mesh/usage open instantly; data fills in async).
     let mut mesh_load_rx: Option<tokio::sync::oneshot::Receiver<Option<forge_tui::MeshOverlay>>> =
         None;
@@ -1144,6 +1147,37 @@ pub(crate) async fn run_chat_tui(
                 continue;
             }
 
+            // Effort slider is modal while open: ←/→ adjust level, Esc/Enter/Ctrl+R close.
+            if app.effort_slider {
+                match key {
+                    KeyKind::Left => {
+                        app.effort_slider_left();
+                        if let Some(level) = app.effort {
+                            session.lock().await.set_effort(Some(level));
+                        }
+                    }
+                    KeyKind::Right => {
+                        app.effort_slider_right();
+                        if let Some(level) = app.effort {
+                            session.lock().await.set_effort(Some(level));
+                        }
+                    }
+                    KeyKind::Esc | KeyKind::Enter | KeyKind::ToggleEffortSlider => {
+                        app.effort_slider = false;
+                    }
+                    _ => {}
+                }
+                dirty = true;
+                continue;
+            }
+
+            // Ctrl+R: toggle the effort slider when nothing else is modal.
+            if matches!(key, KeyKind::ToggleEffortSlider) {
+                app.toggle_effort_slider();
+                dirty = true;
+                continue;
+            }
+
             // The command palette is modal while open: it owns every key. Esc dismisses it
             // (so the user isn't surprised by a quit); Ctrl-C still maps to Esc → here it just
             // closes the palette, and a second Esc with the palette closed quits as usual.
@@ -1293,7 +1327,9 @@ pub(crate) async fn run_chat_tui(
                             }
                         }
                     }
-                    KeyKind::CycleTemper | KeyKind::ToggleSubagentDetail => {}
+                    KeyKind::CycleTemper
+                    | KeyKind::ToggleSubagentDetail
+                    | KeyKind::ToggleEffortSlider => {}
                     // Any other editing key mutates the input at the *cursor* (not blindly at the
                     // end) and then re-syncs the palette to the slash-token the cursor now sits in.
                     // That keeps the text cursor moving while the palette is open, and closes the
@@ -1367,7 +1403,9 @@ pub(crate) async fn run_chat_tui(
                         app.input.pop();
                         sync_at_picker_to_at_token(&mut app);
                     }
-                    KeyKind::CycleTemper | KeyKind::ToggleSubagentDetail => {}
+                    KeyKind::CycleTemper
+                    | KeyKind::ToggleSubagentDetail
+                    | KeyKind::ToggleEffortSlider => {}
                     _ => {}
                 }
                 continue;
@@ -1520,7 +1558,10 @@ pub(crate) async fn run_chat_tui(
                         app.picker.query.pop();
                         app.picker.clamp();
                     }
-                    KeyKind::Tab | KeyKind::CycleTemper | KeyKind::ToggleSubagentDetail => {}
+                    KeyKind::Tab
+                    | KeyKind::CycleTemper
+                    | KeyKind::ToggleSubagentDetail
+                    | KeyKind::ToggleEffortSlider => {}
                     _ => {}
                 }
                 continue;
@@ -2248,6 +2289,14 @@ pub(crate) async fn run_chat_tui(
         }
         if busy {
             let t = (busy_since.elapsed().as_millis() / 60) as usize;
+            if t != app.tick {
+                app.tick = t;
+                dirty = true;
+            }
+        }
+        // Animate the effort slider's rainbow/pulse at XHigh even while idle.
+        if app.effort_slider {
+            let t = (anim_epoch.elapsed().as_millis() / 80) as usize;
             if t != app.tick {
                 app.tick = t;
                 dirty = true;
