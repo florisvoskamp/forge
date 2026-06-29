@@ -895,7 +895,7 @@ impl Session {
             transcript,
             seq,
             checkpoint_root: std::path::PathBuf::from(".forge/checkpoints"),
-            current_turn_seq: 0,
+            current_turn_seq: -1,
             catalog: None,
             tasks,
             pending_plan: None,
@@ -1127,12 +1127,36 @@ impl Session {
     /// Undo the last user turn: rewind to (and including) the most recent user message, dropping
     /// that prompt and everything after it. `Ok(None)` if there's nothing to undo.
     pub fn undo(&mut self) -> Result<Option<RewindOutcome>, CoreError> {
-        let Some(idx) = self.transcript.iter().rposition(|m| m.role == Role::User) else {
+        // Use current_turn_seq — the DB seq of the real user message that started this turn —
+        // rather than rposition(Role::User). The autofix stage injects synthetic Role::User
+        // messages AFTER the real prompt (to feed lint/test failures back to the model); rposition
+        // would land on the synthetic message, making rewind_to start the snapshot search too high
+        // and miss the snapshot stored at current_turn_seq (causing restored: [] on undo).
+        //
+        // transcript_idx = db_seq - offset  (offset = self.seq - len absorbs compaction gaps so
+        // the mapping stays valid after resume). Sentinel -1 means no turn has run yet.
+        if self.current_turn_seq < 0 {
             return Ok(None);
-        };
-        // `rewind_to` takes a DB seq; map the transcript index to one (identity when not compacted).
+        }
         let offset = self.seq - self.transcript.len() as i64;
-        Ok(Some(self.rewind_to(idx as i64 + offset)?))
+        let turn_idx = (self.current_turn_seq - offset).max(0) as usize;
+        if self
+            .transcript
+            .get(turn_idx)
+            .filter(|m| m.role == Role::User)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        // Locate the previous turn's user message before rewinding so chained undos work.
+        let prev_turn_seq = self.transcript[..turn_idx]
+            .iter()
+            .rposition(|m| m.role == Role::User)
+            .map(|p| p as i64 + offset)
+            .unwrap_or(-1);
+        let outcome = self.rewind_to(self.current_turn_seq)?;
+        self.current_turn_seq = prev_turn_seq;
+        Ok(Some(outcome))
     }
 
     /// Publish the current turn's snapshot context (session id, seq, absolute root) to the
