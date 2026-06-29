@@ -457,11 +457,12 @@ impl Store {
         } else {
             Some(serde_json::to_string(tool_calls).unwrap_or_default())
         };
-        self.lock()?.execute(
+        let conn = self.lock()?;
+        conn.prepare_cached(
             "INSERT INTO message (id, session_id, seq, role, content, model, tool_calls_json, tool_call_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            (&id, session_id, seq, role.as_str(), content, model, tool_calls_json, tool_call_id),
-        )?;
+        )?
+        .execute((&id, session_id, seq, role.as_str(), content, model, tool_calls_json, tool_call_id))?;
         Ok(id)
     }
 
@@ -473,17 +474,18 @@ impl Store {
         chosen_model: &str,
         rationale: &str,
     ) -> Result<()> {
-        self.lock()?.execute(
+        let conn = self.lock()?;
+        conn.prepare_cached(
             "INSERT INTO routing_decision (id, message_id, task_tier, chosen_model, rationale)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            (
-                forge_types::new_id(),
-                message_id,
-                tier.as_str(),
-                chosen_model,
-                rationale,
-            ),
-        )?;
+        )?
+        .execute((
+            forge_types::new_id(),
+            message_id,
+            tier.as_str(),
+            chosen_model,
+            rationale,
+        ))?;
         Ok(())
     }
 
@@ -566,11 +568,12 @@ impl Store {
         permission: &str,
         status: &str,
     ) -> Result<()> {
-        self.lock()?.execute(
+        let conn = self.lock()?;
+        conn.prepare_cached(
             "INSERT INTO tool_call (id, message_id, tool_name, args_json, result_json, permission, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            (forge_types::new_id(), message_id, tool_name, args_json, result, permission, status),
-        )?;
+        )?
+        .execute((forge_types::new_id(), message_id, tool_name, args_json, result, permission, status))?;
         Ok(())
     }
 

@@ -3,7 +3,10 @@
 //! off-switchable (`[update] check = false` or `FORGE_NO_UPDATE_CHECK=1`), and never blocks or
 //! fails a session — any error is silently ignored.
 
+use std::sync::mpsc::Sender;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use forge_tui::UiMsg;
 
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const REPO: &str = "florisvoskamp/forge";
@@ -48,6 +51,32 @@ pub async fn maybe_notify(config: &forge_config::Config) {
     println!(
         "⚒ Forge {latest} is available (you have {CURRENT}).\n  Update: run `forge update`, `brew upgrade forge`, or grab it from\n  https://github.com/{REPO}/releases/latest"
     );
+}
+
+/// TUI-mode update check: spawns the network fetch in background so it never blocks startup.
+/// If a newer version is found, emits a Warning via the UiMsg channel instead of printing to
+/// stdout (which would corrupt the TUI). The Sender is cloned before the TUI is built; it is
+/// valid until the TUI exits. Any send error (TUI already gone) is silently ignored.
+pub fn maybe_notify_background(config: &forge_config::Config, tx: Sender<UiMsg>) {
+    if !config.update.check || std::env::var("FORGE_NO_UPDATE_CHECK").is_ok() {
+        return;
+    }
+    if !throttle_elapsed() {
+        return;
+    }
+    touch_throttle();
+    tokio::spawn(async move {
+        let Some(latest) = fetch_latest_tag().await else {
+            return;
+        };
+        if !is_newer(&latest, CURRENT) {
+            return;
+        }
+        let msg = format!(
+            "⚒ Forge {latest} is available (you have {CURRENT}). Run `forge update` to upgrade."
+        );
+        let _ = tx.send(UiMsg::Event(forge_tui::PresenterEvent::Warning(msg)));
+    });
 }
 
 fn throttle_path() -> Option<std::path::PathBuf> {
