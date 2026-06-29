@@ -267,8 +267,8 @@ fn openrouter_windows(body: &serde_json::Value) -> Vec<(String, u32)> {
 ///
 /// `strip_prefix` controls whether the vendor prefix is stripped from the model part:
 /// - `true`  (e.g. anthropic): `anthropic/claude-opus-4-8` → `anthropic::claude-opus-4-8`
-/// - `false` (e.g. nvidia):    `nvidia/llama-3.1-nemotron-70b-instruct`
-///                               → `nvidia::nvidia/llama-3.1-nemotron-70b-instruct`
+/// - `false` (e.g. nvidia): `nvidia/llama-3.1-nemotron-70b-instruct`
+///   → `nvidia::nvidia/llama-3.1-nemotron-70b-instruct`
 ///   NVIDIA NIM returns model IDs with their vendor prefix (`nvidia/model`), so keeping the
 ///   full path as the model part matches the Forge catalog ID.
 fn openrouter_native_cross_map(body: &serde_json::Value) -> Vec<(String, u32)> {
