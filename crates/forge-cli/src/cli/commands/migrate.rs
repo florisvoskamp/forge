@@ -247,11 +247,15 @@ fn push(target: &str, include_keys: bool, include_sessions: bool) -> Result<()> 
     .context("scp failed — check SSH access to the target")?;
 
     println!("→ running remote import (forge must be installed on {target})…");
-    run(
-        "ssh",
-        &[target, &format!("forge migrate import {remote_dir}")],
-    )
-    .context("remote import failed — is `forge` on the target's PATH?")?;
+    // Use a login shell so ~/.local/bin and other user-configured PATH entries are available.
+    // Try `forge` via PATH first; fall back to common install locations.
+    let remote_cmd = format!(
+        "command -v forge >/dev/null 2>&1 && forge migrate import {remote_dir} \
+         || ~/.local/bin/forge migrate import {remote_dir} \
+         || ~/.cargo/bin/forge migrate import {remote_dir}"
+    );
+    run("ssh", &[target, &remote_cmd])
+        .context("remote import failed — is `forge` installed on the target?")?;
 
     let _ = fs::remove_dir_all(&local);
     println!(

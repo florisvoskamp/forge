@@ -6,6 +6,20 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-06-29
+
+### Fixed
+- **Context windows now populated for all providers.** Anthropic's `/v1/models` (`context_window`
+  field) and Gemini's `/v1beta/models` (`inputTokenLimit`) are fetched natively. OpenRouter is
+  always fetched (keyless) and cross-mapped to native namespaces: `openai::`, `xai::`,
+  `deepseek::`, `mistral::`, and `nvidia::`. NVIDIA NIM and other custom providers whose model
+  listing doesn't include context info now get windows via an OR basename lookup (e.g.
+  `nvidia::meta/llama-3.1-405b-instruct` is matched to OR's `meta-llama/llama-3.1-405b-instruct`
+  by model basename). (`crates/forge-cli/src/context_windows.rs`)
+- **`forge migrate push` no longer fails when `forge` isn't on remote PATH.** Falls back to
+  `~/.local/bin/forge` then `~/.cargo/bin/forge` before erroring.
+  (`crates/forge-cli/src/cli/commands/migrate.rs`)
+
 ## [1.8.2] - 2026-06-29
 
 ### Added
