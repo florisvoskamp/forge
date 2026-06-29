@@ -339,16 +339,6 @@ pub(crate) async fn open_models_root(
 
 /// Open the model picker for `/model` (bare): shows the same provider browser as `/models`,
 /// but selecting a leaf model row pins it (closes the picker + shows a confirmation note).
-/// We reuse the same `PickerKind::Models` infrastructure; the render-loop Enter handler
-/// distinguishes "pin mode" from "browse mode" via `app.models_pin_mode`.
-pub(crate) async fn open_models_pin_picker(
-    session: &Arc<tokio::sync::Mutex<Session>>,
-    app: &mut forge_tui::App,
-) -> Result<()> {
-    app.models_pin_mode = true;
-    open_models_root(session, app).await
-}
-
 /// Drill the `/models` browser into one provider's models.
 pub(crate) async fn open_models_provider(
     session: &Arc<tokio::sync::Mutex<Session>>,

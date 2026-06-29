@@ -4182,7 +4182,7 @@ fn render_effort_slider(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for pos in 0..track_w {
         let at_stop = stops.iter().position(|&s| s == pos);
-        let filled = stops.get(idx).map_or(false, |&s| pos <= s);
+        let filled = stops.get(idx).is_some_and(|&s| pos <= s);
         let (ch, style) = match at_stop {
             Some(si) if si == idx => {
                 let hcol = slider_handle_color(idx, tick);
