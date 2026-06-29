@@ -8,7 +8,21 @@ All notable changes to Forge are documented here. The format follows
 
 ## [1.8.3] - 2026-06-29
 
+### Added
+- **CLI bridge context windows.** `claude-cli` (opus=1M, sonnet/haiku=200k), `codex-cli` GPT
+  models, and `agy-cli` Gemini models now have accurate context windows stored at session start,
+  derived from the same native API data already fetched for their underlying providers.
+  (`crates/forge-cli/src/context_windows.rs`)
+- **Context bar updates after every tool step.** The context-window gauge now refreshes on every
+  tool execution, not just at turn end — zero API cost (local token estimate).
+  (`crates/forge-core/src/lib.rs`)
+
 ### Fixed
+- **MCP server startup messages no longer corrupt the TUI input box.** `TokioChildProcess::new()`
+  routes through a builder that defaults stderr to `Stdio::inherit()`, silently overriding any
+  `.stderr(Stdio::null())` set before spawning. Now using the builder API explicitly so the GitHub
+  MCP server's "running on stdio" line (and any other startup text) is suppressed.
+  (`crates/forge-mcp/src/transport.rs`)
 - **Context windows now populated for all providers.** Anthropic's `/v1/models` (`context_window`
   field) and Gemini's `/v1beta/models` (`inputTokenLimit`) are fetched natively. OpenRouter is
   always fetched (keyless) and cross-mapped to native namespaces: `openai::`, `xai::`,
@@ -16,6 +30,12 @@ All notable changes to Forge are documented here. The format follows
   listing doesn't include context info now get windows via an OR basename lookup (e.g.
   `nvidia::meta/llama-3.1-405b-instruct` is matched to OR's `meta-llama/llama-3.1-405b-instruct`
   by model basename). (`crates/forge-cli/src/context_windows.rs`)
+- **Token gauge hides stale ↑0 ↓0 for CLI bridge sessions.** Bridge models don't report API
+  token usage; the turn gauge now shows only the timer (`⧖ 1.2s`) rather than misleading zero
+  counts. (`crates/forge-tui/src/app.rs`)
+- **Session Σ gauge hidden on first turn.** When `turn_base_in=0`, both gauges showed identical
+  values. Σ gauge is now suppressed whenever it equals the turn delta.
+  (`crates/forge-tui/src/app.rs`)
 - **`forge migrate push` no longer fails when `forge` isn't on remote PATH.** Falls back to
   `~/.local/bin/forge` then `~/.cargo/bin/forge` before erroring.
   (`crates/forge-cli/src/cli/commands/migrate.rs`)
