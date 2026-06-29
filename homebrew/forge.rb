@@ -9,7 +9,7 @@
 class Forge < Formula
   desc "Multi-provider mesh AI coding CLI"
   homepage "https://github.com/florisvoskamp/forge"
-  version "1.8.0" # auto-updated by release.yml (scripts/update-brew-formula.sh) per release
+  version "1.8.1" # auto-updated by release.yml (scripts/update-brew-formula.sh) per release
   license "MIT"
 
   on_macos do

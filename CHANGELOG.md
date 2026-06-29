@@ -6,6 +6,33 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-06-29
+
+### Added
+- **429 key-retry before mesh failover.** When a provider has ≥2 API keys configured, a
+  rate-limit error now retries once with the next key (via the round-robin pool's `AtomicUsize`)
+  before escalating to mesh failover. Single-key providers are unaffected.
+  (`crates/forge-provider/src/genai_provider.rs`)
+- **Interactive model-pin picker (`/model`).** Bare `/model` opens an animated ranked picker
+  (mesh auto first, then subscription → frontier → paid → free). `/model <partial>` opens it
+  pre-filtered; `/model provider::model` pins directly; `/model` bare in active-pin state clears
+  the pin and restores mesh auto-routing.
+  (`crates/forge-cli/src/cli/commands/run/pickers.rs`, `crates/forge-tui/src/app.rs`)
+- **Animated effort slider.** `/effort` (bare) opens an interactive slider above the input bar
+  with per-level animation: HIGH pulses orange→gold→red, XHIGH cycles a 12-colour rainbow with
+  sparkle characters. (`crates/forge-tui/src/app.rs`)
+
+### Fixed
+- **MCP stdio stderr leak into TUI.** `TokioChildProcess::new` internally defaults to
+  `stderr=inherit`, overriding any `Command::stderr(null())` we set. Switched to
+  `TokioChildProcess::builder().stderr(null()).spawn()` so child startup text (e.g. "GitHub MCP
+  Server running on stdio") no longer appears in the raw-mode TUI.
+  (`crates/forge-mcp/src/transport.rs`)
+- **MCP double-announce on startup.** The initial `announce_mcp()` ("reconnecting" placeholder)
+  is now suppressed in TUI mode; a background task waits for `connect_active()` to complete via
+  a `tokio::sync::watch` channel and then emits the final connected/failed state only once.
+  (`crates/forge-mcp/src/lib.rs`, `crates/forge-cli/src/cli/commands/run.rs`)
+
 ## [1.8.0] - 2026-06-29
 
 ### Added
@@ -1754,7 +1781,8 @@ Initial public release: Model Mesh routing, multi-provider support, cost/budget 
 inline TUI, session persistence + checkpoints, permission broker, subagents, Assay analysis,
 Lattice code intelligence, MCP client, web tools, hooks, skills/commands, and more.
 
-[Unreleased]: https://github.com/florisvoskamp/forge/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/florisvoskamp/forge/compare/v1.8.1...HEAD
+[1.8.1]: https://github.com/florisvoskamp/forge/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/florisvoskamp/forge/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/florisvoskamp/forge/compare/v1.6.1...v1.7.0
 [0.4.4]: https://github.com/florisvoskamp/forge/compare/v0.4.3...v0.4.4
