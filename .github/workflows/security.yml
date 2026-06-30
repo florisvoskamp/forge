@@ -25,17 +25,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: cargo audit
-        uses: rustsec/audit-check@v2
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      # Fail on any vulnerability OR any unmaintained/unsound/yanked warning (--deny warnings),
+      # EXCEPT the documented unmaintained-transitive advisories below (kept in sync with
+      # deny.toml [advisories].ignore). Real vulnerabilities are FIXED via lockfile bumps, never
+      # ignored — e.g. quinn-proto RUSTSEC-2026-0185 and anyhow RUSTSEC-2026-0190.
+      - name: cargo audit
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2024-0436 \
+            --ignore RUSTSEC-2024-0320 \
+            --ignore RUSTSEC-2025-0141 \
+            --ignore RUSTSEC-2025-0052
 
   deny:
     name: cargo deny (licenses + bans + advisories)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # Need a real toolchain: `cargo deny check` runs `cargo metadata` under the hood.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
         with:
-          command: check
-          arguments: --all-features
+          tool: cargo-deny
+      # Plain `cargo deny check` runs all four checks (advisories + bans + licenses + sources)
+      # against the committed deny.toml. Driven directly (not via cargo-deny-action) so the CLI
+      # surface matches what we validate locally — the action puts `arguments` BEFORE the
+      # subcommand, which broke `cargo deny check all` ("unrecognized subcommand 'all'").
+      - run: cargo deny check
