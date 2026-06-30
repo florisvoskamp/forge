@@ -1,11 +1,106 @@
 //! The core coding tools shipped in v0.1.
 
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
+
 use async_trait::async_trait;
 use forge_types::{DiffKind, FileDiff, SideEffect};
 use globset::{Glob, GlobMatcher};
 use serde_json::{json, Value};
 
 use crate::{str_arg, Tool, ToolError};
+
+// ---------------------------------------------------------------------------------------------
+// Workspace confinement (defense-in-depth behind the permission gate).
+//
+// The in-process file tools call `tokio::fs` directly on a model-supplied path. Only the *shell*
+// tool is Landlock-sandboxed, so in `accept-edits`/`bypass` mode an absolute or `../` path
+// (`~/.ssh/id_rsa`, `/etc/passwd`) would otherwise let the model read or overwrite anything outside
+// the project. Before any fs op the file tools resolve the target and require it to live under an
+// allowed root:
+//   - the WORKSPACE ROOT — the process current dir; Forge runs in, and resolves relative paths
+//     against, the project/worktree directory (the bridge `mcp-serve` child and subagent worktrees
+//     all set cwd to their workspace, so this is correct there too), or
+//   - the system TEMP dir — so scratch-file workflows keep working.
+// Anything else is refused with a clear error, by default, in every mode. This is a floor, not the
+// only guard: the permission broker's secret denylist still runs ahead of it.
+// ---------------------------------------------------------------------------------------------
+
+/// The roots an in-process file op is allowed to touch (workspace cwd + system temp), canonicalized.
+fn workspace_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd.canonicalize().unwrap_or(cwd));
+    }
+    let tmp = std::env::temp_dir();
+    roots.push(tmp.canonicalize().unwrap_or(tmp));
+    roots
+}
+
+/// Collapse `.` and `..` components lexically (no filesystem access), so a non-existent tail like
+/// `a/../../etc/passwd` can't escape before symlink resolution runs.
+fn lexical_clean(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve `path` to an absolute, symlink- and `..`-collapsed form WITHOUT requiring the whole path
+/// to exist (a file being created won't). Lexically collapses `.`/`..`, then canonicalizes the
+/// deepest existing ancestor — resolving symlinks so a symlinked parent can't smuggle the target
+/// out of the workspace — and re-appends the remaining components.
+fn resolve_target(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let cleaned = lexical_clean(&abs);
+    let mut prefix: &Path = &cleaned;
+    let mut tail: Vec<OsString> = Vec::new();
+    loop {
+        if let Ok(real) = prefix.canonicalize() {
+            let mut out = real;
+            for c in tail.iter().rev() {
+                out.push(c);
+            }
+            return out;
+        }
+        match prefix.parent() {
+            Some(parent) => {
+                if let Some(name) = prefix.file_name() {
+                    tail.push(name.to_os_string());
+                }
+                prefix = parent;
+            }
+            None => return cleaned,
+        }
+    }
+}
+
+/// Refuse a path that resolves outside the allowed workspace roots. Returns the resolved path on
+/// success so callers don't resolve twice. See the module-level confinement note.
+fn confine(path_str: &str) -> Result<PathBuf, ToolError> {
+    let target = resolve_target(Path::new(path_str));
+    if workspace_roots().iter().any(|r| target.starts_with(r)) {
+        Ok(target)
+    } else {
+        Err(ToolError::Failed(format!(
+            "path '{path_str}' resolves outside the workspace and is refused \
+             (workspace-confinement safety net). Operate on paths inside the project directory."
+        )))
+    }
+}
 
 /// Map a file extension to a syntax-highlighting language token (best-effort; unknown
 /// extensions pass through and fall back to plain highlighting downstream).
@@ -82,6 +177,7 @@ impl Tool for ReadFileTool {
             return Ok(read_many(paths).await);
         }
         let path = str_arg(args, "path")?;
+        confine(path)?;
         let start_line = args
             .get("start_line")
             .and_then(Value::as_u64)
@@ -124,6 +220,10 @@ async fn read_many(paths: &[Value]) -> String {
     for (i, p) in paths.iter().enumerate() {
         let Some(path) = p.as_str() else { continue };
         out.push_str(&format!("===== {path} =====\n"));
+        if let Err(e) = confine(path) {
+            out.push_str(&format!("[error: {e}]\n"));
+            continue;
+        }
         if spent >= BATCH_READ_TOTAL_BYTES {
             let left = paths.len() - i;
             out.push_str(&format!(
@@ -349,6 +449,7 @@ impl Tool for WriteFileTool {
     async fn run(&self, args: &Value) -> Result<String, ToolError> {
         let path = str_arg(args, "path")?;
         let content = str_arg(args, "content")?;
+        confine(path)?;
         tokio::fs::write(path, content).await?;
         Ok(format!("wrote {} bytes to {path}", content.len()))
     }
@@ -356,6 +457,7 @@ impl Tool for WriteFileTool {
     async fn preview(&self, args: &Value) -> Option<FileDiff> {
         let path = str_arg(args, "path").ok()?;
         let content = str_arg(args, "content").ok()?;
+        confine(path).ok()?;
         let old = tokio::fs::read_to_string(path).await.ok();
         let kind = if old.is_some() {
             DiffKind::Modified
@@ -413,6 +515,7 @@ impl Tool for EditFileTool {
         let old = str_arg(args, "old")?;
         let new = str_arg(args, "new")?;
 
+        confine(path)?;
         let content = tokio::fs::read_to_string(path).await?;
         let (updated, note) = apply_edit(&content, old, new)
             .map_err(|e| ToolError::Failed(format!("{e} (in {path})")))?;
@@ -424,6 +527,7 @@ impl Tool for EditFileTool {
         let path = str_arg(args, "path").ok()?;
         let old = str_arg(args, "old").ok()?;
         let new = str_arg(args, "new").ok()?;
+        confine(path).ok()?;
         let content = tokio::fs::read_to_string(path).await.ok()?;
         // Mirror run() (skip the diff and let run() surface the error when it can't apply).
         let (updated, _) = apply_edit(&content, old, new).ok()?;
@@ -528,6 +632,7 @@ impl Tool for MultiEditTool {
     async fn run(&self, args: &Value) -> Result<String, ToolError> {
         let path = str_arg(args, "path")?;
         let edits = multi_edit_pairs(args)?;
+        confine(path)?;
         let original = tokio::fs::read_to_string(path).await?;
         let updated = apply_edits(&original, &edits)
             .map_err(|e| ToolError::Failed(format!("{e} (in {path}; no edits applied)")))?;
@@ -538,6 +643,7 @@ impl Tool for MultiEditTool {
     async fn preview(&self, args: &Value) -> Option<FileDiff> {
         let path = str_arg(args, "path").ok()?;
         let edits = multi_edit_pairs(args).ok()?;
+        confine(path).ok()?;
         let original = tokio::fs::read_to_string(path).await.ok()?;
         let updated = apply_edits(&original, &edits).ok()?;
         Some(FileDiff {
@@ -617,6 +723,10 @@ impl Tool for ApplyPatchTool {
         use tokio::io::AsyncWriteExt;
         let patch = str_arg(args, "patch")?;
         let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
+        // Confine the application directory to the workspace. `git apply` (without `--unsafe-paths`)
+        // already rejects patches whose `a/`/`b/` headers escape the tree, so this gates the one
+        // model-supplied path on this tool — the dir the patch is applied in.
+        confine(cwd)?;
         let mut child = tokio::process::Command::new("git")
             // Apply byte-faithfully: a global core.autocrlf=true (the default on GitHub's
             // Windows runners) would otherwise rewrite the patched file's line endings.
@@ -783,6 +893,7 @@ impl Tool for NotebookEditTool {
     }
     async fn run(&self, args: &Value) -> Result<String, ToolError> {
         let path = str_arg(args, "path")?;
+        confine(path)?;
         let cell = args
             .get("cell")
             .and_then(Value::as_u64)
@@ -818,6 +929,7 @@ impl Tool for NotebookEditTool {
 
     async fn preview(&self, args: &Value) -> Option<FileDiff> {
         let path = str_arg(args, "path").ok()?;
+        confine(path).ok()?;
         let cell = args.get("cell").and_then(Value::as_u64)? as usize;
         let mode = match args
             .get("mode")
@@ -869,6 +981,7 @@ impl Tool for DeleteFileTool {
     }
     async fn run(&self, args: &Value) -> Result<String, ToolError> {
         let path = str_arg(args, "path")?;
+        confine(path)?;
         tokio::fs::remove_file(path).await?;
         Ok(format!("deleted {path}"))
     }
@@ -1483,11 +1596,15 @@ mod tests {
 
     #[tokio::test]
     async fn delete_file_errors_on_missing() {
+        // A missing file INSIDE an allowed root (temp) passes confinement and fails as an IO error.
+        let dir = temp_dir("delete-missing");
+        let missing = dir.join("xyz.txt");
         let err = DeleteFileTool
-            .run(&json!({ "path": "/no/such/file/xyz.txt" }))
+            .run(&json!({ "path": missing.to_str().unwrap() }))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Io(_)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1719,6 +1836,72 @@ mod tests {
 
         assert!(out.contains("here"));
         assert!(out.contains("[error:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- workspace confinement ----
+
+    #[test]
+    fn confine_allows_in_workspace_and_temp_but_rejects_escapes() {
+        // A relative path inside the workspace (the crate dir during tests) is allowed.
+        assert!(confine("Cargo.toml").is_ok());
+        assert!(confine("src/core_tools.rs").is_ok());
+        // The system temp dir is an allowed root (scratch workflows).
+        let tmp = std::env::temp_dir().join("forge-confine-probe.txt");
+        assert!(confine(tmp.to_str().unwrap()).is_ok());
+        // Absolute escapes outside the workspace are refused.
+        assert!(confine("/etc/passwd").is_err());
+        if let Some(home) = std::env::var_os("HOME") {
+            let ssh = Path::new(&home).join(".ssh/id_rsa");
+            assert!(
+                confine(ssh.to_str().unwrap()).is_err(),
+                "must refuse an absolute path into $HOME/.ssh"
+            );
+        }
+        // `..` traversal out of the workspace is refused (lexically collapsed before the check).
+        assert!(confine("../../../../../../etc/passwd").is_err());
+    }
+
+    #[tokio::test]
+    async fn write_file_refuses_path_outside_workspace() {
+        let err = WriteFileTool
+            .run(&json!({ "path": "/etc/forge_should_not_write", "content": "x" }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Failed(m) => assert!(m.contains("workspace"), "msg: {m}"),
+            other => panic!("expected a confinement Failed error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_file_refuses_dotdot_escape() {
+        // Even with a real file existing, a `..`-escaping target must be refused before any fs op.
+        let err = EditFileTool
+            .run(&json!({
+                "path": "../../../../../../etc/hosts",
+                "old": "x",
+                "new": "y"
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(m) if m.contains("workspace")));
+    }
+
+    #[tokio::test]
+    async fn write_then_edit_within_workspace_still_works() {
+        // Confinement must not break ordinary in-repo writes/edits (here via the temp root).
+        let dir = temp_dir("confine-ok");
+        let path = dir.join("f.txt");
+        WriteFileTool
+            .run(&json!({ "path": path.to_str().unwrap(), "content": "alpha" }))
+            .await
+            .unwrap();
+        EditFileTool
+            .run(&json!({ "path": path.to_str().unwrap(), "old": "alpha", "new": "beta" }))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "beta");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

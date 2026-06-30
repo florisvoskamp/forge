@@ -1198,8 +1198,25 @@ impl Session {
         Ok(Some(outcome))
     }
 
-    /// Publish the current turn's snapshot context (session id, seq, absolute root) to the
-    /// environment so the CLI bridge's `forge mcp-serve` snapshots its writes into this turn's dir.
+    /// Publish the current turn's snapshot context (session id, seq, absolute root, temper) to the
+    /// PROCESS environment so the CLI bridge's `forge mcp-serve` child snapshots its writes into this
+    /// turn's dir and matches the live permission mode.
+    ///
+    /// CONSTRAINT (single-session host only): this mutates process-global env. Both bridge spawn
+    /// paths (`forge-provider`: codex via `-c mcp_servers.forge.env.*`, claude via inherited env)
+    /// read these `FORGE_CHECKPOINT_*` / `FORGE_PERMISSION_MODE` vars back out with `std::env::var`
+    /// at spawn time, so the parent and child communicate through the process env, not an explicit
+    /// argument. That is safe for the serialized TUI (exactly one turn in flight at a time), but:
+    ///   - a future concurrent-session host sharing this process would clobber another session's
+    ///     context between this `set_var` and the child spawn, and
+    ///   - `set_var` racing a concurrent `getenv` on another thread is undefined behavior.
+    ///
+    /// The correct fix is to thread this context EXPLICITLY from here into the spawn call (a
+    /// `CheckpointContext` argument on the provider/bridge API) instead of going through the env.
+    /// That requires changing the `Provider` trait + every bridge spawn site in `forge-provider`/
+    /// `forge-cli`, which is out of scope for this change set; until then this remains the documented
+    /// single-session constraint above. Keep this the ONLY writer of these vars and call it from the
+    /// serialized turn loop only.
     fn export_checkpoint_env(&self, seq: i64) {
         let root = std::path::absolute(&self.checkpoint_root)
             .unwrap_or_else(|_| self.checkpoint_root.clone());
@@ -1880,6 +1897,12 @@ impl Session {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string());
         let os = std::env::consts::OS;
+        // NOTE: this stays a synchronous `std::fs` read on purpose. `.git/HEAD` is a tiny,
+        // OS-cached, single-file read; making it async would force this hot per-request preamble
+        // helper (and `transcript_with_preamble`) to be `async`, which would hold a `&Session`
+        // across an `.await` inside the spawned turn future — and `Session` is not `Sync`
+        // (`Receiver`/`dyn Presenter`), so the turn future would stop being `Send` and could no
+        // longer be `tokio::spawn`ed. Not worth it for a cached tiny read.
         let branch = std::fs::read_to_string(".git/HEAD").ok().and_then(|s| {
             s.strip_prefix("ref: refs/heads/")
                 .map(|b| b.trim().to_string())
@@ -3809,8 +3832,10 @@ Output ONLY that sentence — no preamble, no quotation marks.";
 
         // Inject the project AGENTS.md as a standing system prompt on the first turn of a
         // fresh session. Tried in order: .forge/AGENTS.md, then AGENTS.md in cwd.
-        // Sync I/O intentional: one-time startup read of a small file; no await point so
-        // an abort() between here and user-message persistence can't skip the recording.
+        // Sync I/O intentional (load-bearing): one-time startup read of a small file; with NO await
+        // point an abort() between here and the user-message persistence below can't skip the
+        // recording (an `aborting_a_running_turn_releases_the_session_lock` test pins this). Making
+        // it `tokio::fs` would reintroduce that cancel window, so it stays synchronous.
         if !self.project_prompt_injected {
             self.project_prompt_injected = true;
             for agents_path in [".forge/AGENTS.md", "AGENTS.md"] {
@@ -4256,12 +4281,15 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         // Build a concatenated unified diff: for each file, diff old (blob or empty) vs new.
         let mut combined = String::new();
         for tf in &turn_files {
-            let old = tf
-                .blob
-                .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
+            // Async path: read the snapshot blob + the post-edit file with `tokio::fs` so a slow or
+            // networked filesystem can't stall the executor while the auto-review gate builds its diff.
+            let old = match &tf.blob {
+                Some(p) => tokio::fs::read_to_string(p).await.unwrap_or_default(),
+                None => String::new(),
+            };
+            let new = tokio::fs::read_to_string(&tf.path)
+                .await
                 .unwrap_or_default();
-            let new = std::fs::read_to_string(&tf.path).unwrap_or_default();
             if old == new {
                 continue;
             }
@@ -4772,18 +4800,28 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         let permission_label = if allowed { "allowed" } else { "denied" };
 
         // Snapshot the target's pre-edit bytes BEFORE a permitted write, so `/undo` can restore
-        // it (PR3 shadow snapshots; first touch per path per turn wins).
+        // it (PR3 shadow snapshots; first touch per path per turn wins). The target path is read via
+        // the centralized `extract_path_arg`, so a write tool naming its arg `file_path`/`target`
+        // still gets snapshotted (and is subject to the same secret-deny / permission path logic).
         let write_path = (allowed && side_effect == forge_types::SideEffect::Write)
-            .then(|| effective_args.get("path").and_then(|v| v.as_str()))
+            .then(|| forge_types::extract_path_arg(&effective_args))
             .flatten()
             .map(std::path::PathBuf::from);
         if let Some(path) = &write_path {
-            let _ = snapshot::snapshot_before_write(
+            // Surface a snapshot failure: the write below still proceeds, but `/undo` will NOT be
+            // able to restore this file, so the user must be told rather than silently losing the
+            // safety net.
+            if let Err(e) = snapshot::snapshot_before_write(
                 &self.checkpoint_root,
                 &self.id,
                 self.current_turn_seq,
                 path,
-            );
+            ) {
+                self.presenter.emit(PresenterEvent::Warning(format!(
+                    "could not snapshot {} before writing ({e}) — /undo will not be able to restore this change",
+                    path.display()
+                )));
+            }
         }
 
         let (result, ok) = if allowed {
@@ -5258,7 +5296,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         use forge_types::TodoStatus;
         let args_json = serde_json::to_string(&call.args)?;
         self.tasks = parse_tasks(&call.args);
-        let _ = self.store.set_tasks(&self.id, &self.tasks);
+        self.persist_tasks();
         self.presenter
             .emit(PresenterEvent::Tasks(self.tasks.clone()));
 
@@ -5294,10 +5332,22 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                 status: forge_types::TodoStatus::Pending,
             })
             .collect();
-        let _ = self.store.set_tasks(&self.id, &self.tasks);
+        self.persist_tasks();
         self.presenter
             .emit(PresenterEvent::Tasks(self.tasks.clone()));
         self.pending_plan = Some(plan);
+    }
+
+    /// Persist the current task list, surfacing a write failure as a Warning instead of silently
+    /// swallowing it. A silently-dropped task write means a resumed session's completion gate (which
+    /// reloads tasks from the store) would judge against a stale list — so the user must be told.
+    fn persist_tasks(&mut self) {
+        if let Err(e) = self.store.set_tasks(&self.id, &self.tasks) {
+            self.presenter.emit(PresenterEvent::Warning(format!(
+                "could not persist the task list ({e}) — it may not survive a resume; the \
+                 completion gate could judge against a stale list"
+            )));
+        }
     }
 
     /// Ask the user to approve a proposed plan (called at turn end, after the model loop, so it's
@@ -5717,9 +5767,6 @@ pub fn parse_plan(args: &serde_json::Value) -> forge_types::PlanProposal {
 /// revision. Best-effort: a write failure never breaks the turn.
 pub fn persist_plan(session_id: &str, plan: &forge_types::PlanProposal) {
     let dir = std::path::Path::new(".forge").join("plans");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
     let mut md = format!("# {}\n\n", plan.title.trim());
     for (i, s) in plan.steps.iter().enumerate() {
         md.push_str(&format!("{}. {}\n", i + 1, s.title.trim()));
@@ -5746,7 +5793,22 @@ pub fn persist_plan(session_id: &str, plan: &forge_types::PlanProposal) {
     } else {
         safe
     };
-    let _ = std::fs::write(dir.join(format!("{name}.md")), md);
+    let file = dir.join(format!("{name}.md"));
+
+    // Best-effort, off the executor: the write is small and infrequent, but a slow/networked FS
+    // shouldn't stall the async turn loop. `spawn_blocking` runs it on the blocking pool; when no
+    // runtime is active (a plain sync caller, e.g. a unit test) fall back to an inline write.
+    let do_write = move || {
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(&file, md);
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(do_write);
+        }
+        Err(_) => do_write(),
+    }
 }
 
 /// The `ToolSpec` advertised for [`PRESENT_PLAN_TOOL`] — offered only in planning mode.
@@ -10495,6 +10557,53 @@ mod tests {
             "undo restored the pre-turn bytes"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn snapshot_failure_warns_that_undo_wont_cover_the_write() {
+        // When the pre-write snapshot can't be written, the write still proceeds — but the user must
+        // be warned that /undo can't restore it, instead of silently losing the safety net.
+        let dir = std::env::temp_dir().join(format!("forge-snapfail-{}", forge_types::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("edited.txt");
+        std::fs::write(&file, "original").unwrap();
+        // A regular file standing where the checkpoint root's parent dir would be, so the snapshot's
+        // `create_dir_all` fails (you can't create a directory underneath a file).
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "i am a file, not a dir").unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            permission_mode: PermissionMode::Bypass,
+            ..Config::default()
+        };
+        let mut session = Session::start(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(WritingProvider {
+                path: file.to_string_lossy().to_string(),
+                content: "model wrote this".into(),
+            }),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(CapturePresenter {
+                events: events.clone(),
+            }),
+            config,
+            ".",
+        )
+        .unwrap();
+        session.set_checkpoint_root(blocker.join("snaps"));
+
+        session.run_turn("rewrite the file").await.unwrap();
+
+        // The write still landed…
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "model wrote this");
+        // …and a Warning told the user /undo won't cover it.
+        let warned = events.lock().unwrap().iter().any(|e| {
+            matches!(e, PresenterEvent::Warning(w) if w.contains("undo") && w.contains("snapshot"))
+        });
+        assert!(warned, "expected an /undo snapshot-failure warning");
         std::fs::remove_dir_all(&dir).ok();
     }
 

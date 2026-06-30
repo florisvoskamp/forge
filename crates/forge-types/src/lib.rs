@@ -813,6 +813,31 @@ pub fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// The argument keys a file-touching tool may use to name its target path. Centralized as a single
+/// source of truth so the permission broker, the secret denylist, the pre-write snapshot, and the
+/// in-process workspace confinement all key off the SAME set. A write tool that names its path arg
+/// `file_path`/`target` (instead of `path`) must not slip past the secret deny or miss a snapshot.
+/// Ordered by how common/canonical the key is — the first present string-valued key wins.
+pub const PATH_ARG_KEYS: &[&str] = &[
+    "path",
+    "file_path",
+    "filename",
+    "file",
+    "target",
+    "target_file",
+    "dest",
+    "destination",
+];
+
+/// Extract a tool call's target file path from any of the known [`PATH_ARG_KEYS`]. Returns the
+/// first present string value, or `None` if the args carry no recognizable path key (e.g. a shell
+/// call keyed on `command`, or a tool that takes no path).
+pub fn extract_path_arg(args: &serde_json::Value) -> Option<&str> {
+    PATH_ARG_KEYS
+        .iter()
+        .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
+}
+
 /// A snapshot of the models that are currently benched (rate-limited / unavailable / failed a
 /// probe) and must not be routed to. Built by the store from the `model_health` table — only
 /// models whose cooldown has not yet elapsed are included — and consulted by the mesh router.
@@ -1033,6 +1058,27 @@ impl PartialEq<String> for LoopOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_path_arg_covers_all_known_keys() {
+        use serde_json::json;
+        // Every alias resolves to the path string.
+        for key in PATH_ARG_KEYS {
+            let args = json!({ *key: "src/main.rs" });
+            assert_eq!(
+                extract_path_arg(&args),
+                Some("src/main.rs"),
+                "key `{key}` must be recognized"
+            );
+        }
+        // `path` wins when several keys are present (canonical, first in the list).
+        let multi = json!({ "target": "b.rs", "path": "a.rs" });
+        assert_eq!(extract_path_arg(&multi), Some("a.rs"));
+        // No path key (e.g. a shell call) → None.
+        assert_eq!(extract_path_arg(&json!({ "command": "ls" })), None);
+        // Non-string path values are ignored.
+        assert_eq!(extract_path_arg(&json!({ "path": 7 })), None);
+    }
 
     #[test]
     fn task_tier_up_down_clamps_at_ends() {

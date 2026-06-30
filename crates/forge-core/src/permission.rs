@@ -124,13 +124,20 @@ fn rule_matches(rule: &PermissionRule, tool_name: &str, args: &Value) -> bool {
         }
         return false;
     }
-    // Path tools: match against the path arg and its normalized variants.
-    if let Some(path) = args.get("path").and_then(Value::as_str) {
+    // Path tools: match against the path arg and its normalized variants. The target path is read
+    // via the centralized `extract_path_arg` (not just the literal `"path"` key), so a write tool
+    // that names its arg `file_path`/`target` is still subject to the secret denylist and path rules.
+    if let Some(path) = forge_types::extract_path_arg(args) {
         let candidates = path_candidates(path);
-        return rule
+        if rule
             .patterns
             .iter()
-            .any(|p| candidates.iter().any(|c| path_match(p, c)));
+            .any(|p| candidates.iter().any(|c| path_match(p, c)))
+        {
+            return true;
+        }
+        // Fall through to the generic `"*"` check below rather than early-returning: a rule that
+        // means "match any call to this tool" (patterns = `["*"]`) must still apply to a path tool.
     }
     // Generic tools (MCP server tools, etc.): a bare "*" means "match any args". More specific
     // patterns are intentionally not supported for non-shell/non-path tools — the only meaningful
@@ -630,6 +637,44 @@ mod tests {
                 "{tool} must deny SSH key writes even in bypass"
             );
         }
+    }
+
+    #[test]
+    fn secret_deny_covers_alternate_path_arg_keys() {
+        // The secret denylist must key off ANY known path-arg key, not just `"path"`. A write tool
+        // that names its target `file_path`/`target`/`filename` previously slipped past the deny.
+        let rules = forge_config::builtin_deny_rules();
+        for key in ["file_path", "target", "filename", "dest", "destination"] {
+            let args = json!({ key: "./.env" });
+            assert_eq!(
+                decide(
+                    PermissionMode::Bypass,
+                    SideEffect::Write,
+                    "write_file",
+                    &args,
+                    &rules
+                ),
+                Deny,
+                "secret write via `{key}` arg must be denied even in bypass"
+            );
+        }
+    }
+
+    #[test]
+    fn star_rule_still_matches_path_tool_after_path_keys_broadened() {
+        // Broadening the path-arg extraction must not break the "deny any call to this tool" rule
+        // (patterns = ["*"]) for a path tool whose path didn't match a glob.
+        let rules = [cfg("delete_file", Deny, &["*"])];
+        assert_eq!(
+            decide(
+                PermissionMode::Bypass,
+                SideEffect::Write,
+                "delete_file",
+                &json!({ "path": "src/deep/nested/file.rs" }),
+                &rules
+            ),
+            Deny
+        );
     }
 
     #[test]
