@@ -76,7 +76,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "que
 # running `forge chat` session. axum bundles hyper + tokio-tungstenite; the WS layer needs
 # `ws` (axum) which pulls tungstenite. qrcode renders a scan-to-connect matrix into the TUI.
 axum = { version = "0.8", features = ["ws"] }
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.29"
 qrcode = "0.14"
 # Cross-platform hardware probe (total RAM, CPU cores) to recommend a local-LLM size. default
 # off + only the components we read, to keep the dep light.
