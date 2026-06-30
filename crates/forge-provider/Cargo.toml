@@ -29,4 +29,4 @@ libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
-httpmock = "0.7"
+httpmock = "0.8"
