@@ -8,14 +8,14 @@
 harness that routes every task to the cheapest capable model, fails over across providers when one
 is down, and is *measurably* more reliable than the raw vendor CLIs.**
 
-[![CI](https://github.com/florisvoskamp/forge/actions/workflows/ci.yml/badge.svg)](https://github.com/florisvoskamp/forge/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/florisvoskamp/forge?color=orange)](https://github.com/florisvoskamp/forge/releases)
+[![CI](https://github.com/Adulari/forge/actions/workflows/ci.yml/badge.svg)](https://github.com/Adulari/forge/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Adulari/forge?color=orange)](https://github.com/Adulari/forge/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
 [![Conformance tests](https://img.shields.io/badge/harness_conformance-324_tests-brightgreen.svg)](docs/harness/why-forge-is-a-better-harness.md)
-[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/florisvoskamp)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/Adulari)
 
-**[⚡ Quick Setup Guide](./docs/quickstart.md)** &nbsp;·&nbsp; **[Install](#install)** &nbsp;·&nbsp; **[Quickstart](#quick-start)** &nbsp;·&nbsp; **[Free setup](#free-providers)** &nbsp;·&nbsp; **[Why Forge](#why-forge)** &nbsp;·&nbsp; **[Benchmarks](#benchmarks)** &nbsp;·&nbsp; **[vs. others](#comparison)** &nbsp;·&nbsp; **[Features](#feature-overview)** &nbsp;·&nbsp; **[Docs](#documentation)** &nbsp;·&nbsp; **[💖 Sponsor](https://github.com/sponsors/florisvoskamp)**
+**[⚡ Quick Setup Guide](./docs/quickstart.md)** &nbsp;·&nbsp; **[Install](#install)** &nbsp;·&nbsp; **[Quickstart](#quick-start)** &nbsp;·&nbsp; **[Free setup](#free-providers)** &nbsp;·&nbsp; **[Why Forge](#why-forge)** &nbsp;·&nbsp; **[Benchmarks](#benchmarks)** &nbsp;·&nbsp; **[vs. others](#comparison)** &nbsp;·&nbsp; **[Features](#feature-overview)** &nbsp;·&nbsp; **[Docs](#documentation)** &nbsp;·&nbsp; **[💖 Sponsor](https://github.com/sponsors/Adulari)**
 
 </div>
 
@@ -288,7 +288,7 @@ You can also stack keys via env: `GROQ_API_KEY="k1,k2"` or numbered `GROQ_API_KE
 ### ⚡ One-line install (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/florisvoskamp/forge/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Adulari/forge/main/install.sh | sh
 ```
 
 Detects your OS/arch, downloads the matching release binary (verifying its SHA-256), and installs
@@ -298,7 +298,7 @@ and macOS (Apple Silicon + Intel) are supported; on other arches it falls back t
 ### 🪟 Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/florisvoskamp/forge/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Adulari/forge/main/install.ps1 | iex
 ```
 
 Downloads the x86-64 release binary (verifying its SHA-256), installs `forge.exe` to
@@ -308,7 +308,7 @@ current.
 ### 🍺 Homebrew
 
 ```bash
-brew tap florisvoskamp/forge https://github.com/florisvoskamp/forge
+brew tap Adulari/forge https://github.com/Adulari/forge
 brew install forge
 ```
 
@@ -329,7 +329,7 @@ cp target/release/forge ~/.local/bin/   # or anywhere on PATH
 ```
 
 Requires a recent stable Rust toolchain. Prebuilt binaries for each OS are on the
-[**Releases**](https://github.com/florisvoskamp/forge/releases) page.
+[**Releases**](https://github.com/Adulari/forge/releases) page.
 
 ---
 
@@ -605,7 +605,7 @@ crates/
 Forge is built by one person, fully open source, MIT licensed. If it saves you time, money, or
 API costs — sponsoring helps keep it maintained and growing.
 
-[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/florisvoskamp)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/Adulari)
 
 **What your support funds:**
 - Ongoing maintenance, bugfixes, and reliability work
@@ -623,7 +623,7 @@ API costs — sponsoring helps keep it maintained and growing.
 | 💎 **Gold Sponsor** | $100 | Logo + link in README · direct line for feedback |
 | 🏆 **Platinum Sponsor** | $250 | Prominent README placement · input on roadmap |
 
-**[Become a sponsor →](https://github.com/sponsors/florisvoskamp)**
+**[Become a sponsor →](https://github.com/sponsors/Adulari)**
 
 ---
 

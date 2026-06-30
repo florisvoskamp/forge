@@ -1,5 +1,5 @@
 [package]
-name = "adforge-tools"
+name = "forge-agent-tools"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

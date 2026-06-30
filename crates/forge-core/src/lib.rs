@@ -3978,7 +3978,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             if self.config.git.coauthor {
                 const GIT_ATTRIBUTION: &str = "Git attribution is enabled for this session. When \
 you create commits or pull requests, attribute them to Forge:\n\
-- Commits: a `Co-Authored-By: Forge <noreply@forge.dev>` trailer is added automatically by a git \
+- Commits: a `Co-Authored-By: Forge <forge@adulari.dev>` trailer is added automatically by a git \
 hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
 - Pull requests: include a line in the PR body crediting Forge, e.g. `🔨 Created with Forge`.";
                 let aseq = self.next_seq();

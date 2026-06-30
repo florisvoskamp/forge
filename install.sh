@@ -1,14 +1,14 @@
 #!/bin/sh
 # Forge installer. Downloads the right prebuilt binary from GitHub Releases.
 #
-#   curl -fsSL https://raw.githubusercontent.com/florisvoskamp/forge/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Adulari/forge/main/install.sh | sh
 #
 # Overrides:
 #   FORGE_VERSION      tag to install (default: latest release)
 #   FORGE_INSTALL_DIR  where to put the binary (default: ~/.local/bin)
 set -eu
 
-REPO="florisvoskamp/forge"
+REPO="Adulari/forge"
 INSTALL_DIR="${FORGE_INSTALL_DIR:-$HOME/.local/bin}"
 
 err() { printf 'install: %s\n' "$1" >&2; exit 1; }

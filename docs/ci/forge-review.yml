@@ -20,7 +20,7 @@ jobs:
         with:
           fetch-depth: 0 # full history so --scope diff/branch can resolve the base
 
-      - uses: florisvoskamp/forge/.github/actions/forge-assay@main
+      - uses: Adulari/forge/.github/actions/forge-assay@main
         with:
           version: v0.1.0 # pin to a release whose binary has `forge assay run`
           scope: diff

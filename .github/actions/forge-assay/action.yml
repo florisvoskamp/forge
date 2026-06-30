@@ -49,7 +49,7 @@ runs:
           echo "::error::forge-assay only ships an x86_64 Linux binary; runner is $(uname -m)"; exit 1
         fi
         asset="forge-x86_64-unknown-linux-gnu.tar.gz"
-        url="https://github.com/florisvoskamp/forge/releases/download/${{ inputs.version }}/${asset}"
+        url="https://github.com/Adulari/forge/releases/download/${{ inputs.version }}/${asset}"
         curl -fsSL "$url" -o /tmp/forge.tar.gz
         tar xzf /tmp/forge.tar.gz -C /tmp
         sudo install -m0755 /tmp/forge-x86_64-unknown-linux-gnu/forge /usr/local/bin/forge

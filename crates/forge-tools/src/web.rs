@@ -25,7 +25,7 @@ const MAX_SEARCH_COUNT: u32 = 10;
 const USER_AGENT: &str = concat!(
     "forge/",
     env!("CARGO_PKG_VERSION"),
-    " (+https://github.com/florisvoskamp/forge)"
+    " (+https://github.com/Adulari/forge)"
 );
 
 /// A reqwest `ClientBuilder` pre-seeded with Mozilla's bundled root CAs, so web_fetch / web_search

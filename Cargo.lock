@@ -3,268 +3,6 @@
 version = 4
 
 [[package]]
-name = "adforge"
-version = "2.0.0"
-dependencies = [
- "adforge-config",
- "adforge-core",
- "adforge-index",
- "adforge-lsp",
- "adforge-mcp",
- "adforge-mesh",
- "adforge-provider",
- "adforge-skills",
- "adforge-store",
- "adforge-tools",
- "adforge-tui",
- "adforge-types",
- "anyhow",
- "arboard",
- "axum",
- "axum-server",
- "base64 0.22.1",
- "chrono",
- "clap",
- "crossterm",
- "flate2",
- "futures",
- "image",
- "portable-pty",
- "qrcode",
- "rcgen",
- "reqwest",
- "rmcp",
- "self_update",
- "serde",
- "serde_json",
- "sysinfo",
- "tar",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "toml 1.1.2+spec-1.1.0",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "adforge-config"
-version = "2.0.0"
-dependencies = [
- "adforge-skills",
- "adforge-types",
- "base64 0.22.1",
- "chacha20poly1305",
- "directories",
- "figment",
- "keyring",
- "rand 0.9.4",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "thiserror 2.0.18",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
-]
-
-[[package]]
-name = "adforge-core"
-version = "2.0.0"
-dependencies = [
- "adforge-config",
- "adforge-index",
- "adforge-lsp",
- "adforge-mcp",
- "adforge-mesh",
- "adforge-provider",
- "adforge-skills",
- "adforge-store",
- "adforge-tools",
- "adforge-tui",
- "adforge-types",
- "async-trait",
- "futures",
- "globset",
- "serde",
- "serde_json",
- "shell-words",
- "similar",
- "thiserror 2.0.18",
- "tiktoken-rs",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "adforge-index"
-version = "2.0.0"
-dependencies = [
- "adforge-config",
- "adforge-store",
- "adforge-types",
- "async-trait",
- "ignore",
- "notify-debouncer-mini",
- "reqwest",
- "serde_json",
- "sha2 0.11.0",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-elixir",
- "tree-sitter-go",
- "tree-sitter-haskell",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-kotlin-ng",
- "tree-sitter-lua",
- "tree-sitter-ocaml",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-scala",
- "tree-sitter-tags",
- "tree-sitter-typescript",
- "webpki-root-certs",
-]
-
-[[package]]
-name = "adforge-lsp"
-version = "2.0.0"
-dependencies = [
- "adforge-config",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "adforge-mcp"
-version = "2.0.0"
-dependencies = [
- "adforge-config",
- "adforge-types",
- "futures",
- "parking_lot",
- "reqwest",
- "rmcp",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "webpki-root-certs",
-]
-
-[[package]]
-name = "adforge-mesh"
-version = "2.0.0"
-dependencies = [
- "adforge-config",
- "adforge-types",
- "async-trait",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "adforge-provider"
-version = "2.0.0"
-dependencies = [
- "adforge-config",
- "adforge-index",
- "adforge-types",
- "async-trait",
- "futures",
- "genai",
- "httpmock",
- "libc",
- "reqwest",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "webpki-root-certs",
-]
-
-[[package]]
-name = "adforge-skills"
-version = "2.0.0"
-dependencies = [
- "adforge-types",
- "tracing",
-]
-
-[[package]]
-name = "adforge-store"
-version = "2.0.0"
-dependencies = [
- "adforge-types",
- "chrono",
- "r2d2",
- "rusqlite",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "adforge-tools"
-version = "2.0.0"
-dependencies = [
- "adforge-index",
- "adforge-types",
- "async-trait",
- "futures",
- "globset",
- "landlock",
- "libc",
- "portable-pty",
- "regex",
- "reqwest",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "webpki-root-certs",
-]
-
-[[package]]
-name = "adforge-tui"
-version = "2.0.0"
-dependencies = [
- "adforge-config",
- "adforge-types",
- "crossterm",
- "pulldown-cmark",
- "ratatui",
- "serde",
- "serde_json",
- "similar",
- "syntect",
- "tokio",
- "unicode-width",
-]
-
-[[package]]
-name = "adforge-types"
-version = "2.0.0"
-dependencies = [
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2046,6 +1784,268 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "forge-agent"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "crossterm",
+ "flate2",
+ "forge-agent-config",
+ "forge-agent-core",
+ "forge-agent-index",
+ "forge-agent-lsp",
+ "forge-agent-mcp",
+ "forge-agent-mesh",
+ "forge-agent-provider",
+ "forge-agent-skills",
+ "forge-agent-store",
+ "forge-agent-tools",
+ "forge-agent-tui",
+ "forge-agent-types",
+ "futures",
+ "image",
+ "portable-pty",
+ "qrcode",
+ "rcgen",
+ "reqwest",
+ "rmcp",
+ "self_update",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tar",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "toml 1.1.2+spec-1.1.0",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "forge-agent-config"
+version = "2.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "directories",
+ "figment",
+ "forge-agent-skills",
+ "forge-agent-types",
+ "keyring",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
+name = "forge-agent-core"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "forge-agent-config",
+ "forge-agent-index",
+ "forge-agent-lsp",
+ "forge-agent-mcp",
+ "forge-agent-mesh",
+ "forge-agent-provider",
+ "forge-agent-skills",
+ "forge-agent-store",
+ "forge-agent-tools",
+ "forge-agent-tui",
+ "forge-agent-types",
+ "futures",
+ "globset",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "similar",
+ "thiserror 2.0.18",
+ "tiktoken-rs",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "forge-agent-index"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "forge-agent-config",
+ "forge-agent-store",
+ "forge-agent-types",
+ "ignore",
+ "notify-debouncer-mini",
+ "reqwest",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-elixir",
+ "tree-sitter-go",
+ "tree-sitter-haskell",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-lua",
+ "tree-sitter-ocaml",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-scala",
+ "tree-sitter-tags",
+ "tree-sitter-typescript",
+ "webpki-root-certs",
+]
+
+[[package]]
+name = "forge-agent-lsp"
+version = "2.0.0"
+dependencies = [
+ "forge-agent-config",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "forge-agent-mcp"
+version = "2.0.0"
+dependencies = [
+ "forge-agent-config",
+ "forge-agent-types",
+ "futures",
+ "parking_lot",
+ "reqwest",
+ "rmcp",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "webpki-root-certs",
+]
+
+[[package]]
+name = "forge-agent-mesh"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "forge-agent-config",
+ "forge-agent-types",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "forge-agent-provider"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "forge-agent-config",
+ "forge-agent-index",
+ "forge-agent-types",
+ "futures",
+ "genai",
+ "httpmock",
+ "libc",
+ "reqwest",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "webpki-root-certs",
+]
+
+[[package]]
+name = "forge-agent-skills"
+version = "2.0.0"
+dependencies = [
+ "forge-agent-types",
+ "tracing",
+]
+
+[[package]]
+name = "forge-agent-store"
+version = "2.0.0"
+dependencies = [
+ "chrono",
+ "forge-agent-types",
+ "r2d2",
+ "rusqlite",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "forge-agent-tools"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "forge-agent-index",
+ "forge-agent-types",
+ "futures",
+ "globset",
+ "landlock",
+ "libc",
+ "portable-pty",
+ "regex",
+ "reqwest",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "webpki-root-certs",
+]
+
+[[package]]
+name = "forge-agent-tui"
+version = "2.0.0"
+dependencies = [
+ "crossterm",
+ "forge-agent-config",
+ "forge-agent-types",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "similar",
+ "syntect",
+ "tokio",
+ "unicode-width",
+]
+
+[[package]]
+name = "forge-agent-types"
+version = "2.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+]
 
 [[package]]
 name = "form_urlencoded"
@@ -7304,20 +7304,20 @@ dependencies = [
 name = "xtasks"
 version = "2.0.0"
 dependencies = [
- "adforge",
- "adforge-config",
- "adforge-core",
- "adforge-index",
- "adforge-mesh",
- "adforge-provider",
- "adforge-store",
- "adforge-tools",
- "adforge-tui",
- "adforge-types",
  "anyhow",
  "clap",
  "clap_complete",
  "clap_mangen",
+ "forge-agent",
+ "forge-agent-config",
+ "forge-agent-core",
+ "forge-agent-index",
+ "forge-agent-mesh",
+ "forge-agent-provider",
+ "forge-agent-store",
+ "forge-agent-tools",
+ "forge-agent-tui",
+ "forge-agent-types",
  "tokio",
 ]
 

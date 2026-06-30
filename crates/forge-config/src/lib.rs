@@ -713,7 +713,7 @@ fn default_update_check() -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GitConfig {
     /// When true, `forge git setup` installs a prepare-commit-msg hook that strips
-    /// Claude/Codex co-author lines and adds `Co-Authored-By: Forge <noreply@forge.dev>`.
+    /// Claude/Codex co-author lines and adds `Co-Authored-By: Forge <forge@adulari.dev>`.
     #[serde(default)]
     pub coauthor: bool,
 }

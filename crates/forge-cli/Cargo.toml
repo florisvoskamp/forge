@@ -1,10 +1,10 @@
 [package]
-name = "adforge"
+name = "forge-agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The Forge command-line binary."
+description = "Forge — the model-agnostic AI coding agent. One harness, every provider."
 repository.workspace = true
 
 [[bin]]

@@ -1,5 +1,5 @@
 [package]
-name = "adforge-lsp"
+name = "forge-agent-lsp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -20,7 +20,7 @@ in [`docs/STABILITY.md`](docs/STABILITY.md).
 **Please do not open a public issue for security vulnerabilities.**
 
 Report privately via GitHub's
-[private vulnerability reporting](https://github.com/florisvoskamp/forge/security/advisories/new)
+[private vulnerability reporting](https://github.com/Adulari/forge/security/advisories/new)
 ("Report a vulnerability" under the repository's **Security** tab). If that is unavailable to you,
 email the maintainer at **fvoskamp2005@gmail.com** with `[forge-security]` in the subject.
 

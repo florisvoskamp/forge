@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/florisvoskamp/forge/security/advisories/new
+    url: https://github.com/Adulari/forge/security/advisories/new
     about: Please report security issues privately, not as a public issue (see SECURITY.md).
   - name: Question / discussion
-    url: https://github.com/florisvoskamp/forge/discussions
+    url: https://github.com/Adulari/forge/discussions
     about: Ask questions and share ideas in Discussions.

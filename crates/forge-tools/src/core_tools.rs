@@ -1764,7 +1764,7 @@ mod tests {
             .run(&json!({ "path": "Cargo.toml" }))
             .await
             .unwrap();
-        assert!(out.contains("forge-tools"));
+        assert!(out.contains("forge-agent-tools"));
     }
 
     #[tokio::test]

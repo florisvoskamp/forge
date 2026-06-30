@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/florisvoskamp/forge/blob/main/docs/config-schema.json",
+  "$id": "https://github.com/Adulari/forge/blob/main/docs/config-schema.json",
   "title": "Forge config.toml",
   "description": "Schema for Forge's config.toml (the layered configuration loaded from ~/.config/forge/config.toml and ./.forge/config.toml). Covers the stable, documented top-level sections; partially-modelled sections allow additional properties for forward compatibility. Hand-authored from crates/forge-config — see docs/STABILITY.md for the compatibility policy.",
   "type": "object",

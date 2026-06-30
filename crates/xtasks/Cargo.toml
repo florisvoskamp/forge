@@ -20,8 +20,8 @@ forge-tools = { workspace = true }
 forge-tui = { workspace = true }
 # forge-cli's library facade (lib.rs) exposes `command()` for completion/man generation. Path dep
 # (xtasks is publish=false, never released), so no version needed. Key stays `forge-cli` so
-# `use forge_cli::` keeps working; package renamed to the bare `adforge` (the bin crate).
-forge-cli = { package = "adforge", path = "../forge-cli" }
+# `use forge_cli::` keeps working; package renamed to the bare `forge-agent` (the bin crate).
+forge-cli = { package = "forge-agent", path = "../forge-cli" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

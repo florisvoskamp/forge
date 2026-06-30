@@ -16,9 +16,9 @@ GIT_DIR=$(git rev-parse --git-dir 2>/dev/null || echo .git)
 MODEL=$(cat "$GIT_DIR/forge-model" 2>/dev/null)
 filtered=$(grep -Ev '^Co-Authored-By:.*([Cc]laude|[Cc]odex|[Aa]nthrop)' "$COMMIT_MSG_FILE") || filtered=$(cat "$COMMIT_MSG_FILE")
 if [ -n "$MODEL" ]; then
-  printf '%s\n\nCo-Authored-By: Forge (%s) <noreply@forge.dev>\n' "$filtered" "$MODEL" > "$COMMIT_MSG_FILE"
+  printf '%s\n\nCo-Authored-By: Forge (%s) <forge@adulari.dev>\n' "$filtered" "$MODEL" > "$COMMIT_MSG_FILE"
 else
-  printf '%s\n\nCo-Authored-By: Forge <noreply@forge.dev>\n' "$filtered" > "$COMMIT_MSG_FILE"
+  printf '%s\n\nCo-Authored-By: Forge <forge@adulari.dev>\n' "$filtered" > "$COMMIT_MSG_FILE"
 fi
 "#;
 

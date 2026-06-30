@@ -1884,25 +1884,25 @@ Initial public release: Model Mesh routing, multi-provider support, cost/budget 
 inline TUI, session persistence + checkpoints, permission broker, subagents, Assay analysis,
 Lattice code intelligence, MCP client, web tools, hooks, skills/commands, and more.
 
-[Unreleased]: https://github.com/florisvoskamp/forge/compare/v1.8.1...HEAD
-[1.8.1]: https://github.com/florisvoskamp/forge/compare/v1.8.0...v1.8.1
-[1.8.0]: https://github.com/florisvoskamp/forge/compare/v1.7.0...v1.8.0
-[1.7.0]: https://github.com/florisvoskamp/forge/compare/v1.6.1...v1.7.0
-[0.4.4]: https://github.com/florisvoskamp/forge/compare/v0.4.3...v0.4.4
-[0.4.3]: https://github.com/florisvoskamp/forge/compare/v0.4.2...v0.4.3
-[0.4.2]: https://github.com/florisvoskamp/forge/compare/v0.4.1...v0.4.2
-[0.4.1]: https://github.com/florisvoskamp/forge/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/florisvoskamp/forge/compare/v0.3.10...v0.4.0
-[0.3.10]: https://github.com/florisvoskamp/forge/compare/v0.3.9...v0.3.10
-[0.3.9]: https://github.com/florisvoskamp/forge/compare/v0.3.8...v0.3.9
-[0.3.8]: https://github.com/florisvoskamp/forge/compare/v0.3.7...v0.3.8
-[0.3.7]: https://github.com/florisvoskamp/forge/compare/v0.3.6...v0.3.7
-[0.3.6]: https://github.com/florisvoskamp/forge/compare/v0.3.5...v0.3.6
-[0.3.5]: https://github.com/florisvoskamp/forge/compare/v0.3.4...v0.3.5
-[0.3.4]: https://github.com/florisvoskamp/forge/compare/v0.3.3...v0.3.4
-[0.3.3]: https://github.com/florisvoskamp/forge/compare/v0.3.2...v0.3.3
-[0.3.2]: https://github.com/florisvoskamp/forge/compare/v0.3.1...v0.3.2
-[0.3.1]: https://github.com/florisvoskamp/forge/compare/v0.3.0...v0.3.1
-[0.3.0]: https://github.com/florisvoskamp/forge/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/florisvoskamp/forge/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/florisvoskamp/forge/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Adulari/forge/compare/v1.8.1...HEAD
+[1.8.1]: https://github.com/Adulari/forge/compare/v1.8.0...v1.8.1
+[1.8.0]: https://github.com/Adulari/forge/compare/v1.7.0...v1.8.0
+[1.7.0]: https://github.com/Adulari/forge/compare/v1.6.1...v1.7.0
+[0.4.4]: https://github.com/Adulari/forge/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/Adulari/forge/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/Adulari/forge/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/Adulari/forge/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/Adulari/forge/compare/v0.3.10...v0.4.0
+[0.3.10]: https://github.com/Adulari/forge/compare/v0.3.9...v0.3.10
+[0.3.9]: https://github.com/Adulari/forge/compare/v0.3.8...v0.3.9
+[0.3.8]: https://github.com/Adulari/forge/compare/v0.3.7...v0.3.8
+[0.3.7]: https://github.com/Adulari/forge/compare/v0.3.6...v0.3.7
+[0.3.6]: https://github.com/Adulari/forge/compare/v0.3.5...v0.3.6
+[0.3.5]: https://github.com/Adulari/forge/compare/v0.3.4...v0.3.5
+[0.3.4]: https://github.com/Adulari/forge/compare/v0.3.3...v0.3.4
+[0.3.3]: https://github.com/Adulari/forge/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/Adulari/forge/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/Adulari/forge/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/Adulari/forge/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Adulari/forge/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Adulari/forge/releases/tag/v0.1.0

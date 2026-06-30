@@ -1,7 +1,7 @@
 <#
 Forge installer for Windows. Downloads the prebuilt binary from GitHub Releases.
 
-  irm https://raw.githubusercontent.com/florisvoskamp/forge/main/install.ps1 | iex
+  irm https://raw.githubusercontent.com/Adulari/forge/main/install.ps1 | iex
 
 Overrides (set as environment variables before running):
   FORGE_VERSION      tag to install (default: latest release)
@@ -12,7 +12,7 @@ $ErrorActionPreference = 'Stop'
 # PowerShell 5.1 defaults to TLS 1.0; GitHub requires 1.2+.
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$Repo = 'florisvoskamp/forge'
+$Repo = 'Adulari/forge'
 $InstallDir = if ($env:FORGE_INSTALL_DIR) { $env:FORGE_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\forge' }
 
 function Die($msg) { Write-Error "install: $msg"; exit 1 }

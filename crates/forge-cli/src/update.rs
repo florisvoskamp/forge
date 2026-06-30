@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 
-const REPO_OWNER: &str = "florisvoskamp";
+const REPO_OWNER: &str = "Adulari";
 const REPO_NAME: &str = "forge";
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 

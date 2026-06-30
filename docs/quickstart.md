@@ -9,17 +9,17 @@ No credit card required — Forge works great on free provider tiers.
 
 **macOS / Linux:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/florisvoskamp/forge/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Adulari/forge/main/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/florisvoskamp/forge/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Adulari/forge/main/install.ps1 | iex
 ```
 
 **Homebrew:**
 ```bash
-brew tap florisvoskamp/forge https://github.com/florisvoskamp/forge
+brew tap Adulari/forge https://github.com/Adulari/forge
 brew install forge
 ```
 
@@ -174,4 +174,4 @@ In chat, answer `a` (always) to a prompt to silence it for the session, or run w
 
 ---
 
-> **Questions?** Open an issue at [github.com/florisvoskamp/forge](https://github.com/florisvoskamp/forge/issues).
+> **Questions?** Open an issue at [github.com/Adulari/forge](https://github.com/Adulari/forge/issues).

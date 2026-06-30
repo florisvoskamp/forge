@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use forge_tui::UiMsg;
 
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
-const REPO: &str = "florisvoskamp/forge";
+const REPO: &str = "Adulari/forge";
 /// Don't hit the network more than once a day.
 const THROTTLE_SECS: u64 = 24 * 3600;
 
