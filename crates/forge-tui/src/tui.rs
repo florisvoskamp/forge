@@ -95,25 +95,30 @@ impl Presenter for TuiPresenter {
         self.draw();
     }
 
-    fn confirm(&mut self, tool: &str, side_effect: SideEffect) -> bool {
-        self.app.prompt = Some(format!("allow {tool} ({side_effect:?})?"));
+    fn confirm(&mut self, tool: &str, side_effect: SideEffect) -> crate::ConfirmOutcome {
+        self.app.prompt = Some(format!("allow {tool} ({side_effect:?})? [y/a=always/n]"));
         self.draw();
 
-        let allowed = loop {
+        let outcome = loop {
             match event::read() {
                 Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => break true,
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => break false,
+                    KeyCode::Char('y') | KeyCode::Char('Y') => break crate::ConfirmOutcome::Allow,
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        break crate::ConfirmOutcome::AlwaysAllow
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        break crate::ConfirmOutcome::Deny
+                    }
                     _ => {}
                 },
                 Ok(_) => {}
-                Err(_) => break false, // can't read input -> deny (safe)
+                Err(_) => break crate::ConfirmOutcome::Deny,
             }
         };
 
         self.app.prompt = None;
         self.draw();
-        allowed
+        outcome
     }
 
     fn ask(&mut self, question: &str, options: &[crate::QChoice], allow_other: bool) -> String {

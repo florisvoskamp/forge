@@ -86,7 +86,7 @@ pub enum UiMsg {
     Permission {
         tool: String,
         side_effect: SideEffect,
-        reply: Sender<bool>,
+        reply: Sender<crate::ConfirmOutcome>,
     },
     /// An interactive question (AskUserQuestion): the loop shows it + the options and replies
     /// with the chosen label or a free-text answer.
@@ -135,7 +135,7 @@ impl Presenter for ChannelPresenter {
         }))
     }
 
-    fn confirm(&mut self, tool: &str, side_effect: SideEffect) -> bool {
+    fn confirm(&mut self, tool: &str, side_effect: SideEffect) -> crate::ConfirmOutcome {
         let (reply, answer) = std::sync::mpsc::channel();
         if self
             .tx
@@ -146,9 +146,9 @@ impl Presenter for ChannelPresenter {
             })
             .is_err()
         {
-            return false;
+            return crate::ConfirmOutcome::Deny;
         }
-        recv_blocking(&answer).unwrap_or(false) // blocks this turn task until the loop answers
+        recv_blocking(&answer).unwrap_or(crate::ConfirmOutcome::Deny)
     }
 
     fn ask(&mut self, question: &str, options: &[crate::QChoice], allow_other: bool) -> String {

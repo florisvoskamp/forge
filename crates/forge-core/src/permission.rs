@@ -31,11 +31,11 @@ pub fn decide_mode(mode: PermissionMode, side_effect: SideEffect) -> PermissionD
         PermissionMode::Plan => Deny,
         // Explicit, deliberate "do anything".
         PermissionMode::Bypass => Allow,
-        // Auto-allow edits, still gate shell. A network read is low-risk → allow. An external
-        // (untrusted MCP) call is at least as risky as shell → still ask, even in accept-edits.
+        // Auto-allow edits and shell. A network read is low-risk → allow. An external
+        // (untrusted MCP) call is still gated — deny rules cover catastrophic shell ops.
         PermissionMode::AcceptEdits => match side_effect {
             SideEffect::Write => Allow,
-            SideEffect::Shell => Ask,
+            SideEffect::Shell => Allow,
             SideEffect::ReadOnly => Allow,
             SideEffect::Network => Allow,
             SideEffect::External => Ask,
@@ -403,14 +403,14 @@ mod tests {
     }
 
     #[test]
-    fn accept_edits_allows_write_asks_shell() {
+    fn accept_edits_allows_write_and_shell() {
         assert_eq!(
             decide_mode(PermissionMode::AcceptEdits, SideEffect::Write),
             Allow
         );
         assert_eq!(
             decide_mode(PermissionMode::AcceptEdits, SideEffect::Shell),
-            Ask
+            Allow
         );
     }
 

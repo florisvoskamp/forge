@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 
+// reqwest and serde_json are direct deps of forge-cli (Cargo.toml).
+
 use crate::*;
 
 /// `forge commands` — list discovered slash commands + skills with scope and collision markers.
@@ -39,6 +41,7 @@ pub(crate) fn commands_cmd() -> Result<()> {
 /// generalised SKILL.md methodology, and writes it to the appropriate skills directory.
 pub(crate) async fn skill_cmd(sub: SkillCmd) -> Result<()> {
     match sub {
+        SkillCmd::Install { url } => skills_install(&url).await,
         SkillCmd::FromSession {
             session_id,
             name,
@@ -46,7 +49,195 @@ pub(crate) async fn skill_cmd(sub: SkillCmd) -> Result<()> {
         } => skill_from_session(&session_id, name.as_deref(), scope).await,
         SkillCmd::Export { dest, scope } => skills_export(&dest, scope),
         SkillCmd::Import { src, scope } => skills_import(&src, scope),
+        SkillCmd::Normalize { project } => skills_normalize(project),
     }
+}
+
+/// `forge skill install <owner/repo[@ref]>` — fetch `.md` files from a GitHub repo (or URL) and
+/// install them into the user skills directory. Tries `<repo>/skills/` first; falls back to root.
+pub(crate) async fn skills_install(source: &str) -> Result<()> {
+    let (owner, repo, ref_opt) = parse_github_source(source)?;
+
+    let client = reqwest::Client::builder()
+        .user_agent("forge-cli")
+        .build()
+        .context("building HTTP client")?;
+
+    let ref_query = ref_opt
+        .as_deref()
+        .map(|r| format!("?ref={r}"))
+        .unwrap_or_default();
+
+    // Try <repo>/skills/ first, fall back to repo root.
+    let listing_url = {
+        let skills_url =
+            format!("https://api.github.com/repos/{owner}/{repo}/contents/skills{ref_query}");
+        let resp = client
+            .get(&skills_url)
+            .header("Accept", "application/vnd.github.v3+json")
+            .send()
+            .await;
+        if resp.is_ok_and(|r| r.status().is_success()) {
+            skills_url
+        } else {
+            format!("https://api.github.com/repos/{owner}/{repo}/contents{ref_query}")
+        }
+    };
+
+    let resp = client
+        .get(&listing_url)
+        .header("Accept", "application/vnd.github.v3+json")
+        .send()
+        .await
+        .context("fetching GitHub directory listing")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        anyhow::bail!("GitHub API returned {status} for {listing_url}");
+    }
+
+    let listing: serde_json::Value = resp.json().await.context("parsing directory listing")?;
+    let items = listing
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("unexpected GitHub API response (not a JSON array)"))?;
+
+    let target_dir = forge_config::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve user config directory"))?
+        .join("skills");
+    std::fs::create_dir_all(&target_dir).context("creating skills directory")?;
+
+    let mut installed = 0usize;
+    for item in items {
+        let name = item["name"].as_str().unwrap_or_default();
+        let file_type = item["type"].as_str().unwrap_or_default();
+
+        if file_type != "file" || !name.ends_with(".md") {
+            continue;
+        }
+
+        let download_url = match item["download_url"].as_str() {
+            Some(u) if !u.is_empty() => u.to_string(),
+            _ => {
+                eprintln!("skipping {name}: no download_url (private repo?)");
+                continue;
+            }
+        };
+
+        let content = client
+            .get(&download_url)
+            .send()
+            .await
+            .with_context(|| format!("downloading {name}"))?
+            .text()
+            .await
+            .with_context(|| format!("reading {name}"))?;
+
+        // Normalize ~/.claude/ path references → ~/.config/forge/.
+        let content = content.replace("~/.claude/", "~/.config/forge/");
+
+        let dest = target_dir.join(name);
+        std::fs::write(&dest, content).with_context(|| format!("writing {}", dest.display()))?;
+        println!("installed: {}", dest.display());
+        installed += 1;
+    }
+
+    if installed == 0 {
+        println!("no .md skill files found in {owner}/{repo}");
+    } else {
+        println!(
+            "✓ {installed} skill file(s) installed into {}",
+            target_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Parse a GitHub source string into `(owner, repo, Option<ref>)`.
+///
+/// Accepts:
+/// - `owner/repo`
+/// - `owner/repo@branch`
+/// - `owner/repo.git` (`.git` stripped)
+/// - `https://github.com/owner/repo`
+/// - `https://github.com/owner/repo/tree/branch`
+fn parse_github_source(source: &str) -> Result<(String, String, Option<String>)> {
+    let s = source.trim();
+
+    // Full GitHub URL.
+    if s.starts_with("https://github.com/") || s.starts_with("http://github.com/") {
+        let path = s
+            .trim_start_matches("https://github.com/")
+            .trim_start_matches("http://github.com/");
+        let parts: Vec<&str> = path.splitn(4, '/').collect();
+        let owner = parts
+            .first()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitHub URL owner: {s}"))?
+            .to_string();
+        let repo = parts
+            .get(1)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitHub URL repo: {s}"))?
+            .trim_end_matches(".git")
+            .to_string();
+        // https://github.com/owner/repo/tree/<ref>
+        let ref_opt = if parts.get(2) == Some(&"tree") {
+            parts.get(3).map(|r| r.to_string())
+        } else {
+            None
+        };
+        return Ok((owner, repo, ref_opt));
+    }
+
+    // Shorthand: [owner/repo] or [owner/repo@ref].
+    if let Some((owner_repo, ref_str)) = s.split_once('@') {
+        let (owner, repo) = owner_repo
+            .split_once('/')
+            .ok_or_else(|| anyhow::anyhow!("expected owner/repo[@ref], got: {s}"))?;
+        return Ok((
+            owner.to_string(),
+            repo.trim_end_matches(".git").to_string(),
+            Some(ref_str.to_string()),
+        ));
+    }
+
+    let (owner, repo) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("expected owner/repo[@ref] or a GitHub URL, got: {s}"))?;
+    Ok((
+        owner.to_string(),
+        repo.trim_end_matches(".git").to_string(),
+        None,
+    ))
+}
+
+/// `forge skill normalize [--project]` — re-run path/binary normalization on all installed skills
+/// and commands in-place. Replaces `~/.claude/` paths and `claude`/`codex` binary references with
+/// their Forge equivalents. Safe to run multiple times; only touches files that actually changed.
+pub(crate) fn skills_normalize(project: bool) -> Result<()> {
+    use crate::cli::commands::import::normalize_md_dir;
+
+    let (skills_dir, commands_dir) = if project {
+        (
+            std::path::PathBuf::from("./.forge/skills"),
+            std::path::PathBuf::from("./.forge/commands"),
+        )
+    } else {
+        let base =
+            forge_config::config_dir().context("no user config directory on this platform")?;
+        (base.join("skills"), base.join("commands"))
+    };
+
+    let mut count = 0;
+    count += normalize_md_dir(&skills_dir);
+    count += normalize_md_dir(&commands_dir);
+
+    if count > 0 {
+        println!("normalized {count} skill file(s) (replaced claude/codex paths and commands with forge equivalents)");
+    } else {
+        println!("nothing to normalize — all skills already use forge paths");
+    }
+    Ok(())
 }
 
 /// `forge skill import <dir> [--scope user|project]` — import a Forge bundle (a directory produced

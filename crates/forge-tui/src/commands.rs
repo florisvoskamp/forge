@@ -180,7 +180,25 @@ pub const COMMANDS: &[Command] = &[
         desc: "exit Forge",
         usage: "/quit",
     },
+    Command {
+        name: "statusline",
+        desc: "customize the statusline layout — toggle widgets, show layout, reset to default",
+        usage: "/statusline [layout|toggle <widget>|reset|edit]",
+    },
 ];
+
+/// Subcommand for `/statusline`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatuslineAction {
+    /// Show the current left/center/right layout.
+    Layout,
+    /// Add widget if absent, remove if present (in the right segment).
+    Toggle(String),
+    /// Reset to the built-in default.
+    Reset,
+    /// Open `~/.config/forge/config.toml` in $EDITOR.
+    Edit,
+}
 
 /// What the render loop must do when a command is accepted. forge-tui produces it; the binary
 /// (which owns the `Session`) executes it.
@@ -261,6 +279,8 @@ pub enum CommandAction {
     /// Toggle self-MCP mode (`/self-mcp [enable|disable]`). `None` = toggle current state.
     SelfMcp(Option<bool>),
     Quit,
+    /// Statusline customization (`/statusline`).
+    Statusline(StatuslineAction),
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
 }
@@ -575,6 +595,22 @@ pub fn parse_command(line: &str) -> CommandAction {
         "plan" => CommandAction::Plan(arg),
         "execute" | "approve" | "go" => CommandAction::Execute,
         "quit" | "exit" | "q" => CommandAction::Quit,
+        "statusline" | "sl" => {
+            let action = match arg.to_lowercase().trim() {
+                "layout" | "show" | "" => StatuslineAction::Layout,
+                "reset" | "default" => StatuslineAction::Reset,
+                "edit" => StatuslineAction::Edit,
+                other => {
+                    let widget = other
+                        .strip_prefix("toggle ")
+                        .unwrap_or(other)
+                        .trim()
+                        .to_string();
+                    StatuslineAction::Toggle(widget)
+                }
+            };
+            CommandAction::Statusline(action)
+        }
         other => CommandAction::Unknown(other.to_string()),
     }
 }

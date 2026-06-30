@@ -160,6 +160,7 @@ pub(crate) async fn dispatch_command(
             | CommandAction::Replay(_, _)
             | CommandAction::Usage
             | CommandAction::Remote { .. }
+            | CommandAction::Statusline(_)
     );
     if busy && mutates {
         app.note("⚠ finish or Esc the current turn first");
@@ -771,6 +772,114 @@ and keep going."
                     } else {
                         session.lock().await.remove_mcp_server("forge");
                         app.note("self-MCP disabled — sub-Forge MCP server disconnected");
+                    }
+                }
+            }
+        }
+        CommandAction::Statusline(action) => {
+            use forge_tui::StatuslineAction;
+            let widget_name = |w: &forge_config::StatuslineWidget| -> String {
+                match w {
+                    forge_config::StatuslineWidget::Model => "model".into(),
+                    forge_config::StatuslineWidget::Tier => "tier".into(),
+                    forge_config::StatuslineWidget::SessionCost => "session_cost".into(),
+                    forge_config::StatuslineWidget::Effort => "effort".into(),
+                    forge_config::StatuslineWidget::Mode => "mode".into(),
+                    forge_config::StatuslineWidget::TurnElapsed => "turn_elapsed".into(),
+                    forge_config::StatuslineWidget::TokensIn => "tokens_in".into(),
+                    forge_config::StatuslineWidget::TokensOut => "tokens_out".into(),
+                    forge_config::StatuslineWidget::SessionTokens => "session_tokens".into(),
+                    forge_config::StatuslineWidget::GitBranch => "git_branch".into(),
+                    forge_config::StatuslineWidget::QuotaClaude => "quota_claude".into(),
+                    forge_config::StatuslineWidget::QuotaCodex => "quota_codex".into(),
+                    forge_config::StatuslineWidget::McpStatus => "mcp_status".into(),
+                    forge_config::StatuslineWidget::Custom { text } => {
+                        format!("custom(\"{text}\")")
+                    }
+                }
+            };
+            match action {
+                StatuslineAction::Layout => {
+                    let cfg = &app.statusline_config;
+                    let left: Vec<_> = cfg.left.iter().map(&widget_name).collect();
+                    let center: Vec<_> = cfg.center.iter().map(&widget_name).collect();
+                    let right: Vec<_> = cfg.right.iter().map(&widget_name).collect();
+                    app.note("statusline layout:");
+                    app.note(&format!("  left:   [{}]", left.join(", ")));
+                    if !center.is_empty() {
+                        app.note(&format!("  center: [{}]", center.join(", ")));
+                    }
+                    app.note(&format!("  right:  [{}]", right.join(", ")));
+                    app.note("  /statusline toggle <widget>  to add/remove from right segment");
+                    app.note("  /statusline reset  to restore defaults");
+                    app.note("  /statusline edit   to open config file in $EDITOR");
+                }
+                StatuslineAction::Toggle(widget_name_str) => {
+                    let widget = match widget_name_str.as_str() {
+                        "model" => forge_config::StatuslineWidget::Model,
+                        "tier" => forge_config::StatuslineWidget::Tier,
+                        "session_cost" | "cost" => forge_config::StatuslineWidget::SessionCost,
+                        "effort" => forge_config::StatuslineWidget::Effort,
+                        "mode" | "temper" => forge_config::StatuslineWidget::Mode,
+                        "turn_elapsed" | "elapsed" => forge_config::StatuslineWidget::TurnElapsed,
+                        "tokens_in" => forge_config::StatuslineWidget::TokensIn,
+                        "tokens_out" => forge_config::StatuslineWidget::TokensOut,
+                        "session_tokens" => forge_config::StatuslineWidget::SessionTokens,
+                        "git_branch" | "branch" => forge_config::StatuslineWidget::GitBranch,
+                        "quota_claude" | "claude" => forge_config::StatuslineWidget::QuotaClaude,
+                        "quota_codex" | "codex" => forge_config::StatuslineWidget::QuotaCodex,
+                        "mcp_status" | "mcp" => forge_config::StatuslineWidget::McpStatus,
+                        other => {
+                            app.note(&format!(
+                                "⚠ unknown widget '{other}' — use: model, tier, session_cost, \
+                                 effort, mode, turn_elapsed, tokens_in, tokens_out, \
+                                 session_tokens, git_branch, quota_claude, quota_codex, mcp_status"
+                            ));
+                            return Ok(DispatchOutcome::Handled);
+                        }
+                    };
+                    let cfg = &mut app.statusline_config;
+                    let pos_right = cfg.right.iter().position(|w| w == &widget);
+                    let pos_left = cfg.left.iter().position(|w| w == &widget);
+                    if let Some(i) = pos_right {
+                        cfg.right.remove(i);
+                        app.note(&format!(
+                            "statusline: removed '{widget_name_str}' from right"
+                        ));
+                    } else if let Some(i) = pos_left {
+                        cfg.left.remove(i);
+                        app.note(&format!(
+                            "statusline: removed '{widget_name_str}' from left"
+                        ));
+                    } else {
+                        cfg.right.push(widget);
+                        app.note(&format!("statusline: added '{widget_name_str}' to right"));
+                    }
+                    match forge_config::write_statusline_config(&app.statusline_config.clone()) {
+                        Ok(path) => app.note(&format!("  saved → {}", path.display())),
+                        Err(e) => app.note(&format!("  ⚠ could not save config: {e}")),
+                    }
+                }
+                StatuslineAction::Reset => {
+                    app.statusline_config = forge_config::StatuslineConfig::default();
+                    match forge_config::write_statusline_config(&app.statusline_config.clone()) {
+                        Ok(path) => app.note(&format!(
+                            "statusline: reset to default (saved → {})",
+                            path.display()
+                        )),
+                        Err(e) => app.note(&format!(
+                            "statusline: reset in-memory (could not save: {e})"
+                        )),
+                    }
+                }
+                StatuslineAction::Edit => {
+                    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+                    if let Some(dir) = forge_config::config_dir() {
+                        let path = dir.join("config.toml");
+                        app.note(&format!("opening {}", path.display()));
+                        let _ = std::process::Command::new(&editor).arg(&path).status();
+                    } else {
+                        app.note("⚠ no config directory available on this platform");
                     }
                 }
             }

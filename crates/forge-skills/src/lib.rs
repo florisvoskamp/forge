@@ -17,12 +17,14 @@ use forge_types::TaskTier;
 
 pub mod from_session;
 mod frontmatter;
+pub mod normalize;
 mod template;
 
 pub use from_session::{
     assemble_skill_md, build_distillation_prompt, derive_slug, parse_model_output, write_skill,
     TranscriptEntry,
 };
+pub use normalize::normalize_skill_content;
 pub use template::expand;
 
 /// Where a definition came from. Precedence: `Project` > `User` > `Builtin`.

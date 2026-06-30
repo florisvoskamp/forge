@@ -405,6 +405,7 @@ mode. `Ctrl+O` opens the activity viewer (main chat + subagents + critics).
 | `/thinking` | Toggle display of model reasoning/thinking blocks |
 | `/remote [--lan\|--local\|--anywhere]` | Toggle browser remote control |
 | `/config` | Dynamic settings editor — fuzzy-search + edit any setting (and API keys); Tab toggles user/project scope |
+| `/statusline [layout\|toggle <widget>\|reset\|edit]` | Manage statusline layout — toggle widgets on/off, reorder, or reset to default |
 | `/clear` | Clear the screen (keep the session) |
 | `/` | Open command palette (fuzzy-find skills + commands) |
 
@@ -444,7 +445,7 @@ Type `@` to fuzzy-pick a file; the `@path` token's **contents** are injected int
 | `Ctrl+J` | Insert a newline without submitting |
 | `Esc` | Close palette / cancel / stop a running turn |
 | `↑ / ↓` | Navigate palettes and pickers (or prompt history in the input) |
-| `y / n / a` | Allow / deny / always-allow a permission prompt (`a` persists to config) |
+| `y / n / a` | Allow / deny / always-allow a permission prompt (`a` persists to config **and** the live session — the same tool won't prompt again until restart) |
 
 ### `forge run`
 
@@ -552,26 +553,42 @@ forge commands               # list discovered commands + skills
 forge import claude          # migrate ~/.claude commands/skills/agents
 forge import codex           # migrate ~/.codex/prompts as commands
 forge skill export ./bundle  # export your commands/skills/agents (inverse of import)
+forge skill install owner/repo        # install skills from a GitHub repo (latest main)
+forge skill install owner/repo@ref    # install from a specific branch/tag/SHA
+forge skill normalize                 # rewrite ~/.claude/ paths and claude/codex refs in imported skills
+forge plugin install owner/repo       # install a Forge plugin from GitHub
+forge plugin add <name> <path>        # register a local plugin directory
+forge plugin list                     # list installed plugins
+forge plugin remove <name>            # uninstall a plugin
 forge mcp                    # MCP server status
 forge mcp import             # wizard: scan installed AI CLIs
+forge mcp add <name> [--transport stdio|http|sse] [-s local|user] [-e KEY=VALUE] [-- cmd args]
+                             # add an MCP server (saved to .forge/mcp.toml or ~/.forge/mcp.toml)
+forge mcp remove <name>      # remove an MCP server by name
+forge mcp get <name>         # show config for one MCP server
 forge auth anthropic         # store an API key in the OS keyring
 ```
 
 ### Move your install to another machine — `forge migrate`
 
 Copy a full Forge install (config + skills + commands + MCP servers + hooks + model
-metadata) to another PC or server. The bundle is a plain **directory** — move it with
-`scp -r`, `rsync`, or a USB stick, then import on the other side.
+metadata) to another PC or server. The bundle is a **`.tar.gz` archive** — move it with
+`scp`, `rsync`, or any file transfer, then import on the other side. (Old plain-directory
+bundles are still accepted on import for backward compatibility.)
+
+Skills are **auto-normalized on import**: `~/.claude/` paths are rewritten to `~/.forge/`
+and `claude`/`codex` binary references are replaced with `forge`, so imported skills work
+out of the box without manual edits.
 
 ```bash
 # On the old machine — write a bundle:
-forge migrate export ./forge-bundle                       # config + skills + MCP + model metadata
-forge migrate export ./forge-bundle --include-sessions    # + full session history & usage
-forge migrate export ./forge-bundle --include-keys        # + API keys (PLAINTEXT — see below)
+forge migrate export ./forge-bundle.tar.gz                       # config + skills + MCP + model metadata
+forge migrate export ./forge-bundle.tar.gz --include-sessions    # + full session history & usage
+forge migrate export ./forge-bundle.tar.gz --include-keys        # + API keys (PLAINTEXT — see below)
 
 # Move it, then on the new machine:
-forge migrate import ./forge-bundle                        # restores into this machine's config
-forge migrate import ./forge-bundle --force                # also replace existing session history
+forge migrate import ./forge-bundle.tar.gz                        # restores into this machine's config
+forge migrate import ./forge-bundle.tar.gz --force                # also replace existing session history
 
 # Or do it in one step over SSH (forge must be installed on the target):
 forge migrate push user@server --include-keys
@@ -810,6 +827,35 @@ When enabled, Forge auto-installs a `prepare-commit-msg` hook that strips any Cl
 
 `Full` is opt-in only (`--mode full` / config) — never reachable by cycling. An unoverridable denylist always applies.
 
+**`AcceptEdits` mode** (equivalent to Claude Code's Auto-edit): file writes are auto-approved; shell commands still prompt *unless* blocked by the built-in denylist (rm -rf /, .env reads, pipe-to-sh). Use `--mode accept_edits` or set it in config.
+
+**`always` at a prompt** — pressing `a` writes the rule to config **and** updates the live session immediately, so the same tool is not re-prompted until restart.
+
+---
+
+## Customizable Statusline
+
+The statusline renders as a row of **widgets**. Add, remove, or reorder them via `/statusline` or in config:
+
+```toml
+# ~/.forge/config.toml  (or .forge/config.toml for project scope)
+[statusline]
+widgets = ["model", "mode", "tokens", "cost", "git_branch", "mcp_count", "clock"]
+```
+
+Available widgets: `model`, `mode`, `tokens`, `cost`, `git_branch`, `mcp_count`, `session`, `clock`.
+
+**Live commands:**
+
+| Command | Action |
+|---------|--------|
+| `/statusline layout` | Show current widget order |
+| `/statusline toggle <widget>` | Add or remove a widget |
+| `/statusline reset` | Restore the default layout |
+| `/statusline edit` | Open the raw config line for manual editing |
+
+Changes take effect immediately and are saved to your config file.
+
 ---
 
 ## Cost & Budget Control
@@ -867,7 +913,7 @@ Layered config — defaults → user → project → env vars:
 | Env override | `FORGE_*` prefix |
 | API keys | OS keyring (via `forge auth`) |
 
-Key sections: `[mesh]` (routing, budget, conservation, failover), `[permissions]` (per-tool rules), `[lattice]` (indexing + embeddings), `[shell]` (error interceptor), `[[hooks]]`, `[mcp]`, `[git]`, `[commands]`.
+Key sections: `[mesh]` (routing, budget, conservation, failover), `[permissions]` (per-tool rules), `[lattice]` (indexing + embeddings), `[shell]` (error interceptor), `[[hooks]]`, `[mcp]`, `[git]`, `[commands]`, `[statusline]` (widget layout).
 
 ---
 

@@ -368,6 +368,12 @@ pub struct App {
     /// as a `◉ remote` segment in the statusline so it's visible at a glance that the session is
     /// remotely controllable.
     pub remote_active: bool,
+    /// Cached git branch name (set at startup, not polled). Shown by the `GitBranch` widget.
+    pub git_branch: Option<String>,
+    /// Number of connected MCP servers (from the last `McpStatus` event). Shown by `McpStatus` widget.
+    pub mcp_count: usize,
+    /// Statusline layout loaded from config at startup. Drives `render_statusline`.
+    pub statusline_config: forge_config::StatuslineConfig,
     /// A bounded plain-text ring buffer of the most recent finalized scrollback lines, so a
     /// remote-control snapshot can show the phone the tail of the conversation. Kept small (the
     /// full transcript lives in the terminal's native scrollback); newest is last.
@@ -1073,6 +1079,7 @@ impl App {
                 self.tasks = tasks;
             }
             PresenterEvent::McpStatus(servers) => {
+                self.mcp_count = servers.len();
                 self.flush.extend(crate::render::mcp_status_lines(&servers));
                 self.flush.push(TextLine::default());
             }
@@ -1123,6 +1130,11 @@ impl App {
     /// The live task list (`update_tasks`), for the sticky tasks panel. Empty → panel hidden.
     pub fn tasks(&self) -> &[forge_types::TodoItem] {
         &self.tasks
+    }
+
+    /// Set the git branch label (call once at startup).
+    pub fn set_git_branch(&mut self, branch: Option<String>) {
+        self.git_branch = branch;
     }
 
     /// Number of subagents currently running (between SubagentStart and SubagentResult). When `> 0`
@@ -4214,78 +4226,232 @@ fn render_effort_slider(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(TextLine::from(spans)), inner);
 }
 
+/// Render one statusline widget into a span list, or `None` if the widget has no data to show.
+fn render_statusline_widget<'a>(
+    widget: &forge_config::StatuslineWidget,
+    app: &App,
+    w: u16,
+) -> Option<Vec<Span<'a>>> {
+    use forge_config::StatuslineWidget as W;
+    match widget {
+        W::Model => {
+            let model = app
+                .routing
+                .as_ref()
+                .map(|r| r.model.as_str())
+                .unwrap_or("—");
+            let tier = app.routing.as_ref().map(|r| r.tier.as_str());
+            let mut spans: Vec<Span> = Vec::new();
+            if app.model_search.is_some() && w >= 40 {
+                let f = SPINNER[app.tick % SPINNER.len()];
+                spans.push(Span::styled(
+                    format!("{f} finding a model"),
+                    Style::default().fg(WARNYEL).bg(STATUSBG),
+                ));
+                spans.push(Span::styled(
+                    "  │  ",
+                    Style::default().fg(SEPCOL).bg(STATUSBG),
+                ));
+            } else if app.busy && w >= 40 {
+                let f = SPINNER[app.tick % SPINNER.len()];
+                spans.push(Span::styled(
+                    format!("{f} working"),
+                    Style::default().fg(ACCENT).bold().bg(STATUSBG),
+                ));
+                spans.push(Span::styled(
+                    "  │  ",
+                    Style::default().fg(SEPCOL).bg(STATUSBG),
+                ));
+            }
+            if let (Some(t), true) = (tier, w >= 52) {
+                spans.push(Span::styled(
+                    format!("[{t}] "),
+                    Style::default().fg(DIM).bg(STATUSBG),
+                ));
+            }
+            spans.push(Span::styled(
+                model.to_string(),
+                Style::default().fg(ACCENT).bold().bg(STATUSBG),
+            ));
+            Some(spans)
+        }
+        W::Tier => {
+            let tier = app.routing.as_ref().map(|r| r.tier.clone())?;
+            Some(vec![Span::styled(
+                format!("[{tier}]"),
+                Style::default().fg(DIM).bg(STATUSBG),
+            )])
+        }
+        W::SessionCost => {
+            let model_id = app.routing.as_ref().map(|r| r.model.as_str()).unwrap_or("");
+            let text = cost_cell(model_id, app.cost_usd);
+            let style = if text.starts_with('$') {
+                Style::default().fg(OKGREEN).bold().bg(STATUSBG)
+            } else {
+                Style::default().fg(DIM).bg(STATUSBG)
+            };
+            Some(vec![Span::styled(format!("◈ {text}"), style)])
+        }
+        W::Effort => {
+            let effort = app.effort?;
+            let (label, style) = effort_status(effort);
+            Some(vec![Span::styled(label, style)])
+        }
+        W::Mode => {
+            if app.temper.is_empty() {
+                return None;
+            }
+            if w < 46 {
+                return None;
+            }
+            Some(vec![Span::styled(
+                format!("◆ {}", app.temper),
+                Style::default()
+                    .fg(temper_color(&app.temper))
+                    .bold()
+                    .bg(STATUSBG),
+            )])
+        }
+        W::TurnElapsed => {
+            if !app.busy && !app.turn_ran {
+                return None;
+            }
+            Some(vec![Span::styled(
+                format!("⧖ {}", fmt_dur(app.turn_elapsed_secs)),
+                Style::default()
+                    .fg(if app.busy { ACCENT } else { DIM })
+                    .bg(STATUSBG),
+            )])
+        }
+        W::TokensIn => {
+            if !app.busy && !app.turn_ran {
+                return None;
+            }
+            if app.turn_in == 0 {
+                return None;
+            }
+            Some(vec![Span::styled(
+                format!("↑{}", human(app.turn_in)),
+                Style::default()
+                    .fg(if app.busy { ACCENT } else { DIM })
+                    .bg(STATUSBG),
+            )])
+        }
+        W::TokensOut => {
+            if !app.busy && !app.turn_ran {
+                return None;
+            }
+            if app.turn_out == 0 {
+                return None;
+            }
+            Some(vec![Span::styled(
+                format!("↓{}", human(app.turn_out)),
+                Style::default()
+                    .fg(if app.busy { ACCENT } else { DIM })
+                    .bg(STATUSBG),
+            )])
+        }
+        W::SessionTokens => {
+            if app.session_in == 0 && app.session_out == 0 {
+                return None;
+            }
+            Some(vec![Span::styled(
+                format!("Σ ↑{} ↓{}", human(app.session_in), human(app.session_out)),
+                Style::default().fg(DIM).bg(STATUSBG),
+            )])
+        }
+        W::GitBranch => {
+            let branch = app.git_branch.as_deref()?;
+            Some(vec![Span::styled(
+                format!("⎇ {branch}"),
+                Style::default().fg(DIM).bg(STATUSBG),
+            )])
+        }
+        W::QuotaClaude => {
+            let pct = app.usage_overlay.claude_5h_pct?;
+            let color = if pct >= 90.0 {
+                ERRRED
+            } else if pct >= 70.0 {
+                WARNYEL
+            } else {
+                DIM
+            };
+            Some(vec![Span::styled(
+                format!("claude {pct:.0}%"),
+                Style::default().fg(color).bg(STATUSBG),
+            )])
+        }
+        W::QuotaCodex => {
+            let pct = app.usage_overlay.codex_5h_pct?;
+            let color = if pct >= 90.0 {
+                ERRRED
+            } else if pct >= 70.0 {
+                WARNYEL
+            } else {
+                DIM
+            };
+            Some(vec![Span::styled(
+                format!("codex {pct:.0}%"),
+                Style::default().fg(color).bg(STATUSBG),
+            )])
+        }
+        W::McpStatus => {
+            if app.mcp_count == 0 {
+                return None;
+            }
+            Some(vec![Span::styled(
+                format!("⌬ {} mcp", app.mcp_count),
+                Style::default().fg(DIM).bg(STATUSBG),
+            )])
+        }
+        W::Custom { text } => {
+            if text.is_empty() {
+                return None;
+            }
+            Some(vec![Span::raw(text.clone())])
+        }
+    }
+}
+
 fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
     let bg = Style::default().bg(STATUSBG);
     let w = area.width;
-    let sep = || Span::styled("  │  ", Style::default().fg(SEPCOL).bg(STATUSBG));
+    let sep = |s: &str| Span::styled(s.to_string(), Style::default().fg(SEPCOL).bg(STATUSBG));
+    let widget_sep = || sep(&app.statusline_config.separator);
 
-    let model = app
-        .routing
-        .as_ref()
-        .map(|r| r.model.as_str())
-        .unwrap_or("—");
-    let tier = app.routing.as_ref().map(|r| r.tier.as_str());
+    // ── Row 1 ─────────────────────────────────────────────────────────────────
+    // Build the configurable LEFT segment from the widget list.
+    let mut left_spans: Vec<Span> = vec![Span::styled(" ", bg)];
+    let mut first_widget = true;
 
-    // Line 1: spinner · [tier] model · $cost · ◆ temper · ◉ remote   (hint right-aligned)
-    let mut line1: Vec<Span> = vec![Span::styled(" ", bg)];
-    if app.model_search.is_some() && w >= 40 {
-        // Failover in progress: one animated indicator (replaces the per-hop warning spam). The
-        // model now being tried is the routing line just to the right.
-        let f = SPINNER[app.tick % SPINNER.len()];
-        line1.push(Span::styled(
-            format!("{f} finding a model"),
-            Style::default().fg(WARNYEL).bg(STATUSBG),
-        ));
-        line1.push(sep());
-    } else if app.busy && w >= 40 {
-        let f = SPINNER[app.tick % SPINNER.len()];
-        line1.push(Span::styled(
-            format!("{f} working"),
-            Style::default().fg(ACCENT).bold().bg(STATUSBG),
-        ));
-        line1.push(sep());
+    for widget in &app.statusline_config.left {
+        if let Some(spans) = render_statusline_widget(widget, app, w) {
+            if !first_widget {
+                left_spans.push(widget_sep());
+            }
+            first_widget = false;
+            left_spans.extend(spans);
+        }
     }
-    if let (Some(t), true) = (tier, w >= 52) {
-        line1.push(Span::styled(
-            format!("[{t}] "),
-            Style::default().fg(DIM).bg(STATUSBG),
-        ));
-    }
-    line1.push(Span::styled(
-        model.to_string(),
-        Style::default().fg(ACCENT).bold().bg(STATUSBG),
-    ));
-    line1.push(sep());
-    line1.push(Span::styled(
-        format!("◈ ${:.4}", app.cost_usd),
-        Style::default().fg(OKGREEN).bold().bg(STATUSBG),
-    ));
-    if let Some(effort) = app.effort {
-        let (label, style) = effort_status(effort);
-        line1.push(sep());
-        line1.push(Span::styled(label, style));
-    }
-    // The active temper (operating mode), color-coded by how permissive it is.
-    if !app.temper.is_empty() && w >= 46 {
-        line1.push(sep());
-        line1.push(Span::styled(
-            format!("◆ {}", app.temper),
-            Style::default()
-                .fg(temper_color(&app.temper))
-                .bold()
-                .bg(STATUSBG),
-        ));
-    }
+
+    // Always-shown burst indicators appended after the configured widgets.
+    // These are situational and not worth making configurable.
     if app.remote_active && w >= 52 {
-        line1.push(sep());
-        line1.push(Span::styled(
+        if !first_widget {
+            left_spans.push(widget_sep());
+        }
+        first_widget = false;
+        left_spans.push(Span::styled(
             "◉ remote",
             Style::default().fg(OKGREEN).bold().bg(STATUSBG),
         ));
     }
     if !app.queued.is_empty() {
-        line1.push(sep());
-        line1.push(Span::styled(
+        if !first_widget {
+            left_spans.push(widget_sep());
+        }
+        first_widget = false;
+        left_spans.push(Span::styled(
             format!("⏳ {} queued", app.queued.len()),
             Style::default().fg(WARNYEL).bold().bg(STATUSBG),
         ));
@@ -4293,15 +4459,21 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
     if app.done && w >= 50 {
         match app.last_stop_reason {
             Some(forge_types::StopReason::MaxSteps) => {
-                line1.push(sep());
-                line1.push(Span::styled(
+                if !first_widget {
+                    left_spans.push(widget_sep());
+                }
+                first_widget = false;
+                left_spans.push(Span::styled(
                     "⚠ step limit — send `continue`",
                     Style::default().fg(WARNYEL).bold().bg(STATUSBG),
                 ));
             }
             Some(forge_types::StopReason::BudgetExhausted) => {
-                line1.push(sep());
-                line1.push(Span::styled(
+                if !first_widget {
+                    left_spans.push(widget_sep());
+                }
+                first_widget = false;
+                left_spans.push(Span::styled(
                     "✕ budget cap",
                     Style::default().fg(ERRRED).bold().bg(STATUSBG),
                 ));
@@ -4309,6 +4481,7 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
             _ => {}
         }
     }
+    let _ = first_widget; // suppress unused warning
 
     let version = concat!("v", env!("CARGO_PKG_VERSION"));
     let hint = if app.busy {
@@ -4320,12 +4493,14 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
     };
     let row1 = Rect { height: 1, ..area };
     if w >= 70 {
-        // Right side: version + hint
         let right_text = format!("{version}  {hint}");
         let right_len = right_text.chars().count() as u16;
         let cols =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(right_len)]).split(row1);
-        frame.render_widget(Paragraph::new(TextLine::from(line1)).style(bg), cols[0]);
+        frame.render_widget(
+            Paragraph::new(TextLine::from(left_spans)).style(bg),
+            cols[0],
+        );
         frame.render_widget(
             Paragraph::new(TextLine::from(vec![
                 Span::styled(
@@ -4339,10 +4514,11 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
             cols[1],
         );
     } else {
-        frame.render_widget(Paragraph::new(TextLine::from(line1)).style(bg), row1);
+        frame.render_widget(Paragraph::new(TextLine::from(left_spans)).style(bg), row1);
     }
 
-    // Line 2: ↑in ↓out · ◷ bar used/limit pct% — always untruncated on its own row.
+    // ── Row 2 ─────────────────────────────────────────────────────────────────
+    // Row 2: token timer, context gauge, session totals — unchanged from the original.
     if area.height >= 2 {
         let row2 = Rect {
             y: area.y + 1,
@@ -4378,7 +4554,7 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
         // totals and survives right-truncation on a narrow terminal.
         if app.context_tokens > 0 || app.context_limit.is_some() {
             if line2.len() > 1 {
-                line2.push(sep());
+                line2.push(sep("  │  "));
             }
             line2.extend(context_gauge_spans(app.context_tokens, app.context_limit));
         }
@@ -4389,7 +4565,7 @@ fn render_statusline(frame: &mut Frame, area: Rect, app: &App) {
         let session_differs = app.session_in != app.turn_in || app.session_out != app.turn_out;
         if (app.session_in > 0 || app.session_out > 0) && (!show_turn || session_differs) {
             if line2.len() > 1 {
-                line2.push(sep());
+                line2.push(sep("  │  "));
             }
             line2.push(Span::styled(
                 format!("Σ ↑{} ↓{}", human(app.session_in), human(app.session_out)),
@@ -5993,5 +6169,17 @@ mod tests {
                 UnicodeWidthStr::width(r.as_str())
             );
         }
+    }
+
+    #[test]
+    fn statusline_config_default_shows_model_and_cost() {
+        let app = App::default();
+        let out = screen(&app);
+        // Default config has Model + SessionCost widgets on the left.
+        // Model widget shows "—" when no routing; SessionCost shows "untracked" for no-model.
+        assert!(
+            out.contains('—') || out.contains("untracked"),
+            "default statusline renders: {out:?}"
+        );
     }
 }

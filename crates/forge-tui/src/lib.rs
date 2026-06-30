@@ -50,7 +50,7 @@ pub use app::{
 pub use commands::{
     at_token_at, filter_commands, parse_command, slash_token_at, AtPathPicker, AtToken, Command,
     CommandAction, Palette, PaletteEntry, Picker, PickerKind, PickerRow, RemoteMode, SlashToken,
-    COMMANDS,
+    StatuslineAction, COMMANDS,
 };
 pub use config_editor::{ConfigAction, ConfigEditor, RowKind, SettingRow};
 pub use driver::{ChannelPresenter, InputEvent, MouseKind, Tui, UiMsg};
@@ -250,12 +250,23 @@ pub enum PresenterEvent {
     Effort(Option<forge_types::EffortLevel>),
 }
 
+/// The outcome of a permission confirmation prompt. Returned by [`Presenter::confirm`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmOutcome {
+    /// Allowed for this call only.
+    Allow,
+    /// Allowed, and add a session-level rule so this tool is auto-allowed for the rest of the session.
+    AlwaysAllow,
+    /// Denied.
+    Deny,
+}
+
 /// A rendering + interaction surface. Implementors decide how to display events and how
 /// to obtain a permission decision from the user.
 pub trait Presenter: Send {
     fn emit(&mut self, event: PresenterEvent);
-    /// Ask the user to confirm a side-effecting tool. Returns true to allow.
-    fn confirm(&mut self, tool: &str, side_effect: SideEffect) -> bool;
+    /// Ask the user to confirm a side-effecting tool.
+    fn confirm(&mut self, tool: &str, side_effect: SideEffect) -> ConfirmOutcome;
     /// Ask the user a question with suggested `options` (AskUserQuestion). Returns the chosen
     /// option's label, or — when `allow_other` — a free-text answer; [`NO_ANSWER`] if it can't
     /// be asked interactively.
@@ -475,18 +486,22 @@ impl Presenter for HeadlessPresenter {
         }
     }
 
-    fn confirm(&mut self, tool: &str, side_effect: SideEffect) -> bool {
+    fn confirm(&mut self, tool: &str, side_effect: SideEffect) -> ConfirmOutcome {
         if !self.interactive {
             println!("  ⚠ denying {tool} ({side_effect:?}) — non-interactive session");
-            return false;
+            return ConfirmOutcome::Deny;
         }
-        print!("  ⚠ allow {tool} ({side_effect:?})? [y/N] ");
+        print!("  ⚠ allow {tool} ({side_effect:?})? [y/a=always/N] ");
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_err() {
-            return false;
+            return ConfirmOutcome::Deny;
         }
-        matches!(line.trim(), "y" | "Y" | "yes")
+        match line.trim() {
+            "a" | "A" | "always" => ConfirmOutcome::AlwaysAllow,
+            "y" | "Y" | "yes" => ConfirmOutcome::Allow,
+            _ => ConfirmOutcome::Deny,
+        }
     }
 
     fn ask(&mut self, question: &str, options: &[QChoice], allow_other: bool) -> String {

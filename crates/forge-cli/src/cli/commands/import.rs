@@ -359,3 +359,26 @@ pub(crate) fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io:
     }
     Ok(())
 }
+
+/// Recursively walk `dir` and normalize every `.md` file in-place using
+/// [`forge_skills::normalize_skill_content`]. Returns the count of files actually changed.
+pub(crate) fn normalize_md_dir(dir: &std::path::Path) -> usize {
+    let mut count = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            count += normalize_md_dir(&path);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let normalized = forge_skills::normalize_skill_content(&content);
+                if normalized != content && std::fs::write(&path, &normalized).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}

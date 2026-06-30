@@ -669,7 +669,8 @@ pub(crate) async fn run_chat_tui(
     pin: Option<String>,
 ) -> Result<()> {
     use forge_tui::{
-        banner_lines, handle_key, App, ChannelPresenter, InputOutcome, KeyKind, Tui, UiMsg,
+        banner_lines, handle_key, App, ChannelPresenter, ConfirmOutcome, InputOutcome, KeyKind,
+        Tui, UiMsg,
     };
     use std::time::{Duration, Instant};
 
@@ -761,6 +762,23 @@ pub(crate) async fn run_chat_tui(
     let mut app = App::default();
     app.fullscreen = fullscreen;
     app.transcript_follow = true;
+    // Wire statusline config from the loaded config.
+    app.statusline_config = tui_config.statusline.clone();
+    // Fetch current git branch for the GitBranch statusline widget (best-effort, non-fatal).
+    app.git_branch = std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            }
+        });
     // Welcome banner only on a fresh session — resumes show the transcript separator instead. In
     // full-screen mode there's no native scrollback, so banner lines go into the transcript log.
     if matches!(resume_mode, ResumeMode::Fresh) {
@@ -864,7 +882,7 @@ pub(crate) async fn run_chat_tui(
     // `/loop` state: when set, each completed turn of this generation is re-run until the model
     // signals completion or the iteration cap is hit.
     let mut loop_state: Option<LoopState> = None;
-    let mut pending: Option<(String, std::sync::mpsc::Sender<bool>)> = None;
+    let mut pending: Option<(String, std::sync::mpsc::Sender<ConfirmOutcome>)> = None;
     let mut pending_question: Option<std::sync::mpsc::Sender<String>> = None;
     // Lens filter set by `/assay --only`/`--skip`; consumed when the AssayChoice picker resolves.
     let mut assay_lenses: Vec<forge_types::FindingCategory> = Vec::new();
@@ -1643,7 +1661,7 @@ pub(crate) async fn run_chat_tui(
                                         match msg {
                                             UiMsg::Event(e) => app.apply(e),
                                             UiMsg::Permission { reply, .. } => {
-                                                let _ = reply.send(false);
+                                                let _ = reply.send(ConfirmOutcome::Deny);
                                             }
                                             UiMsg::Question { reply, .. } => {
                                                 let _ =
@@ -1694,15 +1712,16 @@ pub(crate) async fn run_chat_tui(
             }
             if let Some((tool, reply)) = pending.take() {
                 // Answering a permission prompt.
-                let always = matches!(key, KeyKind::Char('a') | KeyKind::Char('A'));
-                let yes = always
-                    || matches!(
-                        key,
-                        KeyKind::Char('y') | KeyKind::Char('Y') | KeyKind::Enter
-                    );
-                let _ = reply.send(yes);
+                let outcome = match key {
+                    KeyKind::Char('a') | KeyKind::Char('A') => ConfirmOutcome::AlwaysAllow,
+                    KeyKind::Char('y') | KeyKind::Char('Y') | KeyKind::Enter => {
+                        ConfirmOutcome::Allow
+                    }
+                    _ => ConfirmOutcome::Deny,
+                };
+                let _ = reply.send(outcome);
                 app.prompt = None;
-                if always {
+                if outcome == ConfirmOutcome::AlwaysAllow {
                     if let Err(e) = forge_config::append_allow_rule(&tool) {
                         app.note(&format!("⚠ could not save allow rule: {e}"));
                     } else {
@@ -2154,7 +2173,12 @@ pub(crate) async fn run_chat_tui(
                     }
                     remote::RemoteInput::Allow { yes } => {
                         if let Some((tool, reply)) = pending.take() {
-                            let _ = reply.send(yes);
+                            let outcome = if yes {
+                                ConfirmOutcome::Allow
+                            } else {
+                                ConfirmOutcome::Deny
+                            };
+                            let _ = reply.send(outcome);
                             app.prompt = None;
                             if yes {
                                 app.note(&format!("✓ remote allowed {tool}"));

@@ -103,6 +103,9 @@ pub struct Config {
     /// `forge self enable` / `forge self disable`. Off by default.
     #[serde(default)]
     pub self_mcp: bool,
+    /// Customizable statusline layout (left / center / right widget segments).
+    #[serde(default)]
+    pub statusline: StatuslineConfig,
 }
 
 /// When a hook fires.
@@ -1253,6 +1256,82 @@ pub struct PriceOverride {
     pub output_per_1k: f64,
 }
 
+/// A widget shown in the statusline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatuslineWidget {
+    /// Spinner + working indicator + model name + tier bracket (compound). Shows spinner while busy.
+    Model,
+    /// Session cost "◈ $X.XXXX"
+    SessionCost,
+    /// Reasoning-effort pin label (only renders when effort is pinned)
+    Effort,
+    /// Operating mode/temper "◆ {label}" (only renders when temper is set)
+    Mode,
+    /// Per-turn elapsed timer "⧖ Xs"
+    TurnElapsed,
+    /// Per-turn input tokens "↑N"
+    TokensIn,
+    /// Per-turn output tokens "↓N"
+    TokensOut,
+    /// Session total tokens "Σ ↑N ↓N"
+    SessionTokens,
+    /// Current git branch "⎇ branch"
+    GitBranch,
+    /// Claude.ai usage % "claude N%"
+    QuotaClaude,
+    /// Codex usage % "codex N%" (only when data is available)
+    QuotaCodex,
+    /// MCP server count "⌬ N mcp" (only when servers are connected)
+    McpStatus,
+    /// Tier bracket only "[tier]"
+    Tier,
+    /// Static text / env-var substitution
+    Custom { text: String },
+}
+
+/// Customizable statusline layout (left / center / right segments).
+/// Default matches the current built-in layout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatuslineConfig {
+    /// Left segment widgets (rendered left-aligned).
+    #[serde(default = "default_sl_left")]
+    pub left: Vec<StatuslineWidget>,
+    /// Center segment widgets (centered; empty = no center).
+    #[serde(default)]
+    pub center: Vec<StatuslineWidget>,
+    /// Right segment widgets (rendered right-aligned).
+    #[serde(default)]
+    pub right: Vec<StatuslineWidget>,
+    /// Separator between widgets within a segment.
+    #[serde(default = "default_sl_separator")]
+    pub separator: String,
+}
+
+fn default_sl_left() -> Vec<StatuslineWidget> {
+    vec![
+        StatuslineWidget::Model,
+        StatuslineWidget::SessionCost,
+        StatuslineWidget::Effort,
+        StatuslineWidget::Mode,
+    ]
+}
+
+fn default_sl_separator() -> String {
+    "  │  ".to_string()
+}
+
+impl Default for StatuslineConfig {
+    fn default() -> Self {
+        Self {
+            left: default_sl_left(),
+            center: Vec::new(),
+            right: Vec::new(),
+            separator: default_sl_separator(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut models = HashMap::new();
@@ -1336,6 +1415,7 @@ impl Default for Config {
             local: LocalConfig::default(),
             update: UpdateConfig::default(),
             self_mcp: false,
+            statusline: StatuslineConfig::default(),
         }
     }
 }
@@ -1538,6 +1618,22 @@ pub fn write_self_mcp(enabled: bool) -> Result<PathBuf, ConfigError> {
         .and_then(|s| s.parse().ok())
         .unwrap_or_default();
     root.insert("self_mcp".to_string(), toml::Value::Boolean(enabled));
+    let body = toml::to_string_pretty(&root).map_err(|e| ConfigError::Write(e.to_string()))?;
+    std::fs::write(&path, body).map_err(|e| ConfigError::Write(e.to_string()))?;
+    Ok(path)
+}
+
+/// Persist `[statusline]` to the user config TOML, preserving all other keys.
+pub fn write_statusline_config(cfg: &StatuslineConfig) -> Result<PathBuf, ConfigError> {
+    let dir = config_dir().ok_or(ConfigError::NoConfigDir)?;
+    std::fs::create_dir_all(&dir).map_err(|e| ConfigError::Write(e.to_string()))?;
+    let path = dir.join("config.toml");
+    let mut root: toml::Table = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+    let val = toml::Value::try_from(cfg).map_err(|e| ConfigError::Write(e.to_string()))?;
+    root.insert("statusline".to_string(), val);
     let body = toml::to_string_pretty(&root).map_err(|e| ConfigError::Write(e.to_string()))?;
     std::fs::write(&path, body).map_err(|e| ConfigError::Write(e.to_string()))?;
     Ok(path)
@@ -3103,5 +3199,51 @@ reason = "no privilege escalation"
             .any(|r| r.tool == "write_file" && r.decision == PermissionDecision::Allow));
 
         std::env::set_current_dir(orig).unwrap();
+    }
+
+    #[test]
+    fn statusline_config_default_layout() {
+        let cfg = StatuslineConfig::default();
+        assert_eq!(
+            cfg.left,
+            vec![
+                StatuslineWidget::Model,
+                StatuslineWidget::SessionCost,
+                StatuslineWidget::Effort,
+                StatuslineWidget::Mode,
+            ]
+        );
+        assert!(cfg.center.is_empty());
+        assert!(cfg.right.is_empty());
+        assert_eq!(cfg.separator, "  │  ");
+    }
+
+    #[test]
+    fn statusline_config_roundtrips_toml() {
+        let cfg = StatuslineConfig {
+            left: vec![StatuslineWidget::Model, StatuslineWidget::GitBranch],
+            center: vec![],
+            right: vec![StatuslineWidget::McpStatus],
+            separator: " | ".to_string(),
+        };
+        let serialized = toml::to_string(&cfg).unwrap();
+        let parsed: StatuslineConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.left, cfg.left);
+        assert_eq!(parsed.right, cfg.right);
+        assert_eq!(parsed.separator, cfg.separator);
+    }
+
+    #[test]
+    fn config_default_includes_statusline() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.statusline.left,
+            vec![
+                StatuslineWidget::Model,
+                StatuslineWidget::SessionCost,
+                StatuslineWidget::Effort,
+                StatuslineWidget::Mode,
+            ]
+        );
     }
 }

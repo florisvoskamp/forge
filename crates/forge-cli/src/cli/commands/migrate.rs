@@ -2,16 +2,19 @@
 //! MCP servers + hooks (the user config dir), plus machine-agnostic model metadata. Session
 //! history (`--include-sessions`) and API keys (`--include-keys`) are opt-in.
 //!
-//! The bundle is a plain DIRECTORY, not an archive — transport-agnostic (`scp -r`, `rsync`, a USB
-//! stick) and fully inspectable, which matters because `--include-keys` writes secrets in
-//! PLAINTEXT. `forge migrate push user@host` is a thin convenience that does export → `scp -r` →
+//! The bundle is a compressed `.tar.gz` archive — single-file transfer, smaller on disk, and
+//! fully inspectable. `--include-keys` writes secrets in PLAINTEXT; use a trusted channel and
+//! delete the archive after import. `forge migrate push user@host` does export → `scp` →
 //! remote `forge migrate import`. See docs/features/migrate.md and the README.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 use crate::cli::args::MigrateCmd;
 
@@ -20,6 +23,7 @@ const CONFIG_SUBDIR: &str = "config";
 const METADATA_FILE: &str = "model-metadata.json";
 const DB_FILE: &str = "forge.db";
 const SECRETS_FILE: &str = "secrets.json";
+const BUNDLE_DIR_NAME: &str = "forge-migrate-bundle";
 
 /// Secret keys that aren't provider auth (search/analytics) but are still worth carrying.
 const EXTRA_SECRET_KEYS: &[&str] = &["artificialanalysis", "brave"];
@@ -43,6 +47,8 @@ pub(crate) async fn migrate_cmd(cmd: MigrateCmd) -> Result<()> {
 // ----------------------------------------------------------------------------- export
 
 fn export(dest: &Path, include_keys: bool, include_sessions: bool) -> Result<()> {
+    let archive = archive_path(dest);
+
     let config_dir = forge_config::config_dir()
         .context("no config directory resolved on this system — nothing to export")?;
     if !config_dir.exists() {
@@ -52,11 +58,15 @@ fn export(dest: &Path, include_keys: bool, include_sessions: bool) -> Result<()>
         );
     }
     let data_dir = forge_config::data_dir();
-    fs::create_dir_all(dest)
-        .with_context(|| format!("creating bundle directory {}", dest.display()))?;
+
+    // Stage files into a temp dir, then pack into the archive.
+    let staging = std::env::temp_dir().join(format!("forge-migrate-stage-{}", now_secs()));
+    let stage_root = staging.join(BUNDLE_DIR_NAME);
+    fs::create_dir_all(&stage_root)
+        .with_context(|| format!("creating staging directory {}", stage_root.display()))?;
 
     // 1. Config tree (config + skills + commands + MCP + hooks) — always.
-    let cfg_out = dest.join(CONFIG_SUBDIR);
+    let cfg_out = stage_root.join(CONFIG_SUBDIR);
     copy_dir_all(&config_dir, &cfg_out)
         .with_context(|| format!("copying config from {}", config_dir.display()))?;
     println!(
@@ -71,7 +81,7 @@ fn export(dest: &Path, include_keys: bool, include_sessions: bool) -> Result<()>
         match forge_store::Store::open(db).and_then(|s| s.export_portable_metadata()) {
             Ok(json) => {
                 metadata_rows = json.matches("\"model\"").count();
-                fs::write(dest.join(METADATA_FILE), json)?;
+                fs::write(stage_root.join(METADATA_FILE), json)?;
                 println!("  ✓ model metadata (health/context/pricing)");
             }
             Err(e) => println!("  ⚠ model metadata skipped: {e}"),
@@ -82,7 +92,7 @@ fn export(dest: &Path, include_keys: bool, include_sessions: bool) -> Result<()>
     if include_sessions {
         match db_path.as_ref().filter(|p| p.exists()) {
             Some(db) => {
-                fs::copy(db, dest.join(DB_FILE))
+                fs::copy(db, stage_root.join(DB_FILE))
                     .with_context(|| format!("copying session db {}", db.display()))?;
                 println!("  ✓ session history + usage (full db)");
             }
@@ -101,14 +111,13 @@ fn export(dest: &Path, include_keys: bool, include_sessions: bool) -> Result<()>
             }
         }
         fs::write(
-            dest.join(SECRETS_FILE),
+            stage_root.join(SECRETS_FILE),
             serde_json::to_string_pretty(&serde_json::Value::Object(secrets))?,
         )?;
         eprintln!(
-            "\n  ⚠ SECURITY: {} API key(s) written to {} IN PLAINTEXT.\n    Move the bundle over a \
+            "\n  ⚠ SECURITY: {} API key(s) written IN PLAINTEXT.\n    Move the bundle over a \
              trusted channel and DELETE it after import. Anyone who reads it gets your keys.\n",
             key_providers.len(),
-            dest.join(SECRETS_FILE).display()
         );
     }
 
@@ -123,15 +132,29 @@ fn export(dest: &Path, include_keys: bool, include_sessions: bool) -> Result<()>
         "metadata_rows": metadata_rows,
     });
     fs::write(
-        dest.join(MANIFEST_FILE),
+        stage_root.join(MANIFEST_FILE),
         serde_json::to_string_pretty(&manifest)?,
     )?;
 
+    // 6. Pack into .tar.gz.
+    if let Some(parent) = archive.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating output directory {}", parent.display()))?;
+        }
+    }
+    pack_bundle(&stage_root, &archive)?;
+    let _ = fs::remove_dir_all(&staging);
+
     println!(
-        "\n✓ exported Forge install to {}\n  copy it over (scp -r / rsync / USB), then on the other \
+        "\n✓ exported Forge install to {}\n  copy it:  scp {} user@host:/tmp/\n  then on the other \
          machine:  forge migrate import {}",
-        dest.display(),
-        dest.display()
+        archive.display(),
+        archive.display(),
+        archive
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| archive.to_string_lossy().into_owned()),
     );
     Ok(())
 }
@@ -139,6 +162,21 @@ fn export(dest: &Path, include_keys: bool, include_sessions: bool) -> Result<()>
 // ----------------------------------------------------------------------------- import
 
 fn import(src: &Path, force: bool) -> Result<()> {
+    if src.to_string_lossy().ends_with(".tar.gz") {
+        let temp = std::env::temp_dir().join(format!("forge-migrate-import-{}", now_secs()));
+        fs::create_dir_all(&temp)
+            .with_context(|| format!("creating temp dir {}", temp.display()))?;
+        unpack_bundle(src, &temp)?;
+        let bundle = temp.join(BUNDLE_DIR_NAME);
+        let result = import_from_dir(&bundle, force);
+        let _ = fs::remove_dir_all(&temp);
+        result
+    } else {
+        import_from_dir(src, force)
+    }
+}
+
+fn import_from_dir(src: &Path, force: bool) -> Result<()> {
     let manifest_path = src.join(MANIFEST_FILE);
     if !manifest_path.exists() {
         bail!(
@@ -158,13 +196,19 @@ fn import(src: &Path, force: bool) -> Result<()> {
             "  ✓ config + skills + commands + MCP → {}",
             config_dir.display()
         );
+
+        // Normalize imported skill/command content: replace claude→forge paths and binary names.
+        let n = normalize_imported_skills(&config_dir);
+        if n > 0 {
+            println!("  ✓ normalized {n} skill file(s) (replaced claude→forge paths)");
+        }
     }
 
     let data_dir = forge_config::data_dir().context("no data directory on this system")?;
     fs::create_dir_all(&data_dir)?;
     let target_db = data_dir.join(DB_FILE);
 
-    // 2. Full session db (if present in the bundle) — never clobber existing history without --force.
+    // 2. Full session db — never clobber existing history without --force.
     let bundle_db = src.join(DB_FILE);
     let mut db_installed = false;
     if bundle_db.exists() {
@@ -229,43 +273,81 @@ fn import(src: &Path, force: bool) -> Result<()> {
 // ----------------------------------------------------------------------------- push (SSH)
 
 fn push(target: &str, include_keys: bool, include_sessions: bool) -> Result<()> {
-    // Export to a temp dir, scp -r it to the host, then run the remote import.
     let stamp = now_secs();
-    let local = std::env::temp_dir().join(format!("forge-migrate-{stamp}"));
+    let local = std::env::temp_dir().join(format!("forge-migrate-{stamp}.tar.gz"));
     export(&local, include_keys, include_sessions)?;
 
-    let remote_dir = format!("/tmp/forge-migrate-{stamp}");
-    println!("\n→ copying bundle to {target}:{remote_dir} (scp -r)…");
+    let remote_path = format!("/tmp/forge-migrate-{stamp}.tar.gz");
+    println!("\n→ copying bundle to {target}:{remote_path} (scp)…");
     run(
         "scp",
-        &[
-            "-r",
-            &local.to_string_lossy(),
-            &format!("{target}:{remote_dir}"),
-        ],
+        &[&local.to_string_lossy(), &format!("{target}:{remote_path}")],
     )
     .context("scp failed — check SSH access to the target")?;
 
     println!("→ running remote import (forge must be installed on {target})…");
-    // Use a login shell so ~/.local/bin and other user-configured PATH entries are available.
     // Try `forge` via PATH first; fall back to common install locations.
     let remote_cmd = format!(
-        "command -v forge >/dev/null 2>&1 && forge migrate import {remote_dir} \
-         || ~/.local/bin/forge migrate import {remote_dir} \
-         || ~/.cargo/bin/forge migrate import {remote_dir}"
+        "command -v forge >/dev/null 2>&1 && forge migrate import {remote_path} \
+         || ~/.local/bin/forge migrate import {remote_path} \
+         || ~/.cargo/bin/forge migrate import {remote_path}"
     );
     run("ssh", &[target, &remote_cmd])
         .context("remote import failed — is `forge` installed on the target?")?;
 
-    let _ = fs::remove_dir_all(&local);
+    let _ = fs::remove_file(&local);
     println!(
-        "\n✓ migrated to {target}. The remote bundle is at {remote_dir} — delete it there if it \
+        "\n✓ migrated to {target}. The remote bundle is at {remote_path} — delete it there if it \
          holds keys."
     );
     Ok(())
 }
 
 // ----------------------------------------------------------------------------- helpers
+
+/// Returns `dest` unchanged if it already ends with `.tar.gz`, otherwise appends `.tar.gz`.
+fn archive_path(dest: &Path) -> PathBuf {
+    if dest.to_string_lossy().ends_with(".tar.gz") {
+        dest.to_path_buf()
+    } else {
+        PathBuf::from(format!("{}.tar.gz", dest.to_string_lossy()))
+    }
+}
+
+/// Packs the contents of `stage_root` into a `.tar.gz` archive at `archive_path`.
+/// Inside the archive, all files are nested under `BUNDLE_DIR_NAME/`.
+fn pack_bundle(stage_root: &Path, archive_path: &Path) -> Result<()> {
+    let out = fs::File::create(archive_path)
+        .with_context(|| format!("creating archive {}", archive_path.display()))?;
+    let gz = GzEncoder::new(out, Compression::default());
+    let mut builder = tar::Builder::new(gz);
+    builder
+        .append_dir_all(BUNDLE_DIR_NAME, stage_root)
+        .with_context(|| format!("packing {}", stage_root.display()))?;
+    let gz = builder.into_inner().context("finalizing tar archive")?;
+    gz.finish().context("flushing gzip stream")?;
+    Ok(())
+}
+
+/// Unpacks a `.tar.gz` archive into `dest`.
+fn unpack_bundle(archive: &Path, dest: &Path) -> Result<()> {
+    let file = fs::File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
+    let gz = GzDecoder::new(file);
+    let mut ar = tar::Archive::new(gz);
+    ar.unpack(dest)
+        .with_context(|| format!("unpacking into {}", dest.display()))?;
+    Ok(())
+}
+
+/// Walk `config_dir/skills/` and `config_dir/commands/` and normalize every `.md` file in-place.
+/// Returns the total number of files changed.
+fn normalize_imported_skills(config_dir: &Path) -> usize {
+    use crate::cli::commands::import::normalize_md_dir;
+    let mut n = 0;
+    n += normalize_md_dir(&config_dir.join("skills"));
+    n += normalize_md_dir(&config_dir.join("commands"));
+    n
+}
 
 fn secret_key_names() -> Vec<String> {
     let mut names: Vec<String> = forge_config::known_key_providers()
@@ -348,5 +430,51 @@ mod tests {
         assert!(names.iter().any(|n| n == "brave"));
         // at least one real provider from the known list
         assert!(names.len() > EXTRA_SECRET_KEYS.len());
+    }
+
+    #[test]
+    fn round_trip_tarball() {
+        let root = std::env::temp_dir().join(format!("forge-mig-rtt-{}", now_secs()));
+
+        // Build a minimal bundle staging directory.
+        let stage_root = root.join("stage");
+        write(
+            &stage_root.join(MANIFEST_FILE),
+            r#"{"kind":"forge-migrate-bundle"}"#,
+        );
+        write(&stage_root.join(CONFIG_SUBDIR).join("settings.json"), "{}");
+
+        // Pack.
+        let archive = root.join("bundle.tar.gz");
+        pack_bundle(&stage_root, &archive).expect("pack_bundle failed");
+        assert!(archive.exists(), "archive should exist after pack");
+
+        // Unpack.
+        let extract = root.join("extract");
+        fs::create_dir_all(&extract).unwrap();
+        unpack_bundle(&archive, &extract).expect("unpack_bundle failed");
+
+        // Verify known files appear under BUNDLE_DIR_NAME/.
+        let manifest = extract.join(BUNDLE_DIR_NAME).join(MANIFEST_FILE);
+        assert!(
+            manifest.exists(),
+            "manifest.json missing from extracted bundle"
+        );
+        let content = fs::read_to_string(&manifest).unwrap();
+        assert!(
+            content.contains("forge-migrate-bundle"),
+            "manifest content mismatch"
+        );
+
+        let settings = extract
+            .join(BUNDLE_DIR_NAME)
+            .join(CONFIG_SUBDIR)
+            .join("settings.json");
+        assert!(
+            settings.exists(),
+            "config/settings.json missing from extracted bundle"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
