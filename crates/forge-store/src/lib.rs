@@ -6,12 +6,99 @@ use std::path::Path;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone};
 use forge_types::{Role, TaskTier, ToolCall, Usage};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 mod memory;
 mod schema;
 
 pub use memory::Memory;
+
+/// Current schema version this build understands. Bumped whenever a new entry is added to
+/// [`MIGRATIONS`]; persisted in the DB via `PRAGMA user_version`. A DB whose `user_version`
+/// exceeds this (written by a NEWER Forge) is refused, rather than silently misread.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Max attempts a critical write makes when SQLite reports the database is busy/locked. The single
+/// WAL writer lock can be briefly held by another connection (TUI vs mcp-serve, or the indexer);
+/// `busy_timeout` covers ordinary lock waits but NOT `SQLITE_BUSY_SNAPSHOT`, so we retry the whole
+/// transaction a bounded number of times with a short backoff rather than dropping the row.
+const BUSY_RETRY_MAX: u32 = 8;
+
+/// Oversized `tool_call.result_json` (e.g. a full large-file read) is truncated to this many bytes
+/// at insert time, with a marker. Keeps the append-only global DB from growing without bound while
+/// preserving the head of the output for audit/replay.
+const MAX_RESULT_JSON_BYTES: usize = 64 * 1024;
+
+/// Default retention horizon: sessions untouched for longer than this are eligible for opportunistic
+/// pruning (cascading to their messages/usage/routing/tool_calls/live_events). ~90 days.
+pub const RETENTION_HORIZON_SECS: i64 = 90 * 24 * 60 * 60;
+
+/// How many old sessions a single opportunistic [`Store::prune`] pass removes — bounded so the prune
+/// piggy-backed on session open stays cheap.
+const PRUNE_BATCH: usize = 50;
+
+/// Run live-event ring-buffer pruning only once every this many appends, instead of on every insert
+/// (the old per-insert correlated-subquery DELETE was O(n) on a hot path).
+const LIVE_EVENT_PRUNE_EVERY: u64 = 256;
+
+/// Max live events kept per session (ring buffer). The actual count drifts up to this plus at most
+/// [`LIVE_EVENT_PRUNE_EVERY`] between prunes.
+const LIVE_EVENT_KEEP: i64 = 2000;
+
+/// Whether a rusqlite error is a transient busy/locked condition worth retrying (covers plain
+/// `SQLITE_BUSY`, `SQLITE_BUSY_SNAPSHOT`, and `SQLITE_LOCKED`).
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Whether a rusqlite error is specifically a UNIQUE / PRIMARY KEY constraint violation (so the seq
+/// allocator can retry with the next seq, without also catching unrelated FK/NOT NULL violations).
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+    )
+}
+
+/// Run a critical write, retrying the WHOLE closure on a transient busy/locked error up to
+/// [`BUSY_RETRY_MAX`] times with a short exponential backoff. Each attempt re-acquires its
+/// connection and re-runs its transaction from scratch (a failed IMMEDIATE txn is rolled back on
+/// drop), so a transcript/usage row isn't lost just because another writer briefly held the lock.
+fn with_busy_retry<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 0u32;
+    loop {
+        let r = f();
+        if attempt < BUSY_RETRY_MAX {
+            if let Err(StoreError::Sqlite(ref e)) = r {
+                if is_busy(e) {
+                    let backoff = 2u64.saturating_pow(attempt.min(6));
+                    std::thread::sleep(std::time::Duration::from_millis(5 * backoff));
+                    attempt += 1;
+                    continue;
+                }
+            }
+        }
+        return r;
+    }
+}
+
+/// Truncate an oversized tool result to [`MAX_RESULT_JSON_BYTES`] on a char boundary, appending a
+/// marker noting how many bytes were elided. Returns the input unchanged when within the cap.
+fn cap_result_json(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.len() <= MAX_RESULT_JSON_BYTES {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut end = MAX_RESULT_JSON_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}…[truncated {} bytes]", &s[..end], s.len() - end))
+}
 
 /// How long a permanently-failed model (a [`Store::exclude_model`] capability exclusion) stays out
 /// of routing before it's re-probed: 24 hours. Long enough to stop the per-session churn of
@@ -88,6 +175,11 @@ pub enum StoreError {
     Pool(String),
     #[error("portable metadata JSON: {0}")]
     Json(String),
+    #[error(
+        "database schema version {found} is newer than this build supports ({supported}); \
+         upgrade Forge to open it"
+    )]
+    SchemaTooNew { found: i64, supported: i64 },
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -128,6 +220,10 @@ pub type ModelPriceRow = (String, f64, f64, Option<f64>);
 
 pub struct Store {
     pool: r2d2::Pool<SqliteManager>,
+    /// Append counter for `live_event`, so the ring-buffer prune runs once every
+    /// [`LIVE_EVENT_PRUNE_EVERY`] inserts instead of on every append (the old per-insert
+    /// correlated-subquery DELETE was O(n) on a hot path).
+    live_event_writes: std::sync::atomic::AtomicU64,
 }
 
 /// How the pool opens a fresh connection. `:memory:` makes a DISTINCT empty DB on every open, so an
@@ -222,6 +318,99 @@ fn migrate_subscription_usage(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// Run `ALTER TABLE ADD COLUMN`, treating an "already present" error as success but surfacing any
+/// OTHER failure. Replaces the old `let _ = conn.execute(...)` that swallowed every error, so a
+/// genuine migration failure is no longer indistinguishable from "column already exists".
+fn add_column_if_missing(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Migration #1: fold the historic ad-hoc `ADD COLUMN` migrations into the versioned runner and add
+/// the `UNIQUE(session_id, seq)` index that makes seq allocation collision-proof. On an existing DB
+/// these ALTERs are idempotent (the columns usually exist); on a fresh DB `schema::SCHEMA` already
+/// created them so the ALTERs no-op. Pre-existing duplicate `(session_id, seq)` rows (from the old
+/// non-atomic seq race) are repaired before the unique index is built so the migration can't fail.
+fn migration_0001(conn: &Connection) -> rusqlite::Result<()> {
+    for stmt in [
+        "ALTER TABLE message ADD COLUMN tool_calls_json TEXT",
+        "ALTER TABLE message ADD COLUMN tool_call_id TEXT",
+        "ALTER TABLE message ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE session ADD COLUMN parent_session_id TEXT",
+        "ALTER TABLE session ADD COLUMN view_snapshot TEXT",
+        "ALTER TABLE lattice_node ADD COLUMN pagerank REAL NOT NULL DEFAULT 0.0",
+        "ALTER TABLE session ADD COLUMN agent_active INTEGER NOT NULL DEFAULT 0",
+    ] {
+        add_column_if_missing(conn, stmt)?;
+    }
+    // These depend on the `active` column the ALTER above adds, so they live here (not in the base
+    // schema batch, which can't add columns to a pre-existing message table).
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_message_session_active ON message(session_id, active, seq)",
+    )?;
+    repair_duplicate_seqs(conn)?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_message_session_seq_unique \
+         ON message(session_id, seq)",
+    )
+}
+
+/// Reassign fresh per-session `seq` values to any duplicate `(session_id, seq)` rows left by the old
+/// non-atomic allocator, keeping the earliest row (lowest rowid) at its original seq. Runs before
+/// the unique index so building it can't fail on a legacy DB. A no-op when there are no duplicates.
+fn repair_duplicate_seqs(conn: &Connection) -> rusqlite::Result<()> {
+    let dups: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id FROM message WHERE rowid NOT IN (
+                 SELECT MIN(rowid) FROM message GROUP BY session_id, seq
+             ) ORDER BY session_id, seq, rowid",
+        )?;
+        let v = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        v
+    };
+    for (id, session_id) in dups {
+        let next: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), -1) + 1 FROM message WHERE session_id = ?1",
+            [&session_id],
+            |r| r.get(0),
+        )?;
+        conn.execute("UPDATE message SET seq = ?1 WHERE id = ?2", (next, &id))?;
+    }
+    Ok(())
+}
+
+/// Ordered migration steps. Index `i` upgrades the DB from `user_version = i` to `i + 1`. Append
+/// new steps here and bump [`SCHEMA_VERSION`]; never reorder or rewrite an already-shipped step.
+const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[migration_0001];
+
+/// Apply every migration the DB hasn't seen yet, bumping `PRAGMA user_version` after each so a
+/// crash mid-run resumes cleanly. Refuses (with [`StoreError::SchemaTooNew`]) to open a DB written
+/// by a newer build, rather than silently misreading it.
+fn run_migrations(conn: &Connection) -> Result<()> {
+    debug_assert_eq!(MIGRATIONS.len() as i64, SCHEMA_VERSION);
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if current > SCHEMA_VERSION {
+        return Err(StoreError::SchemaTooNew {
+            found: current,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    for (v, migrate) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+        migrate(conn)?;
+        conn.pragma_update(None, "user_version", (v + 1) as i64)?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open (creating if needed) a database file and run migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -264,21 +453,14 @@ impl Store {
             // Migrate before schema so old DBs get the composite PK before CREATE TABLE IF NOT EXISTS no-ops.
             let _ = migrate_subscription_usage(&conn);
             conn.execute_batch(schema::SCHEMA)?;
-            // Best-effort migrations for databases created before these columns existed
-            // (errors on already-present columns are expected and ignored).
-            for stmt in [
-                "ALTER TABLE message ADD COLUMN tool_calls_json TEXT",
-                "ALTER TABLE message ADD COLUMN tool_call_id TEXT",
-                "ALTER TABLE message ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
-                "ALTER TABLE session ADD COLUMN parent_session_id TEXT",
-                "ALTER TABLE session ADD COLUMN view_snapshot TEXT",
-                "ALTER TABLE lattice_node ADD COLUMN pagerank REAL NOT NULL DEFAULT 0.0",
-                "ALTER TABLE session ADD COLUMN agent_active INTEGER NOT NULL DEFAULT 0",
-            ] {
-                let _ = conn.execute(stmt, []);
-            }
+            // Versioned migrations (PRAGMA user_version). Folds the historic ad-hoc ADD COLUMN
+            // migrations and the UNIQUE(session_id, seq) index; refuses a DB from a newer build.
+            run_migrations(&conn)?;
         }
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            live_event_writes: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     /// Check out a pooled connection. Named `lock` for continuity with the call sites; the returned
@@ -381,7 +563,50 @@ impl Store {
             "INSERT INTO session (id, cwd, permission_mode, total_cost_usd) VALUES (?1, ?2, ?3, 0)",
             (&id, cwd, mode),
         )?;
+        // Opportunistic, bounded retention sweep so the global append-only DB doesn't grow forever.
+        // Best-effort: a prune failure must never block opening a session.
+        let _ = self.prune(RETENTION_HORIZON_SECS, PRUNE_BATCH);
         Ok(id)
+    }
+
+    /// Delete up to `max_sessions` sessions whose `updated_at` is older than `horizon_secs` ago
+    /// (oldest first), cascading to their messages/usage/routing/tool_calls/live_events/tasks. The
+    /// retention unit is a whole stale session, never individual rows of a live one, so an active
+    /// transcript is never partially pruned. Returns the number of sessions removed.
+    pub fn prune(&self, horizon_secs: i64, max_sessions: usize) -> Result<usize> {
+        if max_sessions == 0 {
+            return Ok(0);
+        }
+        let cutoff = chrono::Utc::now().timestamp() - horizon_secs;
+        with_busy_retry(|| {
+            let conn = self.lock()?;
+            let ids: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM session WHERE updated_at < ?1 AND agent_active = 0 \
+                     ORDER BY updated_at LIMIT ?2",
+                )?;
+                let v = stmt
+                    .query_map((cutoff, max_sessions as i64), |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                v
+            };
+            for id in &ids {
+                // ON DELETE CASCADE clears the dependent rows (messages → usage/routing/tool_call).
+                conn.execute("DELETE FROM session WHERE id = ?1", [id])?;
+            }
+            Ok(ids.len())
+        })
+    }
+
+    /// Reclaim free pages and checkpoint the WAL — the periodic compaction a host can call (e.g. on
+    /// a timer or at shutdown) after retention pruning. `VACUUM` rebuilds the file; the truncating
+    /// checkpoint then shrinks the WAL. Both are safe in WAL mode with no open write transaction.
+    pub fn vacuum(&self) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute_batch("VACUUM")?;
+        // Truncating WAL checkpoint to shrink the -wal file (no-op / harmless on in-memory DBs).
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        Ok(())
     }
 
     /// Create a subagent child session linked to `parent_id` (RFC subagent-orchestration).
@@ -474,12 +699,35 @@ impl Store {
         } else {
             Some(serde_json::to_string(tool_calls).unwrap_or_default())
         };
-        let conn = self.lock()?;
-        conn.prepare_cached(
-            "INSERT INTO message (id, session_id, seq, role, content, model, tool_calls_json, tool_call_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        )?
-        .execute((&id, session_id, seq, role.as_str(), content, model, tool_calls_json, tool_call_id))?;
+        // IMMEDIATE so the write lock is taken up front (no read-snapshot upgrade), bounded-retried
+        // on transient busy, and self-healing on a seq collision: if `seq` is already taken (two
+        // writers raced on `next_seq_for_session`), the UNIQUE(session_id, seq) index rejects it and
+        // we re-allocate MAX(seq)+1 inside the same transaction rather than scrambling order.
+        with_busy_retry(|| {
+            let mut conn = self.lock()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut s = seq;
+            loop {
+                let r = tx.execute(
+                    "INSERT INTO message (id, session_id, seq, role, content, model, tool_calls_json, tool_call_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    (&id, session_id, s, role.as_str(), content, model, &tool_calls_json, tool_call_id),
+                );
+                match r {
+                    Ok(_) => break,
+                    Err(ref e) if is_unique_violation(e) => {
+                        s = tx.query_row(
+                            "SELECT COALESCE(MAX(seq), -1) + 1 FROM message WHERE session_id = ?1",
+                            [session_id],
+                            |row| row.get(0),
+                        )?;
+                    }
+                    Err(e) => return Err(StoreError::Sqlite(e)),
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })?;
         Ok(id)
     }
 
@@ -491,44 +739,48 @@ impl Store {
         chosen_model: &str,
         rationale: &str,
     ) -> Result<()> {
-        let conn = self.lock()?;
-        conn.prepare_cached(
-            "INSERT INTO routing_decision (id, message_id, task_tier, chosen_model, rationale)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?
-        .execute((
-            forge_types::new_id(),
-            message_id,
-            tier.as_str(),
-            chosen_model,
-            rationale,
-        ))?;
-        Ok(())
+        with_busy_retry(|| {
+            let conn = self.lock()?;
+            conn.prepare_cached(
+                "INSERT INTO routing_decision (id, message_id, task_tier, chosen_model, rationale)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute((
+                forge_types::new_id(),
+                message_id,
+                tier.as_str(),
+                chosen_model,
+                rationale,
+            ))?;
+            Ok(())
+        })
     }
 
     /// Record token usage/cost for a message and bump the session's running total.
     /// Batched in one explicit transaction so the INSERT + UPDATE land in a single WAL commit.
     pub fn record_usage(&self, session_id: &str, message_id: &str, usage: &Usage) -> Result<()> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO usage (id, message_id, input_tokens, output_tokens, cost_usd)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            (
-                forge_types::new_id(),
-                message_id,
-                usage.input_tokens as i64,
-                usage.output_tokens as i64,
-                usage.cost_usd,
-            ),
-        )?;
-        tx.execute(
-            "UPDATE session SET total_cost_usd = total_cost_usd + ?1,
-             updated_at = strftime('%s','now') WHERE id = ?2",
-            (usage.cost_usd, session_id),
-        )?;
-        tx.commit()?;
-        Ok(())
+        with_busy_retry(|| {
+            let mut conn = self.lock()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT INTO usage (id, message_id, input_tokens, output_tokens, cost_usd)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    forge_types::new_id(),
+                    message_id,
+                    usage.input_tokens as i64,
+                    usage.output_tokens as i64,
+                    usage.cost_usd,
+                ),
+            )?;
+            tx.execute(
+                "UPDATE session SET total_cost_usd = total_cost_usd + ?1,
+                 updated_at = strftime('%s','now') WHERE id = ?2",
+                (usage.cost_usd, session_id),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Record usage for a side call (compact, diagnose) that has no corresponding agent message.
@@ -540,39 +792,52 @@ impl Store {
         label: &str,
         usage: &Usage,
     ) -> Result<()> {
-        let mut conn = self.lock()?;
         let msg_id = forge_types::new_id();
-        let tx = conn.transaction()?;
-        let max_seq: i64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM message WHERE session_id = ?1",
-                [session_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        tx.execute(
-            "INSERT INTO message (id, session_id, seq, role, content, active) \
-             VALUES (?1, ?2, ?3, 'system', ?4, 0)",
-            (msg_id.as_str(), session_id, max_seq + 1, label),
-        )?;
-        tx.execute(
-            "INSERT INTO usage (id, message_id, input_tokens, output_tokens, cost_usd) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            (
-                forge_types::new_id(),
-                msg_id.as_str(),
-                usage.input_tokens as i64,
-                usage.output_tokens as i64,
-                usage.cost_usd,
-            ),
-        )?;
-        tx.execute(
-            "UPDATE session SET total_cost_usd = total_cost_usd + ?1, \
-             updated_at = strftime('%s','now') WHERE id = ?2",
-            (usage.cost_usd, session_id),
-        )?;
-        tx.commit()?;
-        Ok(())
+        // IMMEDIATE: this SELECTs MAX(seq) then writes. A DEFERRED txn would take a read snapshot
+        // first and, if another connection committed in between, fail the upgrade with
+        // SQLITE_BUSY_SNAPSHOT (which busy_timeout does NOT cover) — silently losing the usage/cost
+        // row. Taking the write lock up front avoids the snapshot conflict entirely.
+        with_busy_retry(|| {
+            let mut conn = self.lock()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut s: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(seq), -1) + 1 FROM message WHERE session_id = ?1",
+                    [session_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            loop {
+                let r = tx.execute(
+                    "INSERT INTO message (id, session_id, seq, role, content, active) \
+                     VALUES (?1, ?2, ?3, 'system', ?4, 0)",
+                    (msg_id.as_str(), session_id, s, label),
+                );
+                match r {
+                    Ok(_) => break,
+                    Err(ref e) if is_unique_violation(e) => s += 1,
+                    Err(e) => return Err(StoreError::Sqlite(e)),
+                }
+            }
+            tx.execute(
+                "INSERT INTO usage (id, message_id, input_tokens, output_tokens, cost_usd) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    forge_types::new_id(),
+                    msg_id.as_str(),
+                    usage.input_tokens as i64,
+                    usage.output_tokens as i64,
+                    usage.cost_usd,
+                ),
+            )?;
+            tx.execute(
+                "UPDATE session SET total_cost_usd = total_cost_usd + ?1, \
+                 updated_at = strftime('%s','now') WHERE id = ?2",
+                (usage.cost_usd, session_id),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Record a tool call and its permission outcome.
@@ -585,13 +850,18 @@ impl Store {
         permission: &str,
         status: &str,
     ) -> Result<()> {
-        let conn = self.lock()?;
-        conn.prepare_cached(
-            "INSERT INTO tool_call (id, message_id, tool_name, args_json, result_json, permission, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?
-        .execute((forge_types::new_id(), message_id, tool_name, args_json, result, permission, status))?;
-        Ok(())
+        // Cap oversized results (full file reads etc.) so the append-only global DB can't grow
+        // without bound; the head is preserved with a truncation marker for audit/replay.
+        let result = cap_result_json(result);
+        with_busy_retry(|| {
+            let conn = self.lock()?;
+            conn.prepare_cached(
+                "INSERT INTO tool_call (id, message_id, tool_name, args_json, result_json, permission, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?
+            .execute((forge_types::new_id(), message_id, tool_name, args_json, result.as_ref(), permission, status))?;
+            Ok(())
+        })
     }
 
     /// Current running cost of a session (the per-session meter — unchanged).
@@ -1345,7 +1615,7 @@ impl Store {
         keep_count: usize,
     ) -> Result<()> {
         let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if keep_count == 0 {
             tx.execute(
                 "UPDATE message SET active = 0 WHERE session_id = ?1 AND active = 1",
@@ -1711,7 +1981,7 @@ impl Store {
         refs: &[LatticeRefRow],
     ) -> Result<()> {
         let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO lattice_file (id, repo_root, rel_path, lang, content_hash, parse_status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -1890,7 +2160,9 @@ impl Store {
         keep: &std::collections::HashSet<String>,
     ) -> Result<usize> {
         let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
+        // IMMEDIATE: SELECTs then DELETEs — a DEFERRED read snapshot could fail to upgrade with
+        // SQLITE_BUSY_SNAPSHOT if the indexer committed concurrently.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stale: Vec<String> = {
             let mut stmt =
                 tx.prepare("SELECT id, rel_path FROM lattice_file WHERE repo_root = ?1")?;
@@ -1926,6 +2198,16 @@ impl Store {
     pub fn prune_lattice_repo(&self, repo_root: &str) -> Result<usize> {
         let conn = self.lock()?;
         Ok(conn.execute("DELETE FROM lattice_file WHERE repo_root = ?1", [repo_root])?)
+    }
+
+    /// Delete a single indexed file's row (cascading to its symbols/edges/refs). Called by the file
+    /// watcher when a source file is removed on disk, so its nodes don't linger as phantom symbols
+    /// in `query`/`impact`. Returns 1 if a row was removed, 0 if it wasn't indexed.
+    pub fn delete_lattice_file(&self, repo_root: &str, rel_path: &str) -> Result<usize> {
+        Ok(self.lock()?.execute(
+            "DELETE FROM lattice_file WHERE repo_root = ?1 AND rel_path = ?2",
+            (repo_root, rel_path),
+        )?)
     }
 
     /// The `rel_path` of an indexed file by its id (for rendering a node's location).
@@ -2071,20 +2353,29 @@ impl Store {
     }
 
     /// Batch-update pagerank scores: for each `(node_id, score)` pair, set `pagerank = score`.
-    /// Runs inside one transaction for performance.
+    /// Committed in chunks (each its own IMMEDIATE transaction) rather than one giant write-txn, so
+    /// the single WAL writer lock is released between batches — a full-table update used to hold it
+    /// long enough to starve a concurrent critical write (transcript/usage) past `busy_timeout`.
     pub fn set_lattice_pageranks(&self, scores: &[(String, f64)]) -> Result<()> {
         if scores.is_empty() {
             return Ok(());
         }
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare("UPDATE lattice_node SET pagerank = ?2 WHERE id = ?1")?;
-            for (id, score) in scores {
-                stmt.execute(rusqlite::params![id, score])?;
-            }
+        const CHUNK: usize = 500;
+        for chunk in scores.chunks(CHUNK) {
+            with_busy_retry(|| {
+                let mut conn = self.lock()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                {
+                    let mut stmt =
+                        tx.prepare("UPDATE lattice_node SET pagerank = ?2 WHERE id = ?1")?;
+                    for (id, score) in chunk {
+                        stmt.execute(rusqlite::params![id, score])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -2096,13 +2387,20 @@ impl Store {
             "INSERT INTO live_event (session_id, payload_json) VALUES (?1, ?2)",
             (session_id, payload_json),
         )?;
-        // Prune to last 2000 rows
-        conn.execute(
-            "DELETE FROM live_event WHERE session_id = ?1 AND id <= (
-                SELECT id FROM live_event WHERE session_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET 2000
-             )",
-            [session_id],
-        )?;
+        // Prune to the ring-buffer cap only once every LIVE_EVENT_PRUNE_EVERY appends. The old code
+        // ran the correlated-subquery DELETE on EVERY insert (an O(n) scan per append on the hottest
+        // write path); amortizing it keeps the buffer bounded without the per-event cost.
+        let n = self
+            .live_event_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % LIVE_EVENT_PRUNE_EVERY == 0 {
+            conn.execute(
+                "DELETE FROM live_event WHERE session_id = ?1 AND id <= (
+                    SELECT id FROM live_event WHERE session_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2
+                 )",
+                (session_id, LIVE_EVENT_KEEP),
+            )?;
+        }
         Ok(())
     }
 
@@ -3069,5 +3367,280 @@ mod tests {
         store.set_session_agent_active(&sid, false).unwrap();
         let active = store.active_agent_session_ids().unwrap();
         assert!(active.is_empty());
+    }
+
+    // --- Concurrency + integrity hardening (v2.0) -------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DB_N: AtomicUsize = AtomicUsize::new(0);
+
+    /// A unique temp DB path (file-backed, so two `Store` handles share ONE database — in-memory
+    /// stores can't, every `:memory:` open is a distinct DB). Cleaned up by the caller's process.
+    fn temp_db_path() -> std::path::PathBuf {
+        let n = DB_N.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("forge-store-test-{}-{n}.db", std::process::id()))
+    }
+
+    fn cleanup(p: &std::path::Path) {
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(p.with_extension("db-wal"));
+        let _ = std::fs::remove_file(p.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn concurrent_writers_dont_drop_rows_or_dup_seqs() {
+        // Two independent Store handles (two pools) on the SAME file DB, several threads each, all
+        // appending to ONE session. With IMMEDIATE txns + busy-retry no append is lost, and the
+        // UNIQUE(session_id, seq) index + atomic re-allocation keeps every seq distinct — so the
+        // final next_seq equals the row count (seqs are a gapless 0..N), proving no collision.
+        let path = temp_db_path();
+        let store_a = std::sync::Arc::new(Store::open(&path).unwrap());
+        let store_b = std::sync::Arc::new(Store::open(&path).unwrap());
+        let sid = store_a.create_session("/tmp", "default").unwrap();
+
+        const THREADS: usize = 6;
+        const PER: usize = 40;
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let store = if t % 2 == 0 {
+                std::sync::Arc::clone(&store_a)
+            } else {
+                std::sync::Arc::clone(&store_b)
+            };
+            let sid = sid.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER {
+                    // Deliberately race the read-then-write: every thread reads next_seq then
+                    // appends, so threads frequently compute the SAME seq.
+                    let seq = store.next_seq_for_session(&sid).unwrap();
+                    store
+                        .add_message(&sid, seq, Role::User, &format!("{t}-{i}"), None)
+                        .expect("append must not be dropped under contention");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let total = (THREADS * PER) as i64;
+        assert_eq!(
+            store_a.message_count(&sid).unwrap(),
+            total,
+            "no appended message was lost"
+        );
+        assert_eq!(
+            store_a.next_seq_for_session(&sid).unwrap(),
+            total,
+            "seqs are gapless and unique (no two writers shared a seq)"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn two_writers_cannot_produce_a_duplicate_seq() {
+        // Force the collision directly: both writers pass the SAME explicit seq. The unique index
+        // rejects the second and add_message re-allocates, so both rows land with distinct seqs.
+        let path = temp_db_path();
+        let store = std::sync::Arc::new(Store::open(&path).unwrap());
+        let sid = store.create_session("/tmp", "default").unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for w in 0..2 {
+            let store = std::sync::Arc::clone(&store);
+            let sid = sid.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .add_message(&sid, 0, Role::User, &format!("writer-{w}"), None)
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(store.message_count(&sid).unwrap(), 2, "both rows persisted");
+        assert_eq!(
+            store.next_seq_for_session(&sid).unwrap(),
+            2,
+            "the two writers got distinct seqs (0 and 1), not a duplicate"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn side_call_usage_survives_concurrent_writers() {
+        // record_side_call_usage SELECTs MAX(seq) then writes — the read-then-write path that a
+        // DEFERRED txn would lose to SQLITE_BUSY_SNAPSHOT. With IMMEDIATE + retry every cost row
+        // lands, so the summed session cost equals the number of calls.
+        let path = temp_db_path();
+        let store_a = std::sync::Arc::new(Store::open(&path).unwrap());
+        let store_b = std::sync::Arc::new(Store::open(&path).unwrap());
+        let sid = store_a.create_session("/tmp", "default").unwrap();
+
+        const THREADS: usize = 6;
+        const PER: usize = 20;
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let store = if t % 2 == 0 {
+                std::sync::Arc::clone(&store_a)
+            } else {
+                std::sync::Arc::clone(&store_b)
+            };
+            let sid = sid.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..PER {
+                    store
+                        .record_side_call_usage(
+                            &sid,
+                            "compact",
+                            &Usage {
+                                input_tokens: 1,
+                                output_tokens: 1,
+                                cached_input_tokens: 0,
+                                cost_usd: 0.01,
+                            },
+                        )
+                        .expect("usage row must not be lost");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let expected = (THREADS * PER) as f64 * 0.01;
+        assert!(
+            (store_a.session_cost(&sid).unwrap() - expected).abs() < 1e-6,
+            "every side-call cost row was recorded under contention"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rejects_db_from_a_newer_build() {
+        // A DB whose user_version exceeds what this build supports must be refused, not misread.
+        let path = temp_db_path();
+        Store::open(&path).unwrap(); // create at the current version
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION + 5)
+                .unwrap();
+        }
+        match Store::open(&path) {
+            Err(StoreError::SchemaTooNew { found, supported }) => {
+                assert_eq!(found, SCHEMA_VERSION + 5);
+                assert_eq!(supported, SCHEMA_VERSION);
+            }
+            Err(e) => panic!("expected SchemaTooNew, got {e:?}"),
+            Ok(_) => panic!("expected SchemaTooNew, but the DB opened"),
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn old_schema_db_upgrades_cleanly() {
+        // An existing user DB on the pre-migration schema (no user_version, missing the columns the
+        // ad-hoc ALTERs added, and carrying duplicate (session_id, seq) rows from the old seq race)
+        // must open, upgrade to the current version, repair the duplicates, and stay usable.
+        let path = temp_db_path();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session (
+                     id TEXT PRIMARY KEY, title TEXT, cwd TEXT NOT NULL,
+                     permission_mode TEXT NOT NULL,
+                     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                     updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                     total_cost_usd REAL NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE message (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                     seq INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+                     model TEXT,
+                     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                 );
+                 INSERT INTO session (id, cwd, permission_mode) VALUES ('s1', '/tmp', 'default');
+                 INSERT INTO message (id, session_id, seq, role, content)
+                     VALUES ('m1', 's1', 0, 'user', 'a');
+                 INSERT INTO message (id, session_id, seq, role, content)
+                     VALUES ('m2', 's1', 0, 'user', 'b');",
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "starts as a version-0 DB"
+            );
+        }
+
+        let store = Store::open(&path).unwrap();
+        {
+            let conn = store.lock().unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION,
+                "upgraded to the current schema version"
+            );
+        }
+        // Both pre-existing rows survived; the duplicate seq was repaired to a distinct value.
+        assert_eq!(store.message_count("s1").unwrap(), 2);
+        // The unique index now blocks a fresh duplicate and the store still appends fine.
+        let seq = store.next_seq_for_session("s1").unwrap();
+        assert_eq!(
+            seq, 2,
+            "repair renumbered the duplicate; next seq is gapless"
+        );
+        store.add_message("s1", seq, Role::User, "c", None).unwrap();
+        assert_eq!(store.message_count("s1").unwrap(), 3);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn oversized_tool_result_is_capped() {
+        let store = Store::open_in_memory().unwrap();
+        let sid = store.create_session("/tmp", "default").unwrap();
+        let mid = store
+            .add_message(&sid, 0, Role::Assistant, "x", None)
+            .unwrap();
+        let huge = "A".repeat(MAX_RESULT_JSON_BYTES * 3);
+        store
+            .record_tool_call(&mid, "read_file", "{}", &huge, "allowed", "ok")
+            .unwrap();
+        let conn = store.lock().unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT result_json FROM tool_call WHERE message_id = ?1",
+                [&mid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored.len() < huge.len(),
+            "oversized result was truncated ({} < {})",
+            stored.len(),
+            huge.len()
+        );
+        assert!(stored.contains("truncated"), "carries a truncation marker");
+    }
+
+    #[test]
+    fn prune_removes_only_old_idle_sessions() {
+        let store = Store::open_in_memory().unwrap();
+        let a = store.create_session("/tmp", "default").unwrap();
+        let b = store.create_session("/tmp", "default").unwrap();
+        // Recent sessions are untouched by a normal-horizon prune.
+        assert_eq!(store.prune(RETENTION_HORIZON_SECS, 50).unwrap(), 0);
+        assert!(store.session_cost(&a).is_ok());
+        // A horizon in the future treats every idle session as stale → both are pruned (cascade).
+        assert_eq!(store.prune(-1, 50).unwrap(), 2);
+        assert!(store.session_cost(&a).is_err(), "old session gone");
+        assert!(store.session_cost(&b).is_err());
     }
 }

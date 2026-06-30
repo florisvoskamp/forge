@@ -1,5 +1,8 @@
-//! Embedded schema. For v0.1 this is a single idempotent batch; a versioned migration
-//! mechanism is a planned enhancement (ADR-0005 follow-up).
+//! Embedded base schema (idempotent `CREATE TABLE IF NOT EXISTS`). Versioned, ordered schema
+//! changes live in `MIGRATIONS` (lib.rs), gated by `PRAGMA user_version`. Anything that depends on a
+//! migrated column (e.g. indexes on `message.active`) must be created in a migration, NOT here —
+//! `CREATE TABLE IF NOT EXISTS` won't add columns to an existing table, so a column-dependent index
+//! in this batch would fail to open a pre-migration DB.
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS session (
@@ -26,8 +29,9 @@ CREATE TABLE IF NOT EXISTS message (
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id, seq);
--- Covers the common `WHERE session_id=? AND active=1 ORDER BY seq` pattern used by load_messages.
-CREATE INDEX IF NOT EXISTS idx_message_session_active ON message(session_id, active, seq);
+-- `idx_message_session_active` (covers `WHERE session_id=? AND active=1 ORDER BY seq`) and the
+-- UNIQUE(session_id, seq) index both depend on the migrated `active` column, so they are created in
+-- `migration_0001` after the ALTER — not here. See the module doc comment above.
 
 -- A labeled rewind point: messages with seq < this boundary are kept on restore
 -- (RFC session-management-and-commands, PR2). label NULL = an auto per-turn checkpoint.

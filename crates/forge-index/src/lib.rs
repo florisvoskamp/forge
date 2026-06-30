@@ -318,7 +318,16 @@ impl Lattice {
         let rel = self.rel_path(path);
         let src = match std::fs::read_to_string(path) {
             Ok(s) => s,
-            Err(_) => return Ok(()), // unreadable (e.g. non-UTF8) — skip, don't fail the whole run
+            Err(_) => {
+                // Unreadable. If the file no longer EXISTS it was deleted — purge its row so its
+                // nodes/edges/refs (via FK cascade) don't survive as phantom symbols in
+                // query/impact. A still-present unreadable file (non-UTF8, transient lock) is
+                // skipped without failing the whole run.
+                if !path.exists() {
+                    let _ = self.store.delete_lattice_file(&self.repo_root, &rel);
+                }
+                return Ok(());
+            }
         };
         let hash = sha_hex(src.as_bytes());
         if self
@@ -740,12 +749,43 @@ impl Lattice {
     }
 
     fn rel_path(&self, path: &Path) -> String {
-        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canon = canonicalize_lenient(path);
         canon
             .strip_prefix(&self.repo_root)
             .unwrap_or(&canon)
             .to_string_lossy()
             .replace('\\', "/")
+    }
+}
+
+/// Canonicalize `path`, tolerating a path that no longer exists on disk (a DELETED file). Plain
+/// `std::fs::canonicalize` fails on a missing path, so the caller used to fall back to the RAW path
+/// — which, on platforms where the temp/working root is itself a symlink (macOS `/var` →
+/// `/private/var`) or uses a verbatim prefix (Windows `\\?\C:\…`), no longer shares the canonical
+/// `repo_root` prefix. The resulting `rel_path` then differed from the one stored at index time, so
+/// the watcher's delete-on-removal silently missed and left phantom symbols. This resolves the
+/// nearest EXISTING ancestor (which still canonicalizes) and re-attaches the missing tail, yielding
+/// the same canonical form a present file would have produced.
+fn canonicalize_lenient(path: &Path) -> std::path::PathBuf {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path;
+    loop {
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                if let Ok(base) = std::fs::canonicalize(parent) {
+                    let mut out = base;
+                    out.extend(tail.iter().rev());
+                    return out;
+                }
+                cur = parent;
+            }
+            // Reached a root / prefix with nothing to canonicalize — give up gracefully.
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -1238,6 +1278,56 @@ mod tests {
         assert!(
             lat.query("alpha", 10).unwrap().is_empty(),
             "stale symbol removed"
+        );
+    }
+
+    #[test]
+    fn deleting_a_file_prunes_its_symbols_on_reindex() {
+        // When a watched source file is removed on disk, reindexing its path must purge the file's
+        // row (cascading its nodes/edges/refs) so query/impact don't keep returning phantom symbols.
+        let t = Tmp::new();
+        t.write("src/gone.rs", "pub fn doomed() {}\n");
+        let lat = lattice(&t.root);
+        lat.update().unwrap();
+        let p = t.root.join("src/gone.rs");
+        assert_eq!(lat.query("doomed", 10).unwrap().len(), 1);
+
+        std::fs::remove_file(&p).unwrap();
+        // The watcher routes a removed supported file through reindex_path; the file no longer
+        // exists, so its row is deleted rather than left stale.
+        lat.reindex_path(&p).unwrap();
+        assert!(
+            lat.query("doomed", 10).unwrap().is_empty(),
+            "deleted file's symbol must not linger as a phantom"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_a_file_under_a_symlinked_root_is_pruned() {
+        // Reproduces the macOS failure (`/var` → `/private/var` symlink) on every platform: when the
+        // watch root is reached through a symlink, the file is indexed under the CANONICAL root but
+        // a deleted file can't be canonicalized — the rel_path used for the delete must still resolve
+        // to the same canonical form (via canonicalize_lenient) or the prune misses → phantom symbol.
+        let t = Tmp::new();
+        let real = t.root.join("real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/gone.rs"), "pub fn doomed() {}\n").unwrap();
+        let link = t.root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Open the Lattice through the SYMLINK; repo_root canonicalizes to `real`.
+        let lat = lattice(&link);
+        lat.update().unwrap();
+        assert_eq!(lat.query("doomed", 10).unwrap().len(), 1);
+
+        // Delete the file and reindex via the symlinked path (as the watcher would).
+        let via_link = link.join("src/gone.rs");
+        std::fs::remove_file(&via_link).unwrap();
+        lat.reindex_path(&via_link).unwrap();
+        assert!(
+            lat.query("doomed", 10).unwrap().is_empty(),
+            "symbol of a deleted file under a symlinked root must be pruned cross-platform"
         );
     }
 
