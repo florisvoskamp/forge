@@ -352,7 +352,7 @@ fn model_weight(id: &str) -> u8 {
     if m.contains("opus") || m.contains("-pro") || m.contains("-max") || m.contains("ultra") {
         3
     } else if m.contains("haiku")
-        || m.contains("mini")
+        || m.contains("-mini")
         || m.contains("nano")
         || m.contains("flash")
         || m.contains("-lite")
@@ -1339,5 +1339,122 @@ mod tests {
         );
 
         assert_eq!(r[0], "openai::model-b");
+    }
+
+    // ── Routing scenario tests: no model should monopolise all tiers ──────────────────
+
+    fn minimax_catalog() -> ModelCatalog {
+        // A realistic NVIDIA NIM catalog: minimax-m3 (large free) vs a genuinely fast small
+        // model (llama-8b on groq, also free). minimax-m3's name formerly matched the "mini"
+        // small-model check, giving it speed_class=3 and making it win every tier.
+        ModelCatalog::new(vec![
+            "nvidia::minimaxai/minimax-m3".into(),
+            "groq::llama-3.1-8b-instant".into(),
+            "groq::llama-3.3-70b-versatile".into(),
+        ])
+    }
+
+    #[test]
+    fn minimax_m3_does_not_win_trivial_over_fast_small_model() {
+        // Trivial tier heavily weights speed (s*2 + q*0.5). After the -mini fix, minimax-m3
+        // is quality_class=2 (speed_class=2), while llama-8b is quality_class=1 (speed_class=3).
+        // llama-8b must lead on trivial; minimax-m3 must NOT be first.
+        let r = minimax_catalog().ranked_for(TaskTier::Trivial, &Pricing::default(), 3);
+        assert_ne!(
+            r[0], "nvidia::minimaxai/minimax-m3",
+            "minimax-m3 must not win trivial over a genuinely fast small model: {r:?}"
+        );
+        assert_eq!(
+            r[0], "groq::llama-3.1-8b-instant",
+            "the fast 8b model must lead trivial: {r:?}"
+        );
+    }
+
+    #[test]
+    fn minimax_m3_does_not_monopolise_all_tiers_without_bench() {
+        // Without benchmark data the heuristic alone must not funnel every tier to minimax.
+        let cat = minimax_catalog();
+        let trivial = cat.ranked_for(TaskTier::Trivial, &Pricing::default(), 1);
+        let complex = cat.ranked_for(TaskTier::Complex, &Pricing::default(), 1);
+        assert_ne!(
+            trivial[0], "nvidia::minimaxai/minimax-m3",
+            "trivial must not go to minimax: {trivial:?}"
+        );
+        // Complex is fine to go to 70b or minimax — just asserting trivial spreads.
+        let _ = complex;
+    }
+
+    #[test]
+    fn minimax_m3_does_not_monopolise_all_tiers_with_high_bench_score() {
+        use crate::bench::BenchmarkScores;
+        // Even with a high AA intelligence score (35, a real value for MiniMax M3), the
+        // trivial tier must still prefer the genuinely fast small model.
+        let mut b = BenchmarkScores::new();
+        b.insert("minimax m3", 35.0, 33.0);
+        b.insert("llama 3.1 8b instant", 6.1, 5.0);
+        b.insert("llama 3.3 70b versatile", 10.0, 9.0);
+        let cat = minimax_catalog().with_benchmarks(Some(b));
+
+        let trivial = cat.ranked_for(TaskTier::Trivial, &Pricing::default(), 3);
+        assert_ne!(
+            trivial[0], "nvidia::minimaxai/minimax-m3",
+            "even with high bench score minimax must not dominate trivial: {trivial:?}"
+        );
+
+        // Complex: with bench 35 vs 10, minimax is the strongest available — that IS correct.
+        let complex = cat.ranked_for(TaskTier::Complex, &Pricing::default(), 3);
+        assert_ne!(
+            complex[0], "groq::llama-3.1-8b-instant",
+            "tiny 8b must not win complex: {complex:?}"
+        );
+    }
+
+    #[test]
+    fn fast_small_model_leads_trivial_across_provider_mix() {
+        // Realistic multi-provider set: ensure a tiny fast free model beats large frontier
+        // on trivial regardless of how many large models are present.
+        let cat = ModelCatalog::new(vec![
+            "nvidia::minimaxai/minimax-m3".into(),
+            "nvidia::meta/llama-3.1-70b-instruct".into(),
+            "groq::llama-3.1-8b-instant".into(),
+            "claude-cli::opus".into(),
+            "openrouter::deepseek/deepseek-r1:free".into(),
+        ]);
+        let r = cat.ranked_for(TaskTier::Trivial, &Pricing::default(), 5);
+        assert_eq!(
+            r[0], "groq::llama-3.1-8b-instant",
+            "fast free 8b must win trivial in a mixed catalog: {r:?}"
+        );
+    }
+
+    #[test]
+    fn no_provider_monopolises_all_three_tiers_in_realistic_catalog() {
+        // With a balanced catalog, the routing should spread across tiers: no single model
+        // wins trivial + standard + complex simultaneously (healthy tier differentiation).
+        use crate::bench::BenchmarkScores;
+        let cat = ModelCatalog::new(vec![
+            "nvidia::minimaxai/minimax-m3".into(),
+            "groq::llama-3.1-8b-instant".into(),
+            "groq::llama-3.3-70b-versatile".into(),
+            "claude-cli::sonnet".into(),
+        ]);
+        let mut b = BenchmarkScores::new();
+        b.insert("minimax m3", 35.0, 33.0);
+        b.insert("llama 3.1 8b instant", 6.1, 5.0);
+        b.insert("llama 3.3 70b versatile", 10.0, 9.0);
+        let cat = cat.with_benchmarks(Some(b));
+
+        let trivial = cat.ranked_for(TaskTier::Trivial, &Pricing::default(), 1);
+        let complex = cat.ranked_for(TaskTier::Complex, &Pricing::default(), 1);
+
+        assert_ne!(
+            trivial[0], complex[0],
+            "trivial and complex must not route to the same model — healthy tier spread expected: trivial={:?} complex={:?}",
+            trivial, complex
+        );
+        assert_eq!(
+            trivial[0], "groq::llama-3.1-8b-instant",
+            "trivial must pick the fast 8b: {trivial:?}"
+        );
     }
 }

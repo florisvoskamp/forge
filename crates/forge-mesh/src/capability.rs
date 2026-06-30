@@ -16,13 +16,29 @@ const BENCH_INDEX_DIVISOR: f64 = 20.0;
 /// Coarse quality class inferred from a model id's family (0 = unknown/small … 3 = frontier).
 pub(crate) fn quality_class(id: &str) -> u8 {
     let m = id.to_lowercase();
+    // Explicit large-parameter counts override product-family naming conventions. A model that
+    // states its size as ≥100 B is frontier-class regardless of whether "small" appears in its
+    // product-line name (e.g. mistral-small-4-119b is 119 B despite "small" in the name).
+    // Checked BEFORE the small-marker group so the product name does not misclassify it.
+    if m.contains("-100b") || m.contains("-119b") || m.contains("-120b") || m.contains("-123b") {
+        return 3;
+    }
     // Small / fast FIRST: a size/speed marker (mini, haiku, -lite, -8b) downgrades even a
     // frontier-family name — `gpt-5.4-mini` and `gpt-4o-mini` are small, not frontier.
+    // Use "-mini" (with dash) not "mini" to avoid matching "minimaxai/minimax-*" (large models).
+    // Ollama uses colon-size notation (deepseek-r1:7b, qwen3-coder:8b) — ":Nb" variants are
+    // also small-model markers even though the frontier name (deepseek-r1, qwen3-coder) matches
+    // the frontier group below. The small check runs first so it wins on both separators.
     if m.contains("-8b")
+        || m.contains(":8b")
         || m.contains("-7b")
+        || m.contains(":7b")
         || m.contains("-3b")
+        || m.contains(":3b")
         || m.contains("-1b")
-        || m.contains("mini")
+        || m.contains(":1b")
+        || m.contains(":1.")  // catches :1.5b, :1.6b Ollama tags
+        || m.contains("-mini")
         || m.contains("nano")
         || m.contains("haiku")
         || m.contains("instant")
@@ -40,7 +56,7 @@ pub(crate) fn quality_class(id: &str) -> u8 {
         || m.contains("-72b")
         || m.contains("-70b")
         || m.contains("deepseek-r1")
-        || m.contains("deepseek-v4")
+        || (m.contains("deepseek-v4") && !m.contains("flash"))
         || m.contains("qwen3-coder")
         || m.contains("grok-4")
     {
@@ -226,5 +242,80 @@ mod tests {
         assert!(!is_frontier("claude-cli::haiku"));
         assert!(is_frontier("codex-cli::gpt-5.4"));
         assert!(is_frontier("claude-cli::opus"));
+    }
+
+    #[test]
+    fn ollama_colon_size_tags_are_classified_as_small() {
+        // Ollama uses colon separators: deepseek-r1:7b, qwen3-coder:8b, deepseek-r1:1.5b.
+        // Without the ":Nb" checks these pass the small-group (-7b etc.) and hit the frontier
+        // check (deepseek-r1, qwen3-coder) → quality_class=3 for a 7B distilled model.
+        assert_eq!(
+            quality_class("ollama::deepseek-r1:7b"),
+            1,
+            "distilled 7b must be small"
+        );
+        assert_eq!(quality_class("ollama::deepseek-r1:8b"), 1);
+        assert_eq!(quality_class("ollama::deepseek-r1:1.5b"), 1);
+        assert_eq!(quality_class("ollama::qwen3-coder:7b"), 1);
+        assert_eq!(quality_class("ollama::qwen3-coder:8b"), 1);
+        // 30B+ Ollama tags are not in the small list — they should be default/frontier.
+        assert!(
+            quality_class("ollama::deepseek-r1:70b") >= 2,
+            "70b is not small"
+        );
+        assert!(
+            quality_class("ollama::qwen3-coder:30b") >= 2,
+            "30b is not small"
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_flash_is_not_frontier() {
+        // deepseek-v4 → quality_class=3 (frontier), but a flash variant is lighter.
+        // The pro/flash guard already exists for other families; apply the same to deepseek-v4.
+        assert!(
+            quality_class("openrouter::deepseek/deepseek-v4") >= 3,
+            "full deepseek-v4 is frontier"
+        );
+        assert!(
+            quality_class("opencode_go::deepseek-v4-flash") < 3,
+            "deepseek-v4-flash must not be frontier: {}",
+            quality_class("opencode_go::deepseek-v4-flash")
+        );
+    }
+
+    #[test]
+    fn large_param_count_overrides_small_product_name() {
+        // "mistral-small-4-119b" is 119 B — product-family "small" must NOT give it speed_class=3.
+        // Same false-speed-boost bug as minimax-m3 (which matched "mini"). The -119b guard fires
+        // first so these get quality_class=3 (frontier), speed_class=1.
+        assert_eq!(
+            quality_class("nvidia::mistralai/mistral-small-4-119b-2603"),
+            3,
+            "119 B model must be frontier despite 'small' in product name"
+        );
+        assert_eq!(quality_class("something::model-123b-instruct"), 3);
+        assert_eq!(quality_class("something::model-120b"), 3);
+        // Normal "small" models still downgrade.
+        assert_eq!(quality_class("mistral::mistral-small-2506"), 1);
+        assert_eq!(quality_class("openai::gpt-4o-mini"), 1);
+    }
+
+    #[test]
+    fn minimax_is_not_classified_as_small() {
+        // "minimax" contains "mini" as a substring — guard against that false match.
+        // MiniMax M3 is a large frontier model; it must NOT get quality_class=1 (tiny/fast).
+        assert!(quality_class("nvidia::minimaxai/minimax-m3") > 1);
+        assert!(quality_class("nvidia::minimaxai/minimax-m2.7") > 1);
+        // Real -mini models must still be downgraded.
+        assert_eq!(quality_class("openai::gpt-4o-mini"), 1);
+        assert_eq!(quality_class("codex-cli::gpt-5.4-mini"), 1);
+        // trivial tier: minimax must NOT outscore a real fast model due to speed_class inflation.
+        let minimax = capability_score("nvidia::minimaxai/minimax-m3", TaskTier::Trivial);
+        let fast = capability_score("groq::llama-3.1-8b-instant", TaskTier::Trivial);
+        assert!(
+            fast >= minimax,
+            "trivial: a genuinely fast small model ({fast}) should beat minimax-m3 ({minimax})"
+        );
     }
 }
