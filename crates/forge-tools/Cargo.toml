@@ -1,11 +1,14 @@
 [package]
-name = "forge-tools"
+name = "adforge-tools"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Tool trait and core coding tools (read/write/shell/search) for Forge."
 repository.workspace = true
+
+[lib]
+name = "forge_tools"
 
 [dependencies]
 forge-types.workspace = true

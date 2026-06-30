@@ -1,11 +1,14 @@
 [package]
-name = "forge-core"
+name = "adforge-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Forge session orchestrator: the agent loop and permission broker."
 repository.workspace = true
+
+[lib]
+name = "forge_core"
 
 [dependencies]
 forge-types.workspace = true

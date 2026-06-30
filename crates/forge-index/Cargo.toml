@@ -1,5 +1,5 @@
 [package]
-name = "forge-index"
+name = "adforge-index"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,6 +7,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Lattice — native tree-sitter code-intelligence graph persisted in SQLite."
+
+[lib]
+name = "forge_index"
 
 [dependencies]
 forge-types = { workspace = true }

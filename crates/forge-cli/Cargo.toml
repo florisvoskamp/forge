@@ -1,5 +1,5 @@
 [package]
-name = "forge-cli"
+name = "adforge"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,9 @@ repository.workspace = true
 [[bin]]
 name = "forge"
 path = "src/main.rs"
+
+[lib]
+name = "forge_cli"
 
 [dependencies]
 forge-types.workspace = true

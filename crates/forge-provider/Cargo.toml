@@ -1,11 +1,14 @@
 [package]
-name = "forge-provider"
+name = "adforge-provider"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Provider-agnostic model interface for Forge, backed by genai (ADR-0003)."
 repository.workspace = true
+
+[lib]
+name = "forge_provider"
 
 [dependencies]
 forge-types.workspace = true

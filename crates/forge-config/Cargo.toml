@@ -1,11 +1,14 @@
 [package]
-name = "forge-config"
+name = "adforge-config"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Layered configuration and secret resolution for Forge."
 repository.workspace = true
+
+[lib]
+name = "forge_config"
 
 [dependencies]
 forge-types.workspace = true

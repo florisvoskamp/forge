@@ -1,11 +1,14 @@
 [package]
-name = "forge-mesh"
+name = "adforge-mesh"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Model Mesh: rule-based task routing for cost x capability (ADR-0006)."
 repository.workspace = true
+
+[lib]
+name = "forge_mesh"
 
 [dependencies]
 forge-types.workspace = true
