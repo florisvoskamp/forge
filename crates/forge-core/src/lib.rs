@@ -780,6 +780,48 @@ pub struct Session {
     edits_this_turn: u32,
     /// Per-turn guard against repeated failing tools and identical-call doom loops.
     failure_tracker: ToolFailureTracker,
+    /// The current git branch (`.git/HEAD` → `refs/heads/<branch>`), cached so the hot per-request
+    /// `system_preamble` reads a field instead of doing a blocking `std::fs` syscall on the async
+    /// executor. Seeded at construction and refreshed once per turn (via `tokio::fs`, AFTER the
+    /// user message is persisted so the refresh await can't reopen the abort-before-persist
+    /// window). `None` outside a git repo.
+    cached_git_branch: Option<String>,
+    /// The project `AGENTS.md` body, read ONCE at construction (sync, off the async executor) so the
+    /// first turn can inject it await-free + syscall-free — a `tokio::fs` read at the injection site
+    /// deterministically reintroduces the abort-before-persist cancel window on the current-thread
+    /// runtime. `None` for a resumed session (already in the transcript) or when no file exists;
+    /// `take()`-n on injection.
+    cached_agents_md: Option<String>,
+}
+
+/// Parse `.git/HEAD` contents into a branch name (`ref: refs/heads/<branch>` → `<branch>`).
+/// Returns `None` for a detached HEAD (a raw commit hash) or anything unexpected.
+fn parse_git_head(head: &str) -> Option<String> {
+    head.strip_prefix("ref: refs/heads/")
+        .map(|b| b.trim().to_string())
+}
+
+/// Read + parse the current git branch synchronously. Used only at session construction (one-time
+/// setup, not on the async turn path); the hot path refreshes the cache via `tokio::fs`.
+fn current_git_branch() -> Option<String> {
+    std::fs::read_to_string(".git/HEAD")
+        .ok()
+        .as_deref()
+        .and_then(parse_git_head)
+}
+
+/// Read the project `AGENTS.md` synchronously (`.forge/AGENTS.md`, then `AGENTS.md`), returning the
+/// first non-empty body. Used only at session construction (one-time setup, not on the async turn
+/// path) so the first-turn injection site stays await-free + syscall-free.
+fn read_project_agents_md() -> Option<String> {
+    for path in [".forge/AGENTS.md", "AGENTS.md"] {
+        if let Ok(body) = std::fs::read_to_string(path) {
+            if !body.trim().is_empty() {
+                return Some(body);
+            }
+        }
+    }
+    None
 }
 
 impl Session {
@@ -918,6 +960,14 @@ impl Session {
             pending_images: Vec::new(),
             edits_this_turn: 0,
             failure_tracker: ToolFailureTracker::new(),
+            cached_git_branch: current_git_branch(),
+            // Read AGENTS.md eagerly (sync, off the async path) only when it will actually be
+            // injected — i.e. a fresh session. A resumed session already has it in the transcript.
+            cached_agents_md: if project_prompt_injected {
+                None
+            } else {
+                read_project_agents_md()
+            },
         };
         let id = s.id.clone();
         s.presenter.emit(PresenterEvent::SessionStarted { id });
@@ -1378,15 +1428,22 @@ impl Session {
     /// Fire the Claude-Code lifecycle hooks (`notification`, `pre_compact`, `post_compact`, `stop`,
     /// `subagent_stop`) for `event`, surfacing any output as a warning note. Inert (no spawn) when
     /// no hooks are configured, so it's safe to call on hot paths. `fields` are merged into the
-    /// hook's stdin payload.
-    async fn fire_lifecycle(&mut self, event: forge_config::HookEvent, fields: serde_json::Value) {
+    /// hook's stdin payload. Returns the [`hooks::LifecycleOutcome`] so a caller that enforces a
+    /// block decision (`stop`/`subagent_stop`) can read `outcome.blocked`; observe-only callers
+    /// (`notification`/`pre_compact`/`post_compact`) ignore the return.
+    async fn fire_lifecycle(
+        &mut self,
+        event: forge_config::HookEvent,
+        fields: serde_json::Value,
+    ) -> hooks::LifecycleOutcome {
         if self.config.hooks.is_empty() {
-            return;
+            return hooks::LifecycleOutcome::default();
         }
         let outcome = hooks::run_lifecycle_hooks(&self.config.hooks, event, &self.id, fields).await;
-        for n in outcome.notes {
-            self.presenter.emit(PresenterEvent::Warning(n));
+        for n in &outcome.notes {
+            self.presenter.emit(PresenterEvent::Warning(n.clone()));
         }
+        outcome
     }
 
     /// Persist the TUI view snapshot (opaque JSON) for this session so a resume restores the
@@ -1905,18 +1962,14 @@ impl Session {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string());
         let os = std::env::consts::OS;
-        // NOTE: this stays a synchronous `std::fs` read on purpose. `.git/HEAD` is a tiny,
-        // OS-cached, single-file read; making it async would force this hot per-request preamble
-        // helper (and `transcript_with_preamble`) to be `async`, which would hold a `&Session`
-        // across an `.await` inside the spawned turn future — and `Session` is not `Sync`
-        // (`Receiver`/`dyn Presenter`), so the turn future would stop being `Send` and could no
-        // longer be `tokio::spawn`ed. Not worth it for a cached tiny read.
-        let branch = std::fs::read_to_string(".git/HEAD").ok().and_then(|s| {
-            s.strip_prefix("ref: refs/heads/")
-                .map(|b| b.trim().to_string())
-        });
+        // No blocking syscall here: this hot per-request helper is `&self` (sync), and making it
+        // `async` to read `.git/HEAD` would hold a `&Session` across an `.await` inside the spawned
+        // turn future — `Session` is not `Sync` (`Receiver`/`dyn Presenter`), so the future would
+        // stop being `Send` and could no longer be `tokio::spawn`ed. Instead the branch is read off
+        // the async path (eagerly at session construction, refreshed via `tokio::fs` at each turn
+        // start) and cached, so we just read the field.
         let mut env = format!("<env>\nworking_directory: {cwd}\nplatform: {os}\n");
-        if let Some(b) = branch {
+        if let Some(b) = &self.cached_git_branch {
             env.push_str(&format!("git_branch: {b}\n"));
         }
         env.push_str("</env>");
@@ -3859,24 +3912,21 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             self.transcript.push(Message::system(g));
         }
 
-        // Inject the project AGENTS.md as a standing system prompt on the first turn of a
-        // fresh session. Tried in order: .forge/AGENTS.md, then AGENTS.md in cwd.
-        // Sync I/O intentional (load-bearing): one-time startup read of a small file; with NO await
-        // point an abort() between here and the user-message persistence below can't skip the
-        // recording (an `aborting_a_running_turn_releases_the_session_lock` test pins this). Making
-        // it `tokio::fs` would reintroduce that cancel window, so it stays synchronous.
+        // Inject the project AGENTS.md as a standing system prompt on the first turn of a fresh
+        // session. The file was read ONCE at session construction (sync `std::fs`, off the async
+        // executor — see `build`) into `cached_agents_md`, so this use-site is await-free AND does
+        // no blocking syscall: an abort() between here and the user-message persistence below must
+        // not skip the recording (`aborting_a_running_turn_releases_the_session_lock` pins this),
+        // and a `tokio::fs` read here would deterministically reintroduce that cancel window on the
+        // current-thread runtime (the blocking-pool completion doesn't promptly unpark the driver,
+        // so the abort lands on the parked read before persistence runs).
         if !self.project_prompt_injected {
             self.project_prompt_injected = true;
-            for agents_path in [".forge/AGENTS.md", "AGENTS.md"] {
-                if let Ok(body) = std::fs::read_to_string(agents_path) {
-                    if !body.trim().is_empty() {
-                        let pseq = self.next_seq();
-                        self.store
-                            .add_message(&self.id, pseq, Role::System, &body, None)?;
-                        self.transcript.push(Message::system(&body));
-                        break;
-                    }
-                }
+            if let Some(body) = self.cached_agents_md.take() {
+                let pseq = self.next_seq();
+                self.store
+                    .add_message(&self.id, pseq, Role::System, &body, None)?;
+                self.transcript.push(Message::system(&body));
             }
 
             // Auto-memory RECALL: surface the few durable facts from past sessions in this project
@@ -3968,6 +4018,17 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         // restorable by `/undo`) is built lazily by `checkpoint_context()` and handed to each bridge
         // completion via `CompletionOptions::checkpoint` — no process-global env mutation here. The
         // in-process tool path snapshots directly in `invoke_tool`.
+
+        // Refresh the cached git branch for this turn's env preamble via `tokio::fs` (non-blocking),
+        // keeping it current if the branch changed since the last turn. Done HERE — after the user
+        // message is persisted — so this await cannot reopen the abort-before-persist window the
+        // synchronous-read invariant protects; `system_preamble` (called per model-loop step below)
+        // then reads the cached field with no syscall and no `.await`, staying `Send`.
+        self.cached_git_branch = tokio::fs::read_to_string(".git/HEAD")
+            .await
+            .ok()
+            .as_deref()
+            .and_then(parse_git_head);
 
         // ★ Auto-retrieve relevant code from the Lattice index and inject it as a system message
         // before the first provider call (code-intelligence.md §5.1). Retrieve into an owned value
@@ -4262,6 +4323,62 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             }
         }
 
+        // ── Stop lifecycle hook (Claude-Code parity: "Stop hook can block stopping") ──────────
+        // Fire the Stop hook BEFORE finalizing. A hook that returns block ({"decision":"block"} /
+        // exit 2) means "don't stop yet": its reason is fed back as a synthetic user message and the
+        // model loop re-runs, so the agent keeps working instead of ending the turn. Bounded by
+        // MAX_STOP_BLOCKS consecutive blocks (mirroring the codebase's other loop guards) so a hook
+        // that always blocks can't wedge the turn — after the cap we force-stop with a warning. The
+        // `stop_hook_active` flag (true once we're already in a continuation) lets a well-behaved
+        // hook break its own loop by approving when set, exactly like Claude Code.
+        const MAX_STOP_BLOCKS: u32 = 3;
+        let mut stop_blocks: u32 = 0;
+        loop {
+            let stop_outcome = self
+                .fire_lifecycle(
+                    forge_config::HookEvent::Stop,
+                    serde_json::json!({
+                        "stop_hook_active": stop_blocks > 0,
+                        "hit_step_cap": hit_step_cap,
+                    }),
+                )
+                .await;
+            let Some(reason) = stop_outcome.blocked else {
+                break;
+            };
+            if stop_blocks >= MAX_STOP_BLOCKS {
+                self.presenter.emit(PresenterEvent::Warning(format!(
+                    "stop hook blocked {MAX_STOP_BLOCKS}× in a row — forcing the turn to end ({reason})"
+                )));
+                break;
+            }
+            stop_blocks += 1;
+            self.presenter.emit(PresenterEvent::Warning(format!(
+                "stop hook requested continuation ({stop_blocks}/{MAX_STOP_BLOCKS}): {reason}"
+            )));
+            // Feed the reason back as a synthetic user message and re-drive the model loop (None
+            // decision: no cross-model failover for the continuation, like the autofix re-run).
+            let cont = format!("[stop hook] {reason}");
+            let seq = self.next_seq();
+            self.store
+                .add_message(&self.id, seq, Role::User, &cont, None)?;
+            self.transcript.push(Message::user(&cont));
+            let cont_specs = self.tool_specs();
+            let cont_outcome = self
+                .run_model_loop(
+                    active_model.clone(),
+                    &cont_specs,
+                    None,
+                    max_steps,
+                    stream_idle,
+                )
+                .await?;
+            final_text = cont_outcome.final_text;
+            context_tokens = cont_outcome.context_tokens;
+            active_model = cont_outcome.active_model;
+            hit_step_cap = cont_outcome.hit_step_cap;
+        }
+
         let (session_in, session_out) = self.store.session_tokens(&self.id)?;
         self.presenter.emit(PresenterEvent::Cost {
             session_total_usd: self.store.session_cost(&self.id)?,
@@ -4278,12 +4395,6 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                 StopReason::FinalAnswer
             },
         });
-        // Stop lifecycle hook (Claude-Code parity): the agent finished responding for this turn.
-        self.fire_lifecycle(
-            forge_config::HookEvent::Stop,
-            serde_json::json!({ "stop_hook_active": false, "hit_step_cap": hit_step_cap }),
-        )
-        .await;
         self.generate_recap(prompt, &final_text).await;
         // Await the handle so one-shot (forge run) exits only after capture completes. In
         // interactive mode the spinner is already cleared and this is a brief background wait.
@@ -5274,11 +5385,27 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         .await?;
 
         // SubagentStop lifecycle hook (Claude-Code parity): the spawned child agent(s) finished.
-        self.fire_lifecycle(
-            forge_config::HookEvent::SubagentStop,
-            serde_json::json!({ "ok": all_ok }),
-        )
-        .await;
+        // Enforce a block decision at the subagent boundary: this `spawn_agents` call returns a tool
+        // result that the PARENT model loop reacts to, so a hook that blocks ("don't let the
+        // subagents stop yet") has its reason appended to that result — feeding the continuation
+        // signal back into the loop that's actually running, instead of merely noting it. Bounded
+        // by construction (a single append; the parent decides what to do next — no auto re-spawn),
+        // so there's no risk of an unbounded re-run loop here.
+        let stop_outcome = self
+            .fire_lifecycle(
+                forge_config::HookEvent::SubagentStop,
+                serde_json::json!({ "ok": all_ok }),
+            )
+            .await;
+        let combined = match stop_outcome.blocked {
+            Some(reason) => {
+                self.presenter.emit(PresenterEvent::Warning(format!(
+                    "subagent_stop hook requested continuation: {reason}"
+                )));
+                format!("{combined}\n\n[subagent_stop hook] {reason}")
+            }
+            None => combined,
+        };
 
         self.store.record_tool_call(
             msg_id,
@@ -7028,6 +7155,128 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w.contains("UNVERIFIED")),
             "a model that did real work but refuses to verify must end flagged UNVERIFIED; warnings: {warnings:?}"
+        );
+    }
+
+    // --- Stop-hook enforcement (Claude-Code "Stop hook can block stopping") ---
+
+    /// A provider that always returns a final text answer with no tool calls, counting how many
+    /// times it was called. Each model-loop run = one call, so the count == 1 + (stop continuations).
+    #[derive(Default)]
+    struct CountingFinalProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for CountingFinalProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(forge_provider::ModelResponse {
+                content: "all done".into(),
+                tool_calls: vec![],
+                usage: forge_types::Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    /// Config with a single `stop` hook running `command`, and recap/auto-memory off so the only
+    /// provider calls are the model-loop runs (keeps the continuation count exact).
+    fn stop_hook_config(command: &str) -> Config {
+        let mut config = Config::default();
+        config.recap.enabled = false;
+        config.mesh.auto_memory = false;
+        config.hooks = vec![forge_config::HookConfig {
+            event: forge_config::HookEvent::Stop,
+            matcher: None,
+            command: command.into(),
+            timeout_secs: 10,
+            cc_compat: false,
+        }];
+        config
+    }
+
+    fn counting_session(
+        provider: Arc<CountingFinalProvider>,
+        config: Config,
+        capture: CapturePresenter,
+    ) -> Session {
+        Session::start(
+            Arc::new(Store::open_in_memory().unwrap()),
+            provider,
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(capture),
+            config,
+            ".",
+        )
+        .unwrap()
+    }
+
+    // The block-once script inspects `stop_hook_active` on stdin — a shell-specific test, so Unix-only
+    // (the cap and non-blocking tests below are cross-platform via plain exit codes).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_hook_block_once_triggers_one_continuation_then_proceeds() {
+        let provider = Arc::new(CountingFinalProvider::default());
+        // Blocks (exit 2) while stop_hook_active is false; approves (exit 0) once it's true — so the
+        // turn re-runs exactly once, then stops. This is Claude Code's stop_hook_active loop-breaker.
+        let config = stop_hook_config(r#"grep -q '"stop_hook_active":true' || exit 2"#);
+        let mut session = counting_session(provider.clone(), config, CapturePresenter::default());
+        session.run_turn("do the task").await.unwrap();
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one block → exactly one extra model-loop run, then the turn proceeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_hook_consecutive_block_cap_is_enforced() {
+        let provider = Arc::new(CountingFinalProvider::default());
+        let config = stop_hook_config("exit 2"); // always blocks (cross-platform: sh & cmd both exit 2)
+        let capture = CapturePresenter::default();
+        let events = capture.events.clone();
+        let mut session = counting_session(provider.clone(), config, capture);
+        session.run_turn("do the task").await.unwrap();
+        // primary + MAX_STOP_BLOCKS (3) continuations = 4 model-loop runs, then a forced stop.
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "the safety cap bounds continuations so an always-blocking hook can't wedge the turn"
+        );
+        let warnings: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PresenterEvent::Warning(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("forcing the turn to end")),
+            "a force-stop warning must be surfaced when the cap is hit; warnings: {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_hook_non_blocking_does_not_continue() {
+        let provider = Arc::new(CountingFinalProvider::default());
+        let config = stop_hook_config("exit 0"); // observe-only: never blocks
+        let mut session = counting_session(provider.clone(), config, CapturePresenter::default());
+        session.run_turn("do the task").await.unwrap();
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a non-blocking stop hook leaves the turn unaffected (no continuation)"
         );
     }
 
