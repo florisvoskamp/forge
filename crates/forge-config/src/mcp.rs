@@ -112,6 +112,7 @@ impl McpServerConfig {
         match self.transport {
             McpTransport::Stdio { .. } => "stdio",
             McpTransport::Http { .. } => "http",
+            McpTransport::Sse { .. } => "sse",
         }
     }
 }
@@ -127,8 +128,16 @@ pub enum McpTransport {
         #[serde(default)]
         env: HashMap<String, String>,
     },
-    /// A remote MCP server over streamable-HTTP / SSE.
+    /// A remote MCP server over streamable-HTTP.
     Http {
+        url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+    /// A remote MCP server over the legacy HTTP+SSE transport (`GET` event-stream + `POST`
+    /// endpoint). Connects via Forge's hand-rolled SSE client (forge-mcp `sse.rs`), since rmcp
+    /// ships no standalone SSE client transport.
+    Sse {
         url: String,
         #[serde(default)]
         headers: HashMap<String, String>,

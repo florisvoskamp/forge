@@ -63,33 +63,7 @@ pub(crate) async fn serve(
                 .map_err(|e| format!("initialize: {e}"))
         }
         McpTransport::Http { url, headers } => {
-            // Decide where the token rides: a custom auth header (e.g. `X-Goog-Api-Key`) is sent
-            // verbatim via the client's default headers; otherwise it's `Authorization: Bearer`.
-            // Static token (env/keyring) takes precedence; OAuth token is used when present and
-            // no static token is configured (run `forge mcp login <name>` to obtain one).
-            let static_token = server.token();
-            let custom_header = server
-                .auth
-                .as_ref()
-                .and_then(|a| a.header.clone())
-                .filter(|h| !h.eq_ignore_ascii_case("authorization"));
-            let mut all_headers = headers.clone();
-            let mut bearer = None;
-            if let Some(token) = static_token {
-                match custom_header {
-                    Some(h) => {
-                        all_headers.insert(h, token);
-                    }
-                    None => bearer = Some(token),
-                }
-            } else if let Some(oauth) = server.auth.as_ref().and_then(|a| a.oauth.as_ref()) {
-                // OAuth server: resolve stored tokens (with auto-refresh on expiry).
-                let _ = oauth; // config used for presence check; tokens are keyed by server name
-                match crate::oauth::resolve_oauth_token_async(&server.name).await {
-                    Ok(token) => bearer = Some(token),
-                    Err(e) => return Err(e),
-                }
-            }
+            let (all_headers, bearer) = resolve_http_auth(server, headers).await?;
             let client = build_http_client(&all_headers)?;
             let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.clone());
             if let Some(b) = bearer {
@@ -110,7 +84,54 @@ pub(crate) async fn serve(
                 msg
             })
         }
+        McpTransport::Sse { url, headers } => {
+            // Legacy HTTP+SSE servers: reuse the same token-resolution as streamable-HTTP, then
+            // drive Forge's hand-rolled SSE client (rmcp has no standalone SSE client transport).
+            let (all_headers, bearer) = resolve_http_auth(server, headers).await?;
+            let client = build_http_client(&all_headers)?;
+            let transport = crate::sse::SseClientTransport::connect(client, url, bearer)
+                .await
+                .map_err(|e| format!("sse connect '{url}': {e}"))?;
+            handler
+                .serve(transport)
+                .await
+                .map_err(|e| format!("initialize: {e}"))
+        }
     }
+}
+
+/// Resolve where a remote server's token rides for the HTTP-family transports (streamable-HTTP and
+/// legacy SSE). A custom auth header (e.g. `X-Goog-Api-Key`) is sent verbatim via the client's
+/// default headers; otherwise the token is returned as a bearer (`Authorization: Bearer`). A static
+/// token (env/keyring) takes precedence; an OAuth token is resolved (with auto-refresh) when present
+/// and no static token is configured. Returns `(default_headers, bearer)`.
+async fn resolve_http_auth(
+    server: &McpServerConfig,
+    headers: &std::collections::HashMap<String, String>,
+) -> Result<(std::collections::HashMap<String, String>, Option<String>), String> {
+    let static_token = server.token();
+    let custom_header = server
+        .auth
+        .as_ref()
+        .and_then(|a| a.header.clone())
+        .filter(|h| !h.eq_ignore_ascii_case("authorization"));
+    let mut all_headers = headers.clone();
+    let mut bearer = None;
+    if let Some(token) = static_token {
+        match custom_header {
+            Some(h) => {
+                all_headers.insert(h, token);
+            }
+            None => bearer = Some(token),
+        }
+    } else if let Some(oauth) = server.auth.as_ref().and_then(|a| a.oauth.as_ref()) {
+        let _ = oauth; // config used for presence check; tokens are keyed by server name
+        match crate::oauth::resolve_oauth_token_async(&server.name).await {
+            Ok(token) => bearer = Some(token),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((all_headers, bearer))
 }
 
 /// Whether an initialize error looks like an HTTP 401/unauthorized (the OAuth challenge case).

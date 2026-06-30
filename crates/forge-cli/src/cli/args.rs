@@ -350,10 +350,19 @@ pub(crate) enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Internal: run Forge's tool registry as an MCP server on stdio (spawned by the CLI
-    /// bridge so claude/codex use Forge's tools under Forge's permission gate). Not for direct use.
+    /// Internal: run Forge's tool registry as an MCP server (spawned by the CLI bridge so
+    /// claude/codex use Forge's tools under Forge's permission gate). Defaults to stdio; pass
+    /// `--transport http --bind <addr>` to serve over streamable-HTTP for remote orchestration
+    /// (requires the `FORGE_MCP_SERVE_TOKEN` bearer token).
     #[command(hide = true)]
-    McpServe,
+    McpServe {
+        /// Transport to serve on: `stdio` (default) or `http` (streamable-HTTP).
+        #[arg(long, default_value = "stdio")]
+        transport: ServeTransportArg,
+        /// Address to bind when `--transport http` (ignored for stdio).
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: String,
+    },
     /// Store a provider API key securely in the OS keyring (reads the key from stdin). Runs ADD by
     /// default — repeat to stack multiple keys that Forge rotates across (multiplies free rate
     /// limits). `--replace` overwrites with a single key, `--list` shows how many are stored,
@@ -804,6 +813,13 @@ pub(crate) enum McpCmd {
 pub(crate) enum McpTransportArg {
     Stdio,
     Sse,
+    Http,
+}
+
+/// Transport for `forge mcp-serve` (Forge serving its own tools as an MCP **server**).
+#[derive(Clone, ValueEnum, Debug)]
+pub(crate) enum ServeTransportArg {
+    Stdio,
     Http,
 }
 

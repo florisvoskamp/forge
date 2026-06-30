@@ -96,7 +96,10 @@ pub(crate) async fn dispatch(command: Command) -> Result<()> {
         Command::Setup | Command::Init => setup(),
         Command::Mcp { cmd } => mcp_cmd(cmd).await,
         Command::Memory { cmd, global } => memory_cmd(cmd, global),
-        Command::McpServe => mcp_serve::run().await,
+        Command::McpServe { transport, bind } => {
+            let http = matches!(transport, crate::cli::args::ServeTransportArg::Http);
+            mcp_serve::run(http, bind).await
+        }
         Command::Lattice { op } => lattice_cmd(op).await,
         Command::Import { source } => import_cmd(source),
         Command::Git { cmd } => git_cmd(cmd),

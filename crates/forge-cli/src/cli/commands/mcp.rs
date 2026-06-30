@@ -557,10 +557,21 @@ pub(crate) fn mcp_add(
                 env: env_map,
             }
         }
-        McpTransportArg::Sse | McpTransportArg::Http => {
+        McpTransportArg::Http => {
             let u =
                 url.ok_or_else(|| anyhow::anyhow!("--url is required for HTTP/SSE transport"))?;
             forge_config::McpTransport::Http {
+                url: u,
+                headers: header_map,
+            }
+        }
+        McpTransportArg::Sse => {
+            // Legacy HTTP+SSE: drives forge-mcp's hand-rolled SSE client (rmcp has no standalone
+            // SSE client transport). Distinct from `Http` (streamable-HTTP) so old SSE-only servers
+            // actually connect instead of silently falling back.
+            let u =
+                url.ok_or_else(|| anyhow::anyhow!("--url is required for HTTP/SSE transport"))?;
+            forge_config::McpTransport::Sse {
                 url: u,
                 headers: header_map,
             }

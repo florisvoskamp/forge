@@ -36,8 +36,14 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::io::stdio;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use serde_json::Value;
+
+/// Env var holding the bearer token required for the HTTP transport. Stdio is unaffected (it's a
+/// trusted parent↔child pipe); HTTP is network-reachable, so it must be behind auth.
+const MCP_SERVE_TOKEN_ENV: &str = "FORGE_MCP_SERVE_TOKEN";
 
 /// Append one JSON record to the out-of-band subagent sink the CLI bridge tails (if it gave us
 /// one via `FORGE_SUBAGENT_SINK`). Used to surface bridge-turn activity (subagents, task-list
@@ -522,9 +528,11 @@ impl ForgeMcp {
     }
 }
 
-/// Run the Forge MCP server on stdio until the client disconnects. Loads config from the cwd
-/// (so it shares the project's permission rules) and serves the core tool registry.
-pub async fn run() -> Result<()> {
+/// Run the Forge MCP server until the client disconnects. Loads config from the cwd (so it shares
+/// the project's permission rules) and serves the core tool registry. `http=false` serves on stdio
+/// (the CLI-bridge default); `http=true` serves the SAME tool surface over streamable-HTTP on
+/// `bind`, behind a bearer token (`FORGE_MCP_SERVE_TOKEN`) for remote/multi-machine orchestration.
+pub async fn run(http: bool, bind: String) -> Result<()> {
     forge_config::inject_provider_keys();
     let mut config = forge_config::load().unwrap_or_else(|_| Config::default());
     // The parent hands us its CURRENT runtime temper via env (set per turn in `export_checkpoint_env`).
@@ -615,7 +623,141 @@ pub async fn run() -> Result<()> {
         mcp,
         skills,
     };
+    if http {
+        return serve_http(server, &bind).await;
+    }
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Serve the same `ForgeMcp` tool surface over rmcp's streamable-HTTP server transport, mounted in
+/// axum behind a bearer-token gate. One shared `ForgeMcp` backs every session (its handlers take
+/// `&self`), so the rmcp session factory just hands out `Arc` clones.
+async fn serve_http(server: ForgeMcp, bind: &str) -> Result<()> {
+    let token = std::env::var(MCP_SERVE_TOKEN_ENV)
+        .ok()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "HTTP transport requires an auth token — set {MCP_SERVE_TOKEN_ENV} to a secret \
+                 bearer token before running `forge mcp-serve --transport http`."
+            )
+        })?;
+
+    let shared = Arc::new(server);
+    let service = StreamableHttpService::new(
+        move || Ok(Arc::clone(&shared)),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+
+    let app = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(Arc::new(token), auth_middleware),
+    );
+
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let local = listener.local_addr()?;
+    eprintln!("forge mcp-serve: streamable-HTTP transport on http://{local}/mcp (bearer auth)");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// axum middleware: reject any request whose `Authorization` header isn't `Bearer <token>` matching
+/// `FORGE_MCP_SERVE_TOKEN`. Applied to the whole MCP router so unauthenticated peers never reach a
+/// tool.
+async fn auth_middleware(
+    axum::extract::State(token): axum::extract::State<Arc<String>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let provided = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if bearer_ok(provided, &token) {
+        next.run(req).await
+    } else {
+        (axum::http::StatusCode::UNAUTHORIZED, "unauthorized\n").into_response()
+    }
+}
+
+/// Whether an `Authorization` header value is a `Bearer <token>` that matches `expected`. The token
+/// comparison is length-checked then constant-time to avoid leaking it via response timing.
+fn bearer_ok(header: Option<&str>, expected: &str) -> bool {
+    let Some(rest) = header.and_then(|h| {
+        h.strip_prefix("Bearer ")
+            .or_else(|| h.strip_prefix("bearer "))
+    }) else {
+        return false;
+    };
+    let provided = rest.trim().as_bytes();
+    let expected = expected.as_bytes();
+    if provided.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in provided.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_ok_accepts_exact_token_either_case_prefix() {
+        assert!(bearer_ok(Some("Bearer s3cret"), "s3cret"));
+        assert!(bearer_ok(Some("bearer s3cret"), "s3cret"));
+        // Trailing whitespace around the token is tolerated.
+        assert!(bearer_ok(Some("Bearer  s3cret "), "s3cret"));
+    }
+
+    #[test]
+    fn bearer_ok_rejects_bad_or_missing_tokens() {
+        assert!(!bearer_ok(None, "s3cret"));
+        assert!(!bearer_ok(Some(""), "s3cret"));
+        assert!(!bearer_ok(Some("s3cret"), "s3cret")); // missing "Bearer " scheme
+        assert!(!bearer_ok(Some("Bearer wrong"), "s3cret"));
+        assert!(!bearer_ok(Some("Bearer s3cre"), "s3cret")); // length mismatch
+        assert!(!bearer_ok(Some("Basic s3cret"), "s3cret"));
+    }
+
+    /// End-to-end (in-memory, no network) check that the auth middleware actually gates a router:
+    /// a request without the bearer is 401, and with it passes through to the inner handler.
+    #[tokio::test]
+    async fn auth_middleware_gates_router() {
+        use axum::body::Body;
+        use axum::http::{header::AUTHORIZATION, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new("topsecret".to_string()),
+                auth_middleware,
+            ));
+
+        let unauth = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let authed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(AUTHORIZATION, "Bearer topsecret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::OK);
+    }
 }

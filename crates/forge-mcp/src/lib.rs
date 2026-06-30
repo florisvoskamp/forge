@@ -34,6 +34,7 @@ use serde_json::Value;
 
 mod handler;
 pub mod oauth;
+mod sse;
 mod transport;
 
 pub use handler::{ForgeClientHandler, SamplingFuture, SamplingHandler};
