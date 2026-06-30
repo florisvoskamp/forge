@@ -10,7 +10,7 @@ is down, and is *measurably* more reliable than the raw vendor CLIs.**
 
 [![CI](https://github.com/Adulari/forge/actions/workflows/ci.yml/badge.svg)](https://github.com/Adulari/forge/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Adulari/forge?color=orange)](https://github.com/Adulari/forge/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
 [![Conformance tests](https://img.shields.io/badge/harness_conformance-324_tests-brightgreen.svg)](docs/harness/why-forge-is-a-better-harness.md)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/Adulari)
@@ -146,7 +146,7 @@ Gemini CLI, Windsurf/Devin, and opencode) lives in **[docs/comparison.md](docs/c
 | MCP client | ✅ | ✅ | ✅ | ✅ | ❌⁴ | ✅ |
 | MCP server (expose itself to other tools) | ✅ | ✅ | ✅ | ❓ | ❌ | ❌ |
 | Skills / Claude Code import | ✅ | ✅ | partial⁵ | ❌ | ❌ | partial⁵ |
-| Open source | ✅ MIT | ❌ | ✅ Apache | ❌ | ✅ Apache | ✅ Apache |
+| Open source | ✅ AGPL-3.0 | ❌ | ✅ Apache | ❌ | ✅ Apache | ✅ Apache |
 | Single static binary (no runtime) | ✅ Rust | Node | ✅ Rust | closed | Python | Node (VS Code) |
 
 <sub>¹ Codex CLI is OpenAI-leaning but reaches any OpenAI-compatible endpoint (incl. Ollama) via
@@ -315,11 +315,11 @@ brew install forge
 ### 🦀 Cargo (crates.io)
 
 ```bash
-cargo install adforge
+cargo install forge-agent
 ```
 
-Installs the latest published release from crates.io. The crate is published as `adforge`; the
-installed binary is still `forge`.
+Installs the latest published release from crates.io. The crate is `forge-agent`; the installed
+binary is `forge`.
 
 ### 🔨 From source
 
@@ -602,7 +602,7 @@ crates/
 
 ## 💖 Sponsor Forge
 
-Forge is built by one person, fully open source, MIT licensed. If it saves you time, money, or
+Forge is built by one person, fully open source, AGPL-3.0 licensed. If it saves you time, money, or
 API costs — sponsoring helps keep it maintained and growing.
 
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/Adulari)
@@ -635,5 +635,5 @@ especially welcome — open an issue with a source.
 
 ## 📄 License
 
-[MIT](./LICENSE) © 2026 Floris Voskamp
+[AGPL-3.0](./LICENSE) © 2026 Floris Voskamp
 </content>
