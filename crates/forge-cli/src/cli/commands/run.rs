@@ -758,12 +758,14 @@ pub(crate) async fn run_chat_tui(
     // Mouse capture (full-screen wheel scroll) is opt-in: it disables native click-drag text
     // selection, so it stays off unless the user enables `[tui] mouse_capture`.
     let mouse_capture = tui_config.tui.mouse_capture;
-    let mut tui = Tui::new(fullscreen, mouse_capture).context("initializing TUI")?;
+    let mut tui = Tui::new(fullscreen, mouse_capture, tui_config.keybinds.clone())
+        .context("initializing TUI")?;
     let mut app = App::default();
     app.fullscreen = fullscreen;
     app.transcript_follow = true;
     // Wire statusline config from the loaded config.
     app.statusline_config = tui_config.statusline.clone();
+    app.keybinds = tui_config.keybinds.clone();
     // Fetch current git branch for the GitBranch statusline widget (best-effort, non-fatal).
     app.git_branch = std::process::Command::new("git")
         .args(["branch", "--show-current"])
@@ -915,6 +917,9 @@ pub(crate) async fn run_chat_tui(
     let mut prompt_history: Vec<String> = Vec::new();
     let mut history_pos: Option<usize> = None;
     let mut history_draft = String::new();
+    // The prompt of the turn currently running (or last run), so `tier_up`/`tier_down` can abort
+    // and re-run it at the shifted routing tier. Set whenever a plain user turn is spawned.
+    let mut last_prompt: Option<String> = None;
     // Prompts typed while a turn is running, queued to run one-per-turn after it finishes
     // (like Claude Code / aider). Drained in the done-handler below; cleared on interrupt.
     let mut queued_prompts: Vec<String> = Vec::new();
@@ -1201,6 +1206,207 @@ pub(crate) async fn run_chat_tui(
                 continue;
             }
 
+            // Global action keys — work in all states (busy and idle).
+            if matches!(key, KeyKind::ToggleReasoning) {
+                app.show_thinking = !app.show_thinking;
+                let state = if app.show_thinking { "on" } else { "off" };
+                app.note(&format!("reasoning display {state}"));
+                dirty = true;
+                continue;
+            }
+
+            if matches!(key, KeyKind::OpenKeybindConfig) {
+                let result =
+                    tui.run_fullscreen(|| forge_tui::run_keybind_configurator(&mut app.keybinds));
+                if let Ok(true) = result {
+                    // Save changed binds
+                    let defaults = forge_config::KeybindsConfig::default();
+                    for (action, combo) in &app.keybinds.binds {
+                        if defaults.binds.get(action.as_str()) != Some(combo) {
+                            let _ = forge_config::write_keybind(action, combo);
+                        }
+                    }
+                    tui.keybinds = app.keybinds.clone();
+                    app.note("✓ keybinds saved");
+                }
+                dirty = true;
+                continue;
+            }
+
+            if matches!(key, KeyKind::ShowHelp) {
+                // Show help by opening the keybind configurator in read-only mode (clone, discard).
+                let mut tmp = app.keybinds.clone();
+                let _ = tui.run_fullscreen(|| forge_tui::run_keybind_configurator(&mut tmp));
+                dirty = true;
+                continue;
+            }
+
+            if matches!(key, KeyKind::EffortCycle) {
+                use forge_types::EffortLevel;
+                let next = match app.effort {
+                    None => Some(EffortLevel::Low),
+                    Some(EffortLevel::Low) => Some(EffortLevel::Medium),
+                    Some(EffortLevel::Medium) => Some(EffortLevel::High),
+                    Some(EffortLevel::High) => Some(EffortLevel::XHigh),
+                    Some(EffortLevel::XHigh) => None,
+                };
+                app.effort = next;
+                session.lock().await.set_effort(next);
+                let label = match next {
+                    None => "unset (provider default)".to_string(),
+                    Some(l) => format!("{l:?}").to_lowercase(),
+                };
+                app.note(&format!("effort → {label}"));
+                dirty = true;
+                continue;
+            }
+
+            if matches!(key, KeyKind::CopyLast) {
+                // Copy last assistant response to clipboard — equivalent to /copy.
+                match dispatch_command(
+                    "/copy",
+                    &session,
+                    &mut tui,
+                    &mut app,
+                    &catalog,
+                    &mut armed_project,
+                    trust_project,
+                    busy,
+                    &mut assay_lenses,
+                    &mut assay_scope,
+                )
+                .await?
+                {
+                    DispatchOutcome::CopyToClipboard(text) => {
+                        let chars = text.chars().count();
+                        copy_selection(&mut clipboard, &text);
+                        app.note(&format!("✓ copied last response ({chars} chars)"));
+                    }
+                    DispatchOutcome::Quit => {
+                        quit = true;
+                        break;
+                    }
+                    _ => {}
+                }
+                dirty = true;
+                continue;
+            }
+
+            if matches!(key, KeyKind::ReloadConfig) {
+                if let Ok(cfg) = forge_config::load() {
+                    app.keybinds = cfg.keybinds.clone();
+                    tui.keybinds = cfg.keybinds;
+                    // Clear the in-session tier override so a reload returns to normal routing.
+                    session.lock().await.pin_tier(None);
+                    app.note("✓ config reloaded (tier override cleared)");
+                } else {
+                    app.note("⚠ config reload failed");
+                }
+                dirty = true;
+                continue;
+            }
+
+            // Ctrl-↑ / Ctrl-↓ (tier_up / tier_down): bias the mesh routing tier for the next turn.
+            // The baseline is the tier currently shown in the statusline (the last routed/classified
+            // tier), defaulting to Standard. Mid-turn it aborts and re-runs the same prompt at the
+            // shifted tier; idle it sets the override so the next turn routes there. Clamped at the
+            // ends. The override persists until changed again or `/reload`.
+            if matches!(key, KeyKind::TierUp | KeyKind::TierDown) {
+                let up = matches!(key, KeyKind::TierUp);
+                let baseline = app
+                    .routing
+                    .as_ref()
+                    .and_then(|r| forge_types::TaskTier::from_name(&r.tier))
+                    .unwrap_or(forge_types::TaskTier::Standard);
+                // Current effective pin (or baseline) to detect a clamp at the end.
+                let new_tier = {
+                    let mut sess = session.lock().await;
+                    let before = sess.pinned_tier().unwrap_or(baseline);
+                    let clamped = (up && before.is_max()) || (!up && before.is_min());
+                    if clamped {
+                        // Already at the extreme — report it without churning a re-run.
+                        let edge = if up { "complex" } else { "trivial" };
+                        app.note(&format!("⤒ already at the {edge} tier"));
+                        dirty = true;
+                        continue;
+                    }
+                    sess.bump_tier(up, baseline)
+                };
+                let arrow = if up { "↑" } else { "↓" };
+                if busy {
+                    // Mid-turn: abort and re-run the same prompt at the new tier.
+                    if let Some(h) = turn_handle.take() {
+                        h.abort();
+                    }
+                    turn_gen += 1;
+                    busy = false;
+                    loop_state = None;
+                    pending = None;
+                    pending_question = None;
+                    app.prompt = None;
+                    app.clear_question();
+                    app.apply(forge_tui::PresenterEvent::AssistantDone);
+                    if let Some(p) = last_prompt.clone() {
+                        app.note(&format!(
+                            "{arrow} tier → {} — re-running at the new tier",
+                            new_tier.as_str()
+                        ));
+                        turn_gen += 1;
+                        turn_handle = Some(spawn_turn_with(
+                            p,
+                            Vec::new(),
+                            Some(new_tier),
+                            &session,
+                            &done_tx,
+                            turn_gen,
+                            &mut app,
+                            &mut busy,
+                            &mut busy_since,
+                        ));
+                    } else {
+                        app.note(&format!(
+                            "{arrow} tier → {} (applies to your next turn)",
+                            new_tier.as_str()
+                        ));
+                    }
+                } else {
+                    app.note(&format!(
+                        "{arrow} tier → {} (applies to your next turn)",
+                        new_tier.as_str()
+                    ));
+                }
+                dirty = true;
+                continue;
+            }
+
+            // Ctrl-K (skip_model): mid-turn, abort the current turn so the user can retry on a
+            // different model. Handled here (before the busy branch swallows it as input) so it
+            // actually fires while a turn is running; idle it's a no-op note.
+            if matches!(key, KeyKind::SkipModel) {
+                if busy {
+                    if let Some(h) = turn_handle.take() {
+                        h.abort();
+                    }
+                    turn_gen += 1;
+                    busy = false;
+                    loop_state = None;
+                    if !queued_prompts.is_empty() {
+                        queued_prompts.clear();
+                        app.set_queued(&queued_prompts);
+                    }
+                    pending = None;
+                    pending_question = None;
+                    app.prompt = None;
+                    app.clear_question();
+                    app.apply(forge_tui::PresenterEvent::AssistantDone);
+                    app.note("⏭ turn aborted — retry with /model to pick a different model");
+                } else {
+                    app.note("⏭ skip-model only applies mid-turn");
+                }
+                dirty = true;
+                continue;
+            }
+
             // The command palette is modal while open: it owns every key. Esc dismisses it
             // (so the user isn't surprised by a quit); Ctrl-C still maps to Esc → here it just
             // closes the palette, and a second Esc with the palette closed quits as usual.
@@ -1352,7 +1558,22 @@ pub(crate) async fn run_chat_tui(
                     }
                     KeyKind::CycleTemper
                     | KeyKind::ToggleSubagentDetail
-                    | KeyKind::ToggleEffortSlider => {}
+                    | KeyKind::ToggleEffortSlider
+                    | KeyKind::SkipModel
+                    | KeyKind::TierUp
+                    | KeyKind::TierDown
+                    | KeyKind::ToggleReasoning
+                    | KeyKind::OpenKeybindConfig
+                    | KeyKind::ModelPicker
+                    | KeyKind::EffortCycle
+                    | KeyKind::TemperCycle
+                    | KeyKind::CopyLast
+                    | KeyKind::ShowHelp
+                    | KeyKind::SaveCheckpoint
+                    | KeyKind::NewSession
+                    | KeyKind::UndoWrite
+                    | KeyKind::CompactSession
+                    | KeyKind::ReloadConfig => {}
                     // Any other editing key mutates the input at the *cursor* (not blindly at the
                     // end) and then re-syncs the palette to the slash-token the cursor now sits in.
                     // That keeps the text cursor moving while the palette is open, and closes the
@@ -1428,7 +1649,22 @@ pub(crate) async fn run_chat_tui(
                     }
                     KeyKind::CycleTemper
                     | KeyKind::ToggleSubagentDetail
-                    | KeyKind::ToggleEffortSlider => {}
+                    | KeyKind::ToggleEffortSlider
+                    | KeyKind::SkipModel
+                    | KeyKind::TierUp
+                    | KeyKind::TierDown
+                    | KeyKind::ToggleReasoning
+                    | KeyKind::OpenKeybindConfig
+                    | KeyKind::ModelPicker
+                    | KeyKind::EffortCycle
+                    | KeyKind::TemperCycle
+                    | KeyKind::CopyLast
+                    | KeyKind::ShowHelp
+                    | KeyKind::SaveCheckpoint
+                    | KeyKind::NewSession
+                    | KeyKind::UndoWrite
+                    | KeyKind::CompactSession
+                    | KeyKind::ReloadConfig => {}
                     _ => {}
                 }
                 continue;
@@ -1584,7 +1820,22 @@ pub(crate) async fn run_chat_tui(
                     KeyKind::Tab
                     | KeyKind::CycleTemper
                     | KeyKind::ToggleSubagentDetail
-                    | KeyKind::ToggleEffortSlider => {}
+                    | KeyKind::ToggleEffortSlider
+                    | KeyKind::SkipModel
+                    | KeyKind::TierUp
+                    | KeyKind::TierDown
+                    | KeyKind::ToggleReasoning
+                    | KeyKind::OpenKeybindConfig
+                    | KeyKind::ModelPicker
+                    | KeyKind::EffortCycle
+                    | KeyKind::TemperCycle
+                    | KeyKind::CopyLast
+                    | KeyKind::ShowHelp
+                    | KeyKind::SaveCheckpoint
+                    | KeyKind::NewSession
+                    | KeyKind::UndoWrite
+                    | KeyKind::CompactSession
+                    | KeyKind::ReloadConfig => {}
                     _ => {}
                 }
                 continue;
@@ -1790,6 +2041,108 @@ pub(crate) async fn run_chat_tui(
                 app.set_temper(new.label());
                 // Remember the chosen temper as the default for the next session (best-effort).
                 let _ = forge_config::write_permission_mode(new);
+            } else if matches!(key, KeyKind::TemperCycle) {
+                // Alt-T: same as SHIFT+TAB temper cycling but via configurable keybind.
+                let new = {
+                    let mut sess = session.lock().await;
+                    sess.cycle_temper()
+                };
+                app.set_temper(new.label());
+                let _ = forge_config::write_permission_mode(new);
+            } else if matches!(key, KeyKind::ModelPicker) {
+                // Alt-M: open the model browser in pin-mode.
+                app.models_pin_mode = true;
+                open_models_root(&session, &mut app).await?;
+            } else if matches!(key, KeyKind::NewSession) {
+                // Ctrl-N: start a fresh session (equivalent to /new).
+                if let DispatchOutcome::Quit = dispatch_command(
+                    "/new",
+                    &session,
+                    &mut tui,
+                    &mut app,
+                    &catalog,
+                    &mut armed_project,
+                    trust_project,
+                    busy,
+                    &mut assay_lenses,
+                    &mut assay_scope,
+                )
+                .await?
+                {
+                    quit = true;
+                    break;
+                }
+            } else if matches!(key, KeyKind::SaveCheckpoint) {
+                // Ctrl-S: save a checkpoint (equivalent to /checkpoint).
+                if let DispatchOutcome::Quit = dispatch_command(
+                    "/checkpoint",
+                    &session,
+                    &mut tui,
+                    &mut app,
+                    &catalog,
+                    &mut armed_project,
+                    trust_project,
+                    busy,
+                    &mut assay_lenses,
+                    &mut assay_scope,
+                )
+                .await?
+                {
+                    quit = true;
+                    break;
+                }
+            } else if matches!(key, KeyKind::UndoWrite) {
+                // Ctrl-Z: undo last write (equivalent to /undo).
+                if let DispatchOutcome::Quit = dispatch_command(
+                    "/undo",
+                    &session,
+                    &mut tui,
+                    &mut app,
+                    &catalog,
+                    &mut armed_project,
+                    trust_project,
+                    busy,
+                    &mut assay_lenses,
+                    &mut assay_scope,
+                )
+                .await?
+                {
+                    quit = true;
+                    break;
+                }
+            } else if matches!(key, KeyKind::CompactSession) {
+                // Ctrl-L: compact the conversation (equivalent to /compact).
+                match dispatch_command(
+                    "/compact",
+                    &session,
+                    &mut tui,
+                    &mut app,
+                    &catalog,
+                    &mut armed_project,
+                    trust_project,
+                    busy,
+                    &mut assay_lenses,
+                    &mut assay_scope,
+                )
+                .await?
+                {
+                    DispatchOutcome::RunCompact => {
+                        turn_gen += 1;
+                        turn_handle = Some(spawn_compact(
+                            &session,
+                            &done_tx,
+                            turn_gen,
+                            &mut app,
+                            &mut busy,
+                            &mut busy_since,
+                        ));
+                    }
+                    DispatchOutcome::Quit => {
+                        quit = true;
+                        break;
+                    }
+                    _ => {}
+                }
             } else if matches!(key, KeyKind::Up) {
                 // Arrow-up: browse to the previous prompt history entry.
                 if history_pos.is_none() {
@@ -1964,6 +2317,7 @@ pub(crate) async fn run_chat_tui(
                                     for s in &skipped {
                                         app.note(&format!("⚠ skipped {s}"));
                                     }
+                                    last_prompt = Some(prompt.clone());
                                     turn_gen += 1;
                                     turn_handle = Some(if file_blocks.is_empty() {
                                         spawn_turn(

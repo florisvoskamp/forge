@@ -188,6 +188,8 @@ pub struct Tui {
     /// Whether mouse capture is on (full-screen wheel scroll). Off by default so the terminal's
     /// native click-drag text selection keeps working. Tracked so teardown matches setup.
     mouse_capture: bool,
+    /// User-configured keybinds, used by `poll_event` to resolve configurable action keys.
+    pub keybinds: forge_config::KeybindsConfig,
 }
 
 /// Set while a full-screen (alternate-screen) TUI is active, so the panic hook knows to leave the
@@ -215,7 +217,11 @@ pub fn install_panic_restore() {
 }
 
 impl Tui {
-    pub fn new(fullscreen: bool, mouse_capture: bool) -> io::Result<Self> {
+    pub fn new(
+        fullscreen: bool,
+        mouse_capture: bool,
+        keybinds: forge_config::KeybindsConfig,
+    ) -> io::Result<Self> {
         // Belt-and-suspenders: if *anything* panics while the terminal is in raw mode, restore
         // it before the panic prints — otherwise a panic would leave the shell wedged (no echo,
         // Ctrl-C inert). `Drop` covers the normal/unwind path; this covers the print itself.
@@ -244,6 +250,7 @@ impl Tui {
             terminal,
             fullscreen,
             mouse_capture,
+            keybinds,
         })
     }
 
@@ -324,6 +331,10 @@ impl Tui {
                 }));
             }
             Event::Key(k) if k.kind == KeyEventKind::Press => {
+                // Configurable action keybinds take priority over static defaults.
+                if let Some(kind) = crate::keybinds::resolve_action(&self.keybinds, &k) {
+                    return Ok(Some(InputEvent::Key(kind)));
+                }
                 let key = match k.code {
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         KeyKind::Esc
@@ -350,7 +361,7 @@ impl Tui {
                         KeyKind::End
                     }
                     KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        KeyKind::ToggleEffortSlider
+                        KeyKind::ToggleReasoning
                     }
                     KeyCode::Char(c) => KeyKind::Char(c),
                     KeyCode::Backspace => KeyKind::Backspace,

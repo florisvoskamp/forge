@@ -161,6 +161,42 @@ impl TaskTier {
             TaskTier::Complex => "complex",
         }
     }
+
+    /// Parse a tier name (`"trivial"`/`"standard"`/`"complex"`, case-insensitive). `None` otherwise.
+    pub fn from_name(s: &str) -> Option<TaskTier> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "trivial" => Some(TaskTier::Trivial),
+            "standard" => Some(TaskTier::Standard),
+            "complex" => Some(TaskTier::Complex),
+            _ => None,
+        }
+    }
+
+    /// The next tier up (trivial→standard→complex), clamped at the top.
+    pub fn up(self) -> TaskTier {
+        match self {
+            TaskTier::Trivial => TaskTier::Standard,
+            TaskTier::Standard | TaskTier::Complex => TaskTier::Complex,
+        }
+    }
+
+    /// The next tier down (complex→standard→trivial), clamped at the bottom.
+    pub fn down(self) -> TaskTier {
+        match self {
+            TaskTier::Complex => TaskTier::Standard,
+            TaskTier::Standard | TaskTier::Trivial => TaskTier::Trivial,
+        }
+    }
+
+    /// True when already at the highest tier (`up()` is a no-op).
+    pub fn is_max(self) -> bool {
+        self == TaskTier::Complex
+    }
+
+    /// True when already at the lowest tier (`down()` is a no-op).
+    pub fn is_min(self) -> bool {
+        self == TaskTier::Trivial
+    }
 }
 
 // ---- Assay: AI-slop / quality analysis (docs/features/analysis-mode.md) ----
@@ -997,6 +1033,21 @@ impl PartialEq<String> for LoopOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_tier_up_down_clamps_at_ends() {
+        assert_eq!(TaskTier::Trivial.up(), TaskTier::Standard);
+        assert_eq!(TaskTier::Standard.up(), TaskTier::Complex);
+        assert_eq!(TaskTier::Complex.up(), TaskTier::Complex); // clamped
+        assert_eq!(TaskTier::Complex.down(), TaskTier::Standard);
+        assert_eq!(TaskTier::Standard.down(), TaskTier::Trivial);
+        assert_eq!(TaskTier::Trivial.down(), TaskTier::Trivial); // clamped
+        assert!(TaskTier::Complex.is_max() && !TaskTier::Complex.is_min());
+        assert!(TaskTier::Trivial.is_min() && !TaskTier::Trivial.is_max());
+        assert_eq!(TaskTier::from_name("Complex"), Some(TaskTier::Complex));
+        assert_eq!(TaskTier::from_name(" standard "), Some(TaskTier::Standard));
+        assert_eq!(TaskTier::from_name("bogus"), None);
+    }
 
     #[test]
     fn todo_status_parses_loosely_and_defaults_to_pending() {

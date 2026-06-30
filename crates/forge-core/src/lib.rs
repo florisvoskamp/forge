@@ -756,6 +756,11 @@ pub struct Session {
     /// In-session reasoning-effort pin (`/effort <level>`). When set, forwarded to the provider
     /// as a `ReasoningEffort` hint each turn. `None` = provider default (no hint sent).
     pinned_effort: Option<EffortLevel>,
+    /// In-session routing-tier override (the `tier_up`/`tier_down` keybinds). When set, it biases
+    /// the mesh to route the next turn at this tier instead of the classifier's pick — unless a
+    /// per-turn `tier_override` (a command/skill `tier:` hint) is passed, which still wins. `None`
+    /// = normal classification.
+    pinned_tier: Option<TaskTier>,
     /// System hints queued by side-call diagnostics (e.g. shell error interceptor) to be injected
     /// into the transcript immediately after the tool result that triggered them. Cleared each time.
     pending_hints: Vec<String>,
@@ -906,6 +911,7 @@ impl Session {
             skills: None,
             pinned_model: None,
             pinned_effort: None,
+            pinned_tier: None,
             pending_hints: vec![],
             always_compact_on_switch: false,
             project_prompt_injected,
@@ -957,6 +963,28 @@ impl Session {
     /// The currently-pinned effort level, if any (`/effort <level>` was called this session).
     pub fn pinned_effort(&self) -> Option<EffortLevel> {
         self.pinned_effort
+    }
+
+    /// The currently-pinned routing tier, if any (set by `tier_up`/`tier_down`). `None` = normal
+    /// mesh classification.
+    pub fn pinned_tier(&self) -> Option<TaskTier> {
+        self.pinned_tier
+    }
+
+    /// Set (or clear) the in-session routing-tier override. `None` returns to normal classification.
+    pub fn pin_tier(&mut self, tier: Option<TaskTier>) {
+        self.pinned_tier = tier;
+    }
+
+    /// Shift the routing-tier bias one step up (`up=true`) or down. The baseline is the current
+    /// pin, or — when nothing is pinned yet — `from`, the last classified/displayed tier (so the
+    /// first press moves relative to what the mesh would pick, not from a fixed middle). Clamped at
+    /// the ends. Returns the new pinned tier so the caller can show a note.
+    pub fn bump_tier(&mut self, up: bool, from: TaskTier) -> TaskTier {
+        let base = self.pinned_tier.unwrap_or(from);
+        let next = if up { base.up() } else { base.down() };
+        self.pinned_tier = Some(next);
+        next
     }
 
     /// The discovered model catalog, if auto-discovery ran for this session.
@@ -3719,6 +3747,9 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         // Quota-aware routing (L3): demote/skip a subscription that the bridge reported is near or
         // over its plan limit (recorded after earlier turns from the CLI's rate-limit events).
         let quota = self.live_quota();
+        // A per-turn `tier_override` (command/skill `tier:` hint) wins; otherwise the in-session
+        // tier pin (set by the `tier_up`/`tier_down` keybinds) biases routing.
+        let effective_tier = tier_override.or(self.pinned_tier);
         let decision = self
             .router
             .route_hinted(
@@ -3726,7 +3757,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                 budget,
                 &health,
                 &quota,
-                tier_override,
+                effective_tier,
                 self.pinned_effort,
             )
             .await;
@@ -11254,6 +11285,39 @@ mod tests {
             ".",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn bump_tier_shifts_and_clamps_the_session_pin() {
+        let mut session = make_session(Config::default());
+        assert_eq!(session.pinned_tier(), None);
+        // First press from a Standard baseline → Complex pin.
+        assert_eq!(
+            session.bump_tier(true, TaskTier::Standard),
+            TaskTier::Complex
+        );
+        assert_eq!(session.pinned_tier(), Some(TaskTier::Complex));
+        // Up again clamps at Complex.
+        assert_eq!(
+            session.bump_tier(true, TaskTier::Standard),
+            TaskTier::Complex
+        );
+        // Down walks back through Standard → Trivial, then clamps.
+        assert_eq!(
+            session.bump_tier(false, TaskTier::Standard),
+            TaskTier::Standard
+        );
+        assert_eq!(
+            session.bump_tier(false, TaskTier::Standard),
+            TaskTier::Trivial
+        );
+        assert_eq!(
+            session.bump_tier(false, TaskTier::Standard),
+            TaskTier::Trivial
+        );
+        // Clearing returns to normal classification.
+        session.pin_tier(None);
+        assert_eq!(session.pinned_tier(), None);
     }
 
     #[test]
