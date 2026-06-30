@@ -1,8 +1,12 @@
 //! Build an rmcp client connection for a configured server and complete the MCP `initialize`
-//! handshake. Both transports resolve to the same `RunningService<RoleClient, ()>`, so the
-//! manager treats stdio and HTTP servers identically once connected.
+//! handshake. Both transports resolve to the same `RunningService<RoleClient, ForgeClientHandler>`,
+//! so the manager treats stdio and HTTP servers identically once connected. The client handler
+//! Forge presents advertises `sampling`/`roots`/`elicitation` (see [`crate::ForgeClientHandler`]).
+
+use std::sync::{Arc, Weak};
 
 use forge_config::{McpServerConfig, McpTransport};
+use rmcp::model::Root;
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::{
@@ -10,9 +14,26 @@ use rmcp::transport::streamable_http_client::{
 };
 use rmcp::ServiceExt;
 
-/// Connect to a server (spawn the stdio child / open the HTTP stream) and run `initialize`.
-/// The unit client handler `()` is a passive client: it makes requests, serves none.
-pub async fn serve(server: &McpServerConfig) -> Result<RunningService<RoleClient, ()>, String> {
+use crate::{Conns, ForgeClientHandler, SamplingHandler};
+
+/// Per-connection dependencies the manager threads into [`serve`] so each [`ForgeClientHandler`]
+/// can advertise the host's roots, route sampling to the host hook, and refresh the live tool
+/// catalog (via the weak link to the shared connection map) on a `tools/list_changed`.
+pub(crate) struct HandlerDeps {
+    pub roots: Vec<Root>,
+    pub sampling: Option<Arc<dyn SamplingHandler>>,
+    pub conns: Weak<Conns>,
+}
+
+/// Connect to a server (spawn the stdio child / open the HTTP stream) and run `initialize`,
+/// presenting Forge's [`ForgeClientHandler`] (advertises sampling/roots/elicitation; serves
+/// `tools/list_changed`).
+pub(crate) async fn serve(
+    server: &McpServerConfig,
+    deps: HandlerDeps,
+) -> Result<RunningService<RoleClient, ForgeClientHandler>, String> {
+    let handler =
+        ForgeClientHandler::new(server.name.clone(), deps.roots, deps.sampling, deps.conns);
     match &server.transport {
         McpTransport::Stdio { command, args, env } => {
             let mut cmd = stdio_command(command, args);
@@ -36,7 +57,8 @@ pub async fn serve(server: &McpServerConfig) -> Result<RunningService<RoleClient
                 .spawn()
                 .map(|(t, _)| t)
                 .map_err(|e| format!("spawn '{command}': {e}"))?;
-            ().serve(transport)
+            handler
+                .serve(transport)
                 .await
                 .map_err(|e| format!("initialize: {e}"))
         }
@@ -74,11 +96,40 @@ pub async fn serve(server: &McpServerConfig) -> Result<RunningService<RoleClient
                 cfg = cfg.auth_header(b); // sent as `Authorization: Bearer <token>`
             }
             let transport = StreamableHttpClientTransport::with_client(client, cfg);
-            ().serve(transport)
-                .await
-                .map_err(|e| format!("initialize: {e}"))
+            handler.serve(transport).await.map_err(|e| {
+                let msg = format!("initialize: {e}");
+                // 401-driven discovery: if the server rejected us as unauthorized, point at its
+                // RFC 9728 protected-resource metadata (the well-known endpoint) and an actionable
+                // hint — run `forge mcp login`, which discovers the authorization server and
+                // performs RFC 7591 dynamic client registration. rmcp's transport abstracts away the
+                // raw `WWW-Authenticate` header, so we derive the resource-metadata URL from the
+                // server URL rather than parsing the header directly.
+                if is_unauthorized(&msg) {
+                    return enrich_unauthorized(&server.name, url, msg);
+                }
+                msg
+            })
         }
     }
+}
+
+/// Whether an initialize error looks like an HTTP 401/unauthorized (the OAuth challenge case).
+fn is_unauthorized(msg: &str) -> bool {
+    let lc = msg.to_lowercase();
+    lc.contains("401") || lc.contains("unauthor")
+}
+
+/// On a 401, derive the resource's well-known metadata URL (RFC 9728) and return an actionable
+/// error directing the user to `forge mcp login`, which does the live discovery + RFC 7591
+/// registration. Pure string-building so connect never blocks on the failure path.
+fn enrich_unauthorized(server_name: &str, base_url: &str, base_msg: String) -> String {
+    let base = base_url.trim_end_matches('/');
+    let well_known = format!("{base}/.well-known/oauth-protected-resource/mcp");
+    format!(
+        "{base_msg} — server requires OAuth. Run `forge mcp login {server_name}` to authorize \
+         (Forge performs RFC 7591 dynamic client registration automatically). \
+         Resource metadata: {well_known}"
+    )
 }
 
 /// Build the command to launch a stdio MCP server `command` with `args`. On Windows the server

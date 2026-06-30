@@ -320,12 +320,6 @@ pub(crate) async fn mcp_login(server: &str) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("fetching auth server metadata from {issuer}: {e}"))?;
 
-    // Choose client_id (from config or a fallback public client).
-    let client_id = oauth_cfg
-        .client_id
-        .clone()
-        .unwrap_or_else(|| "forge-mcp-client".to_string());
-
     // Bind a loopback listener to get the redirect port.
     let redirect_port = oauth_cfg.redirect_port.unwrap_or(0);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", redirect_port))
@@ -341,6 +335,37 @@ pub(crate) async fn mcp_login(server: &str) -> Result<()> {
         vec!["mcp".to_string(), "offline_access".to_string()]
     } else {
         oauth_cfg.scopes.clone()
+    };
+
+    // Resolve the OAuth client. Precedence: an explicitly-pinned config `client_id` → a previously
+    // registered client (reused across logins) → RFC 7591 dynamic client registration against the
+    // auth server's `registration_endpoint`. Hosted servers (GitHub/Linear/Notion) reject the old
+    // hardcoded public client, so registration is what actually makes them work. The `redirect_uri`
+    // is known now (listener bound), which DCR needs.
+    let (client_id, client_secret) = if let Some(id) = oauth_cfg.client_id.clone() {
+        (id, None)
+    } else if let Some(rc) = forge_mcp::oauth::load_registered_client(server) {
+        println!("Using previously registered client '{}'.", rc.client_id);
+        (rc.client_id, rc.client_secret)
+    } else if let Some(reg_ep) = as_meta.registration_endpoint.clone() {
+        println!("Registering OAuth client (RFC 7591) at {reg_ep} …");
+        let registered = forge_mcp::oauth::register_client(
+            &http,
+            &reg_ep,
+            std::slice::from_ref(&redirect_uri),
+            &scopes,
+            "Forge",
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("dynamic client registration: {e}"))?;
+        forge_mcp::oauth::store_registered_client(server, &registered)
+            .map_err(|e| anyhow::anyhow!("persisting registered client: {e}"))?;
+        println!("✓ Registered client '{}'.", registered.client_id);
+        (registered.client_id, registered.client_secret)
+    } else {
+        // No registration endpoint advertised and no client configured — fall back to the public
+        // client id (works for auth servers that accept an unregistered public client).
+        ("forge-mcp-client".to_string(), None)
     };
 
     let auth_url = forge_config::authorize_url(
@@ -393,6 +418,7 @@ pub(crate) async fn mcp_login(server: &str) -> Result<()> {
         &redirect_uri,
         &client_id,
         &pkce.verifier,
+        client_secret.as_deref(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("token exchange: {e}"))?;

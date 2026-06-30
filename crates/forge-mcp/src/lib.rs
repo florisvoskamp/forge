@@ -19,20 +19,46 @@
 //! and tokens resolve from env/keyring only (ADR-0007) — never logged, never in TOML.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 
 use forge_config::McpConfig;
 use forge_types::{McpServerLine, SideEffect};
+use parking_lot::Mutex;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, GetPromptRequestParams, ReadResourceRequestParams,
     ResourceContents,
 };
-use rmcp::service::{RoleClient, RunningService};
+use rmcp::service::{Peer, RoleClient, RunningService};
 use serde_json::Value;
 
+mod handler;
 pub mod oauth;
 mod transport;
+
+pub use handler::{ForgeClientHandler, SamplingFuture, SamplingHandler};
+
+/// The connection map type, shared (via [`Arc`]/[`std::sync::Weak`]) between the manager and each
+/// server's [`ForgeClientHandler`] so a `tools/list_changed` notification can refresh the live
+/// catalog in place. `parking_lot::Mutex` never poisons — a panic in one critical section can't
+/// wedge every later MCP call for the session.
+pub(crate) type Conns = Mutex<HashMap<String, Connection>>;
+
+/// List a peer's tools and namespace them (`server__tool`). Shared by initial discovery and the
+/// `tools/list_changed` refresh path. Pure read — safe to call without holding any manager lock.
+pub(crate) async fn discover_tools(peer: &Peer<RoleClient>, server: &str) -> Vec<DiscoveredTool> {
+    peer.list_all_tools()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| DiscoveredTool {
+            qualified: format!("{server}__{}", t.name),
+            raw_name: t.name.to_string(),
+            description: t.description.map(|d| d.to_string()).unwrap_or_default(),
+            schema: Value::Object((*t.input_schema).clone()),
+        })
+        .collect()
+}
 
 /// Meta-tool names (the deferred-loading + resource/prompt surface). Mirrors the
 /// `ToolSearch`-style mechanism the harness Forge itself runs under.
@@ -55,11 +81,73 @@ pub struct McpToolSpec {
     pub schema: Value,
 }
 
+/// A structured content block from a server tool/prompt/resource result. Text always renders into
+/// [`McpCallOutcome::text`]; non-text blocks (image/audio/binary resource) are ALSO preserved here
+/// with their data + mime type so a multimodal consumer can use them instead of seeing the data
+/// dropped to a lossy placeholder. The `text` field still carries a clearly-typed marker for each
+/// non-text block so text-only consumers know what was returned.
+#[derive(Debug, Clone, PartialEq)]
+pub enum McpContentBlock {
+    Text(String),
+    /// Base64-encoded image data + its mime type (e.g. `image/png`).
+    Image {
+        data: String,
+        mime_type: String,
+    },
+    /// Base64-encoded audio data + its mime type.
+    Audio {
+        data: String,
+        mime_type: String,
+    },
+    /// An embedded resource: text or base64 blob, with its uri + optional mime type.
+    Resource {
+        uri: String,
+        mime_type: Option<String>,
+        text: Option<String>,
+        blob: Option<String>,
+    },
+}
+
+impl McpContentBlock {
+    /// A clearly-typed, human-readable rendering for the model's text channel. Non-text blocks
+    /// become a typed marker (mime + size) rather than a generic "(binary)" placeholder — the
+    /// actual bytes stay in the block itself.
+    fn to_marker(&self) -> String {
+        match self {
+            McpContentBlock::Text(t) => t.clone(),
+            McpContentBlock::Image { data, mime_type } => {
+                format!("[image content: {mime_type}, {} base64 chars]", data.len())
+            }
+            McpContentBlock::Audio { data, mime_type } => {
+                format!("[audio content: {mime_type}, {} base64 chars]", data.len())
+            }
+            McpContentBlock::Resource {
+                uri,
+                mime_type,
+                text,
+                blob,
+            } => match (text, blob) {
+                (Some(t), _) => t.clone(),
+                (None, Some(b)) => format!(
+                    "[binary resource {uri}, {}, {} base64 chars]",
+                    mime_type.as_deref().unwrap_or("application/octet-stream"),
+                    b.len()
+                ),
+                (None, None) => format!("[resource {uri}]"),
+            },
+        }
+    }
+}
+
 /// The result of running an MCP (meta-)tool: the text to feed the model + whether it succeeded.
+/// `blocks` preserves the full structured content (including non-text image/audio/binary) so a
+/// multimodal consumer can use it; text-only consumers read `text` (which carries typed markers
+/// for any non-text blocks). `blocks` is empty for purely-local meta-tool results.
 #[derive(Debug, Clone)]
 pub struct McpCallOutcome {
     pub text: String,
     pub ok: bool,
+    pub blocks: Vec<McpContentBlock>,
 }
 
 impl McpCallOutcome {
@@ -67,13 +155,39 @@ impl McpCallOutcome {
         Self {
             text: text.into(),
             ok: true,
+            blocks: Vec::new(),
         }
     }
     fn err(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             ok: false,
+            blocks: Vec::new(),
         }
+    }
+    /// Build a successful outcome from structured content blocks: `text` is the joined typed
+    /// rendering (truncated), `blocks` preserves everything (incl. non-text).
+    fn ok_blocks(blocks: Vec<McpContentBlock>) -> Self {
+        let text = render_blocks(&blocks);
+        Self {
+            text,
+            ok: true,
+            blocks,
+        }
+    }
+}
+
+/// Join blocks into the model's text channel: each block's typed marker on its own segment.
+fn render_blocks(blocks: &[McpContentBlock]) -> String {
+    let joined = blocks
+        .iter()
+        .map(McpContentBlock::to_marker)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if joined.is_empty() {
+        "(no textual content)".to_string()
+    } else {
+        truncate(&joined)
     }
 }
 
@@ -103,7 +217,7 @@ impl ServerStatus {
 
 /// A discovered tool, namespaced so two servers exposing `search` can't collide.
 #[derive(Debug, Clone)]
-struct DiscoveredTool {
+pub(crate) struct DiscoveredTool {
     raw_name: String,
     qualified: String,
     description: String,
@@ -123,15 +237,16 @@ struct DiscoveredPrompt {
     description: String,
 }
 
-/// One connected (or failed) server. `service` owns the connection lifecycle; `peer` is a cheap
-/// clone used for calls so the manager never holds its lock across an `.await`.
-struct Connection {
+/// One connected (or failed) server. `service` owns the connection lifecycle (and, for stdio, the
+/// child process); `peer` is a cheap clone used for calls so the manager never holds its lock
+/// across an `.await`.
+pub(crate) struct Connection {
     name: String,
     status: ServerStatus,
     transport_label: &'static str,
-    peer: Option<rmcp::service::Peer<RoleClient>>,
-    service: Option<RunningService<RoleClient, ()>>,
-    tools: Vec<DiscoveredTool>,
+    peer: Option<Peer<RoleClient>>,
+    service: Option<RunningService<RoleClient, ForgeClientHandler>>,
+    pub(crate) tools: Vec<DiscoveredTool>,
     resources: Vec<DiscoveredResource>,
     prompts: Vec<DiscoveredPrompt>,
     reconnect_attempts: usize,
@@ -140,10 +255,16 @@ struct Connection {
 /// Connects to and drives a set of external MCP servers. Cheap to hold in an `Arc`; all mutable
 /// state is behind short-lived mutexes (never locked across an `.await`).
 pub struct McpManager {
-    conns: Mutex<HashMap<String, Connection>>,
+    conns: Arc<Conns>,
     config: McpConfig,
     call_timeout: Duration,
     connect_timeout: Duration,
+    /// Workspace root(s) advertised to servers via `roots/list`. Empty by default; the host
+    /// installs the real workspace roots with [`with_roots`](Self::with_roots).
+    roots: Vec<rmcp::model::Root>,
+    /// Host hook for server-initiated `sampling/createMessage`. `None` → the client declines
+    /// sampling with a method-not-found error. Installed via [`with_sampling_handler`].
+    sampling: Option<Arc<dyn SamplingHandler>>,
     /// Fires `true` once `connect_active()` completes (all servers resolved). Callers can
     /// subscribe via [`subscribe_done`] to re-announce status after the initial "connecting"
     /// placeholder is shown.
@@ -154,11 +275,48 @@ impl McpManager {
     fn empty(config: &McpConfig) -> Self {
         let (connect_done, _) = tokio::sync::watch::channel(false);
         Self {
-            conns: Mutex::new(HashMap::new()),
+            conns: Arc::new(Mutex::new(HashMap::new())),
             config: config.clone(),
             call_timeout: Duration::from_secs(config.call_timeout_secs.max(1)),
             connect_timeout: Duration::from_secs(config.connect_timeout_secs.max(1)),
+            roots: Vec::new(),
+            sampling: None,
             connect_done,
+        }
+    }
+
+    /// Install the workspace root(s) advertised to servers via `roots/list` (e.g. the project
+    /// directory). Must be called before connecting so handlers pick them up. Builder-style.
+    pub fn with_roots(mut self, roots: impl IntoIterator<Item = String>) -> Self {
+        self.roots = roots
+            .into_iter()
+            .map(|uri| {
+                // Bare filesystem paths become `file://` URIs; anything already a URI is kept.
+                let uri = if uri.contains("://") {
+                    uri
+                } else {
+                    format!("file://{uri}")
+                };
+                rmcp::model::Root::new(uri)
+            })
+            .collect();
+        self
+    }
+
+    /// Install the host's sampling handler — fulfils server-initiated `sampling/createMessage`
+    /// (a server asking Forge to run an LLM turn). Must be set before connecting. Builder-style.
+    pub fn with_sampling_handler(mut self, handler: Arc<dyn SamplingHandler>) -> Self {
+        self.sampling = Some(handler);
+        self
+    }
+
+    /// Build the per-connection handler dependencies (roots, sampling hook, a weak link to the
+    /// shared connection map for `tools/list_changed` refresh). One per `serve` call.
+    fn handler_deps(&self) -> transport::HandlerDeps {
+        transport::HandlerDeps {
+            roots: self.roots.clone(),
+            sampling: self.sampling.clone(),
+            conns: Arc::downgrade(&self.conns),
         }
     }
 
@@ -188,7 +346,7 @@ impl McpManager {
     pub fn connecting(config: &McpConfig) -> Self {
         let mgr = Self::empty(config);
         {
-            let mut conns = mgr.conns.lock().unwrap();
+            let mut conns = mgr.conns.lock();
             for s in config.active_servers() {
                 conns.insert(
                     s.name.clone(),
@@ -214,10 +372,17 @@ impl McpManager {
     /// background path in `mcp-serve` (after [`connecting`](Self::connecting)).
     pub async fn connect_active(&self) {
         let connect_timeout = self.connect_timeout;
-        let servers: Vec<_> = self.config.active_servers().cloned().collect();
-        let results = futures::future::join_all(servers.into_iter().map(|s| async move {
+        // Pair each server with its own handler dependencies (roots/sampling/catalog link) up front
+        // so the connect futures own everything they need and reference nothing borrowed from self.
+        let jobs: Vec<_> = self
+            .config
+            .active_servers()
+            .cloned()
+            .map(|s| (s, self.handler_deps()))
+            .collect();
+        let results = futures::future::join_all(jobs.into_iter().map(|(s, deps)| async move {
             let label = s.transport_label();
-            match tokio::time::timeout(connect_timeout, transport::serve(&s)).await {
+            match tokio::time::timeout(connect_timeout, transport::serve(&s, deps)).await {
                 Ok(Ok(service)) => (s.name.clone(), label, Ok(service)),
                 Ok(Err(e)) => (s.name.clone(), label, Err(e)),
                 Err(_) => (
@@ -237,7 +402,7 @@ impl McpManager {
                 Ok(service) => self.add_established(&name, label, service).await,
                 Err(reason) => {
                     tracing::warn!("mcp: server '{name}' failed to connect: {reason}");
-                    self.conns.lock().unwrap().insert(
+                    self.conns.lock().insert(
                         name.clone(),
                         Connection {
                             name,
@@ -257,7 +422,7 @@ impl McpManager {
         // Surface declared-but-inactive servers (disabled, or excluded by the allowlist) so the
         // user sees them in `forge mcp` rather than wondering why they're silent.
         {
-            let mut conns = self.conns.lock().unwrap();
+            let mut conns = self.conns.lock();
             for s in &self.config.servers {
                 if !conns.contains_key(&s.name) {
                     conns.insert(
@@ -288,21 +453,10 @@ impl McpManager {
         &self,
         name: &str,
         transport_label: &'static str,
-        service: RunningService<RoleClient, ()>,
+        service: RunningService<RoleClient, ForgeClientHandler>,
     ) {
         let peer = service.peer().clone();
-        let tools = peer
-            .list_all_tools()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| DiscoveredTool {
-                qualified: format!("{name}__{}", t.name),
-                raw_name: t.name.to_string(),
-                description: t.description.map(|d| d.to_string()).unwrap_or_default(),
-                schema: Value::Object((*t.input_schema).clone()),
-            })
-            .collect();
+        let tools = discover_tools(&peer, name).await;
         let resources = peer
             .list_all_resources()
             .await
@@ -325,7 +479,7 @@ impl McpManager {
             })
             .collect();
 
-        self.conns.lock().unwrap().insert(
+        self.conns.lock().insert(
             name.to_string(),
             Connection {
                 name: name.to_string(),
@@ -343,7 +497,7 @@ impl McpManager {
 
     /// No servers connected/declared — the whole MCP path is inert.
     pub fn is_empty(&self) -> bool {
-        self.conns.lock().unwrap().is_empty()
+        self.conns.lock().is_empty()
     }
 
     /// Connect a single server at runtime and add it to the live connection map. Returns `Ok` if
@@ -352,13 +506,18 @@ impl McpManager {
     pub async fn connect_one(&self, server: &forge_config::McpServerConfig) -> Result<(), String> {
         let name = server.name.clone();
         let label = server.transport_label();
-        match tokio::time::timeout(self.connect_timeout, transport::serve(server)).await {
+        match tokio::time::timeout(
+            self.connect_timeout,
+            transport::serve(server, self.handler_deps()),
+        )
+        .await
+        {
             Ok(Ok(service)) => {
                 self.add_established(&name, label, service).await;
                 Ok(())
             }
             Ok(Err(e)) => {
-                self.conns.lock().unwrap().insert(
+                self.conns.lock().insert(
                     name.clone(),
                     Connection {
                         name,
@@ -379,7 +538,7 @@ impl McpManager {
                     "connect timed out after {}s",
                     self.connect_timeout.as_secs()
                 );
-                self.conns.lock().unwrap().insert(
+                self.conns.lock().insert(
                     name.clone(),
                     Connection {
                         name,
@@ -401,7 +560,7 @@ impl McpManager {
     /// Remove a server from the live connection map by name. The child process (if any) will be
     /// dropped, which closes the stdio pipe and causes it to exit.
     pub fn disconnect(&self, name: &str) {
-        self.conns.lock().unwrap().remove(name);
+        self.conns.lock().remove(name);
     }
 
     /// The tools advertised to the model: just the fixed meta-tools (search / call / resources /
@@ -411,7 +570,7 @@ impl McpManager {
     /// (the bridge fixes its tool list once per turn, so a dynamically-"exposed" tool could never
     /// become callable mid-turn — `mcp_call` sidesteps that entirely). Empty when no servers.
     pub fn advertised_specs(&self) -> Vec<McpToolSpec> {
-        if self.conns.lock().unwrap().is_empty() {
+        if self.conns.lock().is_empty() {
             return vec![];
         }
         meta_specs()
@@ -420,7 +579,7 @@ impl McpManager {
     /// Whether `name` is an MCP meta-tool — i.e. core should route it here rather than to the
     /// built-in registry. (Server tools are invoked via `mcp_call`, never by their own name.)
     pub fn knows_tool(&self, name: &str) -> bool {
-        !self.conns.lock().unwrap().is_empty() && is_meta_tool(name)
+        !self.conns.lock().is_empty() && is_meta_tool(name)
     }
 
     /// The permission class for a meta-tool. Local catalog reads (`mcp_search_tools`,
@@ -478,7 +637,7 @@ impl McpManager {
             .to_lowercase();
         let server_filter = args.get("server").and_then(Value::as_str);
         let terms: Vec<&str> = query.split_whitespace().collect();
-        let conns = self.conns.lock().unwrap();
+        let conns = self.conns.lock();
         #[allow(clippy::type_complexity)]
         let mut scored: Vec<(i64, String, String, String)> = Vec::new();
         for conn in conns.values() {
@@ -521,7 +680,7 @@ impl McpManager {
 
     fn list_resources(&self, args: &Value) -> McpCallOutcome {
         let server_filter = args.get("server").and_then(Value::as_str);
-        let conns = self.conns.lock().unwrap();
+        let conns = self.conns.lock();
         let mut out = String::new();
         let mut n = 0;
         for conn in conns.values() {
@@ -560,13 +719,12 @@ impl McpManager {
         let params = ReadResourceRequestParams::new(uri);
         match tokio::time::timeout(self.call_timeout, peer.read_resource(params)).await {
             Ok(Ok(res)) => {
-                let text = res
+                let blocks: Vec<McpContentBlock> = res
                     .contents
                     .iter()
-                    .map(resource_text)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                McpCallOutcome::ok(truncate(&text))
+                    .map(resource_contents_to_block)
+                    .collect();
+                McpCallOutcome::ok_blocks(blocks)
             }
             Ok(Err(e)) => self.classify_call_error(server, e),
             Err(_) => self.timed_out(server),
@@ -583,7 +741,7 @@ impl McpManager {
         let arguments = args.get("arguments").and_then(|v| v.as_object()).cloned();
         // Validate against the discovered prompt catalog; on a miss, list what's available.
         {
-            let conns = self.conns.lock().unwrap();
+            let conns = self.conns.lock();
             if let Some(conn) = conns.get(server) {
                 if !conn.prompts.iter().any(|p| p.name == name) {
                     let avail = conn
@@ -607,13 +765,9 @@ impl McpManager {
         params.arguments = arguments;
         match tokio::time::timeout(self.call_timeout, peer.get_prompt(params)).await {
             Ok(Ok(res)) => {
-                let text = res
-                    .messages
-                    .iter()
-                    .map(prompt_message_text)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                McpCallOutcome::ok(truncate(&text))
+                let blocks: Vec<McpContentBlock> =
+                    res.messages.iter().map(prompt_message_to_block).collect();
+                McpCallOutcome::ok_blocks(blocks)
             }
             Ok(Err(e)) => self.classify_call_error(server, e),
             Err(_) => self.timed_out(server),
@@ -625,7 +779,7 @@ impl McpManager {
     async fn call_server_tool(&self, qualified: &str, args: &Value) -> McpCallOutcome {
         // Resolve qualified -> (server, raw name), re-fetching nothing: catalog is authoritative.
         let resolved = {
-            let conns = self.conns.lock().unwrap();
+            let conns = self.conns.lock();
             conns.values().find_map(|c| {
                 c.tools
                     .iter()
@@ -665,16 +819,12 @@ impl McpManager {
 
     // ---- connection helpers ----
 
-    fn peer_for(&self, server: &str) -> Option<rmcp::service::Peer<RoleClient>> {
-        self.conns
-            .lock()
-            .unwrap()
-            .get(server)
-            .and_then(|c| c.peer.clone())
+    fn peer_for(&self, server: &str) -> Option<Peer<RoleClient>> {
+        self.conns.lock().get(server).and_then(|c| c.peer.clone())
     }
 
     fn mark(&self, server: &str, status: ServerStatus) {
-        if let Some(c) = self.conns.lock().unwrap().get_mut(server) {
+        if let Some(c) = self.conns.lock().get_mut(server) {
             // Don't overwrite a hard Failed with a transient Slow.
             c.status = status;
         }
@@ -695,8 +845,17 @@ impl McpManager {
         // Drop the dead peer so the NEXT call's `peer_for` returns `None` and enters the `reconnect()`
         // path. `mark()` only updates status; without clearing the stale `Some(peer)` here, lazy
         // reconnect was permanently unreachable after a mid-session drop — every later call failed.
-        if let Some(c) = self.conns.lock().unwrap().get_mut(server) {
+        // ALSO drop the dead `RunningService`: it owns the stdio child process, and leaving it in the
+        // map orphaned that child until a later reconnect replaced the entry — it could linger the
+        // whole session. Taking + cancelling it now reaps the child (closes its pipes) immediately.
+        let dead = self.conns.lock().get_mut(server).and_then(|c| {
             c.peer = None;
+            c.service.take()
+        });
+        if let Some(service) = dead {
+            tokio::spawn(async move {
+                let _ = service.cancel().await;
+            });
         }
         McpCallOutcome::err(format!("mcp: {server} disconnected ({msg})"))
     }
@@ -714,7 +873,7 @@ impl McpManager {
     /// fresh peer. On exhaustion marks the server `failed` and withdraws its tools.
     async fn reconnect(&self, server: &str) -> Option<rmcp::service::Peer<RoleClient>> {
         let cfg = {
-            let conns = self.conns.lock().unwrap();
+            let conns = self.conns.lock();
             let c = conns.get(server)?;
             if c.reconnect_attempts >= self.config.max_reconnect_attempts {
                 return None;
@@ -729,19 +888,23 @@ impl McpManager {
         let attempt = self
             .conns
             .lock()
-            .unwrap()
             .get(server)
             .map(|c| c.reconnect_attempts)
             .unwrap_or(0);
         tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
         let label = cfg.transport_label();
-        match tokio::time::timeout(self.connect_timeout, transport::serve(&cfg)).await {
+        match tokio::time::timeout(
+            self.connect_timeout,
+            transport::serve(&cfg, self.handler_deps()),
+        )
+        .await
+        {
             Ok(Ok(service)) => {
                 self.add_established(server, label, service).await;
                 self.peer_for(server)
             }
             _ => {
-                if let Some(c) = self.conns.lock().unwrap().get_mut(server) {
+                if let Some(c) = self.conns.lock().get_mut(server) {
                     c.reconnect_attempts += 1;
                     if c.reconnect_attempts >= self.config.max_reconnect_attempts {
                         c.status = ServerStatus::Failed("reconnect attempts exhausted".into());
@@ -758,7 +921,7 @@ impl McpManager {
 
     /// One [`McpServerLine`] per declared server (connected or not), for `forge mcp` / `/mcp`.
     pub fn status_lines(&self) -> Vec<McpServerLine> {
-        let conns = self.conns.lock().unwrap();
+        let conns = self.conns.lock();
         let mut lines: Vec<McpServerLine> = conns
             .values()
             .map(|c| McpServerLine {
@@ -786,7 +949,7 @@ impl McpManager {
     /// `(qualified_name, one-line description)` for a server's full discovered tool list
     /// (`forge mcp --tools <server>`).
     pub fn tool_lines(&self, server: &str) -> Vec<(String, String)> {
-        let conns = self.conns.lock().unwrap();
+        let conns = self.conns.lock();
         conns
             .get(server)
             .map(|c| {
@@ -800,8 +963,8 @@ impl McpManager {
 
     /// Close all connections (kill stdio children / close HTTP streams). Best-effort.
     pub async fn shutdown(&self) {
-        let services: Vec<RunningService<RoleClient, ()>> = {
-            let mut conns = self.conns.lock().unwrap();
+        let services: Vec<RunningService<RoleClient, ForgeClientHandler>> = {
+            let mut conns = self.conns.lock();
             conns
                 .values_mut()
                 .filter_map(|c| c.service.take())
@@ -929,40 +1092,90 @@ fn meta_specs() -> Vec<McpToolSpec> {
 }
 
 fn tool_result_to_outcome(result: CallToolResult) -> McpCallOutcome {
-    let text = result
-        .content
-        .iter()
-        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let text = if text.is_empty() {
-        "(no textual content)".to_string()
-    } else {
-        truncate(&text)
-    };
+    // Preserve EVERY content block (text, image, audio, embedded resource) instead of keeping only
+    // text and dropping the rest. Non-text blocks keep their data + mime type in `blocks`; `text`
+    // renders a typed marker for them so text-only consumers still see what came back.
+    let blocks: Vec<McpContentBlock> = result.content.iter().map(content_to_block).collect();
     // An MCP `isError` payload is a tool error, not a successful result.
     if result.is_error == Some(true) {
-        McpCallOutcome::err(text)
+        let mut out = McpCallOutcome::err(render_blocks(&blocks));
+        out.blocks = blocks;
+        out
     } else {
-        McpCallOutcome::ok(text)
+        McpCallOutcome::ok_blocks(blocks)
     }
 }
 
-fn resource_text(c: &ResourceContents) -> String {
+/// Map an rmcp tool/prompt content block into Forge's structured [`McpContentBlock`], keeping the
+/// raw data + mime type for non-text blocks rather than collapsing them to a placeholder string.
+fn content_to_block(c: &rmcp::model::Content) -> McpContentBlock {
+    use rmcp::model::RawContent;
+    match &c.raw {
+        RawContent::Text(t) => McpContentBlock::Text(t.text.clone()),
+        RawContent::Image(i) => McpContentBlock::Image {
+            data: i.data.clone(),
+            mime_type: i.mime_type.clone(),
+        },
+        RawContent::Audio(a) => McpContentBlock::Audio {
+            data: a.data.clone(),
+            mime_type: a.mime_type.clone(),
+        },
+        RawContent::Resource(r) => resource_contents_to_block(&r.resource),
+        RawContent::ResourceLink(l) => McpContentBlock::Resource {
+            uri: l.uri.clone(),
+            mime_type: l.mime_type.clone(),
+            text: None,
+            blob: None,
+        },
+    }
+}
+
+/// Map an embedded `ResourceContents` (text or binary blob) into a structured block, preserving the
+/// base64 blob + mime type for binary resources rather than dropping to a placeholder.
+fn resource_contents_to_block(c: &ResourceContents) -> McpContentBlock {
     match c {
-        ResourceContents::TextResourceContents { text, .. } => text.clone(),
-        ResourceContents::BlobResourceContents { uri, mime_type, .. } => format!(
-            "(binary resource {uri}, {})",
-            mime_type.as_deref().unwrap_or("application/octet-stream")
-        ),
+        ResourceContents::TextResourceContents {
+            uri,
+            mime_type,
+            text,
+            ..
+        } => McpContentBlock::Resource {
+            uri: uri.clone(),
+            mime_type: mime_type.clone(),
+            text: Some(text.clone()),
+            blob: None,
+        },
+        ResourceContents::BlobResourceContents {
+            uri,
+            mime_type,
+            blob,
+            ..
+        } => McpContentBlock::Resource {
+            uri: uri.clone(),
+            mime_type: mime_type.clone(),
+            text: None,
+            blob: Some(blob.clone()),
+        },
     }
 }
 
-fn prompt_message_text(m: &rmcp::model::PromptMessage) -> String {
+fn prompt_message_to_block(m: &rmcp::model::PromptMessage) -> McpContentBlock {
     use rmcp::model::PromptMessageContent;
     match &m.content {
-        PromptMessageContent::Text { text } => text.clone(),
-        _ => String::new(),
+        PromptMessageContent::Text { text } => McpContentBlock::Text(text.clone()),
+        PromptMessageContent::Image { image } => McpContentBlock::Image {
+            data: image.data.clone(),
+            mime_type: image.mime_type.clone(),
+        },
+        PromptMessageContent::Resource { resource } => {
+            resource_contents_to_block(&resource.resource)
+        }
+        PromptMessageContent::ResourceLink { link } => McpContentBlock::Resource {
+            uri: link.uri.clone(),
+            mime_type: link.mime_type.clone(),
+            text: None,
+            blob: None,
+        },
     }
 }
 
@@ -1066,7 +1279,10 @@ pub mod testsupport {
                 let _ = server.waiting().await;
             }
         });
-        let client = ().serve(client_io).await.expect("client connects");
+        let client = ForgeClientHandler::passive("test")
+            .serve(client_io)
+            .await
+            .expect("client connects");
         let mgr = McpManager::empty(config);
         mgr.add_established("test", "stdio", client).await;
         mgr
@@ -1220,5 +1436,257 @@ mod tests {
             "meta-tools advertised before any connection completes"
         );
         assert!(mgr.knows_tool(MCP_CALL), "mcp_call routable immediately");
+    }
+
+    // ---- lock hardening (item 5): parking_lot never poisons ----
+
+    #[tokio::test]
+    async fn a_panic_holding_the_conns_lock_does_not_break_later_calls() {
+        // A `std::sync::Mutex` would poison here and make every later `.lock().unwrap()` panic for
+        // the whole session. With `parking_lot::Mutex` the lock is simply released on unwind, so the
+        // manager keeps working — proven by a real tool call succeeding afterwards.
+        let mgr = manager_with_test_server(McpConfig::default()).await;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mgr.conns.lock();
+            panic!("boom while holding the conns lock");
+        }));
+        assert!(result.is_err(), "the panic happened (and was caught)");
+
+        // The lock is usable again …
+        assert!(!mgr.conns.lock().is_empty(), "lock not poisoned");
+        // … and a real call through it still works.
+        let ok = mgr
+            .call(
+                MCP_CALL,
+                &serde_json::json!({"name": "test__echo", "arguments": {"msg": "alive"}}),
+            )
+            .await;
+        assert!(ok.ok, "later MCP call still works: {}", ok.text);
+        assert_eq!(ok.text, "echo: alive");
+    }
+
+    // ---- subprocess cleanup (item 4): dead service dropped on connection loss ----
+
+    #[tokio::test]
+    async fn connection_loss_drops_the_dead_service_and_peer() {
+        let mgr = manager_with_test_server(McpConfig::default()).await;
+        assert!(
+            mgr.conns.lock().get("test").unwrap().service.is_some(),
+            "service (owns the child) present while connected"
+        );
+
+        // A non-auth call error is treated as a dropped connection.
+        let out = mgr.classify_call_error("test", "connection reset by peer");
+        assert!(!out.ok && out.text.contains("disconnected"));
+
+        let conns = mgr.conns.lock();
+        let conn = conns.get("test").unwrap();
+        assert!(conn.peer.is_none(), "stale peer cleared");
+        assert!(
+            conn.service.is_none(),
+            "dead RunningService dropped immediately (child reaped, no session-long orphan)"
+        );
+    }
+
+    // ---- reconnect path (item 9) ----
+
+    #[tokio::test]
+    async fn reconnect_path_gives_up_cleanly_when_no_config_backs_the_server() {
+        // After a drop clears the peer, the next call enters the lazy `reconnect()` path. The
+        // in-process test server has no config entry, so reconnect can't re-serve it — it must fail
+        // gracefully (a clean tool error), never hang or panic.
+        let mgr = manager_with_test_server(McpConfig::default()).await;
+        let _ = mgr.classify_call_error("test", "connection reset by peer");
+        let out = mgr
+            .call(
+                MCP_CALL,
+                &serde_json::json!({"name": "test__echo", "arguments": {"msg": "x"}}),
+            )
+            .await;
+        assert!(!out.ok);
+        assert!(
+            out.text.contains("unavailable") || out.text.contains("disconnected"),
+            "graceful reconnect failure: {}",
+            out.text
+        );
+    }
+
+    // ---- client capabilities (item 2): sampling/roots/elicitation advertised ----
+
+    #[test]
+    fn client_handler_advertises_sampling_roots_and_elicitation() {
+        use rmcp::ClientHandler;
+        let info = ForgeClientHandler::passive("test").get_info();
+        assert!(
+            info.capabilities.sampling.is_some(),
+            "sampling capability advertised"
+        );
+        assert!(
+            info.capabilities.roots.is_some(),
+            "roots capability advertised"
+        );
+        assert!(
+            info.capabilities.elicitation.is_some(),
+            "elicitation capability advertised"
+        );
+        assert_eq!(info.client_info.name, "forge");
+    }
+
+    #[test]
+    fn with_roots_threads_workspace_roots_into_handler_deps() {
+        let mgr = McpManager::empty(&McpConfig::default())
+            .with_roots(["/home/me/project".to_string(), "file:///abs".to_string()]);
+        let deps = mgr.handler_deps();
+        assert_eq!(deps.roots.len(), 2);
+        // A bare path becomes a file:// URI; an existing URI is kept verbatim.
+        assert_eq!(deps.roots[0].uri, "file:///home/me/project");
+        assert_eq!(deps.roots[1].uri, "file:///abs");
+    }
+
+    // ---- non-text content preservation (item 3) ----
+
+    #[test]
+    fn tool_result_preserves_image_and_audio_blocks() {
+        use rmcp::model::{CallToolResult, Content};
+        let result = CallToolResult::success(vec![
+            Content::text("a caption"),
+            Content::image("aGVsbG8=", "image/png"),
+        ]);
+        let outcome = tool_result_to_outcome(result);
+        assert!(outcome.ok);
+        // The data is preserved structurally …
+        assert!(
+            outcome.blocks.iter().any(|b| matches!(
+                b,
+                McpContentBlock::Image { data, mime_type }
+                    if data == "aGVsbG8=" && mime_type == "image/png"
+            )),
+            "image block preserved with data + mime, not dropped"
+        );
+        assert!(outcome
+            .blocks
+            .iter()
+            .any(|b| matches!(b, McpContentBlock::Text(t) if t == "a caption")));
+        // … and the text channel carries a clearly-typed marker, not a generic placeholder.
+        assert!(outcome.text.contains("a caption"));
+        assert!(
+            outcome.text.contains("[image content: image/png"),
+            "typed image marker in text: {}",
+            outcome.text
+        );
+    }
+
+    #[test]
+    fn binary_resource_keeps_its_blob_and_mime() {
+        use rmcp::model::ResourceContents;
+        let block = resource_contents_to_block(&ResourceContents::BlobResourceContents {
+            uri: "mcp://x/file.bin".into(),
+            mime_type: Some("application/octet-stream".into()),
+            blob: "ZGF0YQ==".into(),
+            meta: None,
+        });
+        match block {
+            McpContentBlock::Resource {
+                uri,
+                mime_type,
+                text,
+                blob,
+            } => {
+                assert_eq!(uri, "mcp://x/file.bin");
+                assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
+                assert!(text.is_none());
+                assert_eq!(blob.as_deref(), Some("ZGF0YQ=="), "blob preserved");
+            }
+            other => panic!("expected Resource block, got {other:?}"),
+        }
+    }
+
+    // ---- OAuth dynamic client registration request shaping (item 1) ----
+
+    #[tokio::test]
+    async fn dynamic_client_registration_shapes_the_request_and_parses_the_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A one-shot mock registration endpoint: capture the request body, return an RFC 7591 doc.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = req
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b.to_string())
+                .unwrap_or_default();
+            let resp_body = r#"{"client_id":"dcr-abc123","client_secret":"s3cr3t","token_endpoint_auth_method":"none"}"#;
+            let resp = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            body
+        });
+
+        let client = crate::transport::bundled_client_builder().build().unwrap();
+        let registered = oauth::register_client(
+            &client,
+            &format!("http://127.0.0.1:{port}/register"),
+            &["http://127.0.0.1:9999/callback".to_string()],
+            &["mcp".to_string(), "offline_access".to_string()],
+            "Forge",
+        )
+        .await
+        .expect("registration succeeds");
+
+        assert_eq!(registered.client_id, "dcr-abc123");
+        assert_eq!(registered.client_secret.as_deref(), Some("s3cr3t"));
+
+        // The request body is a well-formed RFC 7591 registration: PKCE/public client, with the
+        // redirect uri and scopes we passed.
+        let body = server.await.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(json["token_endpoint_auth_method"], "none");
+        assert_eq!(json["redirect_uris"][0], "http://127.0.0.1:9999/callback");
+        assert_eq!(json["scope"], "mcp offline_access");
+        assert!(json["grant_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "authorization_code"));
+    }
+
+    // ---- tools/list_changed refresh primitive (item 6) ----
+
+    #[tokio::test]
+    async fn catalog_refresh_relists_a_live_peer_and_updates_what_the_manager_reads() {
+        // The exact mechanism `ForgeClientHandler::on_tool_list_changed` runs when a server sends
+        // `tools/list_changed`: re-list the peer's tools (`discover_tools`) and swap them into the
+        // shared connection map. Exercised here against a live in-process peer — the rmcp
+        // notification *delivery* itself is the handler's trigger in production (see handler.rs).
+        let mgr = manager_with_test_server(McpConfig::default()).await; // "test": echo + boom
+        assert_eq!(mgr.tool_lines("test").len(), 2);
+
+        // Re-list off the live peer (the async half of the refresh).
+        let peer = mgr.peer_for("test").expect("live peer");
+        let relisted = discover_tools(&peer, "test").await;
+        assert_eq!(relisted.len(), 2, "re-list sees the server's current tools");
+        assert!(relisted.iter().any(|t| t.qualified == "test__echo"));
+
+        // Swap a narrowed catalog into the shared map — the same write the handler performs through
+        // its `Weak<Conns>` — and confirm the manager's readers reflect it without a reconnect.
+        {
+            let mut map = mgr.conns.lock();
+            map.get_mut("test").unwrap().tools = relisted.into_iter().take(1).collect();
+        }
+        assert_eq!(
+            mgr.tool_lines("test").len(),
+            1,
+            "live catalog refresh is reflected by the manager"
+        );
     }
 }

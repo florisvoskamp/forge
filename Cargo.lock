@@ -1881,6 +1881,7 @@ dependencies = [
  "forge-config",
  "forge-types",
  "futures",
+ "parking_lot",
  "reqwest",
  "rmcp",
  "serde_json",

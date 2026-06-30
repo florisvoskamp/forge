@@ -49,7 +49,110 @@ pub async fn fetch_auth_server_metadata(
         .map_err(|e| format!("parse auth server metadata from {url}: {e}"))
 }
 
-/// Exchange an authorization code for tokens (RFC 6749 §4.1.3 + PKCE verifier).
+/// A client registered with an authorization server (RFC 7591). `client_secret` is `None` for a
+/// public/PKCE client (`token_endpoint_auth_method=none`), `Some` for a confidential client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredClient {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+}
+
+impl RegisteredClient {
+    fn from_json(v: &serde_json::Value) -> Result<Self, String> {
+        let client_id = v
+            .get("client_id")
+            .and_then(|x| x.as_str())
+            .ok_or("registration response missing client_id")?
+            .to_string();
+        let client_secret = v
+            .get("client_secret")
+            .and_then(|x| x.as_str())
+            .map(str::to_string);
+        Ok(Self {
+            client_id,
+            client_secret,
+        })
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+        })
+    }
+}
+
+/// RFC 7591 §3.1 Dynamic Client Registration: POST client metadata to the authorization server's
+/// `registration_endpoint` (discovered via RFC 8414 metadata) and get back a real `client_id`
+/// (+ optional `client_secret`). Hosted OAuth MCP servers (GitHub, Linear, Notion) reject the old
+/// hardcoded public client id, so first-time auth must register a real client here. Registers as a
+/// public PKCE client (`token_endpoint_auth_method=none`); a server that insists on issuing a
+/// secret has it captured and persisted too.
+pub async fn register_client(
+    client: &reqwest::Client,
+    registration_endpoint: &str,
+    redirect_uris: &[String],
+    scopes: &[String],
+    client_name: &str,
+) -> Result<RegisteredClient, String> {
+    let body = serde_json::json!({
+        "client_name": client_name,
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "scope": scopes.join(" "),
+    });
+    let resp = client
+        .post(registration_endpoint)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {registration_endpoint}: {e}"))?;
+    let status = resp.status();
+    let val: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse registration response: {e}"))?;
+    if !status.is_success() {
+        let err = val
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("registration failed");
+        let desc = val
+            .get("error_description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return Err(format!(
+            "dynamic client registration failed ({status}): {err} {desc}"
+        ));
+    }
+    RegisteredClient::from_json(&val)
+}
+
+/// Keyring key for a server's registered OAuth client (distinct from the tokens key).
+pub fn registered_client_key(server: &str) -> String {
+    format!("mcp-oauth-client:{server}")
+}
+
+/// Persist a registered client (id + optional secret) so subsequent connects/logins reuse it
+/// instead of re-registering. Stored in the same secret store as tokens (keyring, encrypted-file
+/// fallback) — never in config or logs.
+pub fn store_registered_client(server: &str, c: &RegisteredClient) -> Result<(), String> {
+    let json = c.to_json().to_string();
+    forge_config::store_secret(&registered_client_key(server), &json)
+        .map_err(|e| format!("storing registered client: {e}"))
+}
+
+/// Load a server's previously-registered client, or `None` if it has never registered.
+pub fn load_registered_client(server: &str) -> Option<RegisteredClient> {
+    let json = forge_config::load_secret(&registered_client_key(server))?;
+    let val: serde_json::Value = serde_json::from_str(&json).ok()?;
+    RegisteredClient::from_json(&val).ok()
+}
+
+/// Exchange an authorization code for tokens (RFC 6749 §4.1.3 + PKCE verifier). `client_secret` is
+/// included only for a confidential client (a DCR-issued secret); public PKCE clients pass `None`.
 /// Returns a full `OAuthTokens` (access + optional refresh, expiry).
 pub async fn exchange_code(
     client: &reqwest::Client,
@@ -58,14 +161,18 @@ pub async fn exchange_code(
     redirect_uri: &str,
     client_id: &str,
     pkce_verifier: &str,
+    client_secret: Option<&str>,
 ) -> Result<OAuthTokens, String> {
-    let params = [
+    let mut params = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
         ("redirect_uri", redirect_uri),
         ("client_id", client_id),
         ("code_verifier", pkce_verifier),
     ];
+    if let Some(secret) = client_secret {
+        params.push(("client_secret", secret));
+    }
     let resp: serde_json::Value = client
         .post(token_endpoint)
         .form(&params)
@@ -79,20 +186,25 @@ pub async fn exchange_code(
     parse_token_response(resp, token_endpoint, client_id)
 }
 
-/// Refresh an access token using a refresh token (RFC 6749 §6).
+/// Refresh an access token using a refresh token (RFC 6749 §6). `client_secret` (a DCR-issued
+/// secret) is included when present for confidential clients.
 pub async fn refresh_token(
     client: &reqwest::Client,
     tokens: &OAuthTokens,
+    client_secret: Option<&str>,
 ) -> Result<OAuthTokens, String> {
     let rt = tokens
         .refresh_token
         .as_deref()
         .ok_or("no refresh token stored — run `forge mcp login <server>`")?;
-    let params = [
+    let mut params = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", rt),
         ("client_id", tokens.client_id.as_str()),
     ];
+    if let Some(secret) = client_secret {
+        params.push(("client_secret", secret));
+    }
     let resp: serde_json::Value = client
         .post(&tokens.token_endpoint)
         .form(&params)
@@ -151,7 +263,10 @@ pub async fn resolve_oauth_token_async(server_name: &str) -> Result<String, Stri
     let client = crate::transport::bundled_client_builder()
         .build()
         .map_err(|e| format!("http client for '{server_name}': {e}"))?;
-    let new_tokens = refresh_token(&client, &tokens)
+    // Pass the DCR-issued client secret (if this server registered a confidential client) so the
+    // refresh authenticates; public PKCE clients have no secret and pass `None`.
+    let client_secret = load_registered_client(server_name).and_then(|c| c.client_secret);
+    let new_tokens = refresh_token(&client, &tokens, client_secret.as_deref())
         .await
         .map_err(|e| format!("token refresh for '{server_name}' failed: {e}"))?;
     forge_config::store_oauth_tokens(server_name, &new_tokens)

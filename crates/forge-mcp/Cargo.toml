@@ -20,6 +20,11 @@ reqwest = { workspace = true }
 # forge-mcp can't depend on forge-provider). Without it reqwest builds against the OS trust store
 # and panics internally on a system that has none.
 webpki-root-certs = "1"
+# Non-poisoning mutex: a panic inside a critical section must NOT wedge every later MCP call for
+# the session (a poisoned std::sync::Mutex makes `.lock().unwrap()` panic forever after). parking_lot
+# also gives a cheap, no-Result `lock()` and lets the connection map be shared (via Weak) with the
+# rmcp client handler so server `tools/list_changed` notifications can refresh the live catalog.
+parking_lot = "0.12"
 rmcp = { version = "1.7.0", default-features = false, features = [
     "client",
     "server",
