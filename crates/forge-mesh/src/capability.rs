@@ -23,21 +23,52 @@ pub(crate) fn quality_class(id: &str) -> u8 {
     if m.contains("-100b") || m.contains("-119b") || m.contains("-120b") || m.contains("-123b") {
         return 3;
     }
-    // Small / fast FIRST: a size/speed marker (mini, haiku, -lite, -8b) downgrades even a
+    // Mid-size param counts (20–60 B) also override product naming — "mistral-small-3-22b" is
+    // 22 B (mid-tier) despite "small" in the product-line name. Checked before the small-marker
+    // group for the same reason the frontier guard above is checked first.
+    if m.contains("-20b")
+        || m.contains("-22b")
+        || m.contains("-24b")
+        || m.contains("-25b")
+        || m.contains("-27b")
+        || m.contains("-30b")
+        || m.contains("-32b")
+        || m.contains("-34b")
+        || m.contains("-36b")
+        || m.contains("-40b")
+        || m.contains("-47b")
+        || m.contains("-56b")
+        || m.contains("-57b")
+    {
+        return 2;
+    }
+    // Small / fast FIRST: a size/speed marker (mini, haiku, -lite, -4b, -8b) downgrades even a
     // frontier-family name — `gpt-5.4-mini` and `gpt-4o-mini` are small, not frontier.
     // Use "-mini" (with dash) not "mini" to avoid matching "minimaxai/minimax-*" (large models).
     // Ollama uses colon-size notation (deepseek-r1:7b, qwen3-coder:8b) — ":Nb" variants are
     // also small-model markers even though the frontier name (deepseek-r1, qwen3-coder) matches
     // the frontier group below. The small check runs first so it wins on both separators.
+    // Covers dash-notation too: -4b (gemma-3-4b), -11b (llama-3.2-11b), -13b/-14b (qwen/deepseek
+    // distills). Colon variants (:4b, :11b-:14b) cover the same Ollama tag shapes.
     if m.contains("-8b")
         || m.contains(":8b")
         || m.contains("-7b")
         || m.contains(":7b")
+        || m.contains("-4b")
+        || m.contains(":4b")
         || m.contains("-3b")
         || m.contains(":3b")
         || m.contains("-1b")
         || m.contains(":1b")
         || m.contains(":1.")  // catches :1.5b, :1.6b Ollama tags
+        || m.contains("-14b")
+        || m.contains(":14b")
+        || m.contains("-13b")
+        || m.contains(":13b")
+        || m.contains("-12b")
+        || m.contains(":12b")
+        || m.contains("-11b")
+        || m.contains(":11b")
         || m.contains("-mini")
         || m.contains("nano")
         || m.contains("haiku")
@@ -258,6 +289,39 @@ mod tests {
         assert_eq!(quality_class("ollama::deepseek-r1:1.5b"), 1);
         assert_eq!(quality_class("ollama::qwen3-coder:7b"), 1);
         assert_eq!(quality_class("ollama::qwen3-coder:8b"), 1);
+        // :4b — small distilled model, not in original list (was misclassified as frontier).
+        assert_eq!(
+            quality_class("ollama::deepseek-r1:4b"),
+            1,
+            ":4b must be small"
+        );
+        assert_eq!(quality_class("ollama::qwen3-coder:4b"), 1);
+        // :11b/:13b/:14b — small distilled sizes, were misclassified as frontier.
+        assert_eq!(
+            quality_class("ollama::deepseek-r1:14b"),
+            1,
+            ":14b must be small"
+        );
+        assert_eq!(quality_class("ollama::qwen3-coder:14b"), 1);
+        assert_eq!(quality_class("ollama::llama3:11b"), 1);
+        assert_eq!(quality_class("ollama::codestral:12b"), 1);
+        assert_eq!(quality_class("ollama::llama2:13b"), 1);
+        // Dash-notation small sizes not previously covered.
+        assert_eq!(
+            quality_class("openrouter::google/gemma-3-4b-it"),
+            1,
+            "-4b must be small"
+        );
+        assert_eq!(
+            quality_class("openrouter::meta-llama/llama-3.2-11b-vision"),
+            1,
+            "-11b must be small"
+        );
+        assert_eq!(
+            quality_class("openrouter::qwen/qwen2.5-14b-instruct"),
+            1,
+            "-14b must be small"
+        );
         // 30B+ Ollama tags are not in the small list — they should be default/frontier.
         assert!(
             quality_class("ollama::deepseek-r1:70b") >= 2,
@@ -267,6 +331,26 @@ mod tests {
             quality_class("ollama::qwen3-coder:30b") >= 2,
             "30b is not small"
         );
+    }
+
+    #[test]
+    fn mid_param_count_overrides_small_product_name() {
+        // A model with "small" in the product-line name but an explicit 20–60 B param count must
+        // NOT be classified as tiny (quality_class=1). The param-count early return fires first.
+        assert!(
+            quality_class("openrouter::mistralai/mistral-small-3-22b") >= 2,
+            "22 B model must not be tiny despite 'small' in product name"
+        );
+        assert!(
+            quality_class("something::model-small-32b-instruct") >= 2,
+            "32 B model must not be tiny"
+        );
+        assert!(
+            quality_class("something::small-40b") >= 2,
+            "40 B model must not be tiny"
+        );
+        // Normal small models (no param-count override) still downgrade correctly.
+        assert_eq!(quality_class("mistral::mistral-small-2506"), 1);
     }
 
     #[test]
