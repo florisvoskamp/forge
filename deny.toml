@@ -1,0 +1,60 @@
+# cargo-deny configuration — license allowlist, banned/duplicate deps, source pinning, and
+# RUSTSEC advisory gating. Enforced by .github/workflows/security.yml (`cargo deny check`).
+# Run locally with: cargo install cargo-deny && cargo deny check
+
+[graph]
+# Evaluate all targets we actually ship for, so platform-specific deps (Landlock on Linux,
+# keyring backends, windows-native) are linted too.
+all-features = true
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Fail on any unfixed RUSTSEC advisory or yanked crate. To temporarily accept one, add its
+# `RUSTSEC-YYYY-NNNN` id below WITH a comment: why it's tolerable and the tracking issue/date.
+yanked = "deny"
+ignore = [
+  # e.g. "RUSTSEC-2024-0000", # <reason> — tracked in #NNN, revisit YYYY-MM
+]
+
+[licenses]
+version = 2
+# Permissive licenses only. Anything outside this set fails the build and must be reviewed before
+# the dependency is added.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CC0-1.0",
+  "Unlicense",
+  # `ring` (pulled transitively by the rustls TLS stack) ships a composite license that includes
+  # OpenSSL-style terms for its BoringSSL-derived assembly. Permissive; allowed deliberately.
+  "OpenSSL",
+]
+confidence-threshold = 0.8
+# Skip workspace-internal crates that are publish = false / carry no license field (e.g. xtasks).
+private = { ignore = true }
+
+# NOTE: a few crates (notably `ring`, via the rustls stack) declare composite/non-SPDX license
+# expressions. If `cargo deny check` flags one on first run, add a `[[licenses.clarify]]` block with
+# the crate's real LICENSE file hash (deny prints the expected value) rather than loosening `allow`.
+
+[bans]
+# Duplicate versions bloat the binary and the audit surface; warn rather than fail (the genai /
+# ratatui / reqwest trees legitimately pull a few). Promote to "deny" once the tree is clean.
+multiple-versions = "warn"
+wildcard = "warn"
+allow = []
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

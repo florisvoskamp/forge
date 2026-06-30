@@ -4,6 +4,10 @@
 # race"). Run by release.yml after the assets are published, or by hand:
 #   scripts/update-brew-formula.sh 0.4.67                 # fetch checksums.txt from the gh release
 #   scripts/update-brew-formula.sh 0.4.67 path/to/checksums.txt   # use a local checksums file
+#
+# Asset-agnostic: every `sha256` line is matched to the `forge-<target>.tar.gz|zip` URL directly
+# above it, so all four bottles — macOS arm64/x86_64 and Linux x86_64/aarch64 (on_arm) — are
+# filled from checksums.txt with no per-target code here.
 set -euo pipefail
 VERSION="${1:?usage: update-brew-formula.sh <version-without-v> [checksums.txt]}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

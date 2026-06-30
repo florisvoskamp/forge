@@ -1,0 +1,41 @@
+# Maintainer: Floris Voskamp <fvoskamp2005@gmail.com>
+# Prebuilt binary package: pulls the official GitHub release tarball and installs the `forge`
+# binary, shell completions, and man page. Build-from-source users want a `forge` (source) AUR
+# package instead; this is the `-bin` variant.
+pkgname=forge-bin
+pkgver=1.8.4
+pkgrel=1
+pkgdesc="Fast, model-agnostic AI coding harness and CLI in Rust (prebuilt binary)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/florisvoskamp/forge"
+license=('MIT')
+provides=('forge')
+conflicts=('forge')
+# Upstream binary is already stripped; don't let makepkg try to strip it again.
+options=('!strip' '!debug')
+
+source_x86_64=("forge-${pkgver}-x86_64.tar.gz::${url}/releases/download/v${pkgver}/forge-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("forge-${pkgver}-aarch64.tar.gz::${url}/releases/download/v${pkgver}/forge-aarch64-unknown-linux-gnu.tar.gz")
+# Placeholders — run `updpkgsums` (pacman-contrib) against the published release to fill these,
+# or copy them from the release's checksums.txt. 'SKIP' disables verification; replace before
+# publishing to the AUR.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    local _dir="${srcdir}/forge-${CARCH}-unknown-linux-gnu"
+
+    install -Dm755 "${_dir}/forge" "${pkgdir}/usr/bin/forge"
+    install -Dm644 "${_dir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm644 "${_dir}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+
+    if [ -f "${_dir}/forge.1" ]; then
+        install -Dm644 "${_dir}/forge.1" "${pkgdir}/usr/share/man/man1/forge.1"
+    fi
+
+    if [ -d "${_dir}/completions" ]; then
+        install -Dm644 "${_dir}/completions/forge.bash" "${pkgdir}/usr/share/bash-completion/completions/forge"
+        install -Dm644 "${_dir}/completions/_forge" "${pkgdir}/usr/share/zsh/site-functions/_forge"
+        install -Dm644 "${_dir}/completions/forge.fish" "${pkgdir}/usr/share/fish/vendor_completions.d/forge.fish"
+    fi
+}

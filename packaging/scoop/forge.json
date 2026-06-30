@@ -1,0 +1,28 @@
+{
+    "version": "1.8.4",
+    "description": "Fast, model-agnostic AI coding harness and CLI in Rust.",
+    "homepage": "https://github.com/florisvoskamp/forge",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/florisvoskamp/forge/releases/download/v1.8.4/forge-x86_64-pc-windows-msvc.zip",
+            "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "extract_dir": "forge-x86_64-pc-windows-msvc"
+        }
+    },
+    "bin": "forge.exe",
+    "checkver": {
+        "github": "https://github.com/florisvoskamp/forge"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/florisvoskamp/forge/releases/download/v$version/forge-x86_64-pc-windows-msvc.zip",
+                "extract_dir": "forge-x86_64-pc-windows-msvc"
+            }
+        },
+        "hash": {
+            "url": "https://github.com/florisvoskamp/forge/releases/download/v$version/checksums.txt"
+        }
+    }
+}

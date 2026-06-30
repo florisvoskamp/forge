@@ -18,5 +18,11 @@ forge-provider = { workspace = true }
 forge-mesh = { workspace = true }
 forge-tools = { workspace = true }
 forge-tui = { workspace = true }
+# forge-cli's library facade (lib.rs) exposes `command()` for completion/man generation. Path dep
+# (xtasks is publish=false, never released), so no version needed.
+forge-cli = { path = "../forge-cli" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true }
+clap_complete = "4"
+clap_mangen = "0.2"

@@ -106,6 +106,9 @@ pub struct Config {
     /// Customizable statusline layout (left / center / right widget segments).
     #[serde(default)]
     pub statusline: StatuslineConfig,
+    /// User-configurable keybind map (action → key combo). Defaults to the built-in map.
+    #[serde(default)]
+    pub keybinds: KeybindsConfig,
 }
 
 /// When a hook fires.
@@ -1332,6 +1335,60 @@ impl Default for StatuslineConfig {
     }
 }
 
+/// A key combination: a key name plus modifier flags.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct KeyCombo {
+    /// Key name: a single character (e.g. "c", "k", ","), or a named key
+    /// ("up", "down", "left", "right", "enter", "esc", "backspace", "delete",
+    /// "pageup", "pagedown", "home", "end", "tab", "f1"–"f12").
+    pub key: String,
+    #[serde(default)]
+    pub ctrl: bool,
+    #[serde(default)]
+    pub alt: bool,
+    #[serde(default)]
+    pub shift: bool,
+}
+
+/// Configurable keybind map: action name → key combination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeybindsConfig {
+    #[serde(default)]
+    pub binds: std::collections::BTreeMap<String, KeyCombo>,
+}
+
+impl Default for KeybindsConfig {
+    fn default() -> Self {
+        let bind = |key: &str, ctrl: bool, alt: bool, shift: bool| KeyCombo {
+            key: key.to_string(),
+            ctrl,
+            alt,
+            shift,
+        };
+        let mut binds = std::collections::BTreeMap::new();
+        binds.insert("interrupt".into(), bind("c", true, false, false));
+        binds.insert("command_palette".into(), bind("/", false, false, false));
+        binds.insert("skip_model".into(), bind("k", true, false, false));
+        binds.insert("tier_up".into(), bind("up", true, false, false));
+        binds.insert("tier_down".into(), bind("down", true, false, false));
+        binds.insert("toggle_reasoning".into(), bind("r", true, false, false));
+        binds.insert("undo".into(), bind("z", true, false, false));
+        binds.insert("compact".into(), bind("l", true, false, false));
+        binds.insert("model_picker".into(), bind("m", false, true, false));
+        binds.insert("effort_cycle".into(), bind("e", false, true, false));
+        binds.insert("temper_cycle".into(), bind("t", false, true, false));
+        binds.insert("keybind_config".into(), bind(",", true, false, false));
+        binds.insert("new_session".into(), bind("n", true, false, false));
+        binds.insert("copy_last".into(), bind("c", true, false, true));
+        binds.insert("scroll_up".into(), bind("pageup", false, false, false));
+        binds.insert("scroll_down".into(), bind("pagedown", false, false, false));
+        binds.insert("help".into(), bind("f1", false, false, false));
+        binds.insert("checkpoint".into(), bind("s", true, false, false));
+        binds.insert("reload".into(), bind("r", false, true, false));
+        Self { binds }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut models = HashMap::new();
@@ -1416,6 +1473,7 @@ impl Default for Config {
             update: UpdateConfig::default(),
             self_mcp: false,
             statusline: StatuslineConfig::default(),
+            keybinds: KeybindsConfig::default(),
         }
     }
 }
@@ -1660,6 +1718,36 @@ pub fn write_permission_mode(permission: PermissionMode) -> Result<PathBuf, Conf
         "permission_mode".to_string(),
         toml::Value::String(perm_str.to_string()),
     );
+    let body = toml::to_string_pretty(&root).map_err(|e| ConfigError::Write(e.to_string()))?;
+    std::fs::write(&path, body).map_err(|e| ConfigError::Write(e.to_string()))?;
+    Ok(path)
+}
+
+/// Persist a single keybind to `[keybinds.binds]` in the user config TOML, preserving all other keys.
+pub fn write_keybind(action: &str, combo: &KeyCombo) -> Result<PathBuf, ConfigError> {
+    let dir = config_dir().ok_or(ConfigError::NoConfigDir)?;
+    std::fs::create_dir_all(&dir).map_err(|e| ConfigError::Write(e.to_string()))?;
+    let path = dir.join("config.toml");
+    let mut root: toml::Table = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+    let keybinds = root
+        .entry("keybinds".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let toml::Value::Table(kb) = keybinds {
+        let binds = kb
+            .entry("binds".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(binds_t) = binds {
+            let mut combo_t = toml::Table::new();
+            combo_t.insert("key".to_string(), toml::Value::String(combo.key.clone()));
+            combo_t.insert("ctrl".to_string(), toml::Value::Boolean(combo.ctrl));
+            combo_t.insert("alt".to_string(), toml::Value::Boolean(combo.alt));
+            combo_t.insert("shift".to_string(), toml::Value::Boolean(combo.shift));
+            binds_t.insert(action.to_string(), toml::Value::Table(combo_t));
+        }
+    }
     let body = toml::to_string_pretty(&root).map_err(|e| ConfigError::Write(e.to_string()))?;
     std::fs::write(&path, body).map_err(|e| ConfigError::Write(e.to_string()))?;
     Ok(path)
@@ -2683,6 +2771,71 @@ pub fn inject_provider_keys() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keybinds_default_has_all_actions() {
+        let kb = KeybindsConfig::default();
+        assert_eq!(kb.binds.len(), 19);
+        assert_eq!(
+            kb.binds["interrupt"],
+            KeyCombo {
+                key: "c".into(),
+                ctrl: true,
+                alt: false,
+                shift: false
+            }
+        );
+        assert_eq!(
+            kb.binds["copy_last"],
+            KeyCombo {
+                key: "c".into(),
+                ctrl: true,
+                alt: false,
+                shift: true
+            }
+        );
+        assert_eq!(
+            kb.binds["tier_up"],
+            KeyCombo {
+                key: "up".into(),
+                ctrl: true,
+                alt: false,
+                shift: false
+            }
+        );
+        assert_eq!(
+            kb.binds["help"],
+            KeyCombo {
+                key: "f1".into(),
+                ctrl: false,
+                alt: false,
+                shift: false
+            }
+        );
+    }
+
+    /// A partial `[keybinds.binds]` override in the user TOML must DEEP-MERGE over the serialized
+    /// defaults (keeping the other 18 binds), not replace the whole map. `write_keybind` writes a
+    /// single bind, so a replace would unbind everything else — this guards that regression.
+    #[test]
+    fn partial_keybind_override_deep_merges_over_defaults() {
+        use figment::providers::{Format, Toml};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(
+            &path,
+            "[keybinds.binds.toggle_reasoning]\nkey = \"x\"\nctrl = true\nalt = false\nshift = false\n",
+        )
+        .unwrap();
+        let fig = Figment::from(Serialized::defaults(Config::default())).merge(Toml::file(&path));
+        let cfg: Config = fig.extract().unwrap();
+        // The override took effect…
+        assert_eq!(cfg.keybinds.binds["toggle_reasoning"].key, "x");
+        // …and every other default bind survived the merge.
+        assert_eq!(cfg.keybinds.binds.len(), 19);
+        assert_eq!(cfg.keybinds.binds["interrupt"].key, "c");
+        assert_eq!(cfg.keybinds.binds["help"].key, "f1");
+    }
 
     #[test]
     fn config_leaves_discovers_scalars_and_skips_complex_sections() {

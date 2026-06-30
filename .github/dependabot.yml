@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Rust crates across the whole workspace (single root Cargo.lock).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    # Batch minor/patch bumps into one PR to keep review noise down; majors stay separate.
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Pinned GitHub Actions (ci.yml, release.yml, security.yml, e2e.yml).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"

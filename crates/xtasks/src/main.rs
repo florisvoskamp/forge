@@ -3,6 +3,7 @@
 //! Run: `cargo run -p xtasks -- bench-lattice`
 
 mod bench_lattice;
+mod dist;
 mod probe_retrieve;
 mod tasks;
 
@@ -12,8 +13,11 @@ async fn main() -> anyhow::Result<()> {
     match cmd.as_str() {
         "bench-lattice" => bench_lattice::run().await,
         "probe-retrieve" => probe_retrieve::run(),
+        "gen-dist" => dist::run(),
         other => {
-            anyhow::bail!("unknown subcommand: {other:?} (try: bench-lattice, probe-retrieve)")
+            anyhow::bail!(
+                "unknown subcommand: {other:?} (try: bench-lattice, probe-retrieve, gen-dist)"
+            )
         }
     }
 }

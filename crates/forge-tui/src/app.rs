@@ -422,6 +422,9 @@ pub struct App {
     /// raw unwrapped blob); re-parsing every frame would be O(reply) lag, so it's only rebuilt when
     /// new tokens arrive or the width changes.
     stream_cache: std::cell::RefCell<StreamCache>,
+    /// Configurable keybinds loaded from config at startup. Synced into `Tui.keybinds` for
+    /// `poll_event` matching; modified by the keybind configurator overlay.
+    pub keybinds: forge_config::KeybindsConfig,
 }
 
 /// A position in the wrapped transcript: `row` is the wrapped-row index in the cache, `col` the
@@ -668,6 +671,36 @@ pub enum KeyKind {
     JumpBottom,
     /// Ctrl+R — toggle the effort-level slider popup above the input bar.
     ToggleEffortSlider,
+    /// Mid-turn: abort + retry with next mesh model.
+    SkipModel,
+    /// Mid-turn or idle: escalate task to next tier (trivial→standard→complex).
+    TierUp,
+    /// Mid-turn or idle: de-escalate task to previous tier.
+    TierDown,
+    /// Toggle display of model reasoning/thinking blocks.
+    ToggleReasoning,
+    /// Open the keybind configurator overlay.
+    OpenKeybindConfig,
+    /// Open the model picker overlay.
+    ModelPicker,
+    /// Cycle effort level (low→medium→high→max).
+    EffortCycle,
+    /// Cycle operating temper/mode.
+    TemperCycle,
+    /// Copy last assistant response to clipboard.
+    CopyLast,
+    /// Show keybind help overlay (F1).
+    ShowHelp,
+    /// Save session checkpoint.
+    SaveCheckpoint,
+    /// Start a fresh session.
+    NewSession,
+    /// Undo last file write.
+    UndoWrite,
+    /// Compact/summarize the conversation.
+    CompactSession,
+    /// Hot-reload config without restarting.
+    ReloadConfig,
 }
 
 /// The result of feeding a keystroke to the input line.
@@ -845,7 +878,22 @@ pub fn handle_key(input: &mut String, cursor: &mut usize, key: KeyKind) -> Input
         | KeyKind::ToggleEffortSlider
         | KeyKind::PageUp
         | KeyKind::PageDown
-        | KeyKind::JumpBottom => InputOutcome::Editing,
+        | KeyKind::JumpBottom
+        | KeyKind::SkipModel
+        | KeyKind::TierUp
+        | KeyKind::TierDown
+        | KeyKind::ToggleReasoning
+        | KeyKind::OpenKeybindConfig
+        | KeyKind::ModelPicker
+        | KeyKind::EffortCycle
+        | KeyKind::TemperCycle
+        | KeyKind::CopyLast
+        | KeyKind::ShowHelp
+        | KeyKind::SaveCheckpoint
+        | KeyKind::NewSession
+        | KeyKind::UndoWrite
+        | KeyKind::CompactSession
+        | KeyKind::ReloadConfig => InputOutcome::Editing,
     }
 }
 

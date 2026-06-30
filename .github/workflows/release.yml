@@ -13,8 +13,29 @@ permissions:
   pull-requests: write
 
 jobs:
+  # Generate shell completions + the man page ONCE (they're platform-independent text), then
+  # bundle the same set into every OS archive below. Driven by `xtasks gen-dist`, which reads
+  # forge-cli's clap tree via its library facade — no runtime CLI subcommand.
+  assets:
+    name: completions + man page
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: xtasks-assets
+      - name: Generate completions + man page
+        run: cargo run --release -p xtasks -- gen-dist dist-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forge-assets
+          path: dist-assets/**
+          if-no-files-found: error
+
   build:
     name: build ${{ matrix.target }}
+    needs: assets
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -50,6 +71,12 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin forge --target ${{ matrix.target }}
 
+      - name: Fetch generated assets
+        uses: actions/download-artifact@v4
+        with:
+          name: forge-assets
+          path: dist-assets
+
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -58,6 +85,8 @@ jobs:
           mkdir "$dir"
           cp "target/${{ matrix.target }}/release/forge" "$dir/"
           cp README.md LICENSE "$dir/" 2>/dev/null || true
+          cp -r dist-assets/completions "$dir/" 2>/dev/null || true
+          cp dist-assets/forge.1 "$dir/" 2>/dev/null || true
           tar czf "$dir.tar.gz" "$dir"
 
       - name: Package (windows)
@@ -68,6 +97,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/forge.exe" "$dir/"
           Copy-Item README.md, LICENSE "$dir/" -ErrorAction SilentlyContinue
+          Copy-Item -Recurse dist-assets/completions "$dir/" -ErrorAction SilentlyContinue
+          Copy-Item dist-assets/forge.1 "$dir/" -ErrorAction SilentlyContinue
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
 
       - name: Upload artifact

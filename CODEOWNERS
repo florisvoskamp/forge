@@ -1,0 +1,20 @@
+# Code owners for Forge. Listed owners are requested for review automatically and (with branch
+# protection) must approve before merge. Last matching pattern wins.
+
+# Default owner for everything.
+*                       @florisvoskamp
+
+# Docs, README, and governance — same owner, called out explicitly for clarity.
+/README.md              @florisvoskamp
+/docs/                  @florisvoskamp
+/CONTRIBUTING.md        @florisvoskamp
+/SECURITY.md            @florisvoskamp
+/CODE_OF_CONDUCT.md     @florisvoskamp
+
+# Release, CI, and packaging plumbing.
+/.github/               @florisvoskamp
+/packaging/             @florisvoskamp
+/homebrew/              @florisvoskamp
+/install.sh             @florisvoskamp
+/install.ps1            @florisvoskamp
+/deny.toml              @florisvoskamp

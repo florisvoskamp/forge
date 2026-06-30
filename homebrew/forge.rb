@@ -28,10 +28,22 @@ class Forge < Formula
       url "https://github.com/florisvoskamp/forge/releases/download/v#{version}/forge-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
+    on_arm do
+      url "https://github.com/florisvoskamp/forge/releases/download/v#{version}/forge-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    end
   end
 
   def install
     bin.install "forge"
+    # Completions + man page are bundled in releases that built them (xtasks gen-dist, wired into
+    # release.yml). Guard so the formula still installs from older asset sets without them.
+    if File.exist?("completions/forge.bash")
+      bash_completion.install "completions/forge.bash" => "forge"
+      zsh_completion.install "completions/_forge"
+      fish_completion.install "completions/forge.fish"
+    end
+    man1.install "forge.1" if File.exist?("forge.1")
   end
 
   test do

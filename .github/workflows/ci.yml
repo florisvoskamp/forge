@@ -75,8 +75,24 @@ jobs:
       # `lto = "thin"` release profile is slow to link ×3 OSes. Release binaries are built on demand
       # (tags / manual), not on every PR.
 
+  # Release-profile + `--locked` smoke on one platform. The release workflow builds with
+  # `--release --locked`, and breakages there (LTO-only failures, a Cargo.lock that drifted from
+  # Cargo.toml) surface only at tag time otherwise — exactly what failed v0.4.42's first release.
+  # Catch it on every PR. One platform keeps it cheap; the `lto = "thin"` link runs once.
+  release-build:
+    needs: guard
+    if: needs.guard.outputs.has_cargo == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-build
+      - run: cargo build --release --locked --bin forge
+
   CI:
-    needs: [guard, fmt, clippy, test]
+    needs: [guard, fmt, clippy, test, release-build]
     if: always()
     runs-on: ubuntu-latest
     steps:

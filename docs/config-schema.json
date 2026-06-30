@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/florisvoskamp/forge/blob/main/docs/config-schema.json",
+  "title": "Forge config.toml",
+  "description": "Schema for Forge's config.toml (the layered configuration loaded from ~/.config/forge/config.toml and ./.forge/config.toml). Covers the stable, documented top-level sections; partially-modelled sections allow additional properties for forward compatibility. Hand-authored from crates/forge-config — see docs/STABILITY.md for the compatibility policy.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "permission_mode": { "$ref": "#/$defs/PermissionMode" },
+    "self_mcp": {
+      "type": "boolean",
+      "description": "Run a sub-Forge session as an MCP server so the agent can call forge_chat / forge_assay as native tools. Off by default.",
+      "default": false
+    },
+    "mesh": {
+      "type": "object",
+      "description": "Model Mesh: rule-based task routing across providers/models (ADR-0006).",
+      "additionalProperties": true
+    },
+    "permissions": { "$ref": "#/$defs/PermissionsConfig" },
+    "mcp": {
+      "type": "object",
+      "description": "External MCP servers Forge connects to as a client.",
+      "additionalProperties": true
+    },
+    "commands": {
+      "type": "object",
+      "description": "Slash-command + skill discovery and trust.",
+      "additionalProperties": true
+    },
+    "lattice": { "$ref": "#/$defs/LatticeConfig" },
+    "shell": { "$ref": "#/$defs/ShellConfig" },
+    "hooks": {
+      "type": "array",
+      "description": "Pre/post tool-use and lifecycle shell hooks. Each entry runs a command around a matching event.",
+      "items": { "$ref": "#/$defs/HookConfig" }
+    },
+    "git": {
+      "type": "object",
+      "description": "Git integration (co-authoring, hook installation).",
+      "additionalProperties": true
+    },
+    "lsp": {
+      "type": "object",
+      "description": "LSP-backed live diagnostics fed back into the turn after edits. Off = inert.",
+      "additionalProperties": true
+    },
+    "autofix": {
+      "type": "object",
+      "description": "Auto-lint / auto-test self-healing loop after edits. Off = inert.",
+      "additionalProperties": true
+    },
+    "assay": {
+      "type": "object",
+      "description": "Assay-gated auto-review of write turns before they finish. Off = inert.",
+      "additionalProperties": true
+    },
+    "recap": { "$ref": "#/$defs/RecapConfig" },
+    "tui": {
+      "type": "object",
+      "description": "Interactive TUI rendering (inline vs. full-screen alternate-screen mode).",
+      "additionalProperties": true
+    },
+    "local": {
+      "type": "object",
+      "description": "Local-LLM runtime (Ollama): which model to auto-start and whether to start it with Forge.",
+      "additionalProperties": true
+    },
+    "update": { "$ref": "#/$defs/UpdateConfig" },
+    "statusline": {
+      "type": "object",
+      "description": "Customizable statusline layout (left / center / right widget segments).",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "PermissionMode": {
+      "description": "Default permission posture for new sessions (ADR-0008). Canonical values plus accepted aliases.",
+      "type": "string",
+      "enum": [
+        "default",
+        "ask",
+        "accept_edits",
+        "auto-edit",
+        "autoedit",
+        "bypass",
+        "full",
+        "plan",
+        "read-only",
+        "readonly"
+      ],
+      "default": "default"
+    },
+    "PermissionsConfig": {
+      "type": "object",
+      "description": "Fine-grained allow/ask/deny rules layered on top of permission_mode.",
+      "additionalProperties": false,
+      "properties": {
+        "rules": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/RuleConfig" }
+        }
+      }
+    },
+    "RuleConfig": {
+      "type": "object",
+      "description": "One rule block: a tool plus exactly one of allow/ask/deny (string or list of glob-ish patterns).",
+      "additionalProperties": false,
+      "required": ["tool"],
+      "properties": {
+        "tool": { "type": "string", "description": "Tool name this rule targets (e.g. \"shell\", \"write\")." },
+        "allow": { "$ref": "#/$defs/StringOrArray" },
+        "ask": { "$ref": "#/$defs/StringOrArray" },
+        "deny": { "$ref": "#/$defs/StringOrArray" },
+        "reason": { "type": "string" }
+      }
+    },
+    "StringOrArray": {
+      "description": "A single pattern or a list of patterns.",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } }
+      ]
+    },
+    "LatticeConfig": {
+      "type": "object",
+      "description": "Native tree-sitter code-intelligence graph.",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true, "description": "Build + maintain the structural graph." },
+        "inject": { "type": "boolean", "default": true, "description": "Auto-inject relevant code into each turn." }
+      }
+    },
+    "ShellConfig": {
+      "type": "object",
+      "description": "Shell tool behaviour.",
+      "additionalProperties": false,
+      "properties": {
+        "explain_errors": {
+          "type": "boolean",
+          "default": true,
+          "description": "On a failed shell command, make one cheap trivial-tier model call to explain the likely cause + fix."
+        },
+        "sandbox": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt-in Linux Landlock sandbox confining filesystem writes to cwd + temp. No-op on macOS/Windows."
+        },
+        "sandbox_writable": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Extra writable paths when sandbox = true. Absolute, or resolved against cwd."
+        }
+      }
+    },
+    "HookConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event", "command"],
+      "properties": {
+        "event": {
+          "type": "string",
+          "enum": ["pre_tool_use", "post_tool_use", "user_prompt_submit", "session_start", "session_end"],
+          "description": "When the hook fires."
+        },
+        "matcher": {
+          "type": "string",
+          "description": "Tool-name filter for pre/post_tool_use: absent or \"*\" = every tool; else a comma-separated list of exact tool names."
+        },
+        "command": { "type": "string", "description": "Shell command line; receives event data as JSON on stdin." },
+        "timeout_secs": { "type": "integer", "minimum": 0, "default": 30, "description": "Kill the hook after this many seconds." }
+      }
+    },
+    "RecapConfig": {
+      "type": "object",
+      "description": "Per-turn one-line AI recap shown in scrollback after each completed turn.",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true }
+      }
+    },
+    "UpdateConfig": {
+      "type": "object",
+      "description": "Startup update check against GitHub releases (throttled to once a day).",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true }
+      }
+    }
+  }
+}

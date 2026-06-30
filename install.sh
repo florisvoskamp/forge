@@ -98,6 +98,34 @@ mkdir -p "$INSTALL_DIR"
 install -m 0755 "$tmp/forge-$target/forge" "$INSTALL_DIR/forge" 2>/dev/null \
   || { cp "$tmp/forge-$target/forge" "$INSTALL_DIR/forge" && chmod 0755 "$INSTALL_DIR/forge"; }
 
+# Install shell completions + man page if the tarball carries them (releases built with
+# `xtasks gen-dist`). Best-effort: a missing dir or unwritable target never fails the install.
+src="$tmp/forge-$target"
+if [ -d "$src/completions" ]; then
+  data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+  # bash: ~/.local/share/bash-completion/completions/forge
+  [ -f "$src/completions/forge.bash" ] && {
+    mkdir -p "$data_dir/bash-completion/completions" 2>/dev/null \
+      && cp "$src/completions/forge.bash" "$data_dir/bash-completion/completions/forge" 2>/dev/null || true
+  }
+  # zsh: a dir on $fpath; ~/.local/share/zsh/site-functions is a common user-writable choice.
+  [ -f "$src/completions/_forge" ] && {
+    mkdir -p "$data_dir/zsh/site-functions" 2>/dev/null \
+      && cp "$src/completions/_forge" "$data_dir/zsh/site-functions/_forge" 2>/dev/null || true
+  }
+  # fish
+  [ -f "$src/completions/forge.fish" ] && {
+    mkdir -p "$data_dir/fish/vendor_completions.d" 2>/dev/null \
+      && cp "$src/completions/forge.fish" "$data_dir/fish/vendor_completions.d/forge.fish" 2>/dev/null || true
+  }
+  printf 'install: shell completions installed under %s (restart your shell to load)\n' "$data_dir" >&2
+fi
+if [ -f "$src/forge.1" ]; then
+  man_dir="${XDG_DATA_HOME:-$HOME/.local/share}/man/man1"
+  mkdir -p "$man_dir" 2>/dev/null && cp "$src/forge.1" "$man_dir/forge.1" 2>/dev/null \
+    && printf 'install: man page installed to %s/forge.1\n' "$man_dir" >&2 || true
+fi
+
 if [ -n "$prev" ]; then
   printf 'install: forge %s -> %s (was %s; your config and sessions are preserved)\n' "$version" "$INSTALL_DIR/forge" "$prev" >&2
 else
