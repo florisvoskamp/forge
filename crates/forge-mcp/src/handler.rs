@@ -1,3 +1,7 @@
+// Roots and Sampling capabilities are deprecated by SEP-2577 in rmcp 2.0 but still functional.
+// We suppress the warnings rather than dropping the features.
+#![allow(deprecated)]
+
 //! The rmcp **client handler** Forge presents to every connected MCP server.
 //!
 //! Until now the client handler was the unit type `()`, which advertises no capabilities and

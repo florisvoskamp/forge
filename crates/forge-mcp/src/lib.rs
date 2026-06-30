@@ -1,3 +1,6 @@
+// Roots and Sampling MCP capabilities are deprecated by SEP-2577 in rmcp 2.0 but still functional.
+#![allow(deprecated)]
+
 //! Forge as an MCP **client** (docs/features/mcp-client.md). [`McpManager`] connects to the
 //! external servers declared in `[mcp]` config — over stdio (child process) or HTTP/SSE — using
 //! the official `rmcp` SDK, discovers their tools/resources/prompts, and surfaces them to the
@@ -1521,6 +1524,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn with_roots_threads_workspace_roots_into_handler_deps() {
         let mgr = McpManager::empty(&McpConfig::default())
             .with_roots(["/home/me/project".to_string(), "file:///abs".to_string()]);
@@ -1535,10 +1539,10 @@ mod tests {
 
     #[test]
     fn tool_result_preserves_image_and_audio_blocks() {
-        use rmcp::model::{CallToolResult, Content};
+        use rmcp::model::{CallToolResult, ContentBlock};
         let result = CallToolResult::success(vec![
             ContentBlock::text("a caption"),
-            Content::image("aGVsbG8=", "image/png"),
+            ContentBlock::image("aGVsbG8=", "image/png"),
         ]);
         let outcome = tool_result_to_outcome(result);
         assert!(outcome.ok);

@@ -1,3 +1,6 @@
+// Root is deprecated by SEP-2577 in rmcp 2.0 but still functional for the Roots capability.
+#![allow(deprecated)]
+
 //! Build an rmcp client connection for a configured server and complete the MCP `initialize`
 //! handshake. Both transports resolve to the same `RunningService<RoleClient, ForgeClientHandler>`,
 //! so the manager treats stdio and HTTP servers identically once connected. The client handler
