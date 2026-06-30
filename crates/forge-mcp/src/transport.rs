@@ -48,6 +48,11 @@ pub(crate) async fn serve(
             ) {
                 cmd.env(var, token);
             }
+            // Inject any ADDITIONAL secrets (multi-secret stdio servers), each under its own env
+            // var name, resolved from env/keyring just like the primary one.
+            for (var, value) in server.extra_secret_values() {
+                cmd.env(var, value);
+            }
             // Use the builder so stderr is explicitly nulled. TokioChildProcess::new() routes
             // through TokioChildProcessBuilder which defaults to Stdio::inherit() and overrides
             // any cmd.stderr() we set before spawning — causing MCP server startup messages

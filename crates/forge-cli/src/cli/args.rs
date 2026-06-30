@@ -241,6 +241,11 @@ pub(crate) enum Command {
         /// Pin a specific model (e.g. `openai::gpt-4o`), bypassing mesh classification.
         #[arg(long)]
         model: Option<String>,
+        /// Output format: `text` (default, human line output) or `stream-json` (NDJSON — one JSON
+        /// event per line on stdout, mirroring Claude Code's stream-json so editors/tools can embed
+        /// Forge). Pair with `--mode bypass`/`--mode accept-edits` for autonomous tool use.
+        #[arg(long, value_enum, default_value = "text")]
+        output_format: OutputFormat,
     },
     /// Start an interactive multi-turn chat session.
     Chat {
@@ -596,6 +601,17 @@ pub(crate) enum SkillCmd {
         #[arg(long)]
         project: bool,
     },
+    /// Re-fetch installed skill packs and update them in place, using the source recorded in the
+    /// lockfile (`~/.config/forge/installed-skills.toml`). With NAME, update only that pack;
+    /// without, update every recorded pack. Honors the pinned `@ref`/tag from install time.
+    ///
+    /// Examples:
+    ///   forge skill update
+    ///   forge skill update my-pack
+    Update {
+        /// Installed pack name to update (omit to update all).
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -835,9 +851,18 @@ pub(crate) enum McpScopeArg {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum PluginMarketplaceCmd {
-    /// Add a marketplace source.
+    /// Register a marketplace: a name → source mapping. SOURCE is a GitHub `owner/repo` (whose
+    /// top-level directories are packages), a full git URL, or an `owner/repo` index repo.
+    ///
+    /// Examples:
+    ///   forge plugin marketplace add community anthropics/forge-marketplace
+    ///   forge plugin marketplace add internal https://git.corp/ai/skills.git --ref main
     Add {
+        /// Marketplace name used in `forge plugin install <pkg>@<name>`.
+        name: String,
+        /// Source: `owner/repo`, a full git URL, or an index repo.
         source: String,
+        /// Pin the marketplace to a branch/tag.
         #[arg(long, name = "ref")]
         ref_: Option<String>,
     },
@@ -849,25 +874,39 @@ pub(crate) enum PluginMarketplaceCmd {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum PluginCmd {
-    /// Install a skill pack from a GitHub repo or URL. Alias: `add`.
+    /// Install a skill pack. PLUGIN is `owner/repo[@ref]`, a full git URL, `pkg@marketplace`, or a
+    /// bare `pkg` resolved against `--marketplace`. Records a lockfile entry for `forge plugin
+    /// update`. Honors `GITHUB_TOKEN` for private repos. Alias: `add`.
     #[command(alias = "add")]
     Install {
         plugin: String,
+        /// Resolve PLUGIN as a package within this registered marketplace.
         #[arg(long)]
         marketplace: Option<String>,
     },
-    /// List installed skill packs.
+    /// List installed skill packs (from the lockfile) and registered marketplaces.
     List {
         #[arg(long)]
         available: bool,
     },
     /// Remove an installed skill pack.
     Remove { plugin: String },
+    /// Re-fetch installed packs and update them. With PLUGIN, update only that pack.
+    Update { plugin: Option<String> },
     /// Manage plugin marketplaces.
     Marketplace {
         #[command(subcommand)]
         cmd: PluginMarketplaceCmd,
     },
+}
+
+/// Output format for `forge run`. `text` is the human line renderer; `stream-json` emits NDJSON
+/// events mirroring Claude Code's `--output-format stream-json` so tools can embed Forge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum OutputFormat {
+    Text,
+    #[value(name = "stream-json")]
+    StreamJson,
 }
 
 #[derive(Clone, Copy, ValueEnum)]

@@ -557,3 +557,208 @@ impl Presenter for HeadlessPresenter {
         }
     }
 }
+
+/// NDJSON (`stream-json`) presenter: emits one JSON object per line on stdout, mirroring Claude
+/// Code's `--output-format stream-json` event shapes as closely as practical so existing CC
+/// stream-json integrations (editors, agent SDKs) can consume Forge's output. Non-interactive:
+/// confirmations deny (safe default) and prompts return no answer. Run with `--mode bypass` /
+/// `--mode accept-edits` for autonomous tool use.
+pub struct StreamJsonPresenter {
+    out: Box<dyn Write + Send>,
+    session_id: String,
+}
+
+impl Default for StreamJsonPresenter {
+    fn default() -> Self {
+        Self {
+            out: Box::new(std::io::stdout()),
+            session_id: String::new(),
+        }
+    }
+}
+
+impl StreamJsonPresenter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a presenter that writes into an arbitrary sink (used by tests to capture NDJSON).
+    pub fn with_writer(out: Box<dyn Write + Send>) -> Self {
+        Self {
+            out,
+            session_id: String::new(),
+        }
+    }
+
+    /// Write one event as a single compact JSON line, flushing so consumers see it live.
+    fn line(&mut self, value: serde_json::Value) {
+        if serde_json::to_writer(&mut self.out, &value).is_ok() {
+            let _ = self.out.write_all(b"\n");
+            let _ = self.out.flush();
+        }
+    }
+}
+
+impl Presenter for StreamJsonPresenter {
+    fn emit(&mut self, event: PresenterEvent) {
+        let sid = self.session_id.clone();
+        match event {
+            PresenterEvent::SessionStarted { id } => {
+                self.session_id = id.clone();
+                self.line(serde_json::json!({
+                    "type": "system", "subtype": "init", "session_id": id
+                }));
+            }
+            PresenterEvent::Routing {
+                tier,
+                model,
+                rationale,
+            } => self.line(serde_json::json!({
+                "type": "system", "subtype": "routing", "session_id": sid,
+                "tier": tier, "model": model, "rationale": rationale
+            })),
+            PresenterEvent::AssistantText(text) | PresenterEvent::AssistantDelta(text) => self
+                .line(serde_json::json!({
+                    "type": "assistant", "session_id": sid,
+                    "message": { "role": "assistant",
+                                 "content": [ { "type": "text", "text": text } ] }
+                })),
+            PresenterEvent::Reasoning(delta) => self.line(serde_json::json!({
+                "type": "assistant", "session_id": sid,
+                "message": { "role": "assistant",
+                             "content": [ { "type": "thinking", "thinking": delta } ] }
+            })),
+            PresenterEvent::ToolStart { name, args } => {
+                // `args` is a JSON string; embed the parsed value when possible (CC `tool_use.input`).
+                let input = serde_json::from_str::<serde_json::Value>(&args)
+                    .unwrap_or(serde_json::Value::String(args));
+                self.line(serde_json::json!({
+                    "type": "assistant", "session_id": sid,
+                    "message": { "role": "assistant",
+                                 "content": [ { "type": "tool_use", "name": name, "input": input } ] }
+                }));
+            }
+            PresenterEvent::ToolResult { name, ok, summary } => self.line(serde_json::json!({
+                "type": "user", "session_id": sid,
+                "message": { "role": "user",
+                             "content": [ { "type": "tool_result", "tool_name": name,
+                                            "is_error": !ok, "content": summary } ] }
+            })),
+            PresenterEvent::Cost {
+                session_total_usd,
+                session_in,
+                session_out,
+                ..
+            } => self.line(serde_json::json!({
+                "type": "system", "subtype": "usage", "session_id": sid,
+                "total_cost_usd": session_total_usd,
+                "usage": { "input_tokens": session_in, "output_tokens": session_out }
+            })),
+            PresenterEvent::Warning(msg) => self.line(serde_json::json!({
+                "type": "system", "subtype": "warning", "session_id": sid, "message": msg
+            })),
+            PresenterEvent::Error(msg) => self.line(serde_json::json!({
+                "type": "system", "subtype": "error", "session_id": sid, "message": msg
+            })),
+            PresenterEvent::Done {
+                final_text,
+                stop_reason,
+            } => self.line(serde_json::json!({
+                "type": "result", "subtype": "success", "session_id": sid,
+                "result": final_text, "stop_reason": format!("{stop_reason:?}")
+            })),
+            // Other events are not part of the CC stream-json surface; intentionally ignored.
+            _ => {}
+        }
+    }
+
+    fn confirm(&mut self, _tool: &str, _side_effect: SideEffect) -> ConfirmOutcome {
+        ConfirmOutcome::Deny
+    }
+
+    fn ask(&mut self, _question: &str, _options: &[QChoice], _allow_other: bool) -> String {
+        NO_ANSWER.to_string()
+    }
+
+    fn read_line(&mut self) -> Option<String> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod stream_json_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A `Write` sink that captures bytes into a shared buffer the test can read afterwards.
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_json_emits_parseable_ndjson_with_expected_event_types() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let mut p = StreamJsonPresenter::with_writer(Box::new(SharedBuf(buf.clone())));
+
+        p.emit(PresenterEvent::SessionStarted {
+            id: "sess-42".into(),
+        });
+        p.emit(PresenterEvent::Routing {
+            tier: "standard".into(),
+            model: "openai::gpt-4o".into(),
+            rationale: "best coding score".into(),
+        });
+        p.emit(PresenterEvent::AssistantDelta("Hello".into()));
+        p.emit(PresenterEvent::ToolStart {
+            name: "shell".into(),
+            args: "{\"command\":\"ls\"}".into(),
+        });
+        p.emit(PresenterEvent::ToolResult {
+            name: "shell".into(),
+            ok: true,
+            summary: "a.txt b.txt".into(),
+        });
+        p.emit(PresenterEvent::Done {
+            final_text: "done".into(),
+            stop_reason: StopReason::FinalAnswer,
+        });
+
+        let raw = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 6, "one NDJSON object per emit; got:\n{raw}");
+
+        // Every line is valid JSON.
+        let parsed: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("each line must be valid JSON"))
+            .collect();
+
+        // init event carries the session id and CC-style type/subtype.
+        assert_eq!(parsed[0]["type"], "system");
+        assert_eq!(parsed[0]["subtype"], "init");
+        assert_eq!(parsed[0]["session_id"], "sess-42");
+        // session id propagates onto later events.
+        assert_eq!(parsed[2]["session_id"], "sess-42");
+        // assistant text mirrors CC's message.content[].text shape.
+        assert_eq!(parsed[2]["type"], "assistant");
+        assert_eq!(parsed[2]["message"]["content"][0]["type"], "text");
+        assert_eq!(parsed[2]["message"]["content"][0]["text"], "Hello");
+        // tool_use input is embedded as parsed JSON, not a string.
+        assert_eq!(parsed[3]["message"]["content"][0]["type"], "tool_use");
+        assert_eq!(parsed[3]["message"]["content"][0]["input"]["command"], "ls");
+        // tool_result carries the is_error flag.
+        assert_eq!(parsed[4]["message"]["content"][0]["type"], "tool_result");
+        assert_eq!(parsed[4]["message"]["content"][0]["is_error"], false);
+        // terminal result event.
+        assert_eq!(parsed[5]["type"], "result");
+        assert_eq!(parsed[5]["result"], "done");
+    }
+}

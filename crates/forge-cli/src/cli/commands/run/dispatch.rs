@@ -764,6 +764,7 @@ and keep going."
                                 env: std::collections::HashMap::new(),
                             },
                             auth: None,
+                            secret_env: vec![],
                             enabled: true,
                         };
                         let mut s = session.lock().await;

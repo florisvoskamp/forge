@@ -50,6 +50,9 @@ pub(crate) async fn skill_cmd(sub: SkillCmd) -> Result<()> {
         SkillCmd::Export { dest, scope } => skills_export(&dest, scope),
         SkillCmd::Import { src, scope } => skills_import(&src, scope),
         SkillCmd::Normalize { project } => skills_normalize(project),
+        SkillCmd::Update { name } => {
+            crate::cli::commands::marketplace::update_installed(name.as_deref()).await
+        }
     }
 }
 
@@ -160,7 +163,7 @@ pub(crate) async fn skills_install(source: &str) -> Result<()> {
 /// - `owner/repo.git` (`.git` stripped)
 /// - `https://github.com/owner/repo`
 /// - `https://github.com/owner/repo/tree/branch`
-fn parse_github_source(source: &str) -> Result<(String, String, Option<String>)> {
+pub(crate) fn parse_github_source(source: &str) -> Result<(String, String, Option<String>)> {
     let s = source.trim();
 
     // Full GitHub URL.

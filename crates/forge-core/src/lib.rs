@@ -1381,6 +1381,20 @@ impl Session {
         &self.id
     }
 
+    /// Fire the Claude-Code lifecycle hooks (`notification`, `pre_compact`, `post_compact`, `stop`,
+    /// `subagent_stop`) for `event`, surfacing any output as a warning note. Inert (no spawn) when
+    /// no hooks are configured, so it's safe to call on hot paths. `fields` are merged into the
+    /// hook's stdin payload.
+    async fn fire_lifecycle(&mut self, event: forge_config::HookEvent, fields: serde_json::Value) {
+        if self.config.hooks.is_empty() {
+            return;
+        }
+        let outcome = hooks::run_lifecycle_hooks(&self.config.hooks, event, &self.id, fields).await;
+        for n in outcome.notes {
+            self.presenter.emit(PresenterEvent::Warning(n));
+        }
+    }
+
     /// Persist the TUI view snapshot (opaque JSON) for this session so a resume restores the
     /// on-screen activity/viewer state. Best-effort — a store error is ignored.
     pub fn save_view_snapshot(&self, json: &str) {
@@ -2274,6 +2288,12 @@ Rules:\n\
         // Drive the TUI's animated progress band (cleared by CompactionFinished below).
         self.presenter
             .emit(PresenterEvent::CompactionStarted { auto });
+        // PreCompact lifecycle hook (Claude-Code parity): fires before the summary call.
+        self.fire_lifecycle(
+            forge_config::HookEvent::PreCompact,
+            serde_json::json!({ "trigger": if auto { "auto" } else { "manual" } }),
+        )
+        .await;
         let split = before - COMPACT_KEEP_RECENT;
         let older = &self.transcript[..split];
         let rendered = older
@@ -2365,6 +2385,13 @@ Rules:\n\
         self.presenter.emit(PresenterEvent::Warning(format!(
             "compacted {before} messages → {after} (summary via {model})"
         )));
+        // PostCompact lifecycle hook: fires after the summary is folded in (Forge extension beyond
+        // CC, which only has PreCompact).
+        self.fire_lifecycle(
+            forge_config::HookEvent::PostCompact,
+            serde_json::json!({ "before": before, "after": after }),
+        )
+        .await;
         Ok((before, after))
     }
 
@@ -4248,6 +4275,12 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                 StopReason::FinalAnswer
             },
         });
+        // Stop lifecycle hook (Claude-Code parity): the agent finished responding for this turn.
+        self.fire_lifecycle(
+            forge_config::HookEvent::Stop,
+            serde_json::json!({ "stop_hook_active": false, "hit_step_cap": hit_step_cap }),
+        )
+        .await;
         self.generate_recap(prompt, &final_text).await;
         // Await the handle so one-shot (forge run) exits only after capture completes. In
         // interactive mode the spinner is already cleared and this is a brief background wait.
@@ -4773,13 +4806,30 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             }
         }
 
-        let allowed = match permission::decide(
+        let decision = permission::decide(
             self.mode,
             side_effect,
             &call.name,
             &effective_args,
             &self.rules,
-        ) {
+        );
+        // Notification lifecycle hook (Claude-Code parity): the agent needs the user's attention to
+        // approve this tool. Fired just before the prompt is shown (inert when no hooks configured).
+        // Inlined with field-level borrows because `tool` holds an immutable borrow of `self.tools`
+        // here, so a whole-`self` method call wouldn't borrow-check.
+        if matches!(decision, PermissionDecision::Ask) && !self.config.hooks.is_empty() {
+            let outcome = hooks::run_lifecycle_hooks(
+                &self.config.hooks,
+                forge_config::HookEvent::Notification,
+                &self.id,
+                serde_json::json!({ "message": format!("permission needed: {}", call.name) }),
+            )
+            .await;
+            for n in outcome.notes {
+                self.presenter.emit(PresenterEvent::Warning(n));
+            }
+        }
+        let allowed = match decision {
             PermissionDecision::Allow => true,
             PermissionDecision::Deny => false,
             PermissionDecision::Ask => match self.presenter.confirm(&call.name, side_effect) {
@@ -5219,6 +5269,13 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             &mut on_event,
         )
         .await?;
+
+        // SubagentStop lifecycle hook (Claude-Code parity): the spawned child agent(s) finished.
+        self.fire_lifecycle(
+            forge_config::HookEvent::SubagentStop,
+            serde_json::json!({ "ok": all_ok }),
+        )
+        .await;
 
         self.store.record_tool_call(
             msg_id,
@@ -8675,6 +8732,7 @@ mod tests {
                 #[cfg(windows)]
                 command: "echo blocked-by-test 1>&2 & exit /b 1".into(),
                 timeout_secs: 10,
+                cc_compat: false,
             }],
             ..Config::default()
         };

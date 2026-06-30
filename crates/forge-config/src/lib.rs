@@ -221,6 +221,54 @@ pub enum HookEvent {
     /// When the session loop exits cleanly. Observe-only.
     /// Receives `{"session_id": "<id>", "event": "session_end"}` on stdin.
     SessionEnd,
+    /// The agent emitted a user-facing notification (e.g. a tool needs permission). Observe-only.
+    /// Claude-Code parity event (`Notification`).
+    Notification,
+    /// Just before context compaction runs (Claude-Code `PreCompact`). Observe-only.
+    PreCompact,
+    /// Just after context compaction completes. Observe-only. (Forge extension beyond CC, which
+    /// only fires `PreCompact`.)
+    PostCompact,
+    /// A turn finished — the agent stopped (Claude-Code `Stop`). Observe-only.
+    Stop,
+    /// A subagent finished (Claude-Code `SubagentStop`). Observe-only.
+    SubagentStop,
+}
+
+impl HookEvent {
+    /// The Claude-Code event name for this hook (`PreToolUse`, `Notification`, …). Used to build
+    /// the CC stdin payload's `hook_event_name` and to translate CC settings.json config.
+    pub fn cc_name(self) -> &'static str {
+        match self {
+            HookEvent::PreToolUse => "PreToolUse",
+            HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::SessionStart => "SessionStart",
+            HookEvent::SessionEnd => "SessionEnd",
+            HookEvent::Notification => "Notification",
+            HookEvent::PreCompact => "PreCompact",
+            HookEvent::PostCompact => "PostCompact",
+            HookEvent::Stop => "Stop",
+            HookEvent::SubagentStop => "SubagentStop",
+        }
+    }
+
+    /// Parse a Claude-Code event name into a [`HookEvent`]. `None` for an unknown name.
+    pub fn from_cc_name(name: &str) -> Option<HookEvent> {
+        Some(match name {
+            "PreToolUse" => HookEvent::PreToolUse,
+            "PostToolUse" => HookEvent::PostToolUse,
+            "UserPromptSubmit" => HookEvent::UserPromptSubmit,
+            "SessionStart" => HookEvent::SessionStart,
+            "SessionEnd" => HookEvent::SessionEnd,
+            "Notification" => HookEvent::Notification,
+            "PreCompact" => HookEvent::PreCompact,
+            "PostCompact" => HookEvent::PostCompact,
+            "Stop" => HookEvent::Stop,
+            "SubagentStop" => HookEvent::SubagentStop,
+            _ => return None,
+        })
+    }
 }
 
 /// One `[[hooks]]` entry: a shell command run around tool calls matching `matcher`.
@@ -237,20 +285,136 @@ pub struct HookConfig {
     /// Kill the hook after this many seconds (default 30).
     #[serde(default = "default_hook_timeout")]
     pub timeout_secs: u64,
+    /// Claude-Code compatibility mode. When true the hook speaks the CC protocol: it receives the
+    /// CC JSON payload on stdin (`{session_id, transcript_path, cwd, hook_event_name, tool_name,
+    /// tool_input, …}`) and its output is parsed CC-style (`{"decision":"block|approve","reason":…}`
+    /// / `hookSpecificOutput`) with exit-code 2 = block. The `matcher` is interpreted as a CC tool
+    /// matcher (`|`-separated names / `*`) against the CC tool-name alias. When false (default) the
+    /// hook keeps Forge's native protocol. Set automatically for hooks loaded from a CC settings.json.
+    #[serde(default)]
+    pub cc_compat: bool,
 }
 
 fn default_hook_timeout() -> u64 {
     30
 }
 
+/// Map a Forge tool name to its Claude-Code equivalent, so a CC hook matcher written against CC
+/// tool names (`Write`, `Edit`, `Bash`, …) still fires on the corresponding Forge tool. Returns the
+/// original name when there's no distinct CC alias.
+pub fn cc_tool_alias(forge_tool: &str) -> &str {
+    match forge_tool {
+        "shell" => "Bash",
+        "edit_file" | "apply_patch" => "Edit",
+        "write_file" | "create_file" => "Write",
+        "read_file" => "Read",
+        "list_files" | "ls" => "LS",
+        "search" | "grep" | "ripgrep" => "Grep",
+        "glob" => "Glob",
+        "web_fetch" => "WebFetch",
+        "web_search" => "WebSearch",
+        other => other,
+    }
+}
+
+/// Map a Claude-Code tool name (`Bash`, `Edit`, `Read`, …) to Forge's tool name, for translating a
+/// CC `settings.json` permission entry (`Bash(npm run *)`) into a Forge `[[permissions.rules]]`
+/// block. Unknown names (e.g. an MCP tool) pass through unchanged.
+pub fn forge_tool_from_cc(cc_tool: &str) -> &str {
+    match cc_tool {
+        "Bash" => "shell",
+        "Edit" | "MultiEdit" => "edit_file",
+        "Write" => "write_file",
+        "Read" => "read_file",
+        "LS" => "list_files",
+        "Grep" => "search",
+        "Glob" => "glob",
+        "WebFetch" => "web_fetch",
+        "WebSearch" => "web_search",
+        other => other,
+    }
+}
+
 impl HookConfig {
-    /// Whether this hook applies to `tool_name`.
+    /// Whether this hook applies to `tool_name`. Native hooks use Forge's exact/comma-separated
+    /// matcher; CC-compat hooks treat the matcher as a `|`-separated CC matcher tested against both
+    /// the Forge tool name and its [`cc_tool_alias`] (so `"Write|Edit"` fires on `edit_file`).
     pub fn matches(&self, tool_name: &str) -> bool {
         match self.matcher.as_deref() {
             None | Some("") | Some("*") => true,
-            Some(list) => list.split(',').any(|m| m.trim() == tool_name),
+            Some(pattern) => {
+                if self.cc_compat {
+                    let alias = cc_tool_alias(tool_name);
+                    pattern.split('|').map(str::trim).any(|m| {
+                        m == "*"
+                            || m.eq_ignore_ascii_case(tool_name)
+                            || m.eq_ignore_ascii_case(alias)
+                    })
+                } else {
+                    pattern.split(',').any(|m| m.trim() == tool_name)
+                }
+            }
         }
     }
+}
+
+/// Translate a Claude-Code `settings.json` `hooks` object into a flat list of [`HookConfig`]s in
+/// CC-compat mode, so existing CC hook scripts run under Forge unmodified. The CC shape is:
+/// ```json
+/// { "PreToolUse": [ { "matcher": "Write|Edit",
+///                     "hooks": [ { "type": "command", "command": "./h.sh", "timeout": 10 } ] } ],
+///   "Notification": [ { "hooks": [ { "type": "command", "command": "notify" } ] } ] }
+/// ```
+/// `value` may be either the top-level settings object (we look up its `hooks` key) or the `hooks`
+/// object itself. Unknown event names and non-`command` hook types are skipped.
+pub fn cc_hooks_from_settings(value: &serde_json::Value) -> Vec<HookConfig> {
+    let hooks_obj = value
+        .get("hooks")
+        .and_then(|h| h.as_object())
+        .or_else(|| value.as_object());
+    let Some(obj) = hooks_obj else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (event_name, groups) in obj {
+        let Some(event) = HookEvent::from_cc_name(event_name) else {
+            continue;
+        };
+        let Some(groups) = groups.as_array() else {
+            continue;
+        };
+        for group in groups {
+            let matcher = group
+                .get("matcher")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty() && *m != "*")
+                .map(str::to_string);
+            let Some(entries) = group.get("hooks").and_then(|h| h.as_array()) else {
+                continue;
+            };
+            for entry in entries {
+                // CC only defines `"type": "command"` today; skip anything else.
+                if entry.get("type").and_then(|t| t.as_str()) != Some("command") {
+                    continue;
+                }
+                let Some(command) = entry.get("command").and_then(|c| c.as_str()) else {
+                    continue;
+                };
+                let timeout_secs = entry
+                    .get("timeout")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or_else(default_hook_timeout);
+                out.push(HookConfig {
+                    event,
+                    matcher: matcher.clone(),
+                    command: command.to_string(),
+                    timeout_secs,
+                    cc_compat: true,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Settings for the Lattice code-intelligence subsystem.
@@ -1691,6 +1855,23 @@ pub fn load() -> Result<Config, ConfigError> {
         match toml::from_str::<McpConfig>(&text) {
             Ok(mcp) => config.mcp = mcp,
             Err(e) => tracing::warn!("ignoring malformed .forge/mcp.toml: {e}"),
+        }
+    }
+
+    // Claude-Code-compatible hooks: a `settings.json` (user config dir + project `.forge/`) can
+    // declare hooks in CC's event-nested shape. They're appended (CC-compat mode) so existing CC
+    // hook scripts run unmodified alongside any native `[[hooks]]`. User scope first, project last.
+    let mut cc_paths = Vec::new();
+    if let Some(dir) = config_dir() {
+        cc_paths.push(dir.join("settings.json"));
+    }
+    cc_paths.push(PathBuf::from("./.forge/settings.json"));
+    for path in cc_paths {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(v) => config.hooks.extend(cc_hooks_from_settings(&v)),
+                Err(e) => tracing::warn!("ignoring malformed {}: {e}", path.display()),
+            }
         }
     }
     Ok(config)
@@ -3597,6 +3778,7 @@ mod tests {
             matcher: m.map(String::from),
             command: "true".into(),
             timeout_secs: 30,
+            cc_compat: false,
         };
         assert!(mk(None).matches("shell"), "no matcher = all tools");
         assert!(mk(Some("*")).matches("anything"));
@@ -3606,6 +3788,40 @@ mod tests {
             mk(Some("edit_file,write_file")).matches("write_file"),
             "comma list"
         );
+    }
+
+    #[test]
+    fn cc_hooks_parse_from_settings_json_and_match_by_alias() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{ "hooks": {
+                   "PreToolUse": [
+                     { "matcher": "Write|Edit",
+                       "hooks": [ { "type": "command", "command": "./guard.sh", "timeout": 7 } ] }
+                   ],
+                   "Notification": [
+                     { "hooks": [ { "type": "command", "command": "notify-send forge" } ] }
+                   ]
+                 } }"#,
+        )
+        .unwrap();
+        let hooks = cc_hooks_from_settings(&v);
+        assert_eq!(hooks.len(), 2);
+        let pre = hooks
+            .iter()
+            .find(|h| h.event == HookEvent::PreToolUse)
+            .unwrap();
+        assert!(pre.cc_compat);
+        assert_eq!(pre.timeout_secs, 7);
+        // The CC matcher "Write|Edit" fires on Forge's `edit_file`/`write_file` via the alias.
+        assert!(pre.matches("edit_file"), "Edit alias");
+        assert!(pre.matches("write_file"), "Write alias");
+        assert!(!pre.matches("shell"), "Bash not in matcher");
+        let note = hooks
+            .iter()
+            .find(|h| h.event == HookEvent::Notification)
+            .unwrap();
+        assert!(note.matcher.is_none(), "no matcher = all");
+        assert!(note.matches("anything"));
     }
 
     #[test]

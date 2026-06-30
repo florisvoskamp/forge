@@ -84,8 +84,146 @@ fn parse_hook_directive(stdout: &str, event: HookEvent) -> HookDirective {
     }
 }
 
+/// Translate Forge's native hook payload (`{tool, args, result?, ok?}` / `{prompt}`) into the
+/// Claude-Code stdin shape so a CC hook script reads the fields it expects (`tool_name`,
+/// `tool_input`, `tool_response`, `prompt`, `hook_event_name`, `cwd`, `session_id`,
+/// `transcript_path`). Best-effort: `session_id`/`transcript_path` are empty unless the caller
+/// supplied them — most CC hooks only read `tool_name`/`tool_input`, which always round-trip.
+fn to_cc_payload(forge_payload: &str, event: HookEvent, session_id: &str) -> String {
+    let v: serde_json::Value =
+        serde_json::from_str(forge_payload).unwrap_or(serde_json::Value::Null);
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let mut obj = serde_json::Map::new();
+    obj.insert("session_id".into(), session_id.into());
+    obj.insert("transcript_path".into(), "".into());
+    obj.insert("cwd".into(), cwd.into());
+    obj.insert("hook_event_name".into(), event.cc_name().into());
+    if let Some(tool) = v.get("tool").and_then(|t| t.as_str()) {
+        obj.insert("tool_name".into(), tool.into());
+    }
+    if let Some(args) = v.get("args") {
+        obj.insert("tool_input".into(), args.clone());
+    }
+    if let Some(result) = v.get("result") {
+        obj.insert("tool_response".into(), result.clone());
+    }
+    if let Some(prompt) = v.get("prompt") {
+        obj.insert("prompt".into(), prompt.clone());
+    }
+    // Carry through any extra lifecycle fields (message, trigger, …) the caller already put in.
+    if let Some(map) = v.as_object() {
+        for (k, val) in map {
+            if !["tool", "args", "result", "ok", "prompt", "event"].contains(&k.as_str()) {
+                obj.entry(k.clone()).or_insert_with(|| val.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// What a Claude-Code hook's output asked for, after interpreting exit code + stdout/stderr.
+enum CcDecision {
+    /// Block the call/turn (exit 2, `decision:block`, or `permissionDecision:deny`).
+    Block(String),
+    /// Approve/allow with no change (`decision:approve`, `permissionDecision:allow`).
+    Noop,
+    /// Inject this string as model-visible context (`additionalContext` / `hookSpecificOutput`).
+    Context(String),
+    /// Surface this text as a user note (plain stdout, or an unrecognised JSON shape).
+    Note(String),
+}
+
+/// Interpret a Claude-Code hook's result (CC protocol): exit-code 2 blocks (stderr = reason);
+/// otherwise parse stdout for `{"decision":"block|approve","reason":…}`, a `hookSpecificOutput`
+/// object (`permissionDecision` / `additionalContext`), or a top-level `additionalContext`. Plain
+/// non-JSON stdout becomes a note. Empty stdout + exit 0 is a clean no-op.
+fn parse_cc_output(code: i32, stdout: &str, stderr: &str) -> CcDecision {
+    if code == 2 {
+        let err = stderr.trim();
+        let reason = if !err.is_empty() {
+            err
+        } else if !stdout.trim().is_empty() {
+            stdout.trim()
+        } else {
+            "blocked by hook (exit 2)"
+        };
+        return CcDecision::Block(truncate(reason, 800));
+    }
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return CcDecision::Noop;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return CcDecision::Note(truncate(trimmed, 800));
+    };
+    if let Some(decision) = v.get("decision").and_then(|d| d.as_str()) {
+        match decision {
+            "block" => {
+                let reason = v
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("blocked by hook");
+                return CcDecision::Block(truncate(reason, 800));
+            }
+            "approve" | "allow" => return CcDecision::Noop,
+            _ => {}
+        }
+    }
+    if let Some(hso) = v.get("hookSpecificOutput") {
+        if hso.get("permissionDecision").and_then(|d| d.as_str()) == Some("deny") {
+            let reason = hso
+                .get("permissionDecisionReason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("denied by hook");
+            return CcDecision::Block(truncate(reason, 800));
+        }
+        if let Some(ctx) = hso.get("additionalContext").and_then(|c| c.as_str()) {
+            if !ctx.trim().is_empty() {
+                return CcDecision::Context(truncate(ctx, 2000));
+            }
+        }
+    }
+    if let Some(ctx) = v.get("additionalContext").and_then(|c| c.as_str()) {
+        if !ctx.trim().is_empty() {
+            return CcDecision::Context(truncate(ctx, 2000));
+        }
+    }
+    CcDecision::Note(truncate(trimmed, 800))
+}
+
+/// Run one CC-compat hook and fold its decision into `outcome`. Returns `true` if the call should
+/// be blocked + short-circuited (PreToolUse only; PostToolUse downgrades a block to a note).
+async fn run_cc_hook(
+    h: &HookConfig,
+    event: HookEvent,
+    payload: &str,
+    outcome: &mut HookOutcome,
+) -> bool {
+    let cc_payload = to_cc_payload(payload, event, "");
+    match run_one(h, &cc_payload).await {
+        Ok((code, stdout, stderr)) => match parse_cc_output(code, &stdout, &stderr) {
+            CcDecision::Block(reason) => {
+                if event == HookEvent::PreToolUse {
+                    outcome.blocked = Some(reason);
+                    return true;
+                }
+                outcome.notes.push(format!("⎇ hook: {reason}"));
+            }
+            CcDecision::Context(ctx) => outcome.injected_context.push(ctx),
+            CcDecision::Note(text) => outcome.notes.push(format!("⎇ hook: {text}")),
+            CcDecision::Noop => {}
+        },
+        Err(e) => outcome.notes.push(format!("⎇ hook error: {e}")),
+    }
+    false
+}
+
 /// Run every hook matching `event` + `tool`, in declaration order. The first `PreToolUse` hook
 /// that exits non-zero blocks and short-circuits. A hook that fails to launch is noted, not fatal.
+/// CC-compat hooks ([`HookConfig::cc_compat`]) speak the Claude-Code protocol (CC stdin payload +
+/// `decision`/exit-2 output); native hooks keep Forge's directive protocol.
 pub async fn run_hooks(
     hooks: &[HookConfig],
     event: HookEvent,
@@ -94,6 +232,12 @@ pub async fn run_hooks(
 ) -> HookOutcome {
     let mut outcome = HookOutcome::default();
     for h in hooks.iter().filter(|h| h.event == event && h.matches(tool)) {
+        if h.cc_compat {
+            if run_cc_hook(h, event, payload, &mut outcome).await {
+                break;
+            }
+            continue;
+        }
         match run_one(h, payload).await {
             Ok((code, stdout, stderr)) => {
                 let trimmed = stdout.trim();
@@ -153,6 +297,23 @@ pub async fn run_prompt_hooks(hooks: &[HookConfig], prompt: &str) -> Result<Stri
         .iter()
         .filter(|h| h.event == HookEvent::UserPromptSubmit)
     {
+        if h.cc_compat {
+            // CC UserPromptSubmit: a block decision / exit-2 blocks the turn; otherwise stdout (and
+            // `additionalContext`) is APPENDED as extra context (CC semantics — it doesn't replace
+            // the prompt the way a native prompt hook does).
+            let cc_payload = to_cc_payload(&payload, HookEvent::UserPromptSubmit, "");
+            match run_one(h, &cc_payload).await {
+                Ok((code, stdout, stderr)) => match parse_cc_output(code, &stdout, &stderr) {
+                    CcDecision::Block(reason) => return Err(reason),
+                    CcDecision::Context(ctx) | CcDecision::Note(ctx) => {
+                        current = format!("{current}\n\n{ctx}");
+                    }
+                    CcDecision::Noop => {}
+                },
+                Err(e) => eprintln!("⎇ hook error: {e}"),
+            }
+            continue;
+        }
         match run_one(h, &payload).await {
             Ok((code, stdout, stderr)) => {
                 if code != 0 {
@@ -207,6 +368,66 @@ pub async fn run_session_hooks(hooks: &[HookConfig], event: HookEvent, session_i
             Err(e) => eprintln!("⎇ hook error: {e}"),
         }
     }
+}
+
+/// The combined effect of running lifecycle hooks (`notification`, `pre_compact`, `post_compact`,
+/// `stop`, `subagent_stop`) for one event.
+#[derive(Debug, Default)]
+pub struct LifecycleOutcome {
+    /// `Some(reason)` if a hook asked to block (exit 2 / `decision:block`). For `stop`/`subagent_stop`
+    /// this is the "keep going, don't stop yet" signal; the caller decides whether to honor it.
+    pub blocked: Option<String>,
+    /// Lines to surface to the user (hook stdout / decision reasons).
+    pub notes: Vec<String>,
+}
+
+/// Run the Claude-Code lifecycle hooks Forge previously lacked: `Notification`, `PreCompact`,
+/// `PostCompact`, `Stop`, `SubagentStop`. `fields` are merged into the stdin payload (e.g.
+/// `{"message":…}` for a notification, `{"trigger":…}` for compaction). Native hooks receive
+/// `{session_id, event, …fields}`; CC-compat hooks receive the CC shape with `hook_event_name`.
+/// Observe-by-default: output is collected as notes; a block decision is reported but acting on it
+/// is left to the caller (compaction/turn-stop continue regardless in this MVP).
+pub async fn run_lifecycle_hooks(
+    hooks: &[HookConfig],
+    event: HookEvent,
+    session_id: &str,
+    fields: serde_json::Value,
+) -> LifecycleOutcome {
+    let mut outcome = LifecycleOutcome::default();
+    // Native payload: {session_id, event, ...fields}.
+    let mut base = serde_json::Map::new();
+    base.insert("session_id".into(), session_id.into());
+    base.insert("event".into(), event.cc_name().into());
+    if let Some(map) = fields.as_object() {
+        for (k, v) in map {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+    let native_payload = serde_json::Value::Object(base).to_string();
+
+    for h in hooks.iter().filter(|h| h.event == event) {
+        let payload = if h.cc_compat {
+            to_cc_payload(&native_payload, event, session_id)
+        } else {
+            native_payload.clone()
+        };
+        match run_one(h, &payload).await {
+            Ok((code, stdout, stderr)) => match parse_cc_output(code, &stdout, &stderr) {
+                CcDecision::Block(reason) => {
+                    outcome.notes.push(format!("⎇ hook: {reason}"));
+                    if outcome.blocked.is_none() {
+                        outcome.blocked = Some(reason);
+                    }
+                }
+                CcDecision::Context(ctx) | CcDecision::Note(ctx) => {
+                    outcome.notes.push(format!("⎇ hook: {ctx}"));
+                }
+                CcDecision::Noop => {}
+            },
+            Err(e) => outcome.notes.push(format!("⎇ hook error: {e}")),
+        }
+    }
+    outcome
 }
 
 fn hook_shell() -> (&'static str, &'static str) {
@@ -269,6 +490,17 @@ mod tests {
             matcher: None,
             command: command.into(),
             timeout_secs: 10,
+            cc_compat: false,
+        }
+    }
+
+    fn cc_hook(event: HookEvent, command: &str) -> HookConfig {
+        HookConfig {
+            event,
+            matcher: None,
+            command: command.into(),
+            timeout_secs: 10,
+            cc_compat: true,
         }
     }
 
@@ -481,5 +713,140 @@ mod tests {
         // Not a recognised directive AND has an `action` key → surfaced as a note, NOT rewritten args.
         assert!(o.rewritten_args.is_none());
         assert!(o.notes.iter().any(|n| n.contains("frobnicate")));
+    }
+
+    // --- Claude-Code-compatible hook mode (run unmodified CC hook scripts) ---
+
+    #[tokio::test]
+    async fn cc_pretooluse_exit_2_blocks_with_stderr_reason() {
+        // CC protocol: exit code 2 = block, stderr fed back as the reason. Cross-platform.
+        #[cfg(not(windows))]
+        let cmd = "echo cc-denied 1>&2; exit 2";
+        #[cfg(windows)]
+        let cmd = "echo cc-denied 1>&2 & exit /b 2";
+        let hooks = vec![cc_hook(HookEvent::PreToolUse, cmd)];
+        let o = run_hooks(&hooks, HookEvent::PreToolUse, "shell", "{}").await;
+        assert_eq!(o.blocked.as_deref(), Some("cc-denied"));
+    }
+
+    #[tokio::test]
+    async fn cc_pretooluse_nonblocking_exit_1_does_not_block() {
+        // A non-2 non-zero exit is a non-blocking error under CC semantics (unlike native hooks,
+        // where any non-zero PreToolUse exit blocks).
+        #[cfg(not(windows))]
+        let cmd = "echo oops 1>&2; exit 1";
+        #[cfg(windows)]
+        let cmd = "echo oops 1>&2 & exit /b 1";
+        let hooks = vec![cc_hook(HookEvent::PreToolUse, cmd)];
+        let o = run_hooks(&hooks, HookEvent::PreToolUse, "shell", "{}").await;
+        assert!(o.blocked.is_none(), "exit 1 is non-blocking in CC mode");
+    }
+
+    // The CC JSON-decision scripts echo a single-quoted JSON object, which Windows cmd.exe mangles;
+    // `parse_cc_output` is pure Rust and is exercised on Linux + macOS.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn cc_pretooluse_decision_block_is_honored() {
+        let hooks = vec![cc_hook(
+            HookEvent::PreToolUse,
+            "echo '{\"decision\":\"block\",\"reason\":\"policy: no writes to /etc\"}'",
+        )];
+        let o = run_hooks(&hooks, HookEvent::PreToolUse, "shell", "{}").await;
+        assert_eq!(o.blocked.as_deref(), Some("policy: no writes to /etc"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn cc_posttooluse_additional_context_is_injected() {
+        let hooks = vec![cc_hook(
+            HookEvent::PostToolUse,
+            "echo '{\"hookSpecificOutput\":{\"additionalContext\":\"ran clippy: 0 warnings\"}}'",
+        )];
+        let o = run_hooks(&hooks, HookEvent::PostToolUse, "shell", "{}").await;
+        assert_eq!(o.injected_context, vec!["ran clippy: 0 warnings"]);
+        assert!(o.notes.is_empty(), "additionalContext is not a user note");
+    }
+
+    #[tokio::test]
+    async fn cc_hook_receives_cc_shaped_payload_on_stdin() {
+        // The hook echoes its stdin back; assert the CC fields are present (translated from Forge's
+        // native {tool, args} payload). `cat` is available on the project's CI on every OS.
+        let hooks = vec![cc_hook(HookEvent::PreToolUse, "cat")];
+        let o = run_hooks(
+            &hooks,
+            HookEvent::PreToolUse,
+            "shell",
+            "{\"tool\":\"shell\",\"args\":{\"command\":\"ls\"}}",
+        )
+        .await;
+        let joined = o.notes.join(" ");
+        assert!(
+            joined.contains("\"hook_event_name\":\"PreToolUse\""),
+            "{joined}"
+        );
+        assert!(joined.contains("\"tool_name\":\"shell\""), "{joined}");
+        assert!(joined.contains("\"tool_input\""), "{joined}");
+    }
+
+    #[tokio::test]
+    async fn cc_matcher_uses_cc_tool_alias() {
+        // A CC matcher written against CC tool names ("Write|Edit") fires on Forge's edit tool.
+        let mut h = cc_hook(HookEvent::PreToolUse, "exit 2");
+        h.matcher = Some("Write|Edit".into());
+        let o = run_hooks(&[h.clone()], HookEvent::PreToolUse, "edit_file", "{}").await;
+        assert!(o.blocked.is_some(), "Edit alias should match edit_file");
+        let o2 = run_hooks(&[h], HookEvent::PreToolUse, "shell", "{}").await;
+        assert!(o2.blocked.is_none(), "Bash is not in the matcher");
+    }
+
+    // --- New lifecycle events (notification / pre_compact / post_compact / stop / subagent_stop) ---
+
+    #[tokio::test]
+    async fn each_new_lifecycle_event_fires_its_hook() {
+        for event in [
+            HookEvent::Notification,
+            HookEvent::PreCompact,
+            HookEvent::PostCompact,
+            HookEvent::Stop,
+            HookEvent::SubagentStop,
+        ] {
+            // `cat` echoes the payload so we can prove the hook actually ran for THIS event.
+            let hooks = vec![hook(event, "cat")];
+            let o = run_lifecycle_hooks(&hooks, event, "sess-1", serde_json::json!({})).await;
+            assert!(
+                o.notes.iter().any(|n| n.contains(event.cc_name())),
+                "{:?} hook must fire and echo its event; notes: {:?}",
+                event,
+                o.notes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_hook_only_fires_for_its_event() {
+        // A Stop hook must not fire when a Notification event is dispatched.
+        let hooks = vec![hook(HookEvent::Stop, "cat")];
+        let o = run_lifecycle_hooks(
+            &hooks,
+            HookEvent::Notification,
+            "sess-1",
+            serde_json::json!({ "message": "hi" }),
+        )
+        .await;
+        assert!(
+            o.notes.is_empty(),
+            "no Stop hook should run for Notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_cc_hook_exit_2_reports_block() {
+        #[cfg(not(windows))]
+        let cmd = "echo stay 1>&2; exit 2";
+        #[cfg(windows)]
+        let cmd = "echo stay 1>&2 & exit /b 2";
+        let hooks = vec![cc_hook(HookEvent::Stop, cmd)];
+        let o = run_lifecycle_hooks(&hooks, HookEvent::Stop, "sess-1", serde_json::json!({})).await;
+        assert_eq!(o.blocked.as_deref(), Some("stay"));
     }
 }

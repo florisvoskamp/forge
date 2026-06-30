@@ -11,7 +11,19 @@ pub(crate) async fn dispatch(command: Command) -> Result<()> {
             tui,
             resume,
             model,
-        } => run(prompt.join(" "), mock, mode, tui, resume, model).await,
+            output_format,
+        } => {
+            run(
+                prompt.join(" "),
+                mock,
+                mode,
+                tui,
+                resume,
+                model,
+                output_format,
+            )
+            .await
+        }
         Command::Chat {
             mock,
             mode,
@@ -106,7 +118,7 @@ pub(crate) async fn dispatch(command: Command) -> Result<()> {
         Command::Nl { query, mode } => nl_cmd(query.join(" "), mode).await,
         Command::Skill { sub } => skill_cmd(sub).await,
         Command::Migrate { cmd } => migrate_cmd(cmd).await,
-        Command::Plugin { cmd } => plugin_cmd(cmd),
+        Command::Plugin { cmd } => plugin_cmd(cmd).await,
         Command::SelfMcp { action } => self_mcp_cmd(action),
     }
 }

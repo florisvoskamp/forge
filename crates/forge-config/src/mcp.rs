@@ -97,14 +97,53 @@ pub struct McpServerConfig {
     pub transport: McpTransport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<McpAuth>,
+    /// Additional secret env vars beyond the primary `auth` one. A stdio MCP server can need
+    /// several secrets (e.g. an API key AND an org token); each is referenced by env-var name +
+    /// keyring slot here, with the value living only in the keyring (ADR-0007). At connect, every
+    /// one is resolved and injected into the child's environment. Empty for the common single-secret
+    /// case (which uses `auth`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_env: Vec<McpSecretEnv>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
+/// One extra secret env var for a stdio server: the child-env var name + the keyring slot the
+/// value is stored under. The value itself is never in config (ADR-0007).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpSecretEnv {
+    /// Environment variable name injected into the child process at connect.
+    pub env: String,
+    /// Keyring entry name (under the `forge` service), e.g. `mcp:gitlab:GITLAB_ORG_TOKEN`.
+    pub keyring: String,
+}
+
 impl McpServerConfig {
-    /// Resolve this server's bearer token from env/keyring (ADR-0007). `None` if no auth declared.
+    /// Resolve this server's primary bearer token from env/keyring (ADR-0007). `None` if no auth.
     pub fn token(&self) -> Option<String> {
         self.auth.as_ref().and_then(resolve_token)
+    }
+
+    /// Every keyring slot this server references (primary `auth` + each `secret_env`). Used by the
+    /// importer to write all captured secrets.
+    pub fn keyring_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        if let Some(k) = self.auth.as_ref().and_then(|a| a.token_keyring.clone()) {
+            keys.push(k);
+        }
+        for s in &self.secret_env {
+            keys.push(s.keyring.clone());
+        }
+        keys
+    }
+
+    /// Resolve each EXTRA secret (`secret_env`) to `(env_var_name, value)` for stdio injection.
+    /// A secret that resolves to nothing (no env var set, not in keyring) is skipped, not errored.
+    pub fn extra_secret_values(&self) -> Vec<(String, String)> {
+        self.secret_env
+            .iter()
+            .filter_map(|s| resolve_secret_env(s).map(|v| (s.env.clone(), v)))
+            .collect()
     }
 
     /// "stdio" / "http", for status display.
@@ -115,6 +154,16 @@ impl McpServerConfig {
             McpTransport::Sse { .. } => "sse",
         }
     }
+}
+
+/// Resolve one extra secret: its env var first (lets a user override per-shell), then the keyring.
+fn resolve_secret_env(s: &McpSecretEnv) -> Option<String> {
+    if let Ok(v) = std::env::var(&s.env) {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    crate::secret_store::get(&s.keyring).filter(|v| !v.is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,7 +268,9 @@ fn looks_secret(key: &str) -> bool {
 pub struct ParsedServers {
     pub servers: Vec<McpServerConfig>,
     pub notes: Vec<String>,
-    /// server name → token value Forge will store in the keyring under that server's `mcp:<name>`.
+    /// keyring key → token value Forge will store in the OS keyring. Keys are `mcp:<name>` for a
+    /// server's primary secret and `mcp:<name>:<ENV>` for each additional one (multi-secret stdio).
+    /// The values stay in memory only — the importer writes them to the keyring, never to TOML.
     pub secrets: HashMap<String, String>,
 }
 
@@ -234,11 +285,16 @@ fn strip_bearer(v: &str) -> String {
 }
 
 /// Parse one server entry from a JSON spec (the `{type?, command/args/env | url/headers}` object
-/// used by Claude Code, Cursor, Windsurf, …). A secret is **referenced** in the returned config
-/// (`token_keyring = "mcp:<name>"`) and its value captured into `out.secrets[name]`; it is never
-/// embedded in the config. Returns `None` for an entry that is neither stdio nor http.
+/// used by Claude Code, Cursor, Windsurf, …). Each secret is **referenced** in the returned config
+/// (`token_keyring`) and its value captured into `out.secrets` keyed by that keyring slot; it is
+/// never embedded in the config. A stdio server may carry several secrets (the primary in `auth`,
+/// extras in `secret_env`). Skips an entry that is neither stdio nor http.
 fn server_from_json(name: &str, spec: &serde_json::Value, out: &mut ParsedServers) {
     let keyring_key = format!("mcp:{name}");
+    // Env vars the author explicitly marked secret (Forge extension), so an oddly-named secret
+    // (e.g. `SUPABASE_REF`) is protected even though the name heuristic wouldn't catch it.
+    let explicit_secret = explicit_secret_env(spec);
+    let mut secret_env: Vec<McpSecretEnv> = Vec::new();
     let (transport, auth) = if let Some(cmd) = spec.get("command").and_then(|v| v.as_str()) {
         let args = spec
             .get("args")
@@ -252,24 +308,22 @@ fn server_from_json(name: &str, spec: &serde_json::Value, out: &mut ParsedServer
         let mut env = HashMap::new();
         let mut auth: Option<McpAuth> = None;
         if let Some(env_obj) = spec.get("env").and_then(|v| v.as_object()) {
-            for (k, v) in env_obj {
-                let val = v.as_str().unwrap_or("");
-                if looks_secret(k) && !val.is_empty() {
-                    // One keyring slot per server (`mcp:<name>`), so only the FIRST secret env can be
-                    // stored. A second one used to SILENTLY overwrite the first (last-wins) — now it's
-                    // kept deterministically (first-wins) and any extra is flagged loudly, NOT dropped
-                    // into plain env (which would expose it). Multiple secrets need separate servers.
-                    if auth.is_some() {
-                        out.notes.push(format!(
-                            "server '{name}': IGNORING extra secret env '{k}' — a stdio server has \
-                             one keyring slot ('{keyring_key}'), already used. Split into separate \
-                             servers (one secret each) so '{k}' isn't lost."
-                        ));
-                        continue;
-                    }
-                    // Capture the value for the keyring; reference it by env-var name. At connect,
-                    // the resolved token is injected into the child's env under `k`.
-                    out.secrets.insert(name.to_string(), val.to_string());
+            // Deterministic order (JSON object iteration is arbitrary) so the PRIMARY secret pick is
+            // stable across runs — important for the keyring slot the config references.
+            let mut keys: Vec<&String> = env_obj.keys().collect();
+            keys.sort();
+            for k in keys {
+                let val = env_obj.get(k).and_then(|v| v.as_str()).unwrap_or("");
+                let is_secret = !val.is_empty() && (explicit_secret.contains(k) || looks_secret(k));
+                if !is_secret {
+                    env.insert(k.clone(), val.to_string());
+                    continue;
+                }
+                // N secrets per server are now supported. The FIRST becomes the primary `auth`
+                // (keyring slot `mcp:<name>`); each EXTRA gets its own slot `mcp:<name>:<ENV>` and a
+                // `secret_env` entry so connect can inject it. NONE leak into plain env.
+                if auth.is_none() {
+                    out.secrets.insert(keyring_key.clone(), val.to_string());
                     auth = Some(McpAuth {
                         token_env: Some(k.clone()),
                         token_keyring: Some(keyring_key.clone()),
@@ -277,10 +331,18 @@ fn server_from_json(name: &str, spec: &serde_json::Value, out: &mut ParsedServer
                         oauth: None,
                     });
                     out.notes.push(format!(
-                        "server '{name}': storing secret env '{k}' in the keyring"
+                        "server '{name}': storing secret env '{k}' in the keyring ('{keyring_key}')"
                     ));
                 } else {
-                    env.insert(k.clone(), val.to_string());
+                    let extra_key = format!("{keyring_key}:{k}");
+                    out.secrets.insert(extra_key.clone(), val.to_string());
+                    secret_env.push(McpSecretEnv {
+                        env: k.clone(),
+                        keyring: extra_key.clone(),
+                    });
+                    out.notes.push(format!(
+                        "server '{name}': storing additional secret env '{k}' in the keyring ('{extra_key}')"
+                    ));
                 }
             }
         }
@@ -306,7 +368,7 @@ fn server_from_json(name: &str, spec: &serde_json::Value, out: &mut ParsedServer
                     } else {
                         val.to_string()
                     };
-                    out.secrets.insert(name.to_string(), token);
+                    out.secrets.insert(keyring_key.clone(), token);
                     auth = Some(McpAuth {
                         token_env: None,
                         token_keyring: Some(keyring_key.clone()),
@@ -338,8 +400,24 @@ fn server_from_json(name: &str, spec: &serde_json::Value, out: &mut ParsedServer
         name: name.to_string(),
         transport,
         auth,
+        secret_env,
         enabled: true,
     });
+}
+
+/// Collect the env-var names an author explicitly marked secret. Forge extension: a `secretEnv`
+/// (or `secrets`) array of strings in the server spec. Lets a secret with an unusual name be
+/// protected even when the heuristic in [`looks_secret`] wouldn't flag it.
+fn explicit_secret_env(spec: &serde_json::Value) -> std::collections::HashSet<String> {
+    spec.get("secretEnv")
+        .or_else(|| spec.get("secrets"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Parse a JSON `mcpServers` (Claude/Cursor/Windsurf) **or** `servers` (VS Code) object.
@@ -386,8 +464,8 @@ pub struct ImportSource {
     pub servers: Vec<McpServerConfig>,
     /// Notes (e.g. which secrets will be stored in the keyring).
     pub notes: Vec<String>,
-    /// server name → captured token value (in-memory only; the importer writes these to the OS
-    /// keyring under `mcp:<name>`, never to TOML).
+    /// keyring key → captured token value (in-memory only; the importer writes these to the OS
+    /// keyring, never to TOML). Keyed by `mcp:<name>` / `mcp:<name>:<ENV>` (see [`ParsedServers`]).
     pub secrets: HashMap<String, String>,
 }
 
@@ -572,12 +650,14 @@ mod tests {
                     name: "a".into(),
                     transport: stdio(),
                     auth: None,
+                    secret_env: vec![],
                     enabled: true,
                 },
                 McpServerConfig {
                     name: "a".into(),
                     transport: stdio(),
                     auth: None,
+                    secret_env: vec![],
                     enabled: true,
                 },
             ],
@@ -662,7 +742,7 @@ Authorization = "Bearer SECRET-TOKEN"
         );
         // Captured with the `Bearer ` scheme stripped (Forge re-adds it when sending).
         assert_eq!(
-            parsed.secrets.get("remote").map(String::as_str),
+            parsed.secrets.get("mcp:remote").map(String::as_str),
             Some("SECRET-TOKEN")
         );
         // Round-trip the parsed config: the secret must not appear in the serialized TOML.
@@ -727,16 +807,16 @@ Authorization = "Bearer SECRET-TOKEN"
         // …but its token IS captured (for the keyring), Bearer-stripped.
         let helm_secret = sources
             .iter()
-            .find_map(|s| s.secrets.get("helm"))
+            .find_map(|s| s.secrets.get("mcp:helm"))
             .map(String::as_str);
         assert_eq!(helm_secret, Some("X"));
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn stdio_server_with_two_secret_envs_keeps_one_and_flags_the_extra() {
-        // A stdio server has ONE keyring slot. Two secret env vars used to silently last-wins; now
-        // exactly one is stored and the extra is flagged (not dropped into plain env where it'd leak).
+    fn stdio_server_with_two_secret_envs_imports_both_into_the_keyring() {
+        // A stdio server can declare several secrets. BOTH are captured for the keyring (the primary
+        // under `mcp:<name>`, the extra under `mcp:<name>:<ENV>`); NEITHER leaks into plain env.
         let root = serde_json::json!({ "mcpServers": {
             "multi": {
                 "command": "run-it",
@@ -744,22 +824,70 @@ Authorization = "Bearer SECRET-TOKEN"
             }
         }});
         let p = servers_from_json(&root);
-        assert!(
-            p.secrets.contains_key("multi"),
-            "the first secret is still captured"
+        // Both secret values are captured (keyed by keyring slot, value-set compared so the test is
+        // order-independent of which env var becomes primary).
+        let captured: std::collections::HashSet<&str> = p
+            .secrets
+            .iter()
+            .filter(|(k, _)| k.starts_with("mcp:multi"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            captured,
+            ["k1", "k2"].into_iter().collect(),
+            "both secrets must be captured; got {:?}",
+            p.secrets
         );
         let server = p.servers.iter().find(|s| s.name == "multi").unwrap();
-        // Neither secret leaks into plain env.
+        // Neither secret leaks into plain env; the extra is referenced via secret_env.
         if let McpTransport::Stdio { env, .. } = &server.transport {
             assert!(!env.contains_key("API_KEY"));
             assert!(!env.contains_key("AUTH_TOKEN"));
         } else {
             panic!("stdio");
         }
-        assert!(
-            p.notes.iter().any(|n| n.contains("IGNORING extra secret")),
-            "the extra secret must be flagged loudly; notes: {:?}",
-            p.notes
+        assert_eq!(server.secret_env.len(), 1, "one EXTRA secret beyond auth");
+        assert_eq!(server.keyring_keys().len(), 2, "two keyring slots in total");
+        // The config still carries no secret value when serialized.
+        let body = toml::to_string_pretty(&McpConfig {
+            servers: p.servers.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!body.contains("k1") && !body.contains("k2"));
+    }
+
+    #[test]
+    fn explicitly_marked_secret_is_protected_regardless_of_name() {
+        // An oddly-named secret the heuristic would NOT flag is still protected when listed in
+        // `secretEnv`. It must be captured for the keyring, not copied into plain env.
+        let root = serde_json::json!({ "mcpServers": {
+            "supa": {
+                "command": "supabase-mcp",
+                "env": { "SUPABASE_REF": "ref-value", "REGION": "eu" },
+                "secretEnv": ["SUPABASE_REF"]
+            }
+        }});
+        let p = servers_from_json(&root);
+        // The heuristic alone would treat SUPABASE_REF as plain text — the explicit mark protects it.
+        assert!(!looks_secret("SUPABASE_REF"));
+        assert_eq!(
+            p.secrets.get("mcp:supa").map(String::as_str),
+            Some("ref-value")
+        );
+        let server = p.servers.iter().find(|s| s.name == "supa").unwrap();
+        if let McpTransport::Stdio { env, .. } = &server.transport {
+            assert!(
+                !env.contains_key("SUPABASE_REF"),
+                "secret must not be in env"
+            );
+            assert_eq!(env.get("REGION").map(String::as_str), Some("eu"));
+        } else {
+            panic!("stdio");
+        }
+        assert_eq!(
+            server.auth.as_ref().unwrap().token_env.as_deref(),
+            Some("SUPABASE_REF")
         );
     }
 
@@ -776,11 +904,11 @@ Authorization = "Bearer SECRET-TOKEN"
             goog.auth.as_ref().unwrap().header.as_deref(),
             Some("X-Goog-Api-Key")
         );
-        assert_eq!(p.secrets.get("goog").map(String::as_str), Some("GKEY"));
+        assert_eq!(p.secrets.get("mcp:goog").map(String::as_str), Some("GKEY"));
         let bear = p.servers.iter().find(|s| s.name == "bear").unwrap();
         // Authorization → default Bearer (no custom header), token captured without the scheme.
         assert!(bear.auth.as_ref().unwrap().header.is_none());
-        assert_eq!(p.secrets.get("bear").map(String::as_str), Some("BTOK"));
+        assert_eq!(p.secrets.get("mcp:bear").map(String::as_str), Some("BTOK"));
         // Nothing secret ends up in the serialized config.
         let body = toml::to_string_pretty(&McpConfig {
             servers: p.servers,
@@ -841,7 +969,7 @@ Authorization = "Bearer SECRET-TOKEN"
         assert_eq!(auth.token_env.as_deref(), Some("GITLAB_TOKEN"));
         assert_eq!(auth.token_keyring.as_deref(), Some("mcp:gitlab"));
         assert_eq!(
-            parsed.secrets.get("gitlab").map(String::as_str),
+            parsed.secrets.get("mcp:gitlab").map(String::as_str),
             Some("glpat-SECRET")
         );
 

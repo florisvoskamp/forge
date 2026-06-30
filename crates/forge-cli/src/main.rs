@@ -12,8 +12,8 @@ use forge_types::TaskTier;
 
 pub(crate) use cli::args::{
     AssayCmd, AssayFormat, BenchCmd, Cli, Command, ExportScope, FailOnSeverity, GitCmd,
-    ImportSource, LatticeOp, LocalCmd, McpCmd, McpScopeArg, McpTransportArg, Mode, PluginCmd,
-    ProviderCmd, SelfMcpAction, SkillCmd, SkillScope,
+    ImportSource, LatticeOp, LocalCmd, McpCmd, McpScopeArg, McpTransportArg, Mode, OutputFormat,
+    PluginCmd, PluginMarketplaceCmd, ProviderCmd, SelfMcpAction, SkillCmd, SkillScope,
 };
 pub(crate) use cli::commands::assay::{assay_cmd, spawn_assay};
 pub(crate) use cli::commands::git::{git_cmd, maybe_install_git_hook, write_active_model};

@@ -116,16 +116,24 @@ pub(crate) fn mcp_import(path: Option<String>) -> Result<()> {
 
     // Flatten + dedup by server name (first source wins), carrying the captured secret from the
     // SAME source the kept server came from.
-    let mut flat: Vec<(String, forge_config::McpServerConfig, Option<String>)> = Vec::new();
+    let mut flat: Vec<(
+        String,
+        forge_config::McpServerConfig,
+        std::collections::HashMap<String, String>,
+    )> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for s in &sources {
         for srv in &s.servers {
             if seen.insert(srv.name.clone()) {
-                flat.push((
-                    s.label.clone(),
-                    srv.clone(),
-                    s.secrets.get(&srv.name).cloned(),
-                ));
+                // Carry ALL of this server's captured secrets (keyring key → value), so a
+                // multi-secret server keeps every secret from the source it came from.
+                let mut srv_secrets = std::collections::HashMap::new();
+                for key in srv.keyring_keys() {
+                    if let Some(val) = s.secrets.get(&key) {
+                        srv_secrets.insert(key, val.clone());
+                    }
+                }
+                flat.push((s.label.clone(), srv.clone(), srv_secrets));
             }
         }
     }
@@ -134,16 +142,16 @@ pub(crate) fn mcp_import(path: Option<String>) -> Result<()> {
     let selection = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         let items: Vec<forge_tui::SelectItem> = flat
             .iter()
-            .map(|(label, srv, secret)| forge_tui::SelectItem {
+            .map(|(label, srv, secrets)| forge_tui::SelectItem {
                 label: srv.name.clone(),
                 hint: format!(
                     "[{}]  {}{}",
                     srv.transport_label(),
                     label,
-                    if secret.is_some() {
-                        "  · token → keyring"
-                    } else {
-                        ""
+                    match secrets.len() {
+                        0 => String::new(),
+                        1 => "  · token → keyring".to_string(),
+                        n => format!("  · {n} tokens → keyring"),
                     }
                 ),
                 preselected: true,
@@ -169,9 +177,9 @@ pub(crate) fn mcp_import(path: Option<String>) -> Result<()> {
     let mut servers = Vec::new();
     let mut secrets = std::collections::HashMap::new();
     for i in selection {
-        let (_, srv, secret) = &flat[i];
-        if let Some(val) = secret {
-            secrets.insert(srv.name.clone(), val.clone());
+        let (_, srv, srv_secrets) = &flat[i];
+        for (key, val) in srv_secrets {
+            secrets.insert(key.clone(), val.clone());
         }
         servers.push(srv.clone());
     }
@@ -190,20 +198,25 @@ pub(crate) fn finish_import(
     servers: Vec<forge_config::McpServerConfig>,
     secrets: std::collections::HashMap<String, String>,
 ) -> Result<()> {
-    let mut stored = Vec::new();
+    let mut stored: Vec<String> = Vec::new();
+    let mut stored_tokens = 0usize;
     let mut store_failed = Vec::new();
     for srv in &servers {
-        let Some(value) = secrets.get(&srv.name) else {
-            continue;
-        };
-        let key = srv
-            .auth
-            .as_ref()
-            .and_then(|a| a.token_keyring.clone())
-            .unwrap_or_else(|| format!("mcp:{}", srv.name));
-        match forge_config::store_secret(&key, value) {
-            Ok(()) => stored.push(srv.name.clone()),
-            Err(e) => store_failed.push((srv.name.clone(), e.to_string())),
+        // A server may reference several keyring slots (multi-secret stdio). Store every one whose
+        // value was captured during import.
+        for key in srv.keyring_keys() {
+            let Some(value) = secrets.get(&key) else {
+                continue;
+            };
+            match forge_config::store_secret(&key, value) {
+                Ok(()) => {
+                    stored_tokens += 1;
+                    if !stored.contains(&srv.name) {
+                        stored.push(srv.name.clone());
+                    }
+                }
+                Err(e) => store_failed.push((srv.name.clone(), e.to_string())),
+            }
         }
     }
 
@@ -239,7 +252,8 @@ pub(crate) fn finish_import(
     }
     if !stored.is_empty() {
         println!(
-            "  🔐 stored {} token(s) in the OS keyring: {}",
+            "  🔐 stored {} token(s) in the OS keyring for {} server(s): {}",
+            stored_tokens,
             stored.len(),
             stored.join(", ")
         );
@@ -589,6 +603,7 @@ pub(crate) fn mcp_add(
         name: name.clone(),
         transport: mcp_transport,
         auth,
+        secret_env: vec![],
         enabled: true,
     };
 
@@ -649,43 +664,32 @@ pub(crate) fn mcp_get(name: String) -> Result<()> {
 // forge plugin
 // ---------------------------------------------------------------------------
 
-/// `forge plugin <install|list|remove|marketplace>` — plugin management (backed by skills).
-pub(crate) fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
+/// `forge plugin <install|list|remove|update|marketplace>` — real plugin/skill-pack management
+/// backed by the marketplace registry + install lockfile (see `commands::marketplace`).
+pub(crate) async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
+    use crate::cli::commands::marketplace;
     match cmd {
-        PluginCmd::Install { plugin, .. } => {
-            println!(
-                "forge uses skills — run `forge skill install {plugin}` to install a skill pack."
-            );
-            println!("Plugin marketplace support coming soon.");
+        PluginCmd::Install {
+            plugin,
+            marketplace: mkt,
+        } => return marketplace::install_plugin(&plugin, mkt).await,
+        PluginCmd::Update { plugin } => {
+            return marketplace::update_installed(plugin.as_deref()).await
         }
-        PluginCmd::List { available } => {
-            if available {
-                println!("Plugin marketplace support coming soon.");
-                return Ok(());
-            }
-            let skills_dir = forge_config::config_dir().map(|d| d.join("skills"));
-            match skills_dir.filter(|d| d.exists()) {
-                None => println!("no skills directory found"),
-                Some(d) => {
-                    let mut count = 0usize;
-                    if let Ok(entries) = std::fs::read_dir(&d) {
-                        let mut names: Vec<String> = entries
-                            .flatten()
-                            .filter_map(|e| e.file_name().into_string().ok())
-                            .collect();
-                        names.sort();
-                        for name in &names {
-                            println!("{name}");
-                            count += 1;
-                        }
-                    }
-                    if count == 0 {
-                        println!("no plugins (skill packs) installed");
-                    }
+        PluginCmd::List { .. } => return marketplace::list_installed_and_marketplaces(),
+        PluginCmd::Marketplace { cmd } => {
+            return match cmd {
+                PluginMarketplaceCmd::Add { name, source, ref_ } => {
+                    marketplace::marketplace_add(&name, &source, ref_)
                 }
+                PluginMarketplaceCmd::List => marketplace::marketplace_list(),
+                PluginMarketplaceCmd::Remove { name } => marketplace::marketplace_remove(&name),
             }
         }
         PluginCmd::Remove { plugin } => {
+            // Remove the on-disk skill (dir or file) AND its lockfile entry, so a later `update`
+            // doesn't resurrect it.
+            let _ = marketplace::remove_installed_entry(&plugin);
             if let Some(dir) = forge_config::config_dir() {
                 let skill_dir = dir.join("skills").join(&plugin);
                 let skill_file = dir.join("skills").join(format!("{plugin}.md"));
@@ -704,9 +708,6 @@ pub(crate) fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
             println!(
                 "plugin '{plugin}' not found. Use `forge plugin list` to see installed plugins."
             );
-        }
-        PluginCmd::Marketplace { .. } => {
-            println!("Plugin marketplace support coming soon.");
         }
     }
     Ok(())

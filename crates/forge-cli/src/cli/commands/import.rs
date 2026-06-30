@@ -120,7 +120,237 @@ pub(crate) fn import_cmd(source: ImportSource) -> Result<()> {
     for w in cat.warnings() {
         eprintln!("skipped (malformed): {w}");
     }
+
+    // Coverage uplift: also transfer settings.json permission rules + hooks (CC-compatible) and
+    // fold in the MCP servers, instead of silently dropping them. Best-effort; each piece reports
+    // what transferred vs. what was skipped.
+    if label == "claude" {
+        import_claude_settings(&home, project);
+    }
+    import_tool_mcp_servers(label, project);
     Ok(())
+}
+
+/// Translate a Claude-Code `settings.json` (user `~/.claude/settings.json` + project `.claude/`)
+/// into Forge: permission allow/ask/deny rules → `[[permissions.rules]]`, and hooks → a
+/// CC-compatible `settings.json` Forge loads natively (item: CC-compatible hooks). Prints a summary.
+fn import_claude_settings(claude_home: &std::path::Path, project: bool) {
+    // Gather every CC settings file that exists, in increasing precedence.
+    let mut sources = vec![claude_home.join("settings.json")];
+    sources.push(std::path::PathBuf::from("./.claude/settings.json"));
+    sources.push(std::path::PathBuf::from("./.claude/settings.local.json"));
+
+    let mut values = Vec::new();
+    for p in &sources {
+        if let Ok(text) = std::fs::read_to_string(p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                values.push(v);
+            }
+        }
+    }
+    if values.is_empty() {
+        return;
+    }
+
+    // Target files: project scope writes `./.forge/...`; user scope writes the user config dir.
+    let (settings_dst, config_dst) = if project {
+        (
+            std::path::PathBuf::from("./.forge/settings.json"),
+            std::path::PathBuf::from("./.forge/config.toml"),
+        )
+    } else {
+        match forge_config::config_dir() {
+            Some(dir) => (dir.join("settings.json"), dir.join("config.toml")),
+            None => return,
+        }
+    };
+
+    let hooks_n = transfer_hooks(&values, &settings_dst);
+    let perms_n = transfer_permissions(&values, &config_dst);
+
+    if hooks_n > 0 {
+        println!(
+            "✓ imported {hooks_n} hook(s) from settings.json → {} (Claude-Code-compatible mode)",
+            settings_dst.display()
+        );
+    }
+    if perms_n > 0 {
+        println!(
+            "✓ imported {perms_n} permission rule(s) from settings.json → {}",
+            config_dst.display()
+        );
+    }
+    if hooks_n == 0 && perms_n == 0 {
+        println!("• no hooks or permission rules found in settings.json to import");
+    }
+}
+
+/// Merge the `hooks` blocks from CC settings files into Forge's target `settings.json` (which Forge
+/// loads as CC-compatible hooks). Returns the number of hook command entries now present from the
+/// import. Existing target hooks for an event are preserved; imported groups are appended.
+fn transfer_hooks(values: &[serde_json::Value], settings_dst: &std::path::Path) -> usize {
+    use serde_json::Value;
+    // Collect every {event -> [groups]} mapping from the sources.
+    let mut merged: serde_json::Map<String, Value> = serde_json::Map::new();
+    for v in values {
+        let Some(hooks) = v.get("hooks").and_then(|h| h.as_object()) else {
+            continue;
+        };
+        for (event, groups) in hooks {
+            let Some(groups) = groups.as_array() else {
+                continue;
+            };
+            let entry = merged
+                .entry(event.clone())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(arr) = entry.as_array_mut() {
+                arr.extend(groups.iter().cloned());
+            }
+        }
+    }
+    if merged.is_empty() {
+        return 0;
+    }
+
+    // Merge into any existing target settings.json (append per-event).
+    let mut target: serde_json::Map<String, Value> = std::fs::read_to_string(settings_dst)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let target_hooks = target
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(obj) = target_hooks.as_object_mut() {
+        for (event, groups) in &merged {
+            let slot = obj
+                .entry(event.clone())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let (Some(dst), Some(src)) = (slot.as_array_mut(), groups.as_array()) {
+                dst.extend(src.iter().cloned());
+            }
+        }
+    }
+
+    if let Some(parent) = settings_dst.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let body = serde_json::to_string_pretty(&Value::Object(target)).unwrap_or_default();
+    if std::fs::write(settings_dst, body).is_err() {
+        return 0;
+    }
+    // Count the translated hooks (what Forge will actually load) from the merged block.
+    forge_config::cc_hooks_from_settings(&Value::Object(merged)).len()
+}
+
+/// Translate CC `permissions.{allow,ask,deny}` entries into Forge `[[permissions.rules]]` blocks,
+/// appended to the target `config.toml`. Returns the number of rules written.
+fn transfer_permissions(values: &[serde_json::Value], config_dst: &std::path::Path) -> usize {
+    let mut blocks = String::new();
+    let mut count = 0usize;
+    for v in values {
+        let Some(perms) = v.get("permissions").and_then(|p| p.as_object()) else {
+            continue;
+        };
+        for (kind, decision) in [("deny", "deny"), ("ask", "ask"), ("allow", "allow")] {
+            let Some(arr) = perms.get(kind).and_then(|a| a.as_array()) else {
+                continue;
+            };
+            for item in arr {
+                let Some(s) = item.as_str() else { continue };
+                let (cc_tool, pattern) = parse_cc_permission(s);
+                let tool = forge_config::forge_tool_from_cc(&cc_tool);
+                let pat = pattern.unwrap_or_else(|| "*".to_string());
+                blocks.push_str(&format!(
+                    "\n[[permissions.rules]]\ntool = {}\n{decision} = {}\nreason = \"imported from Claude Code settings.json\"\n",
+                    toml_str(tool),
+                    toml_str(&pat),
+                ));
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return 0;
+    }
+    if let Some(parent) = config_dst.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    // Append (create if absent) so existing config.toml settings are preserved.
+    use std::io::Write;
+    let header = if config_dst.exists() {
+        String::new()
+    } else {
+        "# Forge config (imported permission rules from Claude Code)\n".to_string()
+    };
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(config_dst)
+    {
+        Ok(mut f) => {
+            let _ = write!(f, "{header}{blocks}");
+            count
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Parse a CC permission string `Tool(pattern)` → `(tool, Some(pattern))`; a bare `Tool` →
+/// `(tool, None)`.
+fn parse_cc_permission(s: &str) -> (String, Option<String>) {
+    let s = s.trim();
+    if let Some(open) = s.find('(') {
+        if s.ends_with(')') {
+            let tool = s[..open].trim().to_string();
+            let pat = s[open + 1..s.len() - 1].trim().to_string();
+            return (tool, (!pat.is_empty()).then_some(pat));
+        }
+    }
+    (s.to_string(), None)
+}
+
+/// Quote a string as a TOML basic string (escaping `\` and `"`).
+fn toml_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Fold the tool's MCP servers into `.forge/mcp.toml` (item: fold `forge mcp import` into
+/// `forge import`). Non-interactive: imports every server discovered for this tool, storing secrets
+/// in the OS keyring. `label` is `claude` or `codex`; other labels have no MCP sources here.
+fn import_tool_mcp_servers(label: &str, _project: bool) {
+    let prefix = match label {
+        "claude" => "claude",
+        "codex" => "codex",
+        _ => return,
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let sources = forge_config::discover_import_sources(&cwd);
+    let mut servers = Vec::new();
+    let mut secrets = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for s in &sources {
+        if !s.label.starts_with(prefix) {
+            continue;
+        }
+        for srv in &s.servers {
+            if seen.insert(srv.name.clone()) {
+                for key in srv.keyring_keys() {
+                    if let Some(val) = s.secrets.get(&key) {
+                        secrets.insert(key, val.clone());
+                    }
+                }
+                servers.push(srv.clone());
+            }
+        }
+    }
+    if servers.is_empty() {
+        return;
+    }
+    let out = std::path::Path::new(".forge/mcp.toml");
+    if let Err(e) = crate::cli::commands::mcp::finish_import(out, servers, secrets) {
+        eprintln!("• MCP import skipped: {e}");
+    }
 }
 
 /// Copy `*.md` files from `src` into `dst`, skipping any that already exist. Updates `counts`.
@@ -381,4 +611,107 @@ pub(crate) fn normalize_md_dir(dir: &std::path::Path) -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod settings_import_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("forge-imp-{name}-{}", forge_types::new_id()))
+    }
+
+    #[test]
+    fn parse_cc_permission_handles_tool_and_pattern() {
+        assert_eq!(
+            parse_cc_permission("Bash(npm run test:*)"),
+            ("Bash".to_string(), Some("npm run test:*".to_string()))
+        );
+        assert_eq!(parse_cc_permission("Read"), ("Read".to_string(), None));
+        assert_eq!(
+            parse_cc_permission("WebFetch(domain:docs.rs)"),
+            ("WebFetch".to_string(), Some("domain:docs.rs".to_string()))
+        );
+    }
+
+    #[test]
+    fn transfer_permissions_translates_cc_rules_into_toml() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{ "permissions": {
+                   "allow": ["Bash(npm run lint)", "Read"],
+                   "deny": ["Bash(rm -rf *)"]
+                 } }"#,
+        )
+        .unwrap();
+        let dir = tmp("perms");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        let n = transfer_permissions(&[v], &cfg);
+        assert_eq!(n, 3, "two allows + one deny");
+
+        // The written TOML parses, and its [[permissions.rules]] carry the translated tool names +
+        // patterns (CC `Bash` → Forge `shell`, `Read` → `read_file`, bare tool → pattern `*`).
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        let root: toml::Value = toml::from_str(&text).expect("imported config.toml must be valid");
+        let rules = root["permissions"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 3);
+        assert!(rules.iter().any(|r| r["tool"].as_str() == Some("shell")
+            && r.get("deny").and_then(|d| d.as_str()) == Some("rm -rf *")));
+        assert!(rules.iter().any(|r| r["tool"].as_str() == Some("shell")
+            && r.get("allow").and_then(|d| d.as_str()) == Some("npm run lint")));
+        assert!(rules.iter().any(|r| r["tool"].as_str() == Some("read_file")
+            && r.get("allow").and_then(|d| d.as_str()) == Some("*")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transfer_hooks_writes_cc_compatible_settings_json() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{ "hooks": {
+                   "PreToolUse": [
+                     { "matcher": "Bash",
+                       "hooks": [ { "type": "command", "command": "./audit.sh" } ] }
+                   ]
+                 } }"#,
+        )
+        .unwrap();
+        let dir = tmp("hooks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.json");
+        let n = transfer_hooks(&[v], &settings);
+        assert_eq!(n, 1, "one hook command translated");
+
+        // The written settings.json loads back as a CC-compatible HookConfig.
+        let written = std::fs::read_to_string(&settings).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let hooks = forge_config::cc_hooks_from_settings(&value);
+        assert_eq!(hooks.len(), 1);
+        assert!(hooks[0].cc_compat);
+        assert_eq!(hooks[0].event, forge_config::HookEvent::PreToolUse);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transfer_hooks_appends_to_existing_settings() {
+        let dir = tmp("hooks-merge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.json");
+        // Pre-existing target with one PostToolUse hook.
+        std::fs::write(
+            &settings,
+            r#"{ "hooks": { "PostToolUse": [ { "hooks": [ { "type": "command", "command": "x" } ] } ] } }"#,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{ "hooks": { "PreToolUse": [ { "hooks": [ { "type": "command", "command": "y" } ] } ] } }"#,
+        )
+        .unwrap();
+        transfer_hooks(&[v], &settings);
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let hooks = forge_config::cc_hooks_from_settings(&value);
+        // Both the pre-existing PostToolUse and the imported PreToolUse survive.
+        assert_eq!(hooks.len(), 2, "existing hook preserved + new one appended");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

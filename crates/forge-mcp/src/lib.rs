@@ -1426,6 +1426,7 @@ mod tests {
                     headers: Default::default(),
                 },
                 auth: None,
+                secret_env: vec![],
                 enabled: true,
             }],
             ..Default::default()

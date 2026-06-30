@@ -118,6 +118,7 @@ pub(crate) async fn build_session_with(
                     env: std::collections::HashMap::new(),
                 },
                 auth: None,
+                secret_env: vec![],
                 enabled: true,
             },
         );
@@ -398,6 +399,7 @@ pub(crate) async fn run(
     tui: bool,
     resume: Option<String>,
     pin: Option<String>,
+    output_format: OutputFormat,
 ) -> Result<()> {
     if prompt.trim().is_empty() {
         anyhow::bail!("empty prompt — usage: forge run \"<your task>\"");
@@ -405,6 +407,22 @@ pub(crate) async fn run(
     // A first-time user's `forge run "hi"` would otherwise dead-end with no provider; offer the
     // guided wizard (no-ops on non-tty / once configured), same as `chat()`.
     maybe_first_run_setup(mock)?;
+
+    // stream-json: emit NDJSON events on stdout via the StreamJsonPresenter (no TUI, no heartbeat —
+    // stdout stays a clean machine-readable event stream). Ctrl-C still returns partial output.
+    if output_format == OutputFormat::StreamJson {
+        let presenter: Box<dyn Presenter> = Box::new(forge_tui::StreamJsonPresenter::new());
+        let mut session = build_session_with(presenter, mock, mode, resume, pin, true).await?;
+        let turn = session.run_turn(&prompt);
+        tokio::pin!(turn);
+        let result = tokio::select! {
+            r = &mut turn => r.map(|_| ()).context("running agent turn"),
+            _ = tokio::signal::ctrl_c() => Ok(()),
+        };
+        result?;
+        return Ok(());
+    }
+
     let mut session = build_session(mock, mode, tui, resume, pin).await?;
 
     // TUI mode handles its own Ctrl-C (crossterm) + spinner; keep it unchanged.
