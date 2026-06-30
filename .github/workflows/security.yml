@@ -45,10 +45,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # `arguments: all` runs `cargo deny check all` (advisories + bans + licenses + sources).
-      # Do NOT pass --all-features — cargo-deny 0.19 has no such flag; feature handling is the
-      # `[graph] all-features` key in deny.toml. The action's default arg would otherwise error.
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # Need a real toolchain: `cargo deny check` runs `cargo metadata` under the hood.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
         with:
-          command: check
-          arguments: all
+          tool: cargo-deny
+      # Plain `cargo deny check` runs all four checks (advisories + bans + licenses + sources)
+      # against the committed deny.toml. Driven directly (not via cargo-deny-action) so the CLI
+      # surface matches what we validate locally — the action puts `arguments` BEFORE the
+      # subcommand, which broke `cargo deny check all` ("unrecognized subcommand 'all'").
+      - run: cargo deny check
