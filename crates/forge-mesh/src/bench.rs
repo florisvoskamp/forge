@@ -102,12 +102,20 @@ impl BenchmarkScores {
         }
         // Fallback: the row sharing the most tokens, requiring a shared *family* word (an
         // alphabetic token ≥3 chars) so we never match purely on a stray version number.
+        // Role words (coder, chat, instruct, vision…) are explicitly excluded from "family
+        // word" status — they describe a task capability that many unrelated model families
+        // share, not a model-family identifier. Without this exclusion, "coder" would let
+        // deepseek-coder-v2 pick up Qwen2.5-Coder's bench score and vice-versa.
+        const ROLE_WORDS: &[&str] = &["coder", "chat", "code", "instruct", "vision", "embed"];
         let mut best: Option<(usize, f64, BenchScore)> = None; // (overlap, intelligence, score)
         for (toks, score) in &self.entries {
             let shared = overlap(&want, toks);
-            let family = want
-                .iter()
-                .any(|t| t.len() >= 3 && t.chars().all(|c| c.is_alphabetic()) && toks.contains(t));
+            let family = want.iter().any(|t| {
+                t.len() >= 3
+                    && t.chars().all(|c| c.is_alphabetic())
+                    && !ROLE_WORDS.contains(&t.as_str())
+                    && toks.contains(t)
+            });
             if !family || shared < 2 {
                 continue;
             }
@@ -302,6 +310,23 @@ mod tests {
         assert!(b.exact_score_for("ollama::qwen2.5-coder:14b").is_some());
         assert!(b.exact_score_for("ollama::deepseek-coder-v2:16b").is_none());
         assert!(b.exact_score_for("ollama::qwen2.5-coder:7b").is_none()); // different size
+    }
+
+    #[test]
+    fn fuzzy_score_for_does_not_cross_match_on_coder_role_word() {
+        // "coder" is shared by deepseek-coder and qwen-coder but is a ROLE word, not a model
+        // family identifier. Before the ROLE_WORDS exclusion, score_for() would fuzzy-match
+        // ollama::deepseek-coder-v2:16b → Qwen2.5-Coder 14B because they share "coder" (≥3
+        // chars, alphabetic) plus "b" — satisfying the old family-word + shared≥2 guard.
+        let mut b = BenchmarkScores::new();
+        b.insert("Qwen2.5-Coder 14B", 70.0, 82.0);
+        // No deepseek-coder entry → if the role-word fix works, fuzzy gives None.
+        assert!(
+            b.score_for("ollama::deepseek-coder-v2:16b").is_none(),
+            "fuzzy match must not assign Qwen-Coder's score to deepseek-coder via shared 'coder'"
+        );
+        // The exact Qwen model still resolves correctly via the fuzzy path.
+        assert!(b.score_for("openrouter::qwen/qwen2.5-coder-14b").is_some());
     }
 
     #[test]
