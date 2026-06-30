@@ -39,7 +39,7 @@ rmcp = { version = "1.7.0", features = [
 ] }
 serde = { workspace = true }
 serde_json.workspace = true
-toml = "0.8"
+toml = "1.1"
 reqwest = { workspace = true }
 futures.workspace = true
 axum = { workspace = true }
