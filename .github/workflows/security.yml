@@ -24,7 +24,7 @@ jobs:
     name: cargo audit (RUSTSEC)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
@@ -44,7 +44,7 @@ jobs:
     name: cargo deny (licenses + bans + advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Need a real toolchain: `cargo deny check` runs `cargo metadata` under the hood.
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
