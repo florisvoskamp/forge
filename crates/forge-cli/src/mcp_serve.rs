@@ -31,7 +31,7 @@ use forge_store::Store;
 use forge_tools::ToolRegistry;
 use forge_types::{PermissionDecision, PermissionMode, PermissionRule};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, JsonObject, ListToolsResult,
+    CallToolRequestParams, CallToolResult, ContentBlock, JsonObject, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
@@ -190,7 +190,7 @@ impl ServerHandler for ForgeMcp {
                 let _ = self.tasks_store.set_tasks(&session_id, &tasks);
             }
             report_to_sink(serde_json::json!({ "k": "tasks", "tasks": tasks }));
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "task list updated: {} task(s) — {done} done",
                 tasks.len()
             ))]));
@@ -212,7 +212,7 @@ impl ServerHandler for ForgeMcp {
                 _ => "fact".to_string(),
             };
             if text.len() < 4 {
-                return Ok(CallToolResult::error(vec![Content::text(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
                     "error: memory text too short (minimum 4 characters)",
                 )]));
             }
@@ -238,7 +238,7 @@ impl ServerHandler for ForgeMcp {
                 }
             }
             report_to_sink(serde_json::json!({ "k": "memory", "kind": kind_cat, "text": text }));
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "memory saved: [{kind_cat}] {text}"
             ))]));
         }
@@ -250,7 +250,7 @@ impl ServerHandler for ForgeMcp {
             let plan = forge_core::parse_plan(&args);
             let n = plan.steps.len();
             report_to_sink(serde_json::json!({ "k": "plan", "plan": plan }));
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Plan ({n} step(s)) presented to the user for approval. STOP now — do NOT start \
                  implementing. If the user approves, you'll be switched to Auto-edit and asked to \
                  build it."
@@ -266,7 +266,7 @@ impl ServerHandler for ForgeMcp {
                 .unwrap_or("")
                 .trim();
             return Ok(match self.skills.skill_guidance(skill) {
-                Some(g) => CallToolResult::success(vec![Content::text(format!(
+                Some(g) => CallToolResult::success(vec![ContentBlock::text(format!(
                     "Loaded the '{skill}' skill. Apply this methodology now:\n\n{g}"
                 ))]),
                 None => {
@@ -277,7 +277,7 @@ impl ServerHandler for ForgeMcp {
                         .map(|(n, _)| n)
                         .collect::<Vec<_>>()
                         .join(", ");
-                    CallToolResult::error(vec![Content::text(format!(
+                    CallToolResult::error(vec![ContentBlock::text(format!(
                         "no Forge skill named '{skill}'. Available: {available}"
                     ))])
                 }
@@ -305,7 +305,7 @@ impl ServerHandler for ForgeMcp {
                     )
                     .await;
                     if let Some(reason) = outcome.blocked {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                             "blocked by hook: {reason}"
                         ))]));
                     }
@@ -317,7 +317,7 @@ impl ServerHandler for ForgeMcp {
                 let decision =
                     permission::decide(self.mode, side_effect, &name, &effective_args, &self.rules);
                 if decision == PermissionDecision::Deny {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "denied by Forge permission policy: {name}"
                     ))]));
                 }
@@ -347,7 +347,7 @@ impl ServerHandler for ForgeMcp {
                 } else {
                     format!("{note_prefix}{}", out.text)
                 };
-                let content = vec![Content::text(text)];
+                let content = vec![ContentBlock::text(text)];
                 return Ok(if out.ok {
                     CallToolResult::success(content)
                 } else {
@@ -357,7 +357,7 @@ impl ServerHandler for ForgeMcp {
         }
 
         let Some(tool) = self.registry.get(&name) else {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "unknown tool: {name}"
             ))]));
         };
@@ -374,7 +374,7 @@ impl ServerHandler for ForgeMcp {
             )
             .await;
             if let Some(reason) = outcome.blocked {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "blocked by hook: {reason}"
                 ))]));
             }
@@ -383,7 +383,7 @@ impl ServerHandler for ForgeMcp {
         // Forge's permission gate — the unoverridable denylist always applies here.
         let decision = permission::decide(self.mode, tool.side_effect(), &name, &args, &self.rules);
         if decision == PermissionDecision::Deny {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "denied by Forge permission policy: {name}"
             ))]));
         }
@@ -434,9 +434,9 @@ impl ServerHandler for ForgeMcp {
             format!("{note_prefix}{out}")
         };
         Ok(if ok {
-            CallToolResult::success(vec![Content::text(result_text)])
+            CallToolResult::success(vec![ContentBlock::text(result_text)])
         } else {
-            CallToolResult::error(vec![Content::text(result_text)])
+            CallToolResult::error(vec![ContentBlock::text(result_text)])
         })
     }
 }
@@ -444,13 +444,15 @@ impl ServerHandler for ForgeMcp {
 impl ForgeMcp {
     async fn handle_spawn_agents(&self, args: &Value) -> CallToolResult {
         let Some(s) = &self.subagents else {
-            return CallToolResult::error(vec![Content::text(
+            return CallToolResult::error(vec![ContentBlock::text(
                 "spawn_agents is not available here",
             )]);
         };
         let requests = match subagent::parse_requests(args, s.max_agents) {
             Ok(r) => r,
-            Err(msg) => return CallToolResult::error(vec![Content::text(format!("error: {msg}"))]),
+            Err(msg) => {
+                return CallToolResult::error(vec![ContentBlock::text(format!("error: {msg}"))])
+            }
         };
 
         let budget = BudgetState {
@@ -522,8 +524,10 @@ impl ForgeMcp {
         )
         .await
         {
-            Ok((combined, _ok)) => CallToolResult::success(vec![Content::text(combined)]),
-            Err(e) => CallToolResult::error(vec![Content::text(format!("subagents failed: {e}"))]),
+            Ok((combined, _ok)) => CallToolResult::success(vec![ContentBlock::text(combined)]),
+            Err(e) => {
+                CallToolResult::error(vec![ContentBlock::text(format!("subagents failed: {e}"))])
+            }
         }
     }
 }

@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use forge_types::{PermissionMode, SideEffect, TaskTier};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, JsonObject, ListToolsResult, LoggingLevel,
+    CallToolRequestParams, CallToolResult, ContentBlock, JsonObject, ListToolsResult, LoggingLevel,
     LoggingMessageNotificationParam, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
@@ -303,7 +303,7 @@ impl ServerHandler for ForgeAgentServer {
                 let message = match args.get("message").and_then(|v| v.as_str()) {
                     Some(m) if !m.trim().is_empty() => m.trim().to_string(),
                     _ => {
-                        return Ok(CallToolResult::error(vec![Content::text(
+                        return Ok(CallToolResult::error(vec![ContentBlock::text(
                             "forge_chat requires a non-empty `message`",
                         )]));
                     }
@@ -355,12 +355,12 @@ impl ServerHandler for ForgeAgentServer {
                                 tool_calls.join(", ")
                             ));
                         }
-                        Ok(CallToolResult::success(vec![Content::text(out)]))
+                        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
                     }
-                    Some(Err(e)) => Ok(CallToolResult::error(vec![Content::text(format!(
+                    Some(Err(e)) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "turn failed: {e}"
                     ))])),
-                    None => Ok(CallToolResult::success(vec![Content::text(format!(
+                    None => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "turn interrupted via forge_interrupt after {} tool call(s){}. Session \
                          state is preserved — send a new forge_chat to continue or redirect.",
                         tool_calls.len(),
@@ -387,7 +387,7 @@ impl ServerHandler for ForgeAgentServer {
                     "pinned_model": session.pinned_model(),
                     "ready": true,
                 });
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::to_string_pretty(&status).unwrap_or_default(),
                 )]))
             }
@@ -407,7 +407,7 @@ impl ServerHandler for ForgeAgentServer {
                 *self.mode.lock().unwrap() = mode;
                 let mut session = self.session.lock().await;
                 session.set_mode(mode);
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "permission mode → {mode_str}"
                 ))]))
             }
@@ -416,7 +416,7 @@ impl ServerHandler for ForgeAgentServer {
                 // Wake the in-flight turn's `notified()` waiter (if any). Does not touch the
                 // session lock, so it runs even while `forge_chat` holds it for the whole turn.
                 self.interrupt.notify_waiters();
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     "interrupt signaled — the active forge_chat turn (if any) will stop at its \
                      next await point and return its partial result. No-op if no turn is running.",
                 )]))
@@ -437,12 +437,12 @@ impl ServerHandler for ForgeAgentServer {
                 let source = match bundle_scoped_source(&scope, 800_000) {
                     Ok(s) if !s.trim().is_empty() => s,
                     Ok(_) => {
-                        return Ok(CallToolResult::error(vec![Content::text(
+                        return Ok(CallToolResult::error(vec![ContentBlock::text(
                             "assay: no analyzable source files in working directory",
                         )]));
                     }
                     Err(e) => {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                             "assay: failed to bundle source: {e}"
                         ))]));
                     }
@@ -452,7 +452,7 @@ impl ServerHandler for ForgeAgentServer {
                 let pricing = forge_mesh::pricing::Pricing::from_config(&config);
                 let cat = discover_catalog(&config).await;
                 if cat.is_empty() {
-                    return Ok(CallToolResult::error(vec![Content::text(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
                         "assay: no models available — run `forge auth <provider>`",
                     )]));
                 }
@@ -510,21 +510,23 @@ impl ServerHandler for ForgeAgentServer {
                 let _ = notify_task.await;
 
                 match outcome {
-                    Some(Ok(())) => Ok(CallToolResult::success(vec![Content::text(if cleanup {
-                        "assay refine complete — findings have been auto-fixed".to_string()
-                    } else {
-                        "assay analysis complete — findings emitted as events".to_string()
-                    })])),
-                    Some(Err(e)) => Ok(CallToolResult::error(vec![Content::text(format!(
+                    Some(Ok(())) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                        if cleanup {
+                            "assay refine complete — findings have been auto-fixed".to_string()
+                        } else {
+                            "assay analysis complete — findings emitted as events".to_string()
+                        },
+                    )])),
+                    Some(Err(e)) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "assay failed: {e}"
                     ))])),
-                    None => Ok(CallToolResult::success(vec![Content::text(
+                    None => Ok(CallToolResult::success(vec![ContentBlock::text(
                         "assay interrupted".to_string(),
                     )])),
                 }
             }
 
-            _ => Ok(CallToolResult::error(vec![Content::text(format!(
+            _ => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "unknown tool '{name}'. Available: {TOOL_CHAT}, {TOOL_STATUS}, {TOOL_SET_MODE}, \
                  {TOOL_INTERRUPT}, {TOOL_ASSAY}"
             ))])),

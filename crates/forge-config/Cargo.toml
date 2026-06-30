@@ -29,9 +29,9 @@ directories = "6"
 keyring = { version = "3", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 sha2 = "0.11"
 base64 = "0.22"
-rand = "0.9"
+rand = "0.10"
 # AEAD for the encrypted-file secret fallback (used when no OS keyring/Secret Service is reachable).
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 
 [dev-dependencies]
 tempfile = "3"

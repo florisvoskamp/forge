@@ -19,7 +19,6 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use rand::RngCore as _;
 
 use crate::ConfigError;
 
@@ -124,8 +123,7 @@ fn load_or_create_key() -> Result<Key, ConfigError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ConfigError::Keyring(e.to_string()))?;
     }
-    let mut raw = [0u8; 32];
-    rand::rng().fill_bytes(&mut raw);
+    let raw: [u8; 32] = rand::random();
     write_private(&path, &raw)?;
     Ok(*Key::from_slice(&raw))
 }
@@ -170,8 +168,7 @@ fn write_map(map: &BTreeMap<String, String>) -> Result<(), ConfigError> {
 
 fn file_set(key: &str, value: &str) -> Result<(), ConfigError> {
     let cipher = cipher()?;
-    let mut nonce_bytes = [0u8; 12];
-    rand::rng().fill_bytes(&mut nonce_bytes);
+    let nonce_bytes: [u8; 12] = rand::random();
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
         .encrypt(nonce, value.as_bytes())

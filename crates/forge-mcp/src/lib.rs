@@ -1109,25 +1109,26 @@ fn tool_result_to_outcome(result: CallToolResult) -> McpCallOutcome {
 
 /// Map an rmcp tool/prompt content block into Forge's structured [`McpContentBlock`], keeping the
 /// raw data + mime type for non-text blocks rather than collapsing them to a placeholder string.
-fn content_to_block(c: &rmcp::model::Content) -> McpContentBlock {
-    use rmcp::model::RawContent;
-    match &c.raw {
-        RawContent::Text(t) => McpContentBlock::Text(t.text.clone()),
-        RawContent::Image(i) => McpContentBlock::Image {
+fn content_to_block(c: &rmcp::model::ContentBlock) -> McpContentBlock {
+    use rmcp::model::ContentBlock;
+    match c {
+        ContentBlock::Text(t) => McpContentBlock::Text(t.text.clone()),
+        ContentBlock::Image(i) => McpContentBlock::Image {
             data: i.data.clone(),
             mime_type: i.mime_type.clone(),
         },
-        RawContent::Audio(a) => McpContentBlock::Audio {
+        ContentBlock::Audio(a) => McpContentBlock::Audio {
             data: a.data.clone(),
             mime_type: a.mime_type.clone(),
         },
-        RawContent::Resource(r) => resource_contents_to_block(&r.resource),
-        RawContent::ResourceLink(l) => McpContentBlock::Resource {
+        ContentBlock::Resource(r) => resource_contents_to_block(&r.resource),
+        ContentBlock::ResourceLink(l) => McpContentBlock::Resource {
             uri: l.uri.clone(),
             mime_type: l.mime_type.clone(),
             text: None,
             blob: None,
         },
+        _ => McpContentBlock::Text(String::new()),
     }
 }
 
@@ -1157,27 +1158,12 @@ fn resource_contents_to_block(c: &ResourceContents) -> McpContentBlock {
             text: None,
             blob: Some(blob.clone()),
         },
+        _ => McpContentBlock::Text(String::new()),
     }
 }
 
 fn prompt_message_to_block(m: &rmcp::model::PromptMessage) -> McpContentBlock {
-    use rmcp::model::PromptMessageContent;
-    match &m.content {
-        PromptMessageContent::Text { text } => McpContentBlock::Text(text.clone()),
-        PromptMessageContent::Image { image } => McpContentBlock::Image {
-            data: image.data.clone(),
-            mime_type: image.mime_type.clone(),
-        },
-        PromptMessageContent::Resource { resource } => {
-            resource_contents_to_block(&resource.resource)
-        }
-        PromptMessageContent::ResourceLink { link } => McpContentBlock::Resource {
-            uri: link.uri.clone(),
-            mime_type: link.mime_type.clone(),
-            text: None,
-            blob: None,
-        },
-    }
+    content_to_block(&m.content)
 }
 
 fn one_line(s: &str) -> String {
@@ -1208,8 +1194,8 @@ fn truncate(s: &str) -> String {
 pub mod testsupport {
     use super::*;
     use rmcp::model::{
-        CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResult, ContentBlock, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
     };
     use rmcp::service::RequestContext;
     use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
@@ -1260,12 +1246,12 @@ pub mod testsupport {
                         .and_then(|a| a.get("msg"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    Ok(CallToolResult::success(vec![Content::text(format!(
+                    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "echo: {msg}"
                     ))]))
                 }
-                "boom" => Ok(CallToolResult::error(vec![Content::text("kaboom")])),
-                other => Ok(CallToolResult::error(vec![Content::text(format!(
+                "boom" => Ok(CallToolResult::error(vec![ContentBlock::text("kaboom")])),
+                other => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "unknown tool {other}"
                 ))])),
             }
@@ -1551,7 +1537,7 @@ mod tests {
     fn tool_result_preserves_image_and_audio_blocks() {
         use rmcp::model::{CallToolResult, Content};
         let result = CallToolResult::success(vec![
-            Content::text("a caption"),
+            ContentBlock::text("a caption"),
             Content::image("aGVsbG8=", "image/png"),
         ]);
         let outcome = tool_result_to_outcome(result);
