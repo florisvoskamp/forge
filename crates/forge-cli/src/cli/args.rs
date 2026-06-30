@@ -112,6 +112,41 @@ pub(crate) enum LocalCmd {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum ProviderCmd {
+    /// Register a custom OpenAI-compatible endpoint (LM Studio, vLLM, llama.cpp `--server`,
+    /// text-generation-webui, a local/proxy server, …) so its models join discovery + routing.
+    /// Writes a `[[providers.custom]]` block to your user config; active next session.
+    Add {
+        /// Namespace used in model ids and as the provider name (e.g. `lmstudio`). [A-Za-z0-9_-].
+        #[arg(long)]
+        namespace: String,
+        /// Full base URL of the OpenAI-compatible server (e.g. `http://localhost:1234/v1`).
+        #[arg(long)]
+        base_url: String,
+        /// Env var holding the API key. Omit for a keyless local server.
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// Mark this endpoint's models as genuinely free (e.g. a local server).
+        #[arg(long)]
+        free: bool,
+        /// Explicit model id to seed (repeatable). Omit to discover live via `/v1/models`.
+        #[arg(long = "model")]
+        models: Vec<String>,
+        /// Human label shown in `forge provider list`.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List providers: built-in custom endpoints, your runtime-registered ones, and any
+    /// scaffolded-but-not-yet-wired enterprise gateways (with the reason).
+    List,
+    /// Remove a runtime-registered custom provider by namespace (built-ins can't be removed).
+    Remove {
+        /// The namespace to remove.
+        namespace: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum AssayCmd {
     /// List past assay runs (newest first).
     List,
@@ -301,7 +336,8 @@ pub(crate) enum Command {
     /// limits). `--replace` overwrites with a single key, `--list` shows how many are stored,
     /// `--remove` deletes them all.
     Auth {
-        /// Provider: anthropic, openai, gemini, groq, nvidia, sambanova, mistral, openrouter, …
+        /// Provider: anthropic, openai, gemini, groq, nvidia, sambanova, mistral, openrouter,
+        /// together, fireworks, perplexity, bedrock, vertex, …
         provider: String,
         /// Delete all stored keys for this provider instead of setting one.
         #[arg(long)]
@@ -312,6 +348,13 @@ pub(crate) enum Command {
         /// Replace all stored keys with the single key read from stdin (instead of appending).
         #[arg(long)]
         replace: bool,
+    },
+    /// Manage custom OpenAI-compatible providers (LM Studio, vLLM, llama.cpp, proxies, …): register
+    /// a runtime endpoint, list providers, or remove one. Complements `forge auth` (which stores
+    /// keys); this declares the endpoint itself.
+    Provider {
+        #[command(subcommand)]
+        cmd: ProviderCmd,
     },
     /// Guided first-run setup: enable providers (enter API keys), declare which subscription plan
     /// backs each installed CLI bridge, and optionally install a local LLM that fits this machine.

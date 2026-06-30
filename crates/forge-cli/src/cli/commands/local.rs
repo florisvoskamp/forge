@@ -86,6 +86,11 @@ pub(crate) fn provider_label(provider: &str) -> &'static str {
         "mimo" => "Xiaomi MiMo — free",
         "minimax" => "MiniMax — free tier",
         "cohere" => "Cohere — Command A (218B), free trial tier",
+        "bedrock" => "AWS Bedrock — enterprise (Bedrock API key; pin model ids)",
+        "vertex" => "Google Vertex AI — enterprise (needs VERTEX_PROJECT_ID; pin model ids)",
+        "together" => "Together AI — gateway (OSS frontier, metered)",
+        "fireworks" => "Fireworks AI — gateway (fast OSS, metered)",
+        "perplexity" => "Perplexity — Sonar (online + reasoning, metered)",
         // Custom OpenAI-compatible providers carry their label in the registry.
         other => forge_config::custom_provider(other)
             .map(|p| p.label)

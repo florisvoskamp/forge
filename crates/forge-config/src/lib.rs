@@ -109,6 +109,52 @@ pub struct Config {
     /// User-configurable keybind map (action → key combo). Defaults to the built-in map.
     #[serde(default)]
     pub keybinds: KeybindsConfig,
+    /// Runtime-registered providers: custom OpenAI-compatible endpoints (LM Studio, vLLM, llama.cpp
+    /// `--server`, text-generation-webui, local/proxy servers) the user adds without recompiling.
+    /// Merged with the built-in [`CUSTOM_OPENAI_PROVIDERS`] at startup so they participate in
+    /// discovery + routing identically. Empty = inert.
+    #[serde(default)]
+    pub providers: ProvidersConfig,
+}
+
+/// `[providers]` config block. Today just custom OpenAI-compatible endpoints; a home for future
+/// runtime provider registration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProvidersConfig {
+    /// Each `[[providers.custom]]` entry registers one OpenAI-compatible endpoint at runtime.
+    #[serde(default)]
+    pub custom: Vec<CustomProviderConfig>,
+}
+
+/// One user-declared `[[providers.custom]]` endpoint. Mirrors a [`CustomProvider`] row but owned and
+/// deserializable; converted (with validation + endpoint normalization) into the static registry at
+/// startup. Example:
+/// ```toml
+/// [[providers.custom]]
+/// namespace = "lmstudio"
+/// base_url  = "http://localhost:1234/v1"   # trailing /v1 or /v1/ both accepted
+/// api_key_env = "LMSTUDIO_API_KEY"          # optional — omit for a keyless local server
+/// free = true                                # optional (default false)
+/// models = ["qwen2.5-coder-32b"]            # optional — else discovered via /v1/models
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomProviderConfig {
+    /// The `provider::` namespace in model ids and the `forge provider` name.
+    pub namespace: String,
+    /// Full base URL of the OpenAI-compatible server (the part before `chat/completions`).
+    pub base_url: String,
+    /// Env var holding the API key. Omit for a keyless local server (a placeholder is sent).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Whether this endpoint's models are genuinely free to call (e.g. a local server).
+    #[serde(default)]
+    pub free: bool,
+    /// Explicit model ids (bare, no namespace). Empty → discover live via `/v1/models`.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Human label shown in `forge provider list`. Optional.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// When a hook fires.
@@ -1474,6 +1520,7 @@ impl Default for Config {
             self_mcp: false,
             statusline: StatuslineConfig::default(),
             keybinds: KeybindsConfig::default(),
+            providers: ProvidersConfig::default(),
         }
     }
 }
@@ -2348,7 +2395,33 @@ const PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("mimo", "MIMO_API_KEY"),               // Xiaomi MiMo
     ("minimax", "MINIMAX_API_KEY"),
     ("cohere", "COHERE_API_KEY"), // native adapter — Command A (218B), free trial tier
+    // Enterprise gateways with a NATIVE genai 0.6 adapter (Bearer/key auth). They route fine but are
+    // marked non-listable in `forge-provider::is_discoverable` (no enumerable models endpoint for our
+    // flow) so discovery skips them quietly; users pin `bedrock::…` / `vertex::…` model ids.
+    //   • Bedrock → genai's `bedrock_api` adapter (`forge-provider::normalize_namespace` maps it).
+    //     AWS Bedrock Converse with a long-lived Bedrock API key (Bearer). SigV4 auth is NOT wired.
+    //   • Vertex → genai's `vertex` adapter. ALSO needs `VERTEX_PROJECT_ID` (+ optional
+    //     `VERTEX_LOCATION`) exported in the environment — genai reads those directly; Forge only
+    //     manages the `VERTEX_API_KEY`. See docs / `forge provider list`.
+    ("bedrock", "BEDROCK_API_KEY"),
+    ("vertex", "VERTEX_API_KEY"),
 ];
+
+/// Enterprise gateways Forge has config/CLI scaffolding for but CANNOT route to with the pinned genai
+/// version — shown by `forge provider list` with the reason, never entered into routing (honest: not
+/// faked). `(namespace, why)`.
+///
+/// • Azure OpenAI: genai 0.6.5 has no Azure adapter, and Azure's deployment-scoped URL
+///   (`/openai/deployments/<deployment>/chat/completions?api-version=…`) + `api-key` header can't be
+///   expressed through the OpenAI custom-endpoint resolver (which targets `<base>chat/completions`
+///   with a Bearer token). Workaround today: front Azure with an OpenAI-compatible proxy and register
+///   it via `forge provider add --namespace azure --base-url <proxy-url>`.
+pub const UNWIRED_ENTERPRISE_PROVIDERS: &[(&str, &str)] = &[(
+    "azure",
+    "Azure OpenAI — not wired: genai 0.6.5 has no Azure adapter (deployment URL + api-version + \
+     api-key header aren't expressible via the OpenAI custom-endpoint resolver). Front it with an \
+     OpenAI-compatible proxy and run `forge provider add --namespace azure --base-url <proxy>`.",
+)];
 
 /// An OpenAI-compatible API provider that genai has **no native adapter** for. Forge reaches it
 /// by retargeting genai's OpenAI adapter at `endpoint` with the key from `env_var` (see the
@@ -2428,18 +2501,345 @@ pub const CUSTOM_OPENAI_PROVIDERS: &[CustomProvider] = &[
             "magistral-medium-latest",
         ],
     },
+    // Popular OSS gateways — all OpenAI-compatible, reached via the same custom resolver. Paid
+    // (metered), so `free: false`: priced-by-token, not a standing free tier.
+    CustomProvider {
+        namespace: "together",
+        endpoint: "https://api.together.xyz/v1/",
+        env_var: "TOGETHER_API_KEY",
+        free: false,
+        label: "Together AI — gateway (OSS frontier, metered)",
+        seed_models: &[
+            "deepseek-ai/DeepSeek-V3",
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "Qwen/Qwen2.5-Coder-32B-Instruct",
+        ],
+    },
+    CustomProvider {
+        namespace: "fireworks",
+        endpoint: "https://api.fireworks.ai/inference/v1/",
+        env_var: "FIREWORKS_API_KEY",
+        free: false,
+        label: "Fireworks AI — gateway (fast OSS, metered)",
+        seed_models: &[
+            "accounts/fireworks/models/deepseek-v3",
+            "accounts/fireworks/models/llama-v3p3-70b-instruct",
+            "accounts/fireworks/models/qwen2p5-coder-32b-instruct",
+        ],
+    },
+    CustomProvider {
+        namespace: "perplexity",
+        endpoint: "https://api.perplexity.ai/",
+        env_var: "PERPLEXITY_API_KEY",
+        free: false,
+        label: "Perplexity — Sonar (online + reasoning, metered)",
+        seed_models: &[
+            "sonar",
+            "sonar-pro",
+            "sonar-reasoning",
+            "sonar-reasoning-pro",
+        ],
+    },
 ];
 
-/// The custom OpenAI-compatible provider registered under `namespace`, if any.
+/// Owned form of a runtime-registered custom provider (from a `[[providers.custom]]` block), after
+/// validation + endpoint normalization. Leaked into a `'static` [`CustomProvider`] by
+/// [`build_custom_registry`] so it joins the built-ins transparently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeCustomProvider {
+    pub namespace: String,
+    pub endpoint: String,
+    /// Env var holding the key; `""` = keyless (a placeholder is sent by the provider client).
+    pub env_var: String,
+    pub free: bool,
+    pub label: String,
+    pub seed_models: Vec<String>,
+}
+
+/// The merged custom-provider registry: built-in [`CUSTOM_OPENAI_PROVIDERS`] + any runtime
+/// `[[providers.custom]]` entries. Initialized once (lazily from config, or explicitly via
+/// [`register_custom_providers`]) and then immutable for the process — matching the build-once
+/// nature of the genai client and the const it replaces.
+static CUSTOM_PROVIDER_REGISTRY: std::sync::OnceLock<Vec<CustomProvider>> =
+    std::sync::OnceLock::new();
+
+/// The active custom-provider registry. On first access, lazily merges the built-ins with the
+/// runtime `[[providers.custom]]` entries read from the loaded config (zero call-site wiring), unless
+/// [`register_custom_providers`] already seeded it. Process-lifetime `'static`.
+fn custom_provider_registry() -> &'static [CustomProvider] {
+    CUSTOM_PROVIDER_REGISTRY
+        .get_or_init(|| build_custom_registry(&load_runtime_custom_providers()))
+        .as_slice()
+}
+
+/// Read + validate the runtime `[[providers.custom]]` entries from the loaded config. Best-effort:
+/// a malformed entry is skipped (logged), never fatal.
+fn load_runtime_custom_providers() -> Vec<RuntimeCustomProvider> {
+    let custom = load().map(|c| c.providers.custom).unwrap_or_default();
+    custom
+        .into_iter()
+        .filter_map(|c| match c.clone().into_runtime() {
+            Ok(rp) => Some(rp),
+            Err(e) => {
+                tracing::warn!(
+                    "ignoring invalid [[providers.custom]] '{}': {e}",
+                    c.namespace
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+/// Merge built-in custom providers with `runtime` ones, leaking the owned runtime strings to
+/// `'static`. A runtime entry whose namespace collides with a built-in custom provider OR a native
+/// adapter is dropped — built-ins always win, so a config typo can't shadow a first-class provider.
+fn build_custom_registry(runtime: &[RuntimeCustomProvider]) -> Vec<CustomProvider> {
+    let mut out: Vec<CustomProvider> = CUSTOM_OPENAI_PROVIDERS.to_vec();
+    for rp in runtime {
+        let collides = out.iter().any(|p| p.namespace == rp.namespace)
+            || PROVIDER_ENV_VARS.iter().any(|(n, _)| *n == rp.namespace);
+        if collides {
+            tracing::warn!(
+                "[[providers.custom]] '{}' collides with a built-in provider — ignored",
+                rp.namespace
+            );
+            continue;
+        }
+        let seeds: Vec<&'static str> = rp.seed_models.iter().cloned().map(leak_str).collect();
+        let label = if rp.label.is_empty() {
+            format!("{} — custom OpenAI endpoint", rp.namespace)
+        } else {
+            rp.label.clone()
+        };
+        out.push(CustomProvider {
+            namespace: leak_str(rp.namespace.clone()),
+            endpoint: leak_str(rp.endpoint.clone()),
+            env_var: leak_str(rp.env_var.clone()),
+            free: rp.free,
+            label: leak_str(label),
+            seed_models: Box::leak(seeds.into_boxed_slice()),
+        });
+    }
+    out
+}
+
+/// Leak a `String` to `&'static str`. Only ever called on the bounded, build-once provider registry
+/// (a few entries for the whole process), so the leak is intentional and negligible.
+fn leak_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// Explicitly seed the custom-provider registry (built-ins + `runtime`). No-op if already
+/// initialized (lazily or by a prior call). Primarily for tests / explicit startup wiring; normal
+/// runs initialize lazily from config on first [`custom_provider`]/[`custom_providers`] access.
+pub fn register_custom_providers(runtime: &[RuntimeCustomProvider]) {
+    let _ = CUSTOM_PROVIDER_REGISTRY.set(build_custom_registry(runtime));
+}
+
+/// The custom OpenAI-compatible provider registered under `namespace` (built-in or runtime), if any.
 pub fn custom_provider(namespace: &str) -> Option<&'static CustomProvider> {
-    CUSTOM_OPENAI_PROVIDERS
+    custom_provider_registry()
         .iter()
         .find(|p| p.namespace == namespace)
 }
 
-/// All custom OpenAI-compatible providers (no native genai adapter).
+/// All custom OpenAI-compatible providers (built-in + runtime-registered).
 pub fn custom_providers() -> impl Iterator<Item = &'static CustomProvider> {
-    CUSTOM_OPENAI_PROVIDERS.iter()
+    custom_provider_registry().iter()
+}
+
+/// Normalize an OpenAI-compatible base URL to the form the resolver + `/models` listing expect: a
+/// trailing slash (so `{endpoint}models` / `{endpoint}chat/completions` join correctly). Accepts
+/// `http://h/v1` and `http://h/v1/` identically.
+pub fn normalize_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    if trimmed.ends_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
+impl CustomProviderConfig {
+    /// Validate + normalize into a [`RuntimeCustomProvider`]. Rejects an empty/odd namespace or a
+    /// non-HTTP base URL; an absent `api_key_env` means keyless (`env_var = ""`).
+    pub fn into_runtime(self) -> Result<RuntimeCustomProvider, String> {
+        let namespace = self.namespace.trim().to_string();
+        if namespace.is_empty()
+            || !namespace
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!(
+                "namespace '{namespace}' must be non-empty and only [A-Za-z0-9_-]"
+            ));
+        }
+        let endpoint = normalize_endpoint(&self.base_url);
+        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+            return Err(format!(
+                "base_url '{}' must start with http(s)://",
+                self.base_url
+            ));
+        }
+        let env_var = self
+            .api_key_env
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        Ok(RuntimeCustomProvider {
+            namespace,
+            endpoint,
+            env_var,
+            free: self.free,
+            label: self.label.unwrap_or_default(),
+            seed_models: self
+                .models
+                .into_iter()
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty())
+                .collect(),
+        })
+    }
+}
+
+/// Persist a `[[providers.custom]]` block to the user `config.toml`, replacing any existing entry
+/// with the same namespace and preserving every other key. Validates first (so a bad endpoint fails
+/// before writing) and that the whole file still extracts to a [`Config`]. Returns the path written.
+/// Active on the next session start (the registry is build-once per process).
+pub fn add_custom_provider(p: &CustomProviderConfig) -> Result<PathBuf, ConfigError> {
+    let dir = config_dir().ok_or(ConfigError::NoConfigDir)?;
+    std::fs::create_dir_all(&dir).map_err(|e| ConfigError::Write(e.to_string()))?;
+    let path = dir.join("config.toml");
+    add_custom_provider_at(&path, p)?;
+    Ok(path)
+}
+
+/// The file half of [`add_custom_provider`] against an explicit path — split out so it's testable
+/// without touching the real per-user config directory (mirrors `write_subscriptions_at`).
+fn add_custom_provider_at(
+    path: &std::path::Path,
+    p: &CustomProviderConfig,
+) -> Result<(), ConfigError> {
+    // Validate the entry (and that it doesn't collide with a native/built-in provider).
+    let rp = p.clone().into_runtime().map_err(ConfigError::Write)?;
+    if PROVIDER_ENV_VARS.iter().any(|(n, _)| *n == rp.namespace)
+        || CUSTOM_OPENAI_PROVIDERS
+            .iter()
+            .any(|c| c.namespace == rp.namespace)
+    {
+        return Err(ConfigError::Write(format!(
+            "'{}' is a built-in provider — pick another namespace",
+            rp.namespace
+        )));
+    }
+    let mut root: toml::Table = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+
+    let providers = root
+        .entry("providers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !providers.is_table() {
+        *providers = toml::Value::Table(toml::Table::new());
+    }
+    let custom = providers
+        .as_table_mut()
+        .unwrap()
+        .entry("custom".to_string())
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    if !custom.is_array() {
+        *custom = toml::Value::Array(Vec::new());
+    }
+    let arr = custom.as_array_mut().unwrap();
+    arr.retain(|v| v.get("namespace").and_then(|n| n.as_str()) != Some(rp.namespace.as_str()));
+
+    let mut entry = toml::Table::new();
+    entry.insert(
+        "namespace".into(),
+        toml::Value::String(rp.namespace.clone()),
+    );
+    entry.insert(
+        "base_url".into(),
+        toml::Value::String(p.base_url.trim().to_string()),
+    );
+    if let Some(env) = &p.api_key_env {
+        if !env.trim().is_empty() {
+            entry.insert(
+                "api_key_env".into(),
+                toml::Value::String(env.trim().to_string()),
+            );
+        }
+    }
+    if p.free {
+        entry.insert("free".into(), toml::Value::Boolean(true));
+    }
+    if !rp.seed_models.is_empty() {
+        entry.insert(
+            "models".into(),
+            toml::Value::Array(
+                rp.seed_models
+                    .iter()
+                    .cloned()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(label) = &p.label {
+        if !label.trim().is_empty() {
+            entry.insert(
+                "label".into(),
+                toml::Value::String(label.trim().to_string()),
+            );
+        }
+    }
+    arr.push(toml::Value::Table(entry));
+
+    let body = toml::to_string_pretty(&root).map_err(|e| ConfigError::Write(e.to_string()))?;
+    Figment::from(Serialized::defaults(Config::default()))
+        .merge(Toml::string(&body))
+        .extract::<Config>()
+        .map_err(|e| ConfigError::Write(format!("invalid config after add: {e}")))?;
+    std::fs::write(path, body).map_err(|e| ConfigError::Write(e.to_string()))?;
+    Ok(())
+}
+
+/// Remove a user-registered `[[providers.custom]]` entry by namespace from the user `config.toml`.
+/// `Ok(true)` if one was removed, `Ok(false)` if absent (idempotent). Built-ins can't be removed.
+pub fn remove_custom_provider(namespace: &str) -> Result<bool, ConfigError> {
+    let dir = config_dir().ok_or(ConfigError::NoConfigDir)?;
+    let path = dir.join("config.toml");
+    remove_custom_provider_at(&path, namespace)
+}
+
+fn remove_custom_provider_at(path: &std::path::Path, namespace: &str) -> Result<bool, ConfigError> {
+    let Some(text) = std::fs::read_to_string(path).ok() else {
+        return Ok(false);
+    };
+    let mut root: toml::Table = text.parse().unwrap_or_default();
+    let mut removed = false;
+    if let Some(arr) = root
+        .get_mut("providers")
+        .and_then(|p| p.as_table_mut())
+        .and_then(|p| p.get_mut("custom"))
+        .and_then(|c| c.as_array_mut())
+    {
+        let before = arr.len();
+        arr.retain(|v| v.get("namespace").and_then(|n| n.as_str()) != Some(namespace));
+        removed = arr.len() != before;
+    }
+    if removed {
+        let body = toml::to_string_pretty(&root).map_err(|e| ConfigError::Write(e.to_string()))?;
+        std::fs::write(path, body).map_err(|e| ConfigError::Write(e.to_string()))?;
+    }
+    Ok(removed)
+}
+
+/// The user-declared `[[providers.custom]]` entries from config (for `forge provider list`). Empty if
+/// none / unreadable. Distinct from [`custom_providers`], which also includes the built-ins.
+pub fn user_custom_providers() -> Vec<CustomProviderConfig> {
+    load().map(|c| c.providers.custom).unwrap_or_default()
 }
 
 // Search-API providers for the `web_search` tool. Kept separate from PROVIDER_ENV_VARS so
@@ -2547,16 +2947,20 @@ fn env_var_for(provider: &str) -> Option<&'static str> {
         .iter()
         .find(|(name, _)| *name == provider)
         .map(|(_, var)| *var)
-        .or_else(|| custom_provider(provider).map(|p| p.env_var))
+        // A custom provider with an empty `env_var` is KEYLESS (local server) — `None` here makes
+        // `has_api_key` treat it as not-key-blocked and `api_key` return `Ok("")` without erroring.
+        .or_else(|| {
+            custom_provider(provider).and_then(|p| (!p.env_var.is_empty()).then_some(p.env_var))
+        })
 }
 
 /// Provider names Forge knows how to authenticate (for `forge auth` validation/help). Includes
-/// both native-adapter providers and the custom OpenAI-compatible registry.
+/// native-adapter providers and the custom OpenAI-compatible registry (built-in + runtime).
 pub fn known_key_providers() -> impl Iterator<Item = &'static str> {
     PROVIDER_ENV_VARS
         .iter()
         .map(|(name, _)| *name)
-        .chain(CUSTOM_OPENAI_PROVIDERS.iter().map(|p| p.namespace))
+        .chain(custom_provider_registry().iter().map(|p| p.namespace))
 }
 
 /// Conventional / legacy env-var aliases accepted IN ADDITION to the canonical name in
@@ -2659,12 +3063,15 @@ const MAX_NUMBERED_KEY_ENV: u8 = 16;
 /// [`env_var_for`]; the provider client uses it to map a genai `AuthData::FromEnv` back to a
 /// provider so it can substitute a rotated key. Aliases canonicalize to the primary var.
 pub fn provider_for_env_var(var: &str) -> Option<&'static str> {
+    if var.is_empty() {
+        return None; // keyless custom providers carry an empty env_var — never match on it
+    }
     PROVIDER_ENV_VARS
         .iter()
         .find(|(_, v)| *v == var)
         .map(|(p, _)| *p)
         .or_else(|| {
-            CUSTOM_OPENAI_PROVIDERS
+            custom_provider_registry()
                 .iter()
                 .find(|p| p.env_var == var)
                 .map(|p| p.namespace)
@@ -2744,11 +3151,12 @@ pub fn load_secret(key: &str) -> Option<String> {
 /// Best-effort — providers without a stored key are simply left unset.
 pub fn inject_provider_keys() {
     let native = PROVIDER_ENV_VARS.iter().copied();
-    let custom = CUSTOM_OPENAI_PROVIDERS
+    let custom = custom_provider_registry()
         .iter()
         .map(|p| (p.namespace, p.env_var));
     for (provider, var) in native.chain(custom) {
-        if env_set(var) {
+        // Keyless custom providers (local servers) carry an empty env_var — nothing to inject.
+        if var.is_empty() || env_set(var) {
             continue;
         }
         // A conventional alias the user exported (e.g. OPENROUTER_API_KEY) → copy into the
@@ -3398,5 +3806,205 @@ reason = "no privilege escalation"
                 StatuslineWidget::Mode,
             ]
         );
+    }
+
+    // --- Runtime custom OpenAI-compatible providers ---
+
+    #[test]
+    fn custom_provider_config_parses_normalizes_and_keyless() {
+        // A keyless local server (no api_key_env): base_url without trailing slash gets one;
+        // env_var becomes "" (keyless).
+        let toml_src = r#"
+            [[providers.custom]]
+            namespace = "lmstudio"
+            base_url  = "http://localhost:1234/v1"
+            free = true
+            models = ["qwen2.5-coder-32b", "  ", "llama-3.3-70b"]
+        "#;
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml_src))
+            .extract()
+            .unwrap();
+        assert_eq!(cfg.providers.custom.len(), 1);
+        let rp = cfg.providers.custom[0].clone().into_runtime().unwrap();
+        assert_eq!(rp.namespace, "lmstudio");
+        assert_eq!(
+            rp.endpoint, "http://localhost:1234/v1/",
+            "trailing slash added"
+        );
+        assert_eq!(rp.env_var, "", "no api_key_env → keyless");
+        assert!(rp.free);
+        assert_eq!(rp.seed_models, vec!["qwen2.5-coder-32b", "llama-3.3-70b"]);
+    }
+
+    #[test]
+    fn custom_provider_config_rejects_bad_namespace_and_url() {
+        let bad_ns = CustomProviderConfig {
+            namespace: "has space".into(),
+            base_url: "http://x/v1".into(),
+            api_key_env: None,
+            free: false,
+            models: vec![],
+            label: None,
+        };
+        assert!(bad_ns.into_runtime().is_err());
+        let bad_url = CustomProviderConfig {
+            namespace: "x".into(),
+            base_url: "localhost:1234".into(),
+            api_key_env: None,
+            free: false,
+            models: vec![],
+            label: None,
+        };
+        assert!(bad_url.into_runtime().is_err());
+    }
+
+    #[test]
+    fn build_custom_registry_merges_builtins_with_runtime_and_drops_collisions() {
+        let runtime = vec![
+            RuntimeCustomProvider {
+                namespace: "lmstudio".into(),
+                endpoint: "http://localhost:1234/v1/".into(),
+                env_var: "".into(),
+                free: true,
+                label: "".into(),
+                seed_models: vec!["local-model".into()],
+            },
+            // Collides with a built-in custom provider — must be dropped, built-in wins.
+            RuntimeCustomProvider {
+                namespace: "cerebras".into(),
+                endpoint: "http://evil/".into(),
+                env_var: "X".into(),
+                free: false,
+                label: "".into(),
+                seed_models: vec![],
+            },
+            // Collides with a NATIVE provider — also dropped.
+            RuntimeCustomProvider {
+                namespace: "openai".into(),
+                endpoint: "http://evil/".into(),
+                env_var: "X".into(),
+                free: false,
+                label: "".into(),
+                seed_models: vec![],
+            },
+        ];
+        let reg = build_custom_registry(&runtime);
+        let find = |ns: &str| reg.iter().find(|p| p.namespace == ns);
+        // Built-ins present (discovery iterates exactly this list).
+        assert!(find("cerebras").is_some());
+        assert!(find("together").is_some());
+        // The runtime keyless local server merged in with a synthesized label + normalized endpoint.
+        let lm = find("lmstudio").expect("runtime provider merged into registry");
+        assert_eq!(lm.endpoint, "http://localhost:1234/v1/");
+        assert_eq!(lm.env_var, "");
+        assert!(lm.free);
+        assert!(lm.label.contains("lmstudio"));
+        assert_eq!(lm.seed_models, &["local-model"]);
+        // The cerebras collision did NOT overwrite the built-in endpoint.
+        assert_eq!(
+            find("cerebras").unwrap().endpoint,
+            "https://api.cerebras.ai/v1/"
+        );
+        // The native-provider collision was rejected (not added as a custom row).
+        assert!(find("openai").is_none());
+    }
+
+    #[test]
+    fn together_fireworks_perplexity_rows_resolve() {
+        for (ns, ep) in [
+            ("together", "https://api.together.xyz/v1/"),
+            ("fireworks", "https://api.fireworks.ai/inference/v1/"),
+            ("perplexity", "https://api.perplexity.ai/"),
+        ] {
+            let cp = custom_provider(ns).unwrap_or_else(|| panic!("{ns} missing"));
+            assert_eq!(cp.endpoint, ep);
+            assert!(!cp.seed_models.is_empty());
+        }
+        // These are paid gateways, not standing free tiers.
+        assert!(!custom_provider("together").unwrap().free);
+    }
+
+    #[test]
+    fn bedrock_and_vertex_are_native_keyed_providers() {
+        let known: Vec<_> = known_key_providers().collect();
+        assert!(known.contains(&"bedrock"));
+        assert!(known.contains(&"vertex"));
+        assert_eq!(env_var_for("bedrock"), Some("BEDROCK_API_KEY"));
+        assert_eq!(env_var_for("vertex"), Some("VERTEX_API_KEY"));
+        assert_eq!(provider_for_env_var("BEDROCK_API_KEY"), Some("bedrock"));
+        assert_eq!(provider_for_env_var("VERTEX_API_KEY"), Some("vertex"));
+    }
+
+    #[test]
+    fn keyless_custom_provider_is_not_key_blocked() {
+        // env_var_for is None for an empty env var → has_api_key treats it as not-blocked, and the
+        // reverse map never matches the empty string.
+        let reg = build_custom_registry(&[RuntimeCustomProvider {
+            namespace: "lmstudio".into(),
+            endpoint: "http://localhost:1234/v1/".into(),
+            env_var: "".into(),
+            free: true,
+            label: "".into(),
+            seed_models: vec![],
+        }]);
+        let lm = reg.iter().find(|p| p.namespace == "lmstudio").unwrap();
+        assert!(lm.env_var.is_empty());
+        assert_eq!(provider_for_env_var(""), None);
+    }
+
+    #[test]
+    fn add_and_remove_custom_provider_round_trips_through_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let p = CustomProviderConfig {
+            namespace: "lmstudio".into(),
+            base_url: "http://localhost:1234/v1".into(),
+            api_key_env: Some("LMSTUDIO_API_KEY".into()),
+            free: true,
+            models: vec!["qwen2.5-coder-32b".into()],
+            label: None,
+        };
+        add_custom_provider_at(&path, &p).unwrap();
+        // The written file parses back into a Config with the entry intact.
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::file(&path))
+            .extract()
+            .unwrap();
+        assert_eq!(cfg.providers.custom.len(), 1);
+        assert_eq!(cfg.providers.custom[0].namespace, "lmstudio");
+        assert_eq!(cfg.providers.custom[0].base_url, "http://localhost:1234/v1");
+
+        // Adding the same namespace again replaces (no duplicate).
+        add_custom_provider_at(&path, &p).unwrap();
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::file(&path))
+            .extract()
+            .unwrap();
+        assert_eq!(
+            cfg.providers.custom.len(),
+            1,
+            "same namespace replaced, not duplicated"
+        );
+
+        // A built-in namespace is rejected.
+        let collide = CustomProviderConfig {
+            namespace: "cerebras".into(),
+            ..p.clone()
+        };
+        assert!(add_custom_provider_at(&path, &collide).is_err());
+
+        // Remove is idempotent.
+        assert!(remove_custom_provider_at(&path, "lmstudio").unwrap());
+        assert!(!remove_custom_provider_at(&path, "lmstudio").unwrap());
+    }
+
+    #[test]
+    fn azure_is_scaffolded_but_explicitly_unwired() {
+        let azure = UNWIRED_ENTERPRISE_PROVIDERS
+            .iter()
+            .find(|(ns, _)| *ns == "azure")
+            .expect("azure scaffolded");
+        assert!(azure.1.to_lowercase().contains("not wired"));
     }
 }

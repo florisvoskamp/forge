@@ -65,6 +65,35 @@ impl GenAiProvider {
     }
 }
 
+/// Connect-phase timeout for the shared reqwest client (DNS + TCP + TLS only). See
+/// [`build_reqwest_client`] — short because connecting should be fast, and it never truncates a long
+/// streaming body (that's response-read time, which this deliberately does not bound).
+const CONNECT_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Hard ceiling on a single model-discovery network call (`/v1/models`, genai `all_model_names`).
+/// The shared client has NO request-level timeout (it would cut off long streaming turns), so a hung
+/// `/v1/models` load balancer would otherwise stall catalog refresh / startup indefinitely. Bound it
+/// here instead — generous, well above any healthy listing response, so it's a backstop, not the
+/// primary per-provider budget the discovery loop already applies.
+const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wrap a discovery future in [`DISCOVERY_TIMEOUT`], mapping an elapse to a retryable
+/// [`ProviderError::Unavailable`] so a stalled `/v1/models` is skipped instead of hanging the caller.
+/// Bounds the WHOLE future (connect + send + body read), which a client-level `.timeout()` can't do
+/// without also truncating legitimate long streaming turns — hence this targeted wrapper.
+async fn with_discovery_timeout<T>(
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T, ProviderError>>,
+) -> Result<T, ProviderError> {
+    match tokio::time::timeout(DISCOVERY_TIMEOUT, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(ProviderError::Unavailable(format!(
+            "{what} timed out after {}s",
+            DISCOVERY_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 /// List the models a provider currently offers, as Forge `provider::model` ids, by querying the
 /// provider's models endpoint via genai (`all_model_names`). Used by the auto-discovery mesh to
 /// build a live catalog of usable models (docs/features/auto-discovery-mesh.md). The provider's
@@ -73,12 +102,16 @@ impl GenAiProvider {
 pub async fn list_models(namespace: &str) -> Result<Vec<String>, ProviderError> {
     let kind = AdapterKind::from_lower_str(normalize_namespace(namespace))
         .ok_or_else(|| ProviderError::Request(format!("no genai adapter for `{namespace}`")))?;
-    let names = Client::builder()
-        .with_reqwest(build_reqwest_client())
-        .build()
-        .all_model_names(kind, None)
-        .await
-        .map_err(|e| ProviderError::Request(e.to_string()))?;
+    // Bounded so a hung listing endpoint can't stall startup even if a caller forgets its own budget.
+    let names = with_discovery_timeout("model listing", async {
+        Client::builder()
+            .with_reqwest(build_reqwest_client())
+            .build()
+            .all_model_names(kind, None)
+            .await
+            .map_err(|e| ProviderError::Request(e.to_string()))
+    })
+    .await?;
     // Re-namespace with Forge's provider name (so `openrouter` stays `openrouter::…`).
     Ok(names
         .into_iter()
@@ -97,34 +130,43 @@ pub async fn list_models(namespace: &str) -> Result<Vec<String>, ProviderError> 
 pub async fn list_custom_models(namespace: &str) -> Result<Vec<String>, ProviderError> {
     let cp = forge_config::custom_provider(namespace)
         .ok_or_else(|| ProviderError::Request(format!("`{namespace}` is not a custom provider")))?;
-    let key = forge_config::api_key(namespace).map_err(|e| ProviderError::Auth(e.to_string()))?;
+    // A keyless local server (LM Studio / llama.cpp / vLLM with no auth) has no key — send a
+    // placeholder bearer it ignores, so its `/v1/models` is still enumerable. Keyed providers use
+    // their real key (env or keyring).
+    let key = match forge_config::api_key(namespace) {
+        Ok(k) if !k.is_empty() => k,
+        _ => LOCAL_PLACEHOLDER_KEY.to_string(),
+    };
     let url = format!("{}models", cp.endpoint);
-    let resp = build_reqwest_client()
-        .get(&url)
-        .bearer_auth(&key)
-        .send()
-        .await
-        .map_err(|e| ProviderError::Request(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(ProviderError::Request(format!(
-            "{namespace} `/models` returned HTTP {}",
-            resp.status()
-        )));
-    }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| ProviderError::Request(e.to_string()))?;
-    let data = body
-        .get("data")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| ProviderError::Request(format!("{namespace} `/models`: no `data` array")))?;
-    Ok(data
-        .iter()
-        .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
-        .map(|id| format!("{namespace}::{id}"))
-        .filter(|id| !forge_config::is_non_chat_model(id))
-        .collect())
+    // Bound the whole call so a hung load balancer can't stall catalog refresh / startup.
+    with_discovery_timeout(&format!("{namespace} `/models` listing"), async move {
+        let resp = build_reqwest_client()
+            .get(&url)
+            .bearer_auth(&key)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Request(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(ProviderError::Request(format!(
+                "{namespace} `/models` returned HTTP {}",
+                resp.status()
+            )));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Request(e.to_string()))?;
+        let data = body.get("data").and_then(|d| d.as_array()).ok_or_else(|| {
+            ProviderError::Request(format!("{namespace} `/models`: no `data` array"))
+        })?;
+        Ok(data
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+            .map(|id| format!("{namespace}::{id}"))
+            .filter(|id| !forge_config::is_non_chat_model(id))
+            .collect())
+    })
+    .await
 }
 
 /// Whether `namespace` has a genai adapter that can LIST its models (i.e. [`list_models`] can work).
@@ -133,8 +175,22 @@ pub async fn list_custom_models(namespace: &str) -> Result<Vec<String>, Provider
 /// enumerated. The caller uses this to skip such providers in auto-discovery WITHOUT logging a
 /// scary "discovery failed — check your key" warning (the key is fine; they're just config-only).
 pub fn is_discoverable(namespace: &str) -> bool {
+    // Enterprise gateways have a genai adapter (so they route) but no usable model-LISTING endpoint
+    // for our flow — Bedrock/Vertex want pinned deployment ids and per-account model access, and
+    // genai can't enumerate them. Treat them like Cerebras: completion-only, skipped quietly in
+    // discovery (users pin `bedrock::…`/`vertex::…` ids) instead of logging a false "check your key".
+    if NON_LISTABLE_NATIVE.contains(&namespace) {
+        return false;
+    }
     AdapterKind::from_lower_str(normalize_namespace(namespace)).is_some()
 }
+
+/// Native providers genai can ROUTE to but not LIST (no enumerable models endpoint for our flow).
+const NON_LISTABLE_NATIVE: &[&str] = &["bedrock", "vertex"];
+
+/// Bearer token sent to keyless local OpenAI-compatible servers (LM Studio / llama.cpp / vLLM that
+/// require no auth). They ignore it; genai's OpenAI adapter just needs *some* credential present.
+const LOCAL_PLACEHOLDER_KEY: &str = "forge-local";
 
 /// Build a `reqwest::Client` with Mozilla's bundled root CAs (`webpki-root-certs`) as the sole
 /// trust store. This makes HTTPS independent of the OS certificate store so it works even on bare
@@ -155,6 +211,12 @@ fn build_reqwest_client() -> reqwest::Client {
         .tcp_nodelay(true)
         .gzip(true)
         .pool_max_idle_per_host(4)
+        // Connect-only timeout: bounds DNS + TCP + TLS so a dead/hung load balancer can't wedge a
+        // request at the connect phase forever. This is SAFE for long streaming turns — it caps only
+        // connection establishment, NOT the response body read, so a 10-minute generation is never
+        // truncated. (A whole-request `.timeout()` WOULD truncate streams, so we deliberately don't
+        // set one here; discovery calls are bounded separately by `with_discovery_timeout`.)
+        .connect_timeout(CONNECT_PHASE_TIMEOUT)
         .http2_keep_alive_interval(Some(std::time::Duration::from_secs(20)))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
         .http2_keep_alive_while_idle(true)
@@ -227,10 +289,22 @@ pub(crate) fn build_client_with(pool: std::sync::Arc<KeyPool>) -> Client {
             for cp in forge_config::custom_providers() {
                 if st.model.model_name.namespace_is(cp.namespace) {
                     let bare = st.model.model_name.namespace_and_name().1.to_string();
-                    let auth = pool
-                        .next(cp.namespace)
-                        .map(AuthData::from_single)
-                        .unwrap_or_else(|| AuthData::from_env(cp.env_var));
+                    // Auth precedence: a rotated key (≥2 configured) > the provider's env var when
+                    // set (genai reads it — fast, no keyring in the hot path; keyring keys are copied
+                    // to env by `inject_provider_keys` at startup) > a placeholder for keyless local
+                    // servers (LM Studio / llama.cpp / vLLM) so they still route. `env_var` is empty
+                    // for runtime-registered keyless providers.
+                    let auth = if let Some(key) = pool.next(cp.namespace) {
+                        AuthData::from_single(key)
+                    } else if !cp.env_var.is_empty()
+                        && std::env::var(cp.env_var)
+                            .map(|v| !v.is_empty())
+                            .unwrap_or(false)
+                    {
+                        AuthData::from_env(cp.env_var)
+                    } else {
+                        AuthData::from_single(LOCAL_PLACEHOLDER_KEY)
+                    };
                     return Ok(ServiceTarget {
                         endpoint: Endpoint::from_owned(cp.endpoint.to_string()),
                         auth,
@@ -306,11 +380,14 @@ pub(crate) fn to_genai_model(model: &str) -> String {
     }
 }
 
-/// Map a Forge provider prefix to the namespace genai expects. Identity for everything
-/// except `openrouter`, which genai spells `open_router`.
+/// Map a Forge provider prefix to the namespace genai expects. Identity for everything except
+/// `openrouter` → genai's `open_router`, and `bedrock` → genai's `bedrock_api` (the Bearer-token
+/// AWS Bedrock Converse adapter; the SigV4 variant is `bedrock_sigv4`, not wired here). `vertex`
+/// matches genai's namespace as-is.
 fn normalize_namespace(prefix: &str) -> &str {
     match prefix {
         "openrouter" => "open_router",
+        "bedrock" => "bedrock_api",
         other => other,
     }
 }
@@ -460,11 +537,16 @@ fn classify_genai_error(err: &genai::Error) -> ProviderError {
             }
             other => ProviderError::Unavailable(short(&other.to_string())),
         },
-        // Streaming path: status lives only in the message string (`...Status: 429...`).
-        genai::Error::WebStream { cause, .. } => classify_text(cause, err.to_string()),
-        genai::Error::ChatResponse { body, .. } => {
-            classify_text(&body.to_string(), err.to_string())
-        }
+        // Streaming path: genai gives no typed HTTP status, only a string. Prefer a STRUCTURED read
+        // when the cause is (or embeds) a JSON error body — classify on `error.code`/`error.status`/
+        // `error.type` instead of substring-guessing — and fall back to text scanning otherwise.
+        genai::Error::WebStream { cause, .. } => parse_embedded_json(cause)
+            .as_ref()
+            .and_then(classify_error_body)
+            .unwrap_or_else(|| classify_text(cause, err.to_string())),
+        // In-stream error event with a STRUCTURED JSON body — classify on its typed fields first.
+        genai::Error::ChatResponse { body, .. } => classify_error_body(body)
+            .unwrap_or_else(|| classify_text(&body.to_string(), err.to_string())),
         // A bad/truncated stream chunk — transient, worth trying elsewhere.
         genai::Error::StreamParse { .. } => ProviderError::Unavailable(short(&err.to_string())),
         other => {
@@ -481,6 +563,108 @@ fn classify_genai_error(err: &genai::Error) -> ProviderError {
             }
         }
     }
+}
+
+/// Classify a provider error from its STRUCTURED JSON body — the typed signal genai exposes on the
+/// `ChatResponse` stream-error path (and that some providers embed in a `WebStream` cause) — instead
+/// of substring-matching the stringified form. Reads the shapes real providers actually emit:
+///   - a numeric HTTP-ish `error.code` (OpenAI/Gemini `429`) → reuse [`classify_status`] (most
+///     reliable: the same code-based path the typed HTTP errors take);
+///   - Google's `error.status` enum (`RESOURCE_EXHAUSTED` / `UNAUTHENTICATED` / `UNAVAILABLE` / …);
+///   - OpenAI/Anthropic string `error.code` / `error.type` (`rate_limit_exceeded`,
+///     `insufficient_quota`, `rate_limit_error`, `overloaded_error`, `authentication_error`, …).
+///
+/// Returns `None` when the body isn't one of these shapes, so the caller falls back to text scanning.
+/// A provider tweaking its prose no longer silently breaks classification — the typed field still
+/// carries the signal, and the per-provider contract tests assert each shape.
+fn classify_error_body(body: &serde_json::Value) -> Option<ProviderError> {
+    let err = body.get("error").unwrap_or(body);
+    let raw = body.to_string();
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| raw.clone());
+    // Permanent incapability / payment markers win first (mirrors `classify_status`' ordering), so a
+    // "requires more credits" / "function calling not supported" body is EXCLUDED, not retried.
+    if is_capability_failure(&raw) {
+        return Some(ProviderError::Capability(short(&msg)));
+    }
+    // 1. Numeric HTTP code — delegate to the shared status classifier (handles 402/429/401/5xx/…).
+    if let Some(code) = err.get("code").and_then(json_status_code) {
+        return Some(classify_status(
+            code,
+            msg,
+            &raw,
+            parse_retry_after_body(&raw),
+        ));
+    }
+    let m = short(&msg);
+    // 2. Google RPC status enum.
+    if let Some(status) = err.get("status").and_then(|s| s.as_str()) {
+        match status {
+            "RESOURCE_EXHAUSTED" => {
+                return Some(ProviderError::RateLimited {
+                    message: m,
+                    retry_after: parse_retry_after_body(&raw).filter(|_| !quota_is_exhausted(&raw)),
+                })
+            }
+            "UNAUTHENTICATED" | "PERMISSION_DENIED" => return Some(ProviderError::Auth(m)),
+            "UNAVAILABLE" | "INTERNAL" | "DEADLINE_EXCEEDED" => {
+                return Some(ProviderError::Unavailable(m))
+            }
+            _ => {}
+        }
+    }
+    // 3. OpenAI/Anthropic string code or type.
+    let code_type = err
+        .get("code")
+        .and_then(|c| c.as_str())
+        .or_else(|| err.get("type").and_then(|t| t.as_str()));
+    if let Some(ct) = code_type {
+        let l = ct.to_lowercase();
+        if l.contains("rate_limit") || l.contains("resource_exhausted") || l.contains("overloaded")
+        {
+            return Some(ProviderError::RateLimited {
+                message: m,
+                retry_after: parse_retry_after_body(&raw),
+            });
+        }
+        if l.contains("insufficient_quota") || l.contains("billing") || l.contains("payment") {
+            return Some(ProviderError::Capability(m));
+        }
+        if l.contains("authentication")
+            || l.contains("invalid_api_key")
+            || l.contains("unauthorized")
+            || l.contains("permission")
+        {
+            return Some(ProviderError::Auth(m));
+        }
+    }
+    None
+}
+
+/// Read a JSON value as an HTTP status code: an integer (`429`) or a numeric string (`"429"`),
+/// bounded to a plausible 1xx–5xx range so a random `code: 0` / `code: 20000` isn't misread.
+fn json_status_code(v: &serde_json::Value) -> Option<u16> {
+    v.as_u64()
+        .and_then(|n| u16::try_from(n).ok())
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u16>().ok()))
+        .filter(|c| (100..=599).contains(c))
+}
+
+/// Best-effort extract a JSON error body from a free-text stream `cause`: the cause is the whole
+/// JSON, or has one embedded (`...Body: {…}`). Returns the parsed value when found.
+fn parse_embedded_json(cause: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(cause.trim()) {
+        return Some(v);
+    }
+    let start = cause.find('{')?;
+    let end = cause.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&cause[start..=end]).ok()
 }
 
 /// Markers of a no-credentials / misconfigured-provider failure (genai's resolver couldn't build
@@ -1418,5 +1602,224 @@ mod tests {
         assert_eq!(tool.name.as_str(), "read_file");
         assert_eq!(tool.description.as_deref(), Some("read a file"));
         assert_eq!(tool.schema.as_ref(), Some(&schema));
+    }
+
+    // --- Enterprise / custom-endpoint plumbing ---
+
+    #[test]
+    fn bedrock_namespace_maps_to_genai_bedrock_api_and_vertex_passes_through() {
+        // `bedrock::…` must resolve to genai's Bearer-token Bedrock adapter (`bedrock_api`); Vertex
+        // keeps its namespace as-is.
+        assert_eq!(
+            to_genai_model("bedrock::anthropic.claude-sonnet-4-5-v1:0"),
+            "bedrock_api::anthropic.claude-sonnet-4-5-v1:0"
+        );
+        assert_eq!(
+            to_genai_model("vertex::gemini-2.5-pro"),
+            "vertex::gemini-2.5-pro"
+        );
+        // And the genai adapter actually exists for the mapped name.
+        assert!(AdapterKind::from_lower_str("bedrock_api").is_some());
+        assert!(AdapterKind::from_lower_str("vertex").is_some());
+    }
+
+    #[test]
+    fn enterprise_gateways_are_not_listable_but_still_adapter_backed() {
+        // Bedrock/Vertex route via genai but have no enumerable models endpoint for our flow → they
+        // are skipped quietly in discovery (users pin ids), not warned about as a key failure.
+        assert!(!is_discoverable("bedrock"));
+        assert!(!is_discoverable("vertex"));
+        // Regular providers stay discoverable.
+        assert!(is_discoverable("openai"));
+        assert!(is_discoverable("groq"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_timeout_elapses_to_retryable_unavailable() {
+        // A discovery call that never returns must not hang the caller — `with_discovery_timeout`
+        // bounds it and surfaces a retryable Unavailable. `start_paused` auto-advances virtual time
+        // to the next timer once the task is idle, so this is deterministic and instant.
+        let hung = async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok::<(), ProviderError>(())
+        };
+        let e = with_discovery_timeout("model listing", hung)
+            .await
+            .expect_err("a hung discovery call must time out");
+        assert!(matches!(e, ProviderError::Unavailable(_)));
+        assert!(e.is_retryable(), "a discovery timeout should be retryable");
+        assert!(e.to_string().contains("timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_timeout_passes_through_a_fast_result() {
+        let ok = async { Ok::<u8, ProviderError>(7) };
+        assert_eq!(with_discovery_timeout("x", ok).await.unwrap(), 7);
+    }
+
+    // --- Per-provider error-classification contract tests ---
+    //
+    // Feed representative REAL error-body shapes (the typed JSON each vendor returns) through the
+    // structured classifier and the text/status fallbacks, asserting the category. A future provider
+    // rephrasing its prose is caught here because the typed field still carries the signal.
+
+    #[test]
+    fn contract_openai_429_402_401_via_structured_body() {
+        // OpenAI rate limit (string code + type).
+        let rl = json!({"error":{"message":"Rate limit reached for gpt-4o","type":"requests","code":"rate_limit_exceeded"}});
+        assert!(matches!(
+            classify_error_body(&rl),
+            Some(ProviderError::RateLimited { .. })
+        ));
+        // OpenAI out-of-quota (billing) → permanent Capability.
+        let quota = json!({"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}});
+        let q = classify_error_body(&quota).expect("classified");
+        assert!(matches!(q, ProviderError::Capability(_)));
+        assert!(q.is_permanent());
+        // OpenAI bad key.
+        let auth = json!({"error":{"message":"Incorrect API key provided","type":"invalid_request_error","code":"invalid_api_key"}});
+        assert!(matches!(
+            classify_error_body(&auth),
+            Some(ProviderError::Auth(_))
+        ));
+    }
+
+    #[test]
+    fn contract_anthropic_overloaded_ratelimit_auth() {
+        for (body, want_rl) in [
+            (
+                json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}),
+                true,
+            ),
+            (
+                json!({"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}),
+                true,
+            ),
+        ] {
+            let e = classify_error_body(&body).expect("classified");
+            assert_eq!(
+                matches!(e, ProviderError::RateLimited { .. }),
+                want_rl,
+                "{body}"
+            );
+        }
+        let auth = json!({"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}});
+        assert!(matches!(
+            classify_error_body(&auth),
+            Some(ProviderError::Auth(_))
+        ));
+    }
+
+    #[test]
+    fn contract_gemini_resource_exhausted_and_unauthenticated() {
+        let rl = json!({"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Quota exceeded. Please retry in 12s."}});
+        match classify_error_body(&rl).expect("classified") {
+            // code 429 path → RateLimited (the 12s server hint survives, not a limit:0 quota).
+            ProviderError::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(12)))
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        // No numeric code, only the RPC status enum.
+        let auth = json!({"error":{"status":"UNAUTHENTICATED","message":"API key not valid"}});
+        assert!(matches!(
+            classify_error_body(&auth),
+            Some(ProviderError::Auth(_))
+        ));
+    }
+
+    #[test]
+    fn contract_groq_429_and_capability_via_status_and_text() {
+        // Groq returns an OpenAI-shaped 429 body.
+        let rl = json!({"error":{"message":"Rate limit reached","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}});
+        assert!(matches!(
+            classify_error_body(&rl),
+            Some(ProviderError::RateLimited { .. })
+        ));
+        // Groq llama refusing tool use, leaked on the stream path as free text → Capability.
+        let cap = classify_text(
+            "tool use is not supported with this model",
+            "stream err".into(),
+        );
+        assert!(matches!(cap, ProviderError::Capability(_)));
+        assert!(cap.is_permanent());
+    }
+
+    #[test]
+    fn contract_openrouter_402_and_no_tool_endpoints() {
+        // 402 numeric code in the structured body → permanent Capability.
+        let pay = json!({"error":{"code":402,"message":"This request requires more credits, or fewer max_tokens."}});
+        let e = classify_error_body(&pay).expect("classified");
+        assert!(matches!(e, ProviderError::Capability(_)));
+        assert!(e.is_permanent());
+        // The classic "no endpoints found that support tool use".
+        let cap =
+            json!({"error":{"message":"No endpoints found that support tool use.","code":404}});
+        assert!(matches!(
+            classify_error_body(&cap),
+            Some(ProviderError::Capability(_))
+        ));
+    }
+
+    #[test]
+    fn contract_sambanova_payment_required_on_stream_path() {
+        // SambaNova surfaces 402 as free text on the streaming path → Capability, not a transient.
+        let e = classify_text(
+            "A payment method is required to use `Meta-Llama-3.3-70B-Instruct`",
+            "stream err".into(),
+        );
+        assert!(matches!(e, ProviderError::Capability(_)));
+        assert!(e.is_permanent());
+    }
+
+    #[test]
+    fn contract_webstream_cause_with_embedded_json_is_classified_structurally() {
+        // The streaming `cause` often embeds the JSON body after a prefix — extract + classify it.
+        let cause = "Web stream error. Body: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"slow down\"}}";
+        let v = parse_embedded_json(cause).expect("embedded json found");
+        assert!(matches!(
+            classify_error_body(&v),
+            Some(ProviderError::RateLimited { .. })
+        ));
+    }
+
+    #[test]
+    fn json_status_code_accepts_int_and_numeric_string_only() {
+        assert_eq!(json_status_code(&json!(429)), Some(429));
+        assert_eq!(json_status_code(&json!("503")), Some(503));
+        assert_eq!(json_status_code(&json!("rate_limit_exceeded")), None);
+        assert_eq!(json_status_code(&json!(20000)), None); // out of range
+    }
+
+    #[test]
+    fn classify_error_body_returns_none_for_unrecognized_shape() {
+        // A body with no recognizable typed signal → None so the caller falls back to text scanning.
+        let v = json!({"weird":"shape","detail":123});
+        assert!(classify_error_body(&v).is_none());
+    }
+
+    // --- tool_recovery contract tests: the exact per-provider leak formats ---
+
+    #[test]
+    fn contract_tool_recovery_known_leak_formats() {
+        use crate::recover_text_tool_calls;
+        // Gemini-style <invoke> leak.
+        let (c, _) = recover_text_tool_calls(
+            "<invoke name=\"shell\"><parameter name=\"command\">ls</parameter></invoke>",
+        );
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].name, "shell");
+        // Qwen/ollama-style <tool_call> JSON leak.
+        let (c, _) = recover_text_tool_calls(
+            "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"x\"}}</tool_call>",
+        );
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].name, "read_file");
+        // Llama/Groq-style <function=…> leak, optionally wrapped in <tool_call>.
+        let (c, _) = recover_text_tool_calls(
+            "<tool_call><function=shell>{\"command\":\"ls\"}</function></tool_call>",
+        );
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].name, "shell");
     }
 }
