@@ -6,11 +6,68 @@ use crate::bench;
 #[command(
     name = "forge",
     version,
-    about = "Fast, model-agnostic AI coding harness."
+    about = "Fast, model-agnostic AI coding harness.",
+    after_help = AFTER_HELP
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
+}
+
+/// Orientation block appended to `forge --help` so the (large) subcommand list reads as a few
+/// logical groups instead of one flat wall. Pure documentation — changes no behavior.
+const AFTER_HELP: &str = "\
+COMMAND GROUPS:
+  Run a task     run, chat, nl, sessions, replay
+  Models/mesh    models, mesh, benchmarks   (three views of routing — each --help cross-refs the others)
+  Skills/plugins skill, plugin, commands, import   (plugin = canonical pack installer; skill = author/distil)
+  Providers      auth, provider, local, setup/init, doctor
+  Integrations   mcp, memory, lattice, assay, git, migrate
+  Maintenance    update, self
+
+SCOPE FLAG:
+  Subcommands that read/write config (mcp, skill, import) share one --scope local|project|user.
+  The legacy --project boolean still works (hidden alias for --scope project).
+
+See `forge <command> --help` for details and cross-references.";
+
+/// Config scope shared across every subcommand that distinguishes user-global from project-local
+/// state (`forge mcp`, `forge skill`, `forge import`). ONE definition — not a per-command copy.
+///
+/// `local` and `project` are synonyms (both target the current project's `.forge/`); `user`
+/// targets the user-global config dir (`~/.config/forge/`). Per-command defaults differ — see each
+/// subcommand's `--scope` help. The older `--project` boolean is kept as a hidden alias for
+/// `--scope project` so existing scripts keep working.
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
+pub(crate) enum Scope {
+    /// Current project's `.forge/` (synonym for `project`).
+    Local,
+    /// Current project's `.forge/`.
+    Project,
+    /// User-global config dir (`~/.config/forge/`).
+    User,
+}
+
+impl Scope {
+    /// True when this scope targets the current project (`local` or `project`).
+    pub(crate) fn is_project(self) -> bool {
+        matches!(self, Scope::Local | Scope::Project)
+    }
+
+    /// Canonical lowercase name, for error and help messages.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Scope::Local => "local",
+            Scope::Project => "project",
+            Scope::User => "user",
+        }
+    }
+
+    /// Resolve the effective "target the project?" boolean from an optional `--scope` plus the
+    /// legacy `--project` boolean. `--scope` wins when given; otherwise the boolean's value is used.
+    pub(crate) fn to_project(scope: Option<Scope>, legacy_project: bool) -> bool {
+        scope.map(Scope::is_project).unwrap_or(legacy_project)
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -223,6 +280,11 @@ pub(crate) enum AssayCmd {
 #[derive(Subcommand)]
 pub(crate) enum Command {
     /// Run a single agent turn against your prompt.
+    ///
+    /// Surface: plain line output by default; add `--tui` for the interactive TUI (`--plain` is
+    /// accepted too, for symmetry with `forge chat`). Session continuity mirrors `forge chat`:
+    /// `--resume <id>` reattaches by id, `--continue` reattaches the most-recent session, and a
+    /// bare `--resume` opens the interactive picker (TUI only).
     Run {
         /// The prompt / task for the agent.
         prompt: Vec<String>,
@@ -233,11 +295,19 @@ pub(crate) enum Command {
         #[arg(long, value_enum)]
         mode: Option<Mode>,
         /// Render the interactive ratatui TUI instead of plain line output.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "plain")]
         tui: bool,
-        /// Resume an existing session by id instead of starting a new one.
+        /// Force plain line output (this is already the default for `run`; accepted for symmetry
+        /// with `forge chat --plain`).
         #[arg(long)]
-        resume: Option<String>,
+        plain: bool,
+        /// Reattach the most-recent session (cannot be combined with --resume). Same as `chat`.
+        #[arg(long, conflicts_with = "resume")]
+        r#continue: bool,
+        /// Resume a session by id prefix, or open the interactive picker when no id is given
+        /// (picker requires --tui). Cannot be combined with --continue.
+        #[arg(long, num_args = 0..=1, value_name = "ID")]
+        resume: Option<Option<String>>,
         /// Pin a specific model (e.g. `openai::gpt-4o`), bypassing mesh classification.
         #[arg(long)]
         model: Option<String>,
@@ -248,6 +318,10 @@ pub(crate) enum Command {
         output_format: OutputFormat,
     },
     /// Start an interactive multi-turn chat session.
+    ///
+    /// Surface: the interactive TUI by default; add `--plain` for line output (`--tui` is accepted
+    /// too, for symmetry with `forge run`). Session continuity: `--resume <id>` reattaches by id,
+    /// `--continue` reattaches the most-recent session, and a bare `--resume` opens the picker.
     Chat {
         /// Use the offline deterministic mock provider.
         #[arg(long)]
@@ -265,6 +339,10 @@ pub(crate) enum Command {
         /// Force plain line output instead of the interactive TUI.
         #[arg(long)]
         plain: bool,
+        /// Use the interactive TUI (this is already the default for `chat`; accepted for symmetry
+        /// with `forge run --tui`).
+        #[arg(long, conflicts_with = "plain")]
+        tui: bool,
         /// Run the TUI inline in the terminal's native scrollback instead of full-screen.
         /// Overrides the `[tui] fullscreen` config for this invocation.
         #[arg(long, conflicts_with = "fullscreen")]
@@ -307,6 +385,9 @@ pub(crate) enum Command {
     /// List discovered slash commands + skills (project and user scope) with their descriptions.
     Commands,
     /// Show the auto-discovered model catalog and the mesh's best pick per tier.
+    ///
+    /// See also: `forge mesh` (why the mesh routes a given prompt the way it does) and
+    /// `forge benchmarks` (the measured quality scores behind the picks).
     Models {
         /// Re-ping the currently benched/excluded models and persist the result (clear the ones
         /// that recovered, re-bench the still-dead). Cheap: only touches benched models, not the
@@ -325,6 +406,9 @@ pub(crate) enum Command {
     /// Explain how the mesh routes — classification, scored candidates, quota pressure, the
     /// conservation roll, and the final pick. With a PROMPT, explains that prompt; without one,
     /// shows the per-tier picks + subscription quota overview. `--json` for machine output.
+    ///
+    /// See also: `forge models` (the discovered catalog + per-tier picks) and
+    /// `forge benchmarks` (the measured quality scores the routing is based on).
     Mesh {
         /// The task prompt to explain (quote it). Omit for the per-tier / quota overview.
         #[arg(trailing_var_arg = true)]
@@ -336,6 +420,9 @@ pub(crate) enum Command {
     /// Show measured model benchmark scores (Artificial Analysis, ADR-0011) and how well they
     /// cover the discovered catalog. `--refresh` forces a re-fetch (needs ARTIFICIALANALYSIS_API_KEY
     /// or `forge auth artificialanalysis`).
+    ///
+    /// See also: `forge models` (the discovered catalog + per-tier picks) and `forge mesh`
+    /// (how those scores drive routing for a specific prompt).
     Benchmarks {
         #[arg(long)]
         refresh: bool,
@@ -532,6 +619,10 @@ pub(crate) enum SkillCmd {
     /// Fetches every `.md` file from the repo root (or a `skills/` subdir if one exists) and
     /// writes them into the user skills directory (`~/.config/forge/skills/`).
     ///
+    /// See also: `forge plugin install` is the canonical, marketplace-aware pack installer
+    /// (`forge plugin install owner/repo [--marketplace <name>]`); this `skill install` is the
+    /// simpler GitHub/URL fetcher. Both land packs in the same skills directory.
+    ///
     /// Examples:
     ///   forge skill install anthropics/forge-skills
     ///   forge skill install anthropics/forge-skills@main
@@ -555,9 +646,9 @@ pub(crate) enum SkillCmd {
         /// Derived from the session's first user prompt when absent.
         #[arg(long)]
         name: Option<String>,
-        /// Where to write the skill: `user` (default) or `project` (`.forge/skills/`).
+        /// Where to write the skill: `user` (default), `project`, or `local` (`.forge/skills/`).
         #[arg(long, default_value = "user")]
-        scope: SkillScope,
+        scope: Scope,
     },
     /// Export this machine's Forge skills, commands, and agents to a portable directory — the
     /// inverse of `forge import`. Writes `<dest>/commands`, `<dest>/skills`, `<dest>/agents` in the
@@ -574,20 +665,24 @@ pub(crate) enum SkillCmd {
         #[arg(long, default_value = "all")]
         scope: ExportScope,
     },
-    /// Import a Forge bundle (a directory produced by `forge skill export`) — the inverse of export,
-    /// closing the round-trip. Reads `<src>/{commands,skills,agents}` and merges them into your
-    /// skills via the real catalog readers (malformed files skipped + warned); anything already
-    /// present is kept, never overwritten.
+    /// Load a Forge bundle (a directory produced by `forge skill export`) into your skills —
+    /// the inverse of export, closing the round-trip. Alias: `load`.
+    ///
+    /// NOT to be confused with `forge import` (which pulls commands/skills from ANOTHER AI CLI —
+    /// Claude Code, Codex, Cursor, Aider); `forge skill import` loads a Forge-native bundle.
+    /// Reads `<src>/{commands,skills,agents}` and merges them via the real catalog readers
+    /// (malformed files skipped + warned); anything already present is kept, never overwritten.
     ///
     /// Examples:
     ///   forge skill import ./my-forge-skills
-    ///   forge skill import /tmp/bundle --scope project
+    ///   forge skill load /tmp/bundle --scope project
+    #[command(alias = "load")]
     Import {
         /// Source bundle directory (as written by `forge skill export`).
         src: std::path::PathBuf,
-        /// Where to import: `user` (default) or `project` (`.forge/`).
+        /// Where to import: `user` (default), `project`, or `local` (`.forge/`).
         #[arg(long, default_value = "user")]
-        scope: SkillScope,
+        scope: Scope,
     },
     /// Re-run path and binary normalization on all installed skills and commands in-place:
     /// replaces legacy `~/.claude/` paths and `claude`/`codex` command references with their
@@ -595,10 +690,13 @@ pub(crate) enum SkillCmd {
     ///
     /// Examples:
     ///   forge skill normalize
-    ///   forge skill normalize --project
+    ///   forge skill normalize --scope project
     Normalize {
-        /// Normalize project-scope skills (`.forge/`) instead of the user config dir.
-        #[arg(long)]
+        /// Which skills to normalize: `user` (default) or `project`/`local` (`.forge/`).
+        #[arg(long, value_enum)]
+        scope: Option<Scope>,
+        /// Legacy alias for `--scope project` (hidden; kept for back-compat).
+        #[arg(long, hide = true, conflicts_with = "scope")]
         project: bool,
     },
     /// Re-fetch installed skill packs and update them in place, using the source recorded in the
@@ -612,12 +710,6 @@ pub(crate) enum SkillCmd {
         /// Installed pack name to update (omit to update all).
         name: Option<String>,
     },
-}
-
-#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub(crate) enum SkillScope {
-    User,
-    Project,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -639,36 +731,51 @@ pub(crate) enum GitCmd {
     },
 }
 
+/// `forge import <source>` pulls commands/skills FROM ANOTHER AI CLI (Claude Code, Codex, Cursor,
+/// Aider) into Forge. For loading a Forge-native bundle made by `forge skill export`, use
+/// `forge skill import` / `forge skill load` instead.
 #[derive(Subcommand)]
 pub(crate) enum ImportSource {
     /// Copy `~/.claude/commands/*.md` and `~/.claude/skills/*/` into Forge (user scope by
     /// default). Existing definitions are kept; malformed files are skipped.
     Claude {
-        /// Import into the project (`./.forge`) instead of the user config dir.
-        #[arg(long)]
+        /// Where to import: `user` (default), `project`, or `local` (`./.forge`).
+        #[arg(long, value_enum)]
+        scope: Option<Scope>,
+        /// Legacy alias for `--scope project` (hidden; kept for back-compat).
+        #[arg(long, hide = true, conflicts_with = "scope")]
         project: bool,
     },
     /// Copy Codex CLI custom prompts (`~/.codex/prompts/*.md`) into Forge as commands (user
     /// scope by default). Existing definitions are kept; malformed files are skipped.
     Codex {
-        /// Import into the project (`./.forge`) instead of the user config dir.
-        #[arg(long)]
+        /// Where to import: `user` (default), `project`, or `local` (`./.forge`).
+        #[arg(long, value_enum)]
+        scope: Option<Scope>,
+        /// Legacy alias for `--scope project` (hidden; kept for back-compat).
+        #[arg(long, hide = true, conflicts_with = "scope")]
         project: bool,
     },
     /// Import Cursor AI rules (`~/.cursor/rules/*.mdc`) into Forge as commands. Each `.mdc`
     /// rule becomes one command; `globs`/`alwaysApply` fields are dropped — only `description`
     /// and the rule body are kept. Existing commands are not overwritten.
     Cursor {
-        /// Import into the project (`./.forge`) instead of the user config dir.
-        #[arg(long)]
+        /// Where to import: `user` (default), `project`, or `local` (`./.forge`).
+        #[arg(long, value_enum)]
+        scope: Option<Scope>,
+        /// Legacy alias for `--scope project` (hidden; kept for back-compat).
+        #[arg(long, hide = true, conflicts_with = "scope")]
         project: bool,
     },
     /// Import Aider AI convention files into Forge as commands. Looks for
     /// `CONVENTIONS.md` / `.aider.md` / `.aider.conventions.md` in `~` and then `$PWD`.
     /// Each file becomes one command named after the file. Existing commands are not overwritten.
     Aider {
-        /// Import into the project (`./.forge`) instead of the user config dir.
-        #[arg(long)]
+        /// Where to import: `user` (default), `project`, or `local` (`./.forge`).
+        #[arg(long, value_enum)]
+        scope: Option<Scope>,
+        /// Legacy alias for `--scope project` (hidden; kept for back-compat).
+        #[arg(long, hide = true, conflicts_with = "scope")]
         project: bool,
     },
 }
@@ -762,7 +869,7 @@ pub(crate) enum McpCmd {
         transport: McpTransportArg,
         /// Config scope: `local`/`project` → `.forge/mcp.toml`; `user` → `~/.config/forge/mcp.toml`.
         #[arg(long, short = 's', default_value = "local")]
-        scope: McpScopeArg,
+        scope: Scope,
         /// Environment variables to pass to the stdio process (KEY=VALUE).
         #[arg(long, short = 'e', value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -785,7 +892,7 @@ pub(crate) enum McpCmd {
         name: String,
         /// Config scope to remove from.
         #[arg(long, short = 's', default_value = "local")]
-        scope: McpScopeArg,
+        scope: Scope,
     },
     /// Show the config entry for one MCP server.
     Get {
@@ -839,16 +946,6 @@ pub(crate) enum ServeTransportArg {
     Http,
 }
 
-#[derive(Clone, ValueEnum, Debug)]
-pub(crate) enum McpScopeArg {
-    /// Current project's `.forge/mcp.toml` (same as `project`).
-    Local,
-    /// Current project's `.forge/mcp.toml`.
-    Project,
-    /// User-global config dir's `mcp.toml` (`~/.config/forge/mcp.toml`).
-    User,
-}
-
 #[derive(Subcommand, Debug)]
 pub(crate) enum PluginMarketplaceCmd {
     /// Register a marketplace: a name → source mapping. SOURCE is a GitHub `owner/repo` (whose
@@ -877,6 +974,9 @@ pub(crate) enum PluginCmd {
     /// Install a skill pack. PLUGIN is `owner/repo[@ref]`, a full git URL, `pkg@marketplace`, or a
     /// bare `pkg` resolved against `--marketplace`. Records a lockfile entry for `forge plugin
     /// update`. Honors `GITHUB_TOKEN` for private repos. Alias: `add`.
+    ///
+    /// This is the canonical, marketplace-aware pack installer. The simpler `forge skill install`
+    /// is a plain GitHub/URL fetcher that lands packs in the same skills directory.
     #[command(alias = "add")]
     Install {
         plugin: String,

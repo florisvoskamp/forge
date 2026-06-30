@@ -9,16 +9,31 @@ pub(crate) async fn dispatch(command: Command) -> Result<()> {
             mock,
             mode,
             tui,
+            // `run` is plain by default; `--plain` is accepted for symmetry with `chat` and is a
+            // no-op here (clap already rejects `--plain --tui` together).
+            plain: _,
+            r#continue,
             resume,
             model,
             output_format,
         } => {
+            // Unified continuity with `chat`: --continue / --resume <id> / bare --resume (picker).
+            // The picker needs the interactive TUI, so treat the headless run as "plain".
+            let store = open_store()?;
+            let resume_id = match resolve_resume_mode(r#continue, resume, &store, !tui)? {
+                ResumeMode::Id(id) => Some(id),
+                ResumeMode::Fresh => None,
+                ResumeMode::Picker => anyhow::bail!(
+                    "the interactive resume picker isn't available for `forge run` — pass \
+                     `--resume <id>` / `--continue`, or use `forge chat --resume`"
+                ),
+            };
             run(
                 prompt.join(" "),
                 mock,
                 mode,
                 tui,
-                resume,
+                resume_id,
                 model,
                 output_format,
             )
@@ -30,6 +45,9 @@ pub(crate) async fn dispatch(command: Command) -> Result<()> {
             r#continue,
             resume,
             plain,
+            // `chat` defaults to the TUI; `--tui` is accepted for symmetry with `run` and is a
+            // no-op here (clap already rejects `--plain --tui` together).
+            tui: _,
             inline,
             fullscreen,
             model,

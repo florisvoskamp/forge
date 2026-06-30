@@ -15,24 +15,29 @@ pub(crate) struct ImportCounts {
 
 pub(crate) fn import_cmd(source: ImportSource) -> Result<()> {
     // Cursor and Aider have non-standard directory/format layouts — handled separately.
+    // `--scope` wins over the legacy `--project` boolean for every source (see `Scope::to_project`).
     match &source {
-        ImportSource::Cursor { project } => return import_cursor(*project),
-        ImportSource::Aider { project } => return import_aider(*project),
+        ImportSource::Cursor { scope, project } => {
+            return import_cursor(Scope::to_project(*scope, *project))
+        }
+        ImportSource::Aider { scope, project } => {
+            return import_aider(Scope::to_project(*scope, *project))
+        }
         _ => {}
     }
 
     let (label, project, home, commands_sub, skills_sub, agents_sub) = match source {
-        ImportSource::Claude { project } => (
+        ImportSource::Claude { scope, project } => (
             "claude",
-            project,
+            Scope::to_project(scope, project),
             forge_config::claude_dir().context("no home directory — cannot locate ~/.claude")?,
             "commands",
             Some("skills"),
             Some("agents"),
         ),
-        ImportSource::Codex { project } => (
+        ImportSource::Codex { scope, project } => (
             "codex",
-            project,
+            Scope::to_project(scope, project),
             forge_config::codex_dir().context("no home directory — cannot locate ~/.codex")?,
             "prompts",
             None,

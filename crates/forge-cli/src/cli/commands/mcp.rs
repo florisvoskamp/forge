@@ -507,16 +507,13 @@ pub(crate) fn url_decode(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Resolve the mcp.toml path for a given scope.
-fn mcp_scope_path(scope: &McpScopeArg) -> Result<std::path::PathBuf> {
-    match scope {
-        McpScopeArg::Local | McpScopeArg::Project => {
-            Ok(std::path::PathBuf::from(".forge/mcp.toml"))
-        }
-        McpScopeArg::User => {
-            let dir = forge_config::config_dir()
-                .ok_or_else(|| anyhow::anyhow!("cannot resolve user config directory"))?;
-            Ok(dir.join("mcp.toml"))
-        }
+fn mcp_scope_path(scope: &Scope) -> Result<std::path::PathBuf> {
+    if scope.is_project() {
+        Ok(std::path::PathBuf::from(".forge/mcp.toml"))
+    } else {
+        let dir = forge_config::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve user config directory"))?;
+        Ok(dir.join("mcp.toml"))
     }
 }
 
@@ -528,7 +525,7 @@ fn mcp_scope_path(scope: &McpScopeArg) -> Result<std::path::PathBuf> {
 pub(crate) fn mcp_add(
     name: String,
     transport: McpTransportArg,
-    scope: McpScopeArg,
+    scope: Scope,
     env_vars: Vec<String>,
     headers: Vec<String>,
     url: Option<String>,
@@ -610,13 +607,9 @@ pub(crate) fn mcp_add(
     let mut config = forge_config::load_mcp_toml(&path);
     if config.servers.iter().any(|s| s.name == name) {
         anyhow::bail!(
-            "server '{name}' already exists in {}. Use `forge mcp remove {name} --scope {scope}` first.",
+            "server '{name}' already exists in {}. Use `forge mcp remove {name} --scope {}` first.",
             path.display(),
-            scope = match scope {
-                McpScopeArg::Local => "local",
-                McpScopeArg::Project => "project",
-                McpScopeArg::User => "user",
-            }
+            scope.as_str()
         );
     }
     config.servers.push(server);
@@ -627,7 +620,7 @@ pub(crate) fn mcp_add(
 }
 
 /// `forge mcp remove <name> [--scope local|user|project]`
-pub(crate) fn mcp_remove(name: String, scope: McpScopeArg) -> Result<()> {
+pub(crate) fn mcp_remove(name: String, scope: Scope) -> Result<()> {
     let path = mcp_scope_path(&scope)?;
     let mut config = forge_config::load_mcp_toml(&path);
     let before = config.servers.len();

@@ -49,7 +49,9 @@ pub(crate) async fn skill_cmd(sub: SkillCmd) -> Result<()> {
         } => skill_from_session(&session_id, name.as_deref(), scope).await,
         SkillCmd::Export { dest, scope } => skills_export(&dest, scope),
         SkillCmd::Import { src, scope } => skills_import(&src, scope),
-        SkillCmd::Normalize { project } => skills_normalize(project),
+        SkillCmd::Normalize { scope, project } => {
+            skills_normalize(Scope::to_project(scope, project))
+        }
         SkillCmd::Update { name } => {
             crate::cli::commands::marketplace::update_installed(name.as_deref()).await
         }
@@ -248,9 +250,11 @@ pub(crate) fn skills_normalize(project: bool) -> Result<()> {
 /// The inverse of export; closes the round-trip so an exported library can be re-imported on another
 /// machine. Reuses the same catalog-copy helpers as `forge import`: malformed files are validated
 /// and skipped, and anything already present in the target scope is kept (never overwritten).
-pub(crate) fn skills_import(src: &std::path::Path, scope: SkillScope) -> Result<()> {
+pub(crate) fn skills_import(src: &std::path::Path, scope: Scope) -> Result<()> {
     use crate::cli::commands::import::{copy_catalog_assets, count_copy_md_files};
-    use forge_skills::{Scope, ScopedDir, Sources};
+    // `forge_skills::Scope` is the catalog-reader scope; alias it so it doesn't collide with the
+    // CLI's shared `crate::Scope` arg enum (which is `scope`'s type).
+    use forge_skills::{Scope as SkillsScope, ScopedDir, Sources};
 
     if !src.exists() {
         anyhow::bail!("nothing to import: {} does not exist", src.display());
@@ -259,31 +263,30 @@ pub(crate) fn skills_import(src: &std::path::Path, scope: SkillScope) -> Result<
     // Read the bundle's commands + skills through the real catalog readers (validates/skips junk).
     let sources = Sources {
         commands: vec![ScopedDir {
-            scope: Scope::User,
+            scope: SkillsScope::User,
             path: src.join("commands"),
         }],
         skills: vec![ScopedDir {
-            scope: Scope::User,
+            scope: SkillsScope::User,
             path: src.join("skills"),
         }],
     };
     let cat = forge_skills::Catalog::load(&sources);
 
-    let (cmd_dst, skill_dst, agent_dst) = match scope {
-        SkillScope::User => {
-            let base =
-                forge_config::config_dir().context("no user config directory on this platform")?;
-            (
-                base.join("commands"),
-                base.join("skills"),
-                base.join("agents"),
-            )
-        }
-        SkillScope::Project => (
+    let (cmd_dst, skill_dst, agent_dst) = if scope.is_project() {
+        (
             std::path::PathBuf::from("./.forge/commands"),
             std::path::PathBuf::from("./.forge/skills"),
             std::path::PathBuf::from("./.forge/agents"),
-        ),
+        )
+    } else {
+        let base =
+            forge_config::config_dir().context("no user config directory on this platform")?;
+        (
+            base.join("commands"),
+            base.join("skills"),
+            base.join("agents"),
+        )
     };
 
     let mut counts = copy_catalog_assets(&cat, &cmd_dst, &skill_dst);
@@ -292,9 +295,10 @@ pub(crate) fn skills_import(src: &std::path::Path, scope: SkillScope) -> Result<
         count_copy_md_files(&agent_src, &agent_dst, &mut counts);
     }
 
-    let scope_label = match scope {
-        SkillScope::User => "the user config",
-        SkillScope::Project => "./.forge",
+    let scope_label = if scope.is_project() {
+        "./.forge"
+    } else {
+        "the user config"
     };
     println!(
         "✓ imported {} command(s) + {} skill(s) + {} agent(s) from {} into {scope_label} \
@@ -394,7 +398,7 @@ pub(crate) fn skills_export(dest: &std::path::Path, scope: ExportScope) -> Resul
 pub(crate) async fn skill_from_session(
     session_prefix: &str,
     name_override: Option<&str>,
-    scope: SkillScope,
+    scope: Scope,
 ) -> Result<()> {
     // --- Inject provider keys (same as assay / mesh) ---
     forge_config::inject_provider_keys();
@@ -448,13 +452,12 @@ pub(crate) async fn skill_from_session(
     };
 
     // --- Resolve target skills directory ---
-    let skills_dir = match scope {
-        SkillScope::User => {
-            let dir = forge_config::config_dir()
-                .ok_or_else(|| anyhow::anyhow!("cannot resolve user config directory"))?;
-            dir.join("skills")
-        }
-        SkillScope::Project => std::path::PathBuf::from("./.forge/skills"),
+    let skills_dir = if scope.is_project() {
+        std::path::PathBuf::from("./.forge/skills")
+    } else {
+        let dir = forge_config::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve user config directory"))?;
+        dir.join("skills")
     };
 
     // --- Check for existing skill before making the model call ---

@@ -497,3 +497,235 @@ fn resume_mode_bare_resume_tty_gives_picker() {
     // Not asserting the result here because is_terminal() differs per environment;
     // the plain=true path (covered above) is the deterministic guard we rely on.
 }
+
+// ---------------------------------------------------------------------------
+// CLI consistency: --scope unification, run/chat flag parity, command aliases.
+// Pure clap parse tests — no filesystem/network/timing, so they're cross-platform.
+// ---------------------------------------------------------------------------
+
+use clap::{CommandFactory, Parser};
+
+/// The whole clap tree must be internally valid — catches duplicate flags, bad aliases,
+/// conflicting `conflicts_with` references, etc. across every subcommand.
+#[test]
+fn cli_command_tree_is_internally_valid() {
+    <Cli as CommandFactory>::command().debug_assert();
+}
+
+/// `forge --help` and every subcommand's `--help` must render without panicking.
+#[test]
+fn help_renders_for_every_subcommand() {
+    let mut cmd = <Cli as CommandFactory>::command();
+    let _ = cmd.render_long_help();
+    for sub in cmd.get_subcommands_mut() {
+        let _ = sub.render_long_help();
+        // One level deeper (mcp/skill/plugin/import all have nested subcommands).
+        for inner in sub.get_subcommands_mut() {
+            let _ = inner.render_long_help();
+        }
+    }
+}
+
+/// The shared `--scope` resolves to a project-vs-user boolean; `--scope` wins over legacy `--project`.
+#[test]
+fn scope_to_project_resolution() {
+    assert!(Scope::to_project(Some(Scope::Project), false));
+    assert!(Scope::to_project(Some(Scope::Local), false));
+    // `--scope user` wins even when the legacy boolean is set.
+    assert!(!Scope::to_project(Some(Scope::User), true));
+    // No `--scope` → fall back to the legacy `--project` boolean.
+    assert!(Scope::to_project(None, true));
+    assert!(!Scope::to_project(None, false));
+}
+
+#[test]
+fn mcp_add_scope_enum_parses_with_default_local() {
+    for (arg, want) in [
+        ("local", Scope::Local),
+        ("project", Scope::Project),
+        ("user", Scope::User),
+    ] {
+        let cli = Cli::try_parse_from(["forge", "mcp", "add", "srv", "--scope", arg]).unwrap();
+        match cli.command {
+            Command::Mcp {
+                cmd: Some(McpCmd::Add { scope, .. }),
+            } => assert_eq!(scope, want),
+            _ => panic!("expected `mcp add`"),
+        }
+    }
+    // Default is `local`; `-s` short flag is preserved.
+    let cli = Cli::try_parse_from(["forge", "mcp", "add", "srv"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Mcp {
+            cmd: Some(McpCmd::Add {
+                scope: Scope::Local,
+                ..
+            })
+        }
+    ));
+    let cli = Cli::try_parse_from(["forge", "mcp", "add", "srv", "-s", "user"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Mcp {
+            cmd: Some(McpCmd::Add {
+                scope: Scope::User,
+                ..
+            })
+        }
+    ));
+}
+
+#[test]
+fn import_claude_scope_and_legacy_project_alias() {
+    // New canonical form.
+    let cli = Cli::try_parse_from(["forge", "import", "claude", "--scope", "project"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Import {
+            source: ImportSource::Claude {
+                scope: Some(Scope::Project),
+                ..
+            }
+        }
+    ));
+    // Legacy `--project` still parses (back-compat).
+    let cli = Cli::try_parse_from(["forge", "import", "claude", "--project"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Import {
+            source: ImportSource::Claude {
+                project: true,
+                scope: None,
+            }
+        }
+    ));
+    // Default (neither flag) → user scope: scope None + project false.
+    let cli = Cli::try_parse_from(["forge", "import", "codex"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Import {
+            source: ImportSource::Codex {
+                project: false,
+                scope: None,
+            }
+        }
+    ));
+    // `--scope` and legacy `--project` are mutually exclusive.
+    assert!(
+        Cli::try_parse_from(["forge", "import", "claude", "--scope", "user", "--project"]).is_err()
+    );
+}
+
+#[test]
+fn skill_normalize_scope_and_legacy_project_alias() {
+    let cli = Cli::try_parse_from(["forge", "skill", "normalize", "--project"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Skill {
+            sub: SkillCmd::Normalize {
+                project: true,
+                scope: None,
+            }
+        }
+    ));
+    let cli = Cli::try_parse_from(["forge", "skill", "normalize", "--scope", "project"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Skill {
+            sub: SkillCmd::Normalize {
+                scope: Some(Scope::Project),
+                ..
+            }
+        }
+    ));
+}
+
+#[test]
+fn skill_import_load_alias_and_scope_values() {
+    // `load` is an alias for `skill import`; `local` is accepted (maps to project).
+    let cli =
+        Cli::try_parse_from(["forge", "skill", "load", "/tmp/b", "--scope", "local"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Skill {
+            sub: SkillCmd::Import {
+                scope: Scope::Local,
+                ..
+            }
+        }
+    ));
+    // Default scope is `user`.
+    let cli = Cli::try_parse_from(["forge", "skill", "import", "/tmp/b"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Skill {
+            sub: SkillCmd::Import {
+                scope: Scope::User,
+                ..
+            }
+        }
+    ));
+}
+
+#[test]
+fn plugin_add_alias_and_plugins_top_alias() {
+    // `plugin add` is an alias for `plugin install`.
+    let cli = Cli::try_parse_from(["forge", "plugin", "add", "owner/repo"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Plugin {
+            cmd: PluginCmd::Install { .. }
+        }
+    ));
+    // `plugins` (top-level) is an alias for `plugin`.
+    let cli = Cli::try_parse_from(["forge", "plugins", "list"]).unwrap();
+    assert!(matches!(cli.command, Command::Plugin { .. }));
+}
+
+#[test]
+fn run_gains_unified_continuity_and_surface_flags() {
+    // --continue
+    let cli = Cli::try_parse_from(["forge", "run", "do", "a", "thing", "--continue"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Run {
+            r#continue: true,
+            ..
+        }
+    ));
+    // --resume <id>
+    let cli = Cli::try_parse_from(["forge", "run", "task", "--resume", "abc"]).unwrap();
+    match cli.command {
+        Command::Run { resume, .. } => assert_eq!(resume, Some(Some("abc".to_string()))),
+        _ => panic!("expected run"),
+    }
+    // bare --resume → Some(None) (picker intent, resolved at dispatch)
+    let cli = Cli::try_parse_from(["forge", "run", "task", "--resume"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Run {
+            resume: Some(None),
+            ..
+        }
+    ));
+    // --plain and --tui both accepted on run
+    assert!(Cli::try_parse_from(["forge", "run", "task", "--plain"]).is_ok());
+    assert!(Cli::try_parse_from(["forge", "run", "task", "--tui"]).is_ok());
+    // mutually exclusive surfaces / continuity flags
+    assert!(Cli::try_parse_from(["forge", "run", "task", "--plain", "--tui"]).is_err());
+    assert!(Cli::try_parse_from(["forge", "run", "task", "--continue", "--resume", "a"]).is_err());
+}
+
+#[test]
+fn chat_gains_symmetric_tui_flag() {
+    // --tui accepted on chat (default surface anyway), symmetric with run.
+    assert!(Cli::try_parse_from(["forge", "chat", "--tui"]).is_ok());
+    assert!(Cli::try_parse_from(["forge", "chat", "--plain"]).is_ok());
+    // still mutually exclusive
+    assert!(Cli::try_parse_from(["forge", "chat", "--plain", "--tui"]).is_err());
+    // existing continuity flags unchanged
+    assert!(Cli::try_parse_from(["forge", "chat", "--continue"]).is_ok());
+    assert!(Cli::try_parse_from(["forge", "chat", "--resume", "abc"]).is_ok());
+    assert!(Cli::try_parse_from(["forge", "chat", "--resume"]).is_ok());
+}
