@@ -72,7 +72,7 @@ jobs:
         run: cargo build --release --locked --bin forge --target ${{ matrix.target }}
 
       - name: Fetch generated assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: forge-assets
           path: dist-assets
@@ -116,7 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
