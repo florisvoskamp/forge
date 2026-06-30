@@ -28,7 +28,7 @@ webpki-root-certs = "1"
 # also gives a cheap, no-Result `lock()` and lets the connection map be shared (via Weak) with the
 # rmcp client handler so server `tools/list_changed` notifications can refresh the live catalog.
 parking_lot = "0.12"
-rmcp = { version = "1.7.0", default-features = false, features = [
+rmcp = { version = "2.0.0", default-features = false, features = [
     "client",
     "server",
     "transport-async-rw",
