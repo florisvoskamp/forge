@@ -15,7 +15,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 figment = { version = "0.10", features = ["toml", "env"] }
-toml = "0.8"
+toml = "1.1"
 directories = "6"
 # Linux: the Secret Service backend (gnome-keyring/KWallet) persists to disk — unlike the
 # `linux-native` keyutils backend, which is wiped on logout/reboot (the "keyring keeps resetting"
@@ -24,7 +24,7 @@ directories = "6"
 # libdbus-1-dev, incl. CI). `crypto-rust` supplies the transport cipher. Where the Secret Service
 # is unreachable (headless), the encrypted-file fallback in secret_store.rs takes over.
 keyring = { version = "3", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 rand = "0.9"
 # AEAD for the encrypted-file secret fallback (used when no OS keyring/Secret Service is reachable).
