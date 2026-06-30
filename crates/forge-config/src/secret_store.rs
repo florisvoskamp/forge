@@ -19,7 +19,6 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use rand::RngCore as _;
 
 use crate::ConfigError;
 
@@ -118,16 +117,15 @@ fn load_or_create_key() -> Result<Key, ConfigError> {
     let path = keyfile_path().ok_or_else(|| ConfigError::Keyring("no config dir".into()))?;
     if let Ok(bytes) = std::fs::read(&path) {
         if bytes.len() == 32 {
-            return Ok(*Key::from_slice(&bytes));
+            return Ok(Key::try_from(bytes.as_slice()).unwrap());
         }
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ConfigError::Keyring(e.to_string()))?;
     }
-    let mut raw = [0u8; 32];
-    rand::rng().fill_bytes(&mut raw);
+    let raw: [u8; 32] = rand::random();
     write_private(&path, &raw)?;
-    Ok(*Key::from_slice(&raw))
+    Ok(Key::try_from(raw.as_slice()).unwrap())
 }
 
 /// Write a file readable/writable only by the owner (`0600` on Unix).
@@ -170,11 +168,10 @@ fn write_map(map: &BTreeMap<String, String>) -> Result<(), ConfigError> {
 
 fn file_set(key: &str, value: &str) -> Result<(), ConfigError> {
     let cipher = cipher()?;
-    let mut nonce_bytes = [0u8; 12];
-    rand::rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce_bytes: [u8; 12] = rand::random();
+    let nonce = Nonce::try_from(nonce_bytes.as_slice()).unwrap();
     let ct = cipher
-        .encrypt(nonce, value.as_bytes())
+        .encrypt(&nonce, value.as_bytes())
         .map_err(|e| ConfigError::Keyring(e.to_string()))?;
     let mut blob = nonce_bytes.to_vec();
     blob.extend_from_slice(&ct);
@@ -195,7 +192,7 @@ fn file_get(key: &str) -> Option<String> {
     let (nonce_bytes, ct) = blob.split_at(12);
     let pt = cipher()
         .ok()?
-        .decrypt(Nonce::from_slice(nonce_bytes), ct)
+        .decrypt(&Nonce::try_from(nonce_bytes).unwrap(), ct)
         .ok()?;
     String::from_utf8(pt).ok()
 }

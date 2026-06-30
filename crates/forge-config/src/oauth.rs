@@ -82,9 +82,7 @@ impl Pkce {
     /// Generate a fresh PKCE pair: a 32-byte CSPRNG verifier (base64url, ~43 chars) and its
     /// S256 challenge `base64url(sha256(verifier))`.
     pub fn generate() -> Pkce {
-        use rand::RngCore;
-        let mut bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut bytes);
+        let bytes: [u8; 32] = rand::random();
         let verifier = b64url(&bytes);
         Pkce::from_verifier(verifier)
     }
@@ -101,9 +99,7 @@ impl Pkce {
 
 /// A random URL-safe `state` (CSRF guard for the authorize round-trip).
 pub fn random_state() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
+    let bytes: [u8; 16] = rand::random();
     b64url(&bytes)
 }
 
