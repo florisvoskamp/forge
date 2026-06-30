@@ -27,7 +27,7 @@ jobs:
           key: xtasks-assets
       - name: Generate completions + man page
         run: cargo run --release -p xtasks -- gen-dist dist-assets
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: forge-assets
           path: dist-assets/**
@@ -102,7 +102,7 @@ jobs:
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: forge-${{ matrix.target }}
           path: |

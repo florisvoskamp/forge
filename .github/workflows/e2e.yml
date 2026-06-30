@@ -65,7 +65,7 @@ jobs:
 
       - name: upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-${{ matrix.os }}
           path: |
