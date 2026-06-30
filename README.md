@@ -32,7 +32,7 @@ forge lattice impact "UserRepository"          # code-graph blast radius
 
 <a id="why-forge"></a>
 
-## Why Forge wins
+## 🏆 Why Forge wins
 
 Every other coding agent ties you to one vendor's models and one billing relationship. Forge doesn't.
 It is **model-agnostic by design**: connect Anthropic, OpenAI, Google, Groq, NVIDIA, local Ollama —
@@ -60,7 +60,7 @@ sonnet` fixes **50% more bugs through Forge than through the raw CLI**.
 
 <a id="the-mesh"></a>
 
-## The Mesh — model-agnostic intelligent routing
+## 🧠 The Mesh — model-agnostic intelligent routing
 
 This is the wedge no other terminal agent has. You don't pick a model; you connect providers and let
 Forge pick. Every task is classified into a tier, then routed to the **cheapest model that meets the
@@ -97,7 +97,7 @@ is spent only where it matters. Inspect any of these decisions live with `/mesh`
 
 <a id="benchmarks"></a>
 
-## Proof: same model, better results
+## 📊 Proof: same model, better results
 
 The honest test of a harness: run the **same model** Forge bridges (`claude sonnet`) *through* Forge vs.
 the raw `claude` CLI on **SWE-bench Lite** (real GitHub bug fixes), scored by the **official `swebench`
@@ -121,7 +121,7 @@ same direction (11 vs 9).
 
 <a id="comparison"></a>
 
-## Forge vs. the alternatives
+## ⚖️ Forge vs. the alternatives
 
 Accurate per cell, last verified mid-2026. The **bold rows are Forge-only** — no other terminal agent
 does benchmark-ranked cost-tier routing across *independent* providers, cross-provider failover, *and*
@@ -162,7 +162,7 @@ Forge-only.
 
 <a id="free-providers"></a>
 
-## Recommended free providers
+## 🆓 Recommended free providers
 
 Forge is **free to run with zero paid keys.** These providers all offer a genuine free tier with
 high-quality models and usable rate limits — connect a few and the mesh routes across them, failing
@@ -171,7 +171,7 @@ over automatically when one is throttled. Keys are stored in your **OS keyring**
 > Connect each with `forge auth <name>` (reads the key from stdin). The model catalog is discovered
 > live, so new free models appear automatically.
 
-### Start here (fast + frontier, best limits)
+### ⭐ Start here (fast + frontier, best limits)
 
 | Provider | Best free models | Free limits | Get a key | Connect |
 |----------|------------------|-------------|-----------|---------|
@@ -179,7 +179,7 @@ over automatically when one is throttled. Keys are stored in your **OS keyring**
 | **NVIDIA NIM** | DeepSeek-R1, Llama-3.1-405B, Nemotron-Ultra-550B, GPT-OSS-120B (100+ models) | ~40 RPM | [build.nvidia.com](https://build.nvidia.com/) | `forge auth nvidia` |
 | **Cerebras** | GPT-OSS-120B, Qwen-3-Coder-480B, Llama-3.3-70B | ~30 RPM · 14.4K/day | [cloud.cerebras.ai](https://cloud.cerebras.ai/) | `forge auth cerebras` |
 
-### Add for breadth (big context, more frontier models)
+### ➕ Add for breadth (big context, more frontier models)
 
 | Provider | Best free models | Free limits | Get a key | Connect |
 |----------|------------------|-------------|-----------|---------|
@@ -187,7 +187,7 @@ over automatically when one is throttled. Keys are stored in your **OS keyring**
 | **SambaNova** | DeepSeek-V3.1, Llama-4 Maverick, Llama-3.3-70B | ~20 RPM | [cloud.sambanova.ai](https://cloud.sambanova.ai/) | `forge auth sambanova` |
 | **Mistral** | Mistral Large 3, Codestral, Magistral | ~1 RPS · 500K TPM | [console.mistral.ai/api-keys](https://console.mistral.ai/api-keys) | `forge auth mistral` |
 
-### Optional (aggregators + niche)
+### 🧩 Optional (aggregators + niche)
 
 | Provider | Best free models | Free limits | Get a key | Connect |
 |----------|------------------|-------------|-----------|---------|
@@ -219,9 +219,9 @@ You can also stack keys via env: `GROQ_API_KEY="k1,k2"` or numbered `GROQ_API_KE
 
 <a id="feature-overview"></a>
 
-## Feature highlights
+## ✨ Feature highlights
 
-**Routing & Cost**
+**💸 Routing & Cost**
 - Auto-discovery of every model your keys can reach; cost-tiered routing (trivial / standard / complex)
 - Benchmark ranking against real Artificial Analysis intelligence + coding scores
 - Health-aware, capability-aware failover down the full ranked catalog
@@ -231,7 +231,7 @@ You can also stack keys via env: `GROQ_API_KEY="k1,k2"` or numbered `GROQ_API_KE
 - `/effort` slider that steers the whole mesh route, not just a provider's reasoning param
 - Prompt caching, per-model pricing fetched from OpenRouter, persistent cross-restart usage store
 
-**Agentic Coding**
+**🤖 Agentic Coding**
 - Objective, tool-grounded completion gate — never reports a phantom success
 - Doom-loop + repeated-failure guards; recovery of tool calls written as prose
 - Lattice code intelligence: tree-sitter symbol graph (9 languages), blast-radius, call-chains,
@@ -243,7 +243,7 @@ You can also stack keys via env: `GROQ_API_KEY="k1,k2"` or numbered `GROQ_API_KE
 - Cross-session auto-memory: typed durable facts, relevance-ranked recall
 - Vision input (`/image` or paste); `@file` context injection
 
-**Ecosystem / Interop**
+**🔌 Ecosystem / Interop**
 - 17+ providers including Anthropic, OpenAI, Ollama, Groq, Gemini, DeepSeek, OpenRouter, NVIDIA NIM,
   SambaNova, Mistral, Cohere, xAI, Cerebras — any OpenAI-compatible endpoint in one config row
 - Subscription bridges: Claude Code CLI, Codex CLI, Antigravity CLI (free Gemini)
@@ -253,7 +253,7 @@ You can also stack keys via env: `GROQ_API_KEY="k1,k2"` or numbered `GROQ_API_KE
 - `forge skill install owner/repo[@ref]` from GitHub; `forge plugin install/add/list/remove` for plugin/skill-packs
 - Pre/post tool-use hooks — block, observe, rewrite args, or inject model-visible context
 
-**TUI / UX**
+**🎨 TUI / UX**
 - Full-screen ratatui TUI: scrollable transcript, pinned panels, live progress, cost meter
 - Context-window token gauge, fuzzy command palette, dynamic `/config` settings editor
 - Unified activity viewer (subagents + critics), session/checkpoint pickers
@@ -261,7 +261,7 @@ You can also stack keys via env: `GROQ_API_KEY="k1,k2"` or numbered `GROQ_API_KE
 - Remote control: drive a session from a phone/desktop browser (`/remote`)
 - `--inline` for native scrollback; `--mock` offline deterministic provider (no key needed)
 
-**Safety**
+**🔒 Safety**
 - Permission broker with per-tool rules and four tempers (Read-only / Ask / Auto-edit / Full)
 - `Auto-edit` (accept-edits) auto-approves file writes **and** shell commands; the unoverridable denylist still blocks catastrophic ops (`rm -rf /`, `.env` reads, pipe-to-sh)
 - Answering `a` (always) at a prompt persists for the rest of the session — that tool won't prompt again until restart — and is saved to config
@@ -277,9 +277,11 @@ You can also stack keys via env: `GROQ_API_KEY="k1,k2"` or numbered `GROQ_API_KE
 
 ---
 
-## Install
+<a id="install"></a>
 
-### One-line install (recommended)
+## 📦 Install
+
+### ⚡ One-line install (recommended)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/florisvoskamp/forge/main/install.sh | sh
@@ -289,7 +291,7 @@ Detects your OS/arch, downloads the matching release binary (verifying its SHA-2
 `forge` to `~/.local/bin`. Override with `FORGE_VERSION` (a tag) or `FORGE_INSTALL_DIR`. Linux x86-64
 and macOS (Apple Silicon + Intel) are supported; on other arches it falls back to building from source.
 
-### Windows (PowerShell)
+### 🪟 Windows (PowerShell)
 
 ```powershell
 irm https://raw.githubusercontent.com/florisvoskamp/forge/main/install.ps1 | iex
@@ -299,14 +301,23 @@ Downloads the x86-64 release binary (verifying its SHA-256), installs `forge.exe
 `%LOCALAPPDATA%\Programs\forge`, and adds it to your user `PATH`. After install, `forge update` keeps it
 current.
 
-### Homebrew
+### 🍺 Homebrew
 
 ```bash
 brew tap florisvoskamp/forge https://github.com/florisvoskamp/forge
 brew install forge
 ```
 
-### From source
+### 🦀 Cargo (crates.io)
+
+```bash
+cargo install adforge
+```
+
+Installs the latest published release from crates.io. The crate is published as `adforge`; the
+installed binary is still `forge`.
+
+### 🔨 From source
 
 ```bash
 cargo build --release          # produces target/release/forge
@@ -318,7 +329,9 @@ Requires a recent stable Rust toolchain. Prebuilt binaries for each OS are on th
 
 ---
 
-## Quick Start
+<a id="quick-start"></a>
+
+## 🚀 Quick Start
 
 ```bash
 # Guided setup: API keys + subscription plans + optional local LLM
@@ -353,9 +366,9 @@ forge chat --mock
 
 ---
 
-## CLI Reference
+## ⌨️ CLI Reference
 
-### `forge chat` — interactive TUI
+### 💬 `forge chat` — interactive TUI
 
 ```bash
 forge chat
@@ -398,7 +411,7 @@ viewer (main chat + subagents + critics).
 **Keyboard shortcuts:** `SHIFT+TAB` cycle temper · `Ctrl+O` activity viewer · `Ctrl+J` newline ·
 `Esc` cancel/stop · `↑/↓` navigate · `y/n/a` allow/deny/always-allow a permission prompt.
 
-### `forge run` — single non-interactive turn
+### ▶️ `forge run` — single non-interactive turn
 
 ```bash
 forge run "add tests for the payment service"
@@ -406,7 +419,7 @@ forge run --tui "debug the startup crash"      # with live TUI
 forge run --mode bypass "apply all the diffs"  # no prompts
 ```
 
-### Setup, health, models, memory
+### 🩺 Setup, health, models, memory
 
 ```bash
 forge setup              # guided: API keys + subscription plans + optional local LLM
@@ -419,7 +432,7 @@ forge memory add "use 4-space indent" --kind decision
 forge mesh "<task>"      # explain how a task would route
 ```
 
-### `forge local` — local LLMs via Ollama
+### 🖥️ `forge local` — local LLMs via Ollama
 
 ```bash
 forge local              # animated menu, benchmark-ranked (install / start / status)
@@ -428,7 +441,7 @@ forge local install      # install the top-ranked model (installs Ollama if miss
 forge local start [tag]  # ensure the runtime + model are up
 ```
 
-### `forge lattice` — code intelligence
+### 🕸️ `forge lattice` — code intelligence
 
 ```bash
 forge lattice update .               # (re)index, incremental by content hash
@@ -438,7 +451,7 @@ forge lattice path "main" "persist"  # shortest call chain A → B
 forge lattice why "authenticate"     # git provenance — who last changed it
 ```
 
-### Audit, migrate, MCP, skills
+### 🧰 Audit, migrate, MCP, skills
 
 ```bash
 forge sessions               # list sessions, newest first
@@ -467,7 +480,7 @@ forge git setup              # install the model-aware co-author commit hook
 
 ---
 
-## Customizable Statusline
+## 🎨 Customizable Statusline
 
 The statusline is a row of **widgets** you can add, remove, or reorder — live with `/statusline` or in config:
 
@@ -484,7 +497,7 @@ immediately and persist to your config.
 
 ---
 
-## Configuration
+## ⚙️ Configuration
 
 Layered config — defaults → user → project → env vars:
 
@@ -512,7 +525,7 @@ auto_orchestrate = true       # apply the orchestration framework on every turn
 
 ---
 
-## Extending Forge
+## 🔌 Extending Forge
 
 **MCP** — connect any MCP server (stdio or HTTP/SSE) in `.forge/mcp.toml`; tools are exposed as
 namespaced `ToolSpec`s through the permission broker. OAuth 2.0 + PKCE for protected servers. Import
@@ -545,7 +558,9 @@ command = "bash -c 'jq .args <<< $FORGE_TOOL_INPUT >> audit.log'"
 
 ---
 
-## Documentation
+<a id="documentation"></a>
+
+## 📚 Documentation
 
 | Doc | What |
 |-----|------|
@@ -559,7 +574,7 @@ command = "bash -c 'jq .args <<< $FORGE_TOOL_INPUT >> audit.log'"
 
 ---
 
-## Project Layout
+## 🗂️ Project Layout
 
 ```
 crates/
@@ -579,13 +594,13 @@ crates/
 
 ---
 
-## Contributing
+## 🤝 Contributing
 
 Issues and PRs welcome. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for how to build, test, and submit
 changes, and [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md). Competitor-comparison corrections are
 especially welcome — open an issue with a source.
 
-## License
+## 📄 License
 
 [MIT](./LICENSE) © 2026 Floris Voskamp
 </content>
