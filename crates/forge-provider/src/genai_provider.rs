@@ -6,6 +6,7 @@
 //! prior tool results are replayed as genai tool responses so multi-step loops round-trip.
 
 use async_trait::async_trait;
+use forge_config::AzureProvider;
 use forge_types::{EffortLevel, Message, Role, ToolCall, Usage};
 use futures::StreamExt;
 use genai::adapter::AdapterKind;
@@ -14,7 +15,7 @@ use genai::chat::{
     ContentPart, MessageContent, ReasoningEffort, Tool, ToolCall as GenAiToolCall, ToolResponse,
 };
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
-use genai::{Client, ModelIden, ServiceTarget};
+use genai::{Client, Headers, ModelIden, ServiceTarget};
 
 use crate::{
     CompletionOptions, EventSink, ModelResponse, Provider, ProviderError, StreamEvent, ToolSpec,
@@ -276,10 +277,57 @@ pub(crate) fn build_client() -> Client {
     build_client_with(std::sync::Arc::new(KeyPool::from_config()))
 }
 
-/// Build the genai client with a key-rotation `pool` captured by the service-target resolver.
+/// Build the genai client with a key-rotation `pool` captured by the service-target resolver. Azure
+/// config is read from the loaded config (`[providers.azure]`).
 pub(crate) fn build_client_with(pool: std::sync::Arc<KeyPool>) -> Client {
+    build_client_full(pool, forge_config::azure_provider().cloned())
+}
+
+/// Build the Azure OpenAI [`ServiceTarget`]: retarget genai's OpenAI adapter (so the request BODY is
+/// standard OpenAI chat-completions — tool calls included) at Azure's deployment-scoped URL with an
+/// `api-key` header, via a per-request `AuthData::RequestOverride`. genai's `exec_chat`/`exec_chat_stream`
+/// replace the adapter's URL+headers with these, so `api-version` (query) and `api-key` (header) —
+/// neither expressible through the standard OpenAI resolver — are honored. The deployment name is the
+/// body `model`; Azure routes by the URL deployment regardless.
+pub(crate) fn azure_service_target(
+    azure: &AzureProvider,
+    deployment: &str,
+    key: &str,
+) -> ServiceTarget {
+    let url = azure.chat_completions_url(deployment);
+    ServiceTarget {
+        // Unused once `RequestOverride` replaces the URL, but `ServiceTarget` requires an endpoint.
+        endpoint: Endpoint::from_owned(url.clone()),
+        auth: AuthData::RequestOverride {
+            url,
+            headers: Headers::from(vec![("api-key".to_string(), key.to_string())]),
+        },
+        model: ModelIden::new(AdapterKind::OpenAI, deployment.to_string()),
+    }
+}
+
+/// Build the genai client with the key-rotation `pool` and an optional resolved Azure provider,
+/// both captured by the service-target resolver. Split from [`build_client_with`] so tests can inject
+/// an Azure provider pointing at a mock HTTP server without touching global config.
+pub(crate) fn build_client_full(
+    pool: std::sync::Arc<KeyPool>,
+    azure: Option<AzureProvider>,
+) -> Client {
     let resolver = ServiceTargetResolver::from_resolver_fn(
         move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+            // Azure OpenAI (`azure::<deployment>`): genai has no Azure adapter and the deployment URL +
+            // `api-version` query + `api-key` header don't fit the standard OpenAI resolver, so build a
+            // per-request override. Key precedence mirrors the custom branch: rotated pool key > env var.
+            if let Some(azure) = azure.as_ref() {
+                if st.model.model_name.namespace_is(forge_config::AZURE_NS) {
+                    let deployment = st.model.model_name.namespace_and_name().1.to_string();
+                    let key = pool
+                        .next(forge_config::AZURE_NS)
+                        .or_else(|| std::env::var(&azure.env_var).ok().filter(|k| !k.is_empty()))
+                        .unwrap_or_default();
+                    return Ok(azure_service_target(azure, &deployment, &key));
+                }
+            }
             // Custom OpenAI-compatible providers (no native genai adapter): genai keeps the full
             // `provider::model` string as the model name (unknown namespace → Ollama fallback), so
             // detect the namespace, strip it, and retarget the OpenAI adapter at the registered
@@ -1105,6 +1153,83 @@ fn is_phantom_truncation(saw_end: bool, has_tool_calls: bool, usage: &Usage) -> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_azure(endpoint: &str, env_var: &str) -> AzureProvider {
+        AzureProvider {
+            endpoint: endpoint.to_string(),
+            api_version: "2024-10-21".to_string(),
+            env_var: env_var.to_string(),
+            deployments: vec!["gpt4o".to_string()],
+            free: false,
+            label: String::new(),
+        }
+    }
+
+    #[test]
+    fn azure_service_target_builds_override_url_and_api_key_header() {
+        let azure = test_azure("https://res.openai.azure.com", "AZURE_OPENAI_API_KEY");
+        let st = azure_service_target(&azure, "gpt4o", "sk-secret");
+        match st.auth {
+            AuthData::RequestOverride { url, headers } => {
+                assert_eq!(
+                    url,
+                    "https://res.openai.azure.com/openai/deployments/gpt4o/chat/completions?api-version=2024-10-21"
+                );
+                let api_key = headers.iter().find(|(k, _)| k.as_str() == "api-key");
+                assert_eq!(api_key.map(|(_, v)| v.as_str()), Some("sk-secret"));
+                // Azure authenticates with `api-key`, never `Authorization: Bearer`.
+                assert!(headers.iter().all(|(k, _)| k.as_str() != "Authorization"));
+            }
+            other => panic!("expected RequestOverride, got {other:?}"),
+        }
+        // The OpenAI adapter shapes the (standard) request body; deployment is the body model.
+        assert_eq!(st.model.model_name.as_str(), "gpt4o");
+    }
+
+    #[tokio::test]
+    async fn azure_routes_through_genai_to_the_deployment_url_with_api_key() {
+        // Mock the HTTP layer — never hit real Azure. Prove an `azure::<deployment>` id is routed by
+        // the resolver to Azure's deployment-scoped URL, with the `api-key` header and the
+        // `api-version` query, and that the standard OpenAI response body round-trips back.
+        let server = httpmock::MockServer::start();
+        let env_var = "FORGE_AZURE_TEST_KEY";
+        std::env::set_var(env_var, "sk-azure-mock");
+
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/openai/deployments/gpt4o/chat/completions")
+                .query_param("api-version", "2024-10-21")
+                .header("api-key", "sk-azure-mock");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "model": "gpt4o",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello from azure"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+                }));
+        });
+
+        let azure = test_azure(&server.base_url(), env_var);
+        let client = build_client_full(std::sync::Arc::new(KeyPool::default()), Some(azure));
+        let req = ChatRequest::new(vec![ChatMessage::user("hi")]);
+        let res = client
+            .exec_chat("azure::gpt4o", req, None)
+            .await
+            .expect("azure chat completes against the mock");
+
+        std::env::remove_var(env_var);
+        mock.assert(); // the deployment URL + api-key header + api-version query were all matched
+        assert_eq!(
+            res.first_text().map(str::to_string).as_deref(),
+            Some("hello from azure")
+        );
+    }
 
     #[test]
     fn ollama_v1_endpoint_normalizes_host_forms() {

@@ -136,8 +136,31 @@ pub(crate) enum ProviderCmd {
         #[arg(long)]
         label: Option<String>,
     },
-    /// List providers: built-in custom endpoints, your runtime-registered ones, and any
-    /// scaffolded-but-not-yet-wired enterprise gateways (with the reason).
+    /// Configure Azure OpenAI (`azure::<deployment>` models). Writes `[providers.azure]` to your
+    /// user config; set the key via `AZURE_OPENAI_API_KEY` or `forge auth azure`. Active next session.
+    Azure {
+        /// Azure resource name → `https://<resource>.openai.azure.com`. Use `--endpoint` for a full
+        /// custom URL (sovereign clouds, proxies). Exactly one of `--resource` / `--endpoint`.
+        #[arg(long, conflicts_with = "endpoint")]
+        resource: Option<String>,
+        /// Full resource endpoint base (e.g. `https://my-resource.openai.azure.com`).
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Azure REST `api-version` (default: a recent GA version).
+        #[arg(long)]
+        api_version: Option<String>,
+        /// Env var holding the API key (default: `AZURE_OPENAI_API_KEY`).
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// A deployment name to expose as `azure::<deployment>` (repeatable).
+        #[arg(long = "deployment")]
+        deployments: Vec<String>,
+        /// Human label shown in `forge provider list`.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List providers: built-in custom endpoints, your runtime-registered ones, Azure OpenAI (when
+    /// configured), and any scaffolded-but-not-yet-wired enterprise gateways (with the reason).
     List,
     /// Remove a runtime-registered custom provider by namespace (built-ins can't be removed).
     Remove {

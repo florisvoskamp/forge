@@ -208,6 +208,14 @@ pub(crate) async fn discover_catalog(config: &forge_config::Config) -> forge_mes
     for list in custom_lists {
         models.extend(list);
     }
+    // Azure OpenAI: deployments are configured (`[providers.azure]`), not enumerable via an API in our
+    // flow, so seed each `azure::<deployment>` when a key is present. Routing reaches them through the
+    // genai per-request override (deployment URL + api-key header).
+    if forge_config::has_api_key("azure") {
+        if let Some(az) = forge_config::azure_provider() {
+            models.extend(az.deployments.iter().map(|d| format!("azure::{d}")));
+        }
+    }
     // Always-available subscription bridges (claude-cli/codex-cli) if their CLI is installed.
     // They don't rate-limit like the free API tiers, so the mesh can rely on them — and being
     // $0 subscriptions they rank first (prefer_subscription), so routing reaches a working model
