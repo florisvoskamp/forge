@@ -16,6 +16,19 @@ const BENCH_INDEX_DIVISOR: f64 = 20.0;
 /// Coarse quality class inferred from a model id's family (0 = unknown/small … 3 = frontier).
 pub(crate) fn quality_class(id: &str) -> u8 {
     let m = id.to_lowercase();
+    // Domain-specialized fine-tunes and stale-generation models slip through the size-only
+    // checks below despite NOT being general-purpose frontier-quality: NVIDIA's NIM catalog
+    // re-exports hundreds of partner/community models at "frontier" param counts that are
+    // narrowly tuned or simply outdated, not comparable to opus/gpt-5/gemini-pro. Checked
+    // BEFORE every size check (including -100b) so a big parameter count can't override this —
+    // unlike the small-vs-large overrides above, which is by genuine size, this is by KNOWN
+    // weak/narrow product family regardless of size.
+    //   - codellama: Meta's 2023 code-only model, predates Llama-3; weaker than modern 70B peers.
+    //   - palmyra (Writer): narrow domain (finance/medical/creative) fine-tunes, not general.
+    //   - stockmark: Japanese-focused instruct model, narrow general/English coverage.
+    if m.contains("codellama") || m.contains("palmyra") || m.contains("stockmark") {
+        return 2;
+    }
     // Explicit large-parameter counts override product-family naming conventions. A model that
     // states its size as ≥100 B is frontier-class regardless of whether "small" appears in its
     // product-line name (e.g. mistral-small-4-119b is 119 B despite "small" in the name).
@@ -351,6 +364,32 @@ mod tests {
         );
         // Normal small models (no param-count override) still downgrade correctly.
         assert_eq!(quality_class("mistral::mistral-small-2506"), 1);
+    }
+
+    #[test]
+    fn niche_or_stale_70b_models_are_not_frontier() {
+        // Live mesh bug: `forge mesh` tied codellama-70b + 3 palmyra variants + stockmark-2-100b
+        // at #1 on Complex (ahead of bench-scored opus) purely because they match `-70b`/`-100b`.
+        // None of these are general-purpose frontier-quality models:
+        //   - codellama-70b: Meta's 2023 code-only model, predates Llama-3.
+        //   - palmyra-fin/med (Writer): narrow finance/medical domain fine-tunes.
+        //   - stockmark-2-100b: Japanese-focused, not a general/English frontier model.
+        for id in [
+            "nvidia::meta/codellama-70b",
+            "nvidia::writer/palmyra-fin-70b-32k",
+            "nvidia::writer/palmyra-med-70b",
+            "nvidia::writer/palmyra-med-70b-32k",
+            "nvidia::stockmark/stockmark-2-100b-instruct",
+        ] {
+            assert_eq!(
+                quality_class(id),
+                2,
+                "{id} must not be classified frontier purely by param count"
+            );
+        }
+        // Genuine large general-purpose models are unaffected — still frontier.
+        assert_eq!(quality_class("nvidia::meta/llama-3.3-70b-instruct"), 3);
+        assert_eq!(quality_class("openrouter::qwen/qwen2.5-72b-instruct"), 3);
     }
 
     #[test]
