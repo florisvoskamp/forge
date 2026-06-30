@@ -4723,7 +4723,20 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         ) {
             PermissionDecision::Allow => true,
             PermissionDecision::Deny => false,
-            PermissionDecision::Ask => self.presenter.confirm(&call.name, side_effect),
+            PermissionDecision::Ask => match self.presenter.confirm(&call.name, side_effect) {
+                forge_tui::ConfirmOutcome::AlwaysAllow => {
+                    self.rules.push(forge_types::PermissionRule {
+                        tool: call.name.clone(),
+                        patterns: vec![],
+                        decision: forge_types::PermissionDecision::Allow,
+                        source: forge_types::RuleSource::Configured,
+                        reason: Some("user answered 'always' at runtime prompt".into()),
+                    });
+                    true
+                }
+                forge_tui::ConfirmOutcome::Allow => true,
+                forge_tui::ConfirmOutcome::Deny => false,
+            },
         };
         let permission_label = if allowed { "allowed" } else { "denied" };
 
@@ -4922,7 +4935,20 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         ) {
             PermissionDecision::Allow => true,
             PermissionDecision::Deny => false,
-            PermissionDecision::Ask => self.presenter.confirm(&call.name, side_effect),
+            PermissionDecision::Ask => match self.presenter.confirm(&call.name, side_effect) {
+                forge_tui::ConfirmOutcome::AlwaysAllow => {
+                    self.rules.push(forge_types::PermissionRule {
+                        tool: call.name.clone(),
+                        patterns: vec![],
+                        decision: forge_types::PermissionDecision::Allow,
+                        source: forge_types::RuleSource::Configured,
+                        reason: Some("user answered 'always' at runtime prompt".into()),
+                    });
+                    true
+                }
+                forge_tui::ConfirmOutcome::Allow => true,
+                forge_tui::ConfirmOutcome::Deny => false,
+            },
         };
         // When the model routes an MCP server tool via the mcp_call meta-wrapper, also gate the
         // inner (real) tool name against the permission broker. Without this, a per-tool
@@ -4952,9 +4978,23 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                 ) {
                     PermissionDecision::Allow => true,
                     PermissionDecision::Deny => false,
-                    PermissionDecision::Ask => self
+                    PermissionDecision::Ask => match self
                         .presenter
-                        .confirm(inner_name, forge_types::SideEffect::External),
+                        .confirm(inner_name, forge_types::SideEffect::External)
+                    {
+                        forge_tui::ConfirmOutcome::AlwaysAllow => {
+                            self.rules.push(forge_types::PermissionRule {
+                                tool: inner_name.to_string(),
+                                patterns: vec![],
+                                decision: forge_types::PermissionDecision::Allow,
+                                source: forge_types::RuleSource::Configured,
+                                reason: Some("user answered 'always' at runtime prompt".into()),
+                            });
+                            true
+                        }
+                        forge_tui::ConfirmOutcome::Allow => true,
+                        forge_tui::ConfirmOutcome::Deny => false,
+                    },
                 }
             }
         } else {
@@ -6172,8 +6212,8 @@ mod tests {
         fn emit(&mut self, event: PresenterEvent) {
             self.events.lock().unwrap().push(event);
         }
-        fn confirm(&mut self, _tool: &str, _side_effect: SideEffect) -> bool {
-            false
+        fn confirm(&mut self, _tool: &str, _side_effect: SideEffect) -> forge_tui::ConfirmOutcome {
+            forge_tui::ConfirmOutcome::Deny
         }
         fn ask(&mut self, _q: &str, options: &[forge_tui::QChoice], _allow_other: bool) -> String {
             // Deterministic: pick the first option (or empty) so tests don't block on input.
@@ -6193,8 +6233,8 @@ mod tests {
     }
     impl Presenter for ScriptedPresenter {
         fn emit(&mut self, _event: PresenterEvent) {}
-        fn confirm(&mut self, _tool: &str, _side_effect: SideEffect) -> bool {
-            true
+        fn confirm(&mut self, _tool: &str, _side_effect: SideEffect) -> forge_tui::ConfirmOutcome {
+            forge_tui::ConfirmOutcome::Allow
         }
         fn ask(&mut self, _q: &str, _options: &[forge_tui::QChoice], _allow_other: bool) -> String {
             *self.asks.lock().unwrap() += 1;

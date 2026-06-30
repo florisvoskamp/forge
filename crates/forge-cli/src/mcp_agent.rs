@@ -69,15 +69,21 @@ impl forge_tui::Presenter for AgentPresenter {
         }
     }
 
-    fn confirm(&mut self, _tool: &str, side_effect: SideEffect) -> bool {
+    fn confirm(&mut self, _tool: &str, side_effect: SideEffect) -> forge_tui::ConfirmOutcome {
         match *self.mode.lock().unwrap() {
             // Full auto: allow everything unconditionally.
-            PermissionMode::Bypass => true,
+            PermissionMode::Bypass => forge_tui::ConfirmOutcome::Allow,
             // Accept edits: allow all file mutations; defer shell to SideEffect check.
-            PermissionMode::AcceptEdits => side_effect != SideEffect::External,
+            PermissionMode::AcceptEdits => {
+                if side_effect != SideEffect::External {
+                    forge_tui::ConfirmOutcome::Allow
+                } else {
+                    forge_tui::ConfirmOutcome::Deny
+                }
+            }
             // Default / Plan: only read-only is auto-allowed; writes need explicit permission.
             // In an agent context with no TTY, treat "ask" as allow so turns don't hang.
-            PermissionMode::Default | PermissionMode::Plan => true,
+            PermissionMode::Default | PermissionMode::Plan => forge_tui::ConfirmOutcome::Allow,
         }
     }
 
