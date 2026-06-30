@@ -65,7 +65,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # default-fancy = bundled syntaxes/themes with the pure-Rust fancy-regex backend
 # (no oniguruma C dep → clean cross-compile, smaller footprint).
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-similar = "2"
+similar = "3"
 regex = "1"
 # Real BPE token counting for precise context accounting (not a chars/token estimate). Bundles the
 # o200k_base / cl100k_base vocabularies in-crate, so it works fully offline.
