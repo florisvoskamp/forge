@@ -124,6 +124,51 @@ pub struct ProvidersConfig {
     /// Each `[[providers.custom]]` entry registers one OpenAI-compatible endpoint at runtime.
     #[serde(default)]
     pub custom: Vec<CustomProviderConfig>,
+    /// `[providers.azure]` — an Azure OpenAI resource. Unlike the standard OpenAI shape, Azure scopes
+    /// the URL to a deployment and authenticates with an `api-key` header (not `Authorization:
+    /// Bearer`), so it needs its own block rather than a `[[providers.custom]]` row. Absent = inert.
+    #[serde(default)]
+    pub azure: Option<AzureConfig>,
+}
+
+/// `[providers.azure]`: an Azure OpenAI resource the user configures without recompiling. Azure's
+/// chat URL is `https://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?
+/// api-version=<ver>` with an `api-key` header — Forge reaches it through genai's OpenAI adapter via a
+/// per-request URL+header override (`AuthData::RequestOverride`), so the request body is standard
+/// OpenAI chat-completions (tool calls included). Each model id is `azure::<deployment>`; the
+/// deployment name is both the routing key and the body `model`. Example:
+/// ```toml
+/// [providers.azure]
+/// resource    = "my-resource"          # -> https://my-resource.openai.azure.com  (or set `endpoint`)
+/// api_version = "2024-10-21"           # optional — defaults to a recent GA version
+/// api_key_env = "AZURE_OPENAI_API_KEY" # optional — this is the default
+/// deployments = ["gpt-4o", "gpt-4o-mini"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AzureConfig {
+    /// Azure resource name → `https://<resource>.openai.azure.com`. Ignored if `endpoint` is set.
+    #[serde(default)]
+    pub resource: Option<String>,
+    /// Full resource endpoint base (e.g. `https://my-resource.openai.azure.com`). Overrides
+    /// `resource`; lets sovereign/custom Azure clouds (`*.openai.azure.us`, proxies) be targeted.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Azure REST `api-version` query value. Optional — defaults to [`DEFAULT_AZURE_API_VERSION`].
+    #[serde(default)]
+    pub api_version: Option<String>,
+    /// Env var holding the Azure API key. Optional — defaults to [`AZURE_DEFAULT_KEY_ENV`].
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Deployment names (each becomes an `azure::<deployment>` model id). May be empty (the user pins
+    /// `azure::<deployment>` ids manually); Azure has no enumerable deployments endpoint in our flow.
+    #[serde(default)]
+    pub deployments: Vec<String>,
+    /// Whether these deployments are free to call. Azure is metered, so this is `false` by default.
+    #[serde(default)]
+    pub free: bool,
+    /// Human label shown in `forge provider list`. Optional.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// One user-declared `[[providers.custom]]` endpoint. Mirrors a [`CustomProvider`] row but owned and
@@ -2425,19 +2470,133 @@ const PROVIDER_ENV_VARS: &[(&str, &str)] = &[
 
 /// Enterprise gateways Forge has config/CLI scaffolding for but CANNOT route to with the pinned genai
 /// version — shown by `forge provider list` with the reason, never entered into routing (honest: not
-/// faked). `(namespace, why)`.
-///
-/// • Azure OpenAI: genai 0.6.5 has no Azure adapter, and Azure's deployment-scoped URL
-///   (`/openai/deployments/<deployment>/chat/completions?api-version=…`) + `api-key` header can't be
-///   expressed through the OpenAI custom-endpoint resolver (which targets `<base>chat/completions`
-///   with a Bearer token). Workaround today: front Azure with an OpenAI-compatible proxy and register
-///   it via `forge provider add --namespace azure --base-url <proxy-url>`.
-pub const UNWIRED_ENTERPRISE_PROVIDERS: &[(&str, &str)] = &[(
-    "azure",
-    "Azure OpenAI — not wired: genai 0.6.5 has no Azure adapter (deployment URL + api-version + \
-     api-key header aren't expressible via the OpenAI custom-endpoint resolver). Front it with an \
-     OpenAI-compatible proxy and run `forge provider add --namespace azure --base-url <proxy>`.",
-)];
+/// faked). `(namespace, why)`. Empty now that Azure OpenAI is wired through genai's per-request
+/// URL+header override (see [`AzureConfig`] / `[providers.azure]`); kept as the home for the next
+/// gateway that genai can't yet reach.
+pub const UNWIRED_ENTERPRISE_PROVIDERS: &[(&str, &str)] = &[];
+
+/// Provider namespace for Azure OpenAI model ids (`azure::<deployment>`).
+pub const AZURE_NS: &str = "azure";
+
+/// Default env var Forge reads for the Azure OpenAI API key (overridable via `api_key_env`).
+pub const AZURE_DEFAULT_KEY_ENV: &str = "AZURE_OPENAI_API_KEY";
+
+/// Default Azure REST `api-version` when the config omits one. A recent GA version that supports
+/// tool/function calling; the user can pin any version their resource exposes via `api_version`.
+pub const DEFAULT_AZURE_API_VERSION: &str = "2024-10-21";
+
+/// A resolved, validated Azure OpenAI provider (from `[providers.azure]`). The genai client builds a
+/// per-request `AuthData::RequestOverride` from this to retarget the OpenAI adapter at Azure's
+/// deployment-scoped URL with an `api-key` header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AzureProvider {
+    /// Resource endpoint base, no trailing slash (e.g. `https://my-resource.openai.azure.com`).
+    pub endpoint: String,
+    /// Azure REST `api-version` query value.
+    pub api_version: String,
+    /// Env var holding the API key.
+    pub env_var: String,
+    /// Deployment names → `azure::<deployment>` model ids.
+    pub deployments: Vec<String>,
+    /// Whether these deployments are free (Azure is metered, so normally false).
+    pub free: bool,
+    /// Human label for `forge provider list`.
+    pub label: String,
+}
+
+impl AzureProvider {
+    /// The full Azure chat-completions URL for a deployment, including the `api-version` query. This
+    /// is what the genai OpenAI adapter's request is redirected to via `AuthData::RequestOverride`.
+    pub fn chat_completions_url(&self, deployment: &str) -> String {
+        format!(
+            "{}/openai/deployments/{}/chat/completions?api-version={}",
+            self.endpoint.trim_end_matches('/'),
+            deployment,
+            self.api_version
+        )
+    }
+}
+
+impl AzureConfig {
+    /// Resolve the endpoint base (no trailing slash) from `endpoint` (preferred) or `resource`.
+    fn resolved_endpoint(&self) -> Option<String> {
+        if let Some(ep) = self
+            .endpoint
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(ep.trim_end_matches('/').to_string());
+        }
+        let res = self
+            .resource
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())?;
+        Some(format!("https://{res}.openai.azure.com"))
+    }
+
+    /// Validate + resolve into an [`AzureProvider`]. Requires `endpoint` or `resource`; the
+    /// endpoint must be `http(s)://`. `api_version`/`api_key_env` fall back to the defaults.
+    pub fn into_provider(self) -> Result<AzureProvider, String> {
+        let endpoint = self
+            .resolved_endpoint()
+            .ok_or_else(|| "[providers.azure] needs `resource` or `endpoint`".to_string())?;
+        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+            return Err(format!(
+                "azure endpoint '{endpoint}' must start with http(s)://"
+            ));
+        }
+        let api_version = self
+            .api_version
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_AZURE_API_VERSION.to_string());
+        let env_var = self
+            .api_key_env
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| AZURE_DEFAULT_KEY_ENV.to_string());
+        Ok(AzureProvider {
+            endpoint,
+            api_version,
+            env_var,
+            deployments: self
+                .deployments
+                .into_iter()
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty())
+                .collect(),
+            free: self.free,
+            label: self.label.unwrap_or_default(),
+        })
+    }
+}
+
+/// The resolved Azure provider, cached process-wide (build-once, like the custom-provider registry).
+/// `None` when no valid `[providers.azure]` block is configured.
+static AZURE_REGISTRY: std::sync::OnceLock<Option<AzureProvider>> = std::sync::OnceLock::new();
+
+fn azure_registry() -> Option<&'static AzureProvider> {
+    AZURE_REGISTRY
+        .get_or_init(|| {
+            let cfg = load().ok().and_then(|c| c.providers.azure)?;
+            match cfg.into_provider() {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!("ignoring invalid [providers.azure]: {e}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// The configured Azure OpenAI provider, if `[providers.azure]` is present and valid. Used by the
+/// provider client to build the per-request Azure override, and by discovery to seed deployments.
+pub fn azure_provider() -> Option<&'static AzureProvider> {
+    azure_registry()
+}
 
 /// An OpenAI-compatible API provider that genai has **no native adapter** for. Forge reaches it
 /// by retargeting genai's OpenAI adapter at `endpoint` with the key from `env_var` (see the
@@ -2858,6 +3017,80 @@ pub fn user_custom_providers() -> Vec<CustomProviderConfig> {
     load().map(|c| c.providers.custom).unwrap_or_default()
 }
 
+/// The raw `[providers.azure]` block from config (unresolved), for `forge provider list` to show what
+/// the user set. `None` if absent. [`azure_provider`] returns the validated, resolved form.
+pub fn user_azure_config() -> Option<AzureConfig> {
+    load().ok().and_then(|c| c.providers.azure)
+}
+
+/// Persist a `[providers.azure]` block to the user `config.toml`, validating first (a bad
+/// resource/endpoint fails before writing) and that the whole file still extracts to a [`Config`].
+/// Returns the path written. Active on the next session start (the registry is build-once).
+pub fn add_azure_provider(cfg: &AzureConfig) -> Result<PathBuf, ConfigError> {
+    let dir = config_dir().ok_or(ConfigError::NoConfigDir)?;
+    std::fs::create_dir_all(&dir).map_err(|e| ConfigError::Write(e.to_string()))?;
+    let path = dir.join("config.toml");
+    add_azure_provider_at(&path, cfg)?;
+    Ok(path)
+}
+
+/// The file half of [`add_azure_provider`] against an explicit path — testable without the real
+/// per-user config dir (mirrors [`add_custom_provider_at`]).
+fn add_azure_provider_at(path: &std::path::Path, cfg: &AzureConfig) -> Result<(), ConfigError> {
+    // Validate (resource/endpoint present + well-formed) before touching the file.
+    cfg.clone().into_provider().map_err(ConfigError::Write)?;
+
+    let mut root: toml::Table = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+
+    let providers = root
+        .entry("providers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !providers.is_table() {
+        *providers = toml::Value::Table(toml::Table::new());
+    }
+    let azure = providers
+        .as_table_mut()
+        .unwrap()
+        .entry("azure".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let mut entry = toml::Table::new();
+    let mut put = |k: &str, v: Option<&String>| {
+        if let Some(s) = v.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            entry.insert(k.into(), toml::Value::String(s.to_string()));
+        }
+    };
+    put("resource", cfg.resource.as_ref());
+    put("endpoint", cfg.endpoint.as_ref());
+    put("api_version", cfg.api_version.as_ref());
+    put("api_key_env", cfg.api_key_env.as_ref());
+    put("label", cfg.label.as_ref());
+    if cfg.free {
+        entry.insert("free".into(), toml::Value::Boolean(true));
+    }
+    let deps: Vec<toml::Value> = cfg
+        .deployments
+        .iter()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .map(toml::Value::String)
+        .collect();
+    if !deps.is_empty() {
+        entry.insert("deployments".into(), toml::Value::Array(deps));
+    }
+    *azure = toml::Value::Table(entry);
+
+    let body = toml::to_string_pretty(&root).map_err(|e| ConfigError::Write(e.to_string()))?;
+    Figment::from(Serialized::defaults(Config::default()))
+        .merge(Toml::string(&body))
+        .extract::<Config>()
+        .map_err(|e| ConfigError::Write(format!("invalid config after azure add: {e}")))?;
+    std::fs::write(path, body).map_err(|e| ConfigError::Write(e.to_string()))?;
+    Ok(())
+}
+
 // Search-API providers for the `web_search` tool. Kept separate from PROVIDER_ENV_VARS so
 // they never enter model discovery / the mesh — they authenticate a tool, not a model.
 const SEARCH_ENV_VARS: &[(&str, &str)] = &[("brave", "BRAVE_API_KEY")];
@@ -2968,6 +3201,14 @@ fn env_var_for(provider: &str) -> Option<&'static str> {
         .or_else(|| {
             custom_provider(provider).and_then(|p| (!p.env_var.is_empty()).then_some(p.env_var))
         })
+        // Azure carries a configurable key env var (default `AZURE_OPENAI_API_KEY`); the resolved
+        // provider is build-once `'static`, so the borrowed name is `'static` too.
+        .or_else(|| {
+            (provider == AZURE_NS)
+                .then(azure_registry)
+                .flatten()
+                .map(|a| a.env_var.as_str())
+        })
 }
 
 /// Provider names Forge knows how to authenticate (for `forge auth` validation/help). Includes
@@ -2977,6 +3218,8 @@ pub fn known_key_providers() -> impl Iterator<Item = &'static str> {
         .iter()
         .map(|(name, _)| *name)
         .chain(custom_provider_registry().iter().map(|p| p.namespace))
+        // Azure is a known keyed provider only when configured (so `forge auth azure` is valid then).
+        .chain(azure_registry().map(|_| AZURE_NS))
 }
 
 /// Conventional / legacy env-var aliases accepted IN ADDITION to the canonical name in
@@ -3092,6 +3335,11 @@ pub fn provider_for_env_var(var: &str) -> Option<&'static str> {
                 .find(|p| p.env_var == var)
                 .map(|p| p.namespace)
         })
+        .or_else(|| {
+            azure_registry()
+                .filter(|a| a.env_var == var)
+                .map(|_| AZURE_NS)
+        })
 }
 
 /// Store a provider API key, REPLACING any existing key(s) with this single one
@@ -3170,7 +3418,10 @@ pub fn inject_provider_keys() {
     let custom = custom_provider_registry()
         .iter()
         .map(|p| (p.namespace, p.env_var));
-    for (provider, var) in native.chain(custom) {
+    let azure = azure_registry()
+        .into_iter()
+        .map(|a| (AZURE_NS, a.env_var.as_str()));
+    for (provider, var) in native.chain(custom).chain(azure) {
         // Keyless custom providers (local servers) carry an empty env_var — nothing to inject.
         if var.is_empty() || env_set(var) {
             continue;
@@ -4016,11 +4267,118 @@ reason = "no privilege escalation"
     }
 
     #[test]
-    fn azure_is_scaffolded_but_explicitly_unwired() {
-        let azure = UNWIRED_ENTERPRISE_PROVIDERS
-            .iter()
-            .find(|(ns, _)| *ns == "azure")
-            .expect("azure scaffolded");
-        assert!(azure.1.to_lowercase().contains("not wired"));
+    fn azure_is_no_longer_in_the_unwired_list() {
+        // Azure is wired now (genai per-request URL+header override), so it must NOT appear as a
+        // scaffolded-but-unwired gateway.
+        assert!(
+            !UNWIRED_ENTERPRISE_PROVIDERS
+                .iter()
+                .any(|(ns, _)| *ns == "azure"),
+            "azure should be wired, not listed as unwired"
+        );
+    }
+
+    #[test]
+    fn azure_config_resolves_resource_and_builds_deployment_url() {
+        let cfg = AzureConfig {
+            resource: Some("my-resource".into()),
+            deployments: vec!["gpt-4o".into(), "  ".into(), "gpt-4o-mini".into()],
+            ..Default::default()
+        };
+        let p = cfg.into_provider().unwrap();
+        assert_eq!(p.endpoint, "https://my-resource.openai.azure.com");
+        // Defaults applied when omitted.
+        assert_eq!(p.api_version, DEFAULT_AZURE_API_VERSION);
+        assert_eq!(p.env_var, AZURE_DEFAULT_KEY_ENV);
+        // Blank deployments filtered out.
+        assert_eq!(p.deployments, vec!["gpt-4o", "gpt-4o-mini"]);
+        // The deployment-scoped URL with the api-version query is the Azure REST shape.
+        assert_eq!(
+            p.chat_completions_url("gpt-4o"),
+            format!(
+                "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version={DEFAULT_AZURE_API_VERSION}"
+            )
+        );
+    }
+
+    #[test]
+    fn azure_explicit_endpoint_overrides_resource_and_strips_trailing_slash() {
+        let cfg = AzureConfig {
+            resource: Some("ignored".into()),
+            endpoint: Some("https://sovereign.openai.azure.us/".into()),
+            api_version: Some("2025-01-01".into()),
+            api_key_env: Some("MY_AZURE_KEY".into()),
+            ..Default::default()
+        };
+        let p = cfg.into_provider().unwrap();
+        assert_eq!(p.endpoint, "https://sovereign.openai.azure.us");
+        assert_eq!(p.api_version, "2025-01-01");
+        assert_eq!(p.env_var, "MY_AZURE_KEY");
+        assert!(p.chat_completions_url("d").starts_with(
+            "https://sovereign.openai.azure.us/openai/deployments/d/chat/completions?"
+        ));
+    }
+
+    #[test]
+    fn azure_config_requires_resource_or_endpoint() {
+        let err = AzureConfig::default().into_provider().unwrap_err();
+        assert!(err.contains("resource") || err.contains("endpoint"));
+    }
+
+    #[test]
+    fn azure_config_block_parses_from_toml() {
+        let toml = r#"
+[providers.azure]
+resource = "acme"
+api_version = "2024-10-21"
+deployments = ["gpt-4o", "gpt-4o-mini"]
+"#;
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        let az = cfg.providers.azure.expect("azure block parsed");
+        assert_eq!(az.resource.as_deref(), Some("acme"));
+        assert_eq!(az.deployments.len(), 2);
+        // And it resolves to a usable provider.
+        let p = az.into_provider().unwrap();
+        assert_eq!(p.endpoint, "https://acme.openai.azure.com");
+    }
+
+    #[test]
+    fn add_azure_provider_round_trips_through_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = AzureConfig {
+            resource: Some("acme".into()),
+            api_version: Some("2024-10-21".into()),
+            deployments: vec!["gpt-4o".into()],
+            ..Default::default()
+        };
+        add_azure_provider_at(&path, &cfg).unwrap();
+        let parsed: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::file(&path))
+            .extract()
+            .unwrap();
+        let az = parsed.providers.azure.expect("azure persisted");
+        assert_eq!(az.resource.as_deref(), Some("acme"));
+        assert_eq!(az.deployments, vec!["gpt-4o"]);
+
+        // Re-adding replaces the block (no duplicate / merge cruft).
+        let cfg2 = AzureConfig {
+            endpoint: Some("https://acme.openai.azure.com".into()),
+            deployments: vec!["o3-mini".into()],
+            ..Default::default()
+        };
+        add_azure_provider_at(&path, &cfg2).unwrap();
+        let parsed: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::file(&path))
+            .extract()
+            .unwrap();
+        let az = parsed.providers.azure.unwrap();
+        assert_eq!(az.deployments, vec!["o3-mini"]);
+
+        // An invalid block (no resource/endpoint) is rejected before writing.
+        assert!(add_azure_provider_at(&path, &AzureConfig::default()).is_err());
     }
 }

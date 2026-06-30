@@ -3,8 +3,11 @@
 //! coalesce save bursts; skips build/VCS/vendored dirs. A watcher must never crash the session, so
 //! once running, per-file reindex errors are swallowed.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use notify_debouncer_mini::notify::{
@@ -16,10 +19,37 @@ use notify_debouncer_mini::{
 
 use crate::{is_skippable_dir, lang_for_path, Lattice};
 
-/// Keeps the background watcher alive; dropping it stops watching. Holds either the native inotify
-/// backend or the polling backend (used on filesystems where inotify is unreliable — see below).
+/// Keeps the background watcher alive; dropping it stops watching AND joins the reindex worker so no
+/// thread leaks. Holds the OS watcher backend (native inotify or polling) plus the worker thread that
+/// drains changed paths and reindexes them OFF the notify/debouncer thread (so a save burst can't
+/// serialize reindexing on the watcher thread or hold the store write lock too long).
 pub struct LatticeWatcher {
-    _inner: WatcherInner,
+    // Dropped FIRST (see the explicit `Drop`): the debouncer owns the channel `Sender` (it lives in
+    // the handler closure), so dropping it disconnects the channel, which is the worker's shutdown
+    // signal. `Option` so `Drop` can `take()` it before joining the worker.
+    inner: Option<WatcherInner>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl LatticeWatcher {
+    fn new(inner: WatcherInner, worker: JoinHandle<()>) -> Self {
+        Self {
+            inner: Some(inner),
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for LatticeWatcher {
+    fn drop(&mut self) {
+        // Drop the debouncer first: that drops its handler closure, the sole channel `Sender`, so the
+        // worker's `recv()` returns `Err` (disconnected) and the loop exits. Then join the worker so
+        // it's torn down deterministically instead of leaked.
+        self.inner.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 // Variants hold the debouncer purely to keep its background thread alive (dropping stops watching);
@@ -33,6 +63,12 @@ enum WatcherInner {
 /// How often the POLLING backend rescans the tree on a filesystem without working inotify (9p/etc.).
 /// A balance between reindex latency and the cost of a full stat-walk over a remote/host link.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// After the worker pulls the first changed path of a batch, it waits this long for stragglers from
+/// the same save burst (a multi-file save, a `git checkout`) before reindexing — so paths arriving in
+/// quick succession coalesce into one reindex pass instead of one pass each. Short enough to stay
+/// imperceptible on top of the debounce window.
+const COALESCE_WINDOW: Duration = Duration::from_millis(50);
 
 /// Watch `root` recursively and reindex changed source files into `lattice`. Returns an error only
 /// if the OS watcher can't be set up at all; the returned handle must be kept alive for watching to
@@ -50,29 +86,55 @@ pub fn spawn_watcher(
     root: &Path,
     debounce: Duration,
 ) -> Result<LatticeWatcher, String> {
-    let inner = build_watcher(lattice, root, debounce, needs_polling(root), POLL_INTERVAL)?;
-    Ok(LatticeWatcher { _inner: inner })
+    build_watcher(
+        lattice,
+        root,
+        debounce,
+        needs_polling(root),
+        POLL_INTERVAL,
+        COALESCE_WINDOW,
+    )
 }
 
 /// Build the backend explicitly (the `poll` decision + interval are parameters so tests can exercise
 /// the polling path on a native test filesystem). `poll=false` → inotify; `poll=true` → stat-walk
-/// every `poll_interval`.
+/// every `poll_interval`. `coalesce` is the worker's batch window (see [`COALESCE_WINDOW`]).
+///
+/// The notify/debouncer thread runs the cheap `handler`: it only *enqueues* changed paths onto a
+/// channel and returns immediately, so a burst of saves never serializes reindexing (which takes the
+/// store write lock) on the watcher thread. A dedicated worker thread drains the channel, coalesces
+/// duplicate paths within `coalesce`, and reindexes — off the watcher thread.
 fn build_watcher(
     lattice: Arc<Lattice>,
     root: &Path,
     debounce: Duration,
     poll: bool,
     poll_interval: Duration,
-) -> Result<WatcherInner, String> {
+    coalesce: Duration,
+) -> Result<LatticeWatcher, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+    let worker = std::thread::Builder::new()
+        .name("forge-lattice-reindex".into())
+        .spawn(move || {
+            run_reindex_worker(rx, coalesce, |path| {
+                let _ = lattice.reindex_path(path);
+            });
+        })
+        .map_err(|e| e.to_string())?;
+
+    // The handler runs ON the notify/debouncer thread, so it must stay cheap: just forward each
+    // supported changed path to the worker. A send only fails once the worker has exited (channel
+    // closed); that can't normally happen while the debouncer is alive, so it's ignored.
     let handler = move |res: DebounceEventResult| {
         let Ok(events) = res else { return };
         for ev in events {
             if should_reindex(&ev.path) {
-                let _ = lattice.reindex_path(&ev.path);
+                let _ = tx.send(ev.path);
             }
         }
     };
-    if poll {
+
+    let inner = if poll {
         // compare_contents so a same-SIZE edit (changing a value, a rename of equal length) is still
         // caught — metadata-only polling would miss it if mtime granularity coincides. Costs a content
         // read per file per tick, bounded by the project-root scope + debounce.
@@ -88,14 +150,44 @@ fn build_watcher(
             .watcher()
             .watch(root, RecursiveMode::Recursive)
             .map_err(|e| e.to_string())?;
-        Ok(WatcherInner::Poll(debouncer))
+        WatcherInner::Poll(debouncer)
     } else {
         let mut debouncer = new_debouncer(debounce, handler).map_err(|e| e.to_string())?;
         debouncer
             .watcher()
             .watch(root, RecursiveMode::Recursive)
             .map_err(|e| e.to_string())?;
-        Ok(WatcherInner::Native(debouncer))
+        WatcherInner::Native(debouncer)
+    };
+    Ok(LatticeWatcher::new(inner, worker))
+}
+
+/// Drain reindex requests off `rx` and apply `reindex` to each changed path, OFF the watcher thread.
+/// Coalesces a burst: after the first path arrives it grabs everything already queued, waits
+/// `coalesce` for stragglers from the same save, grabs those too, then reindexes each unique path
+/// ONCE — so one save that emits the same path several times (or several debounce windows for one
+/// file) reindexes it a single time, not N times. Exits when the channel disconnects (every `Sender`
+/// dropped, i.e. the watcher was dropped), which is the clean-shutdown signal.
+fn run_reindex_worker<F: FnMut(&Path)>(rx: Receiver<PathBuf>, coalesce: Duration, mut reindex: F) {
+    while let Ok(first) = rx.recv() {
+        let mut batch: HashSet<PathBuf> = HashSet::new();
+        batch.insert(first);
+        drain_pending(&rx, &mut batch);
+        if !coalesce.is_zero() {
+            std::thread::sleep(coalesce);
+            drain_pending(&rx, &mut batch);
+        }
+        for path in &batch {
+            reindex(path);
+        }
+    }
+}
+
+/// Move every currently-queued path from `rx` into `batch` (deduping), without blocking. Stops at the
+/// first `Empty` (nothing more queued right now) or `Disconnected` (sender gone) — both end the drain.
+fn drain_pending(rx: &Receiver<PathBuf>, batch: &mut HashSet<PathBuf>) {
+    while let Ok(path) = rx.try_recv() {
+        batch.insert(path);
     }
 }
 
@@ -291,15 +383,15 @@ mod tests {
         let lattice = Arc::new(Lattice::new(store, &root));
         lattice.update().unwrap();
 
-        let inner = build_watcher(
+        let _w = build_watcher(
             Arc::clone(&lattice),
             &root,
             Duration::from_millis(100),
             true, // force the polling backend
             Duration::from_millis(150),
+            COALESCE_WINDOW,
         )
         .expect("poll watcher starts");
-        let _w = LatticeWatcher { _inner: inner };
 
         std::fs::write(&file, "pub fn gamma() {}\n").unwrap();
         let mut reindexed = false;
@@ -352,6 +444,69 @@ mod tests {
             reindexed,
             "channel-held watcher did not reindex the external edit"
         );
+    }
+
+    #[test]
+    fn worker_coalesces_a_burst_and_stops_on_sender_drop() {
+        // A rapid burst of changes to the SAME path must coalesce into far fewer reindexes than the
+        // number of events (don't reindex a file 10× for one save), and dropping the sole `Sender`
+        // (what `LatticeWatcher::drop` does to the debouncer's handler) must stop the worker so its
+        // thread can be joined — no leak.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        let reindexes = Arc::new(AtomicUsize::new(0));
+        let r2 = Arc::clone(&reindexes);
+        let worker = std::thread::spawn(move || {
+            run_reindex_worker(rx, Duration::from_millis(80), move |_p| {
+                r2.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+
+        // Fire 20 events for one path back-to-back; they should land within a single coalesce window.
+        let path = PathBuf::from("src/a.rs");
+        for _ in 0..20 {
+            tx.send(path.clone()).unwrap();
+        }
+
+        drop(tx); // sole sender gone → worker must finish the batch and exit
+        worker
+            .join()
+            .expect("worker thread joins after sender drop");
+
+        let n = reindexes.load(Ordering::SeqCst);
+        assert!(n >= 1, "the burst must reindex the path at least once");
+        assert!(
+            n < 20,
+            "20 events for one path must coalesce to fewer reindexes, got {n}"
+        );
+    }
+
+    #[test]
+    fn worker_reindexes_distinct_paths_in_a_batch() {
+        // Coalescing dedups by path, so distinct paths in one burst are each reindexed once.
+        use std::sync::Mutex;
+
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        let seen: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+        let s2 = Arc::clone(&seen);
+        let worker = std::thread::spawn(move || {
+            run_reindex_worker(rx, Duration::from_millis(80), move |p| {
+                s2.lock().unwrap().insert(p.to_path_buf());
+            });
+        });
+
+        for name in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            // each path sent twice — dedup should still reindex each once
+            tx.send(PathBuf::from(name)).unwrap();
+            tx.send(PathBuf::from(name)).unwrap();
+        }
+        drop(tx);
+        worker.join().expect("worker joins");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "each distinct path reindexed");
+        assert!(seen.contains(Path::new("src/b.rs")));
     }
 
     #[test]
