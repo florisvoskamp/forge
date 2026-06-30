@@ -829,7 +829,10 @@ pub(crate) async fn run_chat_tui(
     // outside Forge. Codex comes from its rollout files (fresh); claude's stale cache is only a
     // weak fallback — the background probe below fetches claude's CURRENT 5h+weekly utilisation
     // (via the `claude --debug` rate-limit headers) so the store is live within a few seconds.
-    {
+    // Skipped entirely under `--mock`: it's documented as the offline/deterministic provider, and
+    // `refresh_claude_quota` spawns the REAL `claude` CLI as a subprocess — a real network call
+    // with real side effects, not something "offline" should ever trigger.
+    if !mock {
         // bridge_stats::fetch recursively scans ~/.claude/projects/**/*.jsonl — on a slow FS (WSL
         // /mnt, a huge history) that can stall the first frame. Run it in a background task;
         // the quota overlay refreshes on its own cadence so the numbers fill in within seconds.
@@ -845,12 +848,12 @@ pub(crate) async fn run_chat_tui(
                 }
             }
         });
-    }
-    if claude_quota_is_stale(&session, 300).await {
-        tokio::spawn({
-            let s = session.clone();
-            async move { refresh_claude_quota(&s).await }
-        });
+        if claude_quota_is_stale(&session, 300).await {
+            tokio::spawn({
+                let s = session.clone();
+                async move { refresh_claude_quota(&s).await }
+            });
+        }
     }
 
     // Inline-mode banner: print BEFORE ratatui creates the inline viewport so the terminal's own

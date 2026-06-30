@@ -43,19 +43,41 @@ pub fn probe_claude_limits() -> Vec<(String, f64)> {
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let out = std::process::Command::new("claude")
-            .args([
-                "--debug",
-                "--print",
-                "--model",
-                "haiku",
-                "--append-system-prompt",
-                "Reply with a single period.",
-            ])
-            .arg(".")
-            .env("ANTHROPIC_LOG", "debug")
-            .stdin(std::process::Stdio::null())
-            .output();
+        #[allow(unused_mut)]
+        let mut cmd = std::process::Command::new("claude");
+        cmd.args([
+            "--debug",
+            "--print",
+            "--model",
+            "haiku",
+            "--append-system-prompt",
+            "Reply with a single period.",
+        ])
+        .arg(".")
+        .env("ANTHROPIC_LOG", "debug")
+        .stdin(std::process::Stdio::null());
+        // `--debug` makes the real `claude` CLI write verbose diagnostic output straight to the
+        // controlling terminal via /dev/tty, bypassing stdout/stderr redirection entirely (a
+        // common "always show this even if piped" pattern). Stdio::piped() (what `.output()`
+        // uses) does NOT stop that — it only redirects fds 1/2, and /dev/tty is a separate path
+        // to the same terminal as long as this child shares our session. Detach it into its own
+        // session (setsid) so /dev/tty has no controlling terminal to resolve to: the probe still
+        // runs and its captured stdout/stderr are unaffected, but it can no longer scribble raw
+        // debug text over our own TUI's rendering on the same pty. Unix-only; Windows consoles
+        // don't have this controlling-terminal/setsid concept, so no equivalent is needed there.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Safety: setsid() is async-signal-safe and valid to call between fork and exec
+            // (the same pattern already used in forge-tools/src/shell.rs's sandbox pre_exec).
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+        let out = cmd.output();
         let _ = tx.send(out);
     });
     let out = match rx.recv_timeout(PROBE_TIMEOUT) {

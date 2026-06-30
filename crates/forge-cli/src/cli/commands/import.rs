@@ -170,12 +170,19 @@ fn import_claude_settings(claude_home: &std::path::Path, project: bool) {
         }
     };
 
-    let hooks_n = transfer_hooks(&values, &settings_dst);
+    // Hooks are NOT imported by default (see `count_cc_hooks` doc comment for why) — only
+    // permission rules transfer automatically.
+    let hooks_n = count_cc_hooks(&values);
     let perms_n = transfer_permissions(&values, &config_dst);
 
     if hooks_n > 0 {
         println!(
-            "✓ imported {hooks_n} hook(s) from settings.json → {} (Claude-Code-compatible mode)",
+            "• found {hooks_n} hook(s) in settings.json — NOT imported. Claude Code hooks \
+             commonly assume they're running inside Claude Code itself (e.g. injecting text \
+             into an LLM's system prompt, or talking to Claude-Code-only tooling) and can \
+             misbehave or print confusing raw output when Forge runs them as its own session \
+             hooks. Review them and add any that genuinely apply to {} manually \
+             (docs/features/hooks.md).",
             settings_dst.display()
         );
     }
@@ -190,12 +197,19 @@ fn import_claude_settings(claude_home: &std::path::Path, project: bool) {
     }
 }
 
-/// Merge the `hooks` blocks from CC settings files into Forge's target `settings.json` (which Forge
-/// loads as CC-compatible hooks). Returns the number of hook command entries now present from the
-/// import. Existing target hooks for an event are preserved; imported groups are appended.
-fn transfer_hooks(values: &[serde_json::Value], settings_dst: &std::path::Path) -> usize {
+/// Count the hook command entries present across the CC settings sources — for the import
+/// summary only, nothing is written. Hooks are deliberately NOT auto-imported (unlike commands/
+/// skills/agents/permissions): a CC hook script is written against Claude Code's specific
+/// behavior — many exist purely to inject text into an LLM's SYSTEM PROMPT (mode trackers,
+/// project-context primers) or to talk to Claude-Code-only tooling, and assume nobody but an
+/// LLM ever sees their raw stdout. Forge has its own session lifecycle and currently renders a
+/// CC-compatible hook's stdout directly as a visible chat note — so blindly importing someone's
+/// personal Claude Code hook set silently turned every new Forge session into a wall of garbled,
+/// context-injection-style text (found via a real user report; the hooks were never meant to be
+/// shown to a human). Permissions stay auto-imported below — `allow`/`deny`/`ask` tool rules are
+/// data, not arbitrary code, so they carry no equivalent execution-context mismatch risk.
+fn count_cc_hooks(values: &[serde_json::Value]) -> usize {
     use serde_json::Value;
-    // Collect every {event -> [groups]} mapping from the sources.
     let mut merged: serde_json::Map<String, Value> = serde_json::Map::new();
     for v in values {
         let Some(hooks) = v.get("hooks").and_then(|h| h.as_object()) else {
@@ -216,35 +230,6 @@ fn transfer_hooks(values: &[serde_json::Value], settings_dst: &std::path::Path) 
     if merged.is_empty() {
         return 0;
     }
-
-    // Merge into any existing target settings.json (append per-event).
-    let mut target: serde_json::Map<String, Value> = std::fs::read_to_string(settings_dst)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    let target_hooks = target
-        .entry("hooks".to_string())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    if let Some(obj) = target_hooks.as_object_mut() {
-        for (event, groups) in &merged {
-            let slot = obj
-                .entry(event.clone())
-                .or_insert_with(|| Value::Array(Vec::new()));
-            if let (Some(dst), Some(src)) = (slot.as_array_mut(), groups.as_array()) {
-                dst.extend(src.iter().cloned());
-            }
-        }
-    }
-
-    if let Some(parent) = settings_dst.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let body = serde_json::to_string_pretty(&Value::Object(target)).unwrap_or_default();
-    if std::fs::write(settings_dst, body).is_err() {
-        return 0;
-    }
-    // Count the translated hooks (what Forge will actually load) from the merged block.
     forge_config::cc_hooks_from_settings(&Value::Object(merged)).len()
 }
 
@@ -670,7 +655,10 @@ mod settings_import_tests {
     }
 
     #[test]
-    fn transfer_hooks_writes_cc_compatible_settings_json() {
+    fn count_cc_hooks_counts_without_writing_anything() {
+        // Hooks must NOT be auto-imported (they assume Claude-Code-specific behavior and Forge
+        // renders their raw stdout as a visible chat note — see count_cc_hooks's doc comment).
+        // count_cc_hooks only reports how many exist; it must not touch the filesystem at all.
         let v: serde_json::Value = serde_json::from_str(
             r#"{ "hooks": {
                    "PreToolUse": [
@@ -683,40 +671,35 @@ mod settings_import_tests {
         let dir = tmp("hooks");
         std::fs::create_dir_all(&dir).unwrap();
         let settings = dir.join("settings.json");
-        let n = transfer_hooks(&[v], &settings);
-        assert_eq!(n, 1, "one hook command translated");
-
-        // The written settings.json loads back as a CC-compatible HookConfig.
-        let written = std::fs::read_to_string(&settings).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
-        let hooks = forge_config::cc_hooks_from_settings(&value);
-        assert_eq!(hooks.len(), 1);
-        assert!(hooks[0].cc_compat);
-        assert_eq!(hooks[0].event, forge_config::HookEvent::PreToolUse);
+        let n = count_cc_hooks(&[v]);
+        assert_eq!(n, 1, "one hook command counted");
+        assert!(
+            !settings.exists(),
+            "count_cc_hooks must not write a settings.json"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn transfer_hooks_appends_to_existing_settings() {
-        let dir = tmp("hooks-merge");
-        std::fs::create_dir_all(&dir).unwrap();
-        let settings = dir.join("settings.json");
-        // Pre-existing target with one PostToolUse hook.
-        std::fs::write(
-            &settings,
+    fn count_cc_hooks_sums_across_multiple_settings_sources() {
+        let user: serde_json::Value = serde_json::from_str(
             r#"{ "hooks": { "PostToolUse": [ { "hooks": [ { "type": "command", "command": "x" } ] } ] } }"#,
         )
         .unwrap();
-        let v: serde_json::Value = serde_json::from_str(
+        let project: serde_json::Value = serde_json::from_str(
             r#"{ "hooks": { "PreToolUse": [ { "hooks": [ { "type": "command", "command": "y" } ] } ] } }"#,
         )
         .unwrap();
-        transfer_hooks(&[v], &settings);
-        let value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        let hooks = forge_config::cc_hooks_from_settings(&value);
-        // Both the pre-existing PostToolUse and the imported PreToolUse survive.
-        assert_eq!(hooks.len(), 2, "existing hook preserved + new one appended");
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            count_cc_hooks(&[user, project]),
+            2,
+            "hooks from every CC settings source are counted"
+        );
+    }
+
+    #[test]
+    fn count_cc_hooks_is_zero_with_no_hooks_key() {
+        let v: serde_json::Value = serde_json::from_str(r#"{ "permissions": {} }"#).unwrap();
+        assert_eq!(count_cc_hooks(&[v]), 0);
     }
 }

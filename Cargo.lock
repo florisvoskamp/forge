@@ -1700,6 +1700,7 @@ dependencies = [
  "forge-agent-types",
  "futures",
  "image",
+ "libc",
  "portable-pty",
  "qrcode",
  "rcgen",
