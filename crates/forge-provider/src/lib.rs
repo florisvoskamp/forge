@@ -296,6 +296,26 @@ pub enum StreamEvent {
 /// A sink for [`StreamEvent`]s as they arrive (text, reasoning, tool activity).
 pub type EventSink<'a> = dyn FnMut(StreamEvent) + Send + 'a;
 
+/// The per-turn snapshot context a CLI-bridge turn needs to hand its `forge mcp-serve` child so the
+/// child snapshots the model's file edits into THIS turn's checkpoint dir and gates on the parent's
+/// live permission mode. Passed EXPLICITLY (parent → provider → child `Command` env) instead of
+/// through the parent's process-global env: a process-wide `set_var` here races a concurrent
+/// `getenv` (UB) and would clobber another session's context in a future multi-session host. The
+/// child still reads the same `FORGE_CHECKPOINT_*` / `FORGE_PERMISSION_MODE` var names from ITS OWN
+/// env — only the parent stops mutating its global env. Field names map 1:1 to
+/// `forge_core::snapshot::ENV_*`.
+#[derive(Debug, Clone)]
+pub struct CheckpointContext {
+    /// Parent session id (`FORGE_CHECKPOINT_SESSION`).
+    pub session: String,
+    /// Current user-turn seq (`FORGE_CHECKPOINT_SEQ`).
+    pub seq: i64,
+    /// Absolute checkpoint root the child snapshots into (`FORGE_CHECKPOINT_ROOT`).
+    pub root: String,
+    /// Parent's live permission temper key (`FORGE_PERMISSION_MODE`).
+    pub mode: String,
+}
+
 /// Per-completion options that extend the base [`Provider::complete`] signature without breaking
 /// existing call sites. Passed via [`Provider::complete_with`]; the base `complete` ignores it.
 #[derive(Debug, Clone, Default)]
@@ -305,6 +325,9 @@ pub struct CompletionOptions {
     /// Sampling temperature. `None` = provider default; coding turns set a low value so edits and
     /// patches are deterministic rather than creatively varied.
     pub temperature: Option<f32>,
+    /// Checkpoint context handed explicitly to a CLI-bridge child. `None` for non-bridge calls and
+    /// the base `complete` path, which fall back to inherited process env for legacy compatibility.
+    pub checkpoint: Option<CheckpointContext>,
 }
 
 /// A model backend. Implement this trait (and nothing in the core) to add a provider.
@@ -433,17 +456,17 @@ impl Provider for DispatchProvider {
         if model.starts_with("claude-cli::") {
             self.cli_notice();
             self.claude_cli
-                .complete(model, messages, tools, on_event)
+                .complete_with(model, messages, tools, opts, on_event)
                 .await
         } else if model.starts_with("codex-cli::") {
             self.cli_notice();
             self.codex_cli
-                .complete(model, messages, tools, on_event)
+                .complete_with(model, messages, tools, opts, on_event)
                 .await
         } else if model.starts_with("agy-cli::") {
             self.cli_notice();
             self.agy_cli
-                .complete(model, messages, tools, on_event)
+                .complete_with(model, messages, tools, opts, on_event)
                 .await
         } else {
             self.genai

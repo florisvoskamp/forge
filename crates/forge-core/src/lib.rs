@@ -1198,36 +1198,30 @@ impl Session {
         Ok(Some(outcome))
     }
 
-    /// Publish the current turn's snapshot context (session id, seq, absolute root, temper) to the
-    /// PROCESS environment so the CLI bridge's `forge mcp-serve` child snapshots its writes into this
-    /// turn's dir and matches the live permission mode.
+    /// Build the current turn's snapshot context (session id, seq, absolute root, live temper) so the
+    /// CLI bridge's `forge mcp-serve` child snapshots its writes into this turn's dir and matches the
+    /// live permission mode.
     ///
-    /// CONSTRAINT (single-session host only): this mutates process-global env. Both bridge spawn
-    /// paths (`forge-provider`: codex via `-c mcp_servers.forge.env.*`, claude via inherited env)
-    /// read these `FORGE_CHECKPOINT_*` / `FORGE_PERMISSION_MODE` vars back out with `std::env::var`
-    /// at spawn time, so the parent and child communicate through the process env, not an explicit
-    /// argument. That is safe for the serialized TUI (exactly one turn in flight at a time), but:
-    ///   - a future concurrent-session host sharing this process would clobber another session's
-    ///     context between this `set_var` and the child spawn, and
-    ///   - `set_var` racing a concurrent `getenv` on another thread is undefined behavior.
+    /// This is handed EXPLICITLY to the provider via [`CompletionOptions::checkpoint`], which applies
+    /// it to the spawned child's own `Command` env at the spawn site — the parent no longer mutates
+    /// its process-global env. That removes two hazards of the old `std::env::set_var` handoff:
+    ///   - a future concurrent-session host sharing this process clobbering another session's context
+    ///     between the write and the child spawn, and
+    ///   - `set_var` racing a concurrent `getenv` on another thread (undefined behavior).
     ///
-    /// The correct fix is to thread this context EXPLICITLY from here into the spawn call (a
-    /// `CheckpointContext` argument on the provider/bridge API) instead of going through the env.
-    /// That requires changing the `Provider` trait + every bridge spawn site in `forge-provider`/
-    /// `forge-cli`, which is out of scope for this change set; until then this remains the documented
-    /// single-session constraint above. Keep this the ONLY writer of these vars and call it from the
-    /// serialized turn loop only.
-    fn export_checkpoint_env(&self, seq: i64) {
+    /// The child still reads the same `FORGE_CHECKPOINT_*` / `FORGE_PERMISSION_MODE` var names from
+    /// ITS OWN environment — unchanged from the child's perspective. The live temper is read fresh
+    /// here so a Plan→Auto-edit switch (plan approval) or SHIFT+TAB reaches `mcp-serve` rather than it
+    /// falling back to the stale on-disk config mode.
+    fn checkpoint_context(&self) -> forge_provider::CheckpointContext {
         let root = std::path::absolute(&self.checkpoint_root)
             .unwrap_or_else(|_| self.checkpoint_root.clone());
-        std::env::set_var(snapshot::ENV_SESSION, &self.id);
-        std::env::set_var(snapshot::ENV_SEQ, seq.to_string());
-        std::env::set_var(snapshot::ENV_ROOT, root);
-        // Hand the bridge child our CURRENT runtime temper so its permission gate matches the UI —
-        // a Plan→Auto-edit switch (plan approval) or SHIFT+TAB now actually reaches `mcp-serve`,
-        // instead of it falling back to the stale on-disk config mode (which denied writes after the
-        // user switched to Auto-edit, or allowed them during Plan mode).
-        std::env::set_var(snapshot::ENV_MODE, self.temper().key());
+        forge_provider::CheckpointContext {
+            session: self.id.clone(),
+            seq: self.current_turn_seq,
+            root: root.to_string_lossy().into_owned(),
+            mode: self.temper().key().to_string(),
+        }
     }
 
     /// Save a conversation checkpoint at the current boundary. `label` None = an auto checkpoint.
@@ -2067,6 +2061,8 @@ Rules:\n\
         let completion_opts = CompletionOptions {
             effort: self.pinned_effort,
             temperature: Some(CODING_TEMPERATURE),
+            // The planner runs with no tools (it can't edit files), so it needs no checkpoint context.
+            checkpoint: None,
         };
 
         let mut chain = fallbacks.into_iter();
@@ -2884,6 +2880,11 @@ Output ONLY that sentence — no preamble, no quotation marks.";
         // Counts INSPECTION tools (anything except `update_tasks`/`present_plan`) — the verification
         // gate requires the bridge to actually CHECK real state, not just re-assert "done".
         let inspect_ran = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // This turn's snapshot context, handed explicitly to each bridge completion so its
+        // `forge mcp-serve` child snapshots edits into THIS turn's dir under the live temper — no
+        // process-global env mutation. Computed once before the per-step borrows (the temper is
+        // constant within a turn); non-bridge providers ignore it.
+        let checkpoint_ctx = self.checkpoint_context();
 
         for step in 0..max_steps {
             let tools_before = tools_ran.load(std::sync::atomic::Ordering::Relaxed);
@@ -2985,6 +2986,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                     let completion_opts = CompletionOptions {
                         effort: self.pinned_effort,
                         temperature: Some(CODING_TEMPERATURE),
+                        checkpoint: Some(checkpoint_ctx.clone()),
                     };
                     let fut = provider.complete_with(
                         &active_model,
@@ -3961,10 +3963,11 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         let _ = self
             .store
             .add_checkpoint(&self.id, Some(&checkpoint_preview(prompt)), seq);
-        // Export this turn's snapshot context so a CLI-bridge model's file edits (which run in
-        // `forge mcp-serve`, a separate process) get snapshotted into THIS turn's dir and are
-        // restorable by `/undo` (the in-process tool path snapshots directly in `invoke_tool`).
-        self.export_checkpoint_env(seq);
+        // This turn's snapshot context (so a CLI-bridge model's file edits, which run in
+        // `forge mcp-serve`, a separate process, get snapshotted into THIS turn's dir and are
+        // restorable by `/undo`) is built lazily by `checkpoint_context()` and handed to each bridge
+        // completion via `CompletionOptions::checkpoint` — no process-global env mutation here. The
+        // in-process tool path snapshots directly in `invoke_tool`.
 
         // ★ Auto-retrieve relevant code from the Lattice index and inject it as a system message
         // before the first provider call (code-intelligence.md §5.1). Retrieve into an owned value
@@ -10521,6 +10524,57 @@ mod tests {
                 quotas: Vec::new(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_context_is_explicit_and_does_not_pollute_process_env() {
+        // The bridge handoff was a process-global `set_var` (a `getenv` race / cross-session clobber
+        // risk). It is now an EXPLICIT `CheckpointContext` threaded via `CompletionOptions` to the
+        // spawned child's own env. Prove the parent builds it from session state and, crucially, that
+        // running a turn no longer writes this session's context into the process-global env.
+        let dir = std::env::temp_dir().join(format!("forge-cpctx-{}", forge_types::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "ORIGINAL").unwrap();
+
+        let config = Config {
+            permission_mode: PermissionMode::AcceptEdits,
+            ..Config::default()
+        };
+        let mut session = Session::start(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(WritingProvider {
+                path: file.to_string_lossy().to_string(),
+                content: "X".into(),
+            }),
+            Arc::new(HeuristicRouter::new(config.clone())),
+            ToolRegistry::with_core_tools(),
+            Box::new(HeadlessPresenter::new(false)),
+            config,
+            ".",
+        )
+        .unwrap();
+        session.set_checkpoint_root(dir.join("snaps"));
+
+        session.run_turn("edit it").await.unwrap();
+
+        let ctx = session.checkpoint_context();
+        assert_eq!(ctx.session, session.id);
+        assert_eq!(ctx.seq, session.current_turn_seq);
+        assert_eq!(ctx.mode, session.temper().key());
+        assert!(
+            std::path::Path::new(&ctx.root).is_absolute(),
+            "checkpoint root is absolutized for the child"
+        );
+
+        // The race fix: this session's id must NOT have leaked into the process-global env.
+        assert_ne!(
+            std::env::var(snapshot::ENV_SESSION).ok().as_deref(),
+            Some(session.id.as_str()),
+            "the parent no longer mutates process-global checkpoint env"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

@@ -33,7 +33,10 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 
-use crate::{EventSink, ModelResponse, Provider, ProviderError, StreamEvent, ToolSpec};
+use crate::{
+    CheckpointContext, CompletionOptions, EventSink, ModelResponse, Provider, ProviderError,
+    StreamEvent, ToolSpec,
+};
 
 /// Which official CLI to bridge to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,6 +408,51 @@ fn forge_mcp_config(forge_exe: &str, mcp_env: &[(String, String)]) -> String {
         exe = serde_json::Value::String(forge_exe.to_string()),
         env = env_obj,
     )
+}
+
+/// The out-of-band env handed to a bridge turn's `forge mcp-serve` child: the subagent sink plus
+/// the per-turn checkpoint context. The checkpoint values come from the EXPLICIT [`CheckpointContext`]
+/// the parent threaded through (so the parent never mutates its process-global env); when absent
+/// (the base `complete` path) they fall back to this process's inherited env for legacy callers.
+/// `FORGE_SUBAGENT_DEPTH` is an independent recursion bound that is always legitimately inherited.
+/// Key names mirror `forge_core::snapshot::ENV_*` (stable cross-process contract strings;
+/// forge-provider can't depend on that crate).
+fn bridge_mcp_env(
+    sink_path: Option<&std::path::Path>,
+    checkpoint: Option<&CheckpointContext>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Some(p) = sink_path {
+        if let Some(s) = p.to_str() {
+            env.push((SUBAGENT_SINK_ENV.to_string(), s.to_string()));
+        }
+    }
+    match checkpoint {
+        Some(c) => {
+            env.push(("FORGE_CHECKPOINT_SESSION".to_string(), c.session.clone()));
+            env.push(("FORGE_CHECKPOINT_SEQ".to_string(), c.seq.to_string()));
+            env.push(("FORGE_CHECKPOINT_ROOT".to_string(), c.root.clone()));
+            // The parent's live temper, so the bridge's permission gate matches the UI mode
+            // (Plan→Auto-edit switches reach mcp-serve instead of it using the stale config).
+            env.push(("FORGE_PERMISSION_MODE".to_string(), c.mode.clone()));
+        }
+        None => {
+            for key in [
+                "FORGE_CHECKPOINT_SESSION",
+                "FORGE_CHECKPOINT_SEQ",
+                "FORGE_CHECKPOINT_ROOT",
+                "FORGE_PERMISSION_MODE",
+            ] {
+                if let Ok(val) = std::env::var(key) {
+                    env.push((key.to_string(), val));
+                }
+            }
+        }
+    }
+    if let Ok(val) = std::env::var("FORGE_SUBAGENT_DEPTH") {
+        env.push(("FORGE_SUBAGENT_DEPTH".to_string(), val));
+    }
+    env
 }
 
 /// Build the CLI argv for a bridge turn. The prompt is NOT included here — it is streamed to the
@@ -1211,23 +1259,57 @@ impl Provider for CliProvider {
         tools: &[ToolSpec],
         on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
-        // P1 persistent transport (claude only, opt-out): drive the turn on a long-lived
-        // `--input-format stream-json` process. `Fallback` means the live session couldn't be
-        // established BEFORE any turn output ran, so retrying as one-shot can't double-execute a
-        // tool; `Failed` means the turn started (tools may have run) — propagate, don't re-run.
-        if self.persistent && self.kind == CliKind::ClaudeCode {
-            match self.complete_persistent(model, messages, on_event).await {
-                Ok(r) => return Ok(r),
-                Err(PersistentTurn::Fallback) => {}
-                Err(PersistentTurn::Failed(e)) => return Err(e),
-            }
-        }
-        self.complete_oneshot(model, messages, tools, on_event)
+        // No explicit checkpoint context on the base path → the bridge child falls back to inherited
+        // process env (legacy compatibility for callers that don't pass options).
+        self.complete_routed(model, messages, tools, None, on_event)
+            .await
+    }
+
+    async fn complete_with(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        opts: &CompletionOptions,
+        on_event: &mut EventSink<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        // The parent threads its per-turn checkpoint context here instead of mutating process-global
+        // env; it is forwarded to the spawned child's own `Command` env at the spawn site.
+        self.complete_routed(model, messages, tools, opts.checkpoint.as_ref(), on_event)
             .await
     }
 }
 
 impl CliProvider {
+    /// Shared transport dispatch for both `complete` and `complete_with`: try the persistent live
+    /// process (claude only) then fall back to a one-shot spawn. `checkpoint` is the turn's snapshot
+    /// context to hand the child explicitly (`None` → legacy inherited-env fallback).
+    async fn complete_routed(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        checkpoint: Option<&CheckpointContext>,
+        on_event: &mut EventSink<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        // P1 persistent transport (claude only, opt-out): drive the turn on a long-lived
+        // `--input-format stream-json` process. `Fallback` means the live session couldn't be
+        // established BEFORE any turn output ran, so retrying as one-shot can't double-execute a
+        // tool; `Failed` means the turn started (tools may have run) — propagate, don't re-run.
+        if self.persistent && self.kind == CliKind::ClaudeCode {
+            match self
+                .complete_persistent(model, messages, checkpoint, on_event)
+                .await
+            {
+                Ok(r) => return Ok(r),
+                Err(PersistentTurn::Fallback) => {}
+                Err(PersistentTurn::Failed(e)) => return Err(e),
+            }
+        }
+        self.complete_oneshot(model, messages, tools, checkpoint, on_event)
+            .await
+    }
+
     /// One spawn per turn: the original bridge transport. Sends the full transcript (or a
     /// `--resume` delta) on a fresh CLI process and reads until it exits. Always available as the
     /// fallback for the persistent path, and the only path for codex/agy.
@@ -1237,6 +1319,7 @@ impl CliProvider {
         messages: &[Message],
         _tools: &[ToolSpec], // harness mode serves Forge's tools via `forge mcp-serve`, which
         // builds its own registry — not from this param; text mode uses the CLI's own tools.
+        checkpoint: Option<&CheckpointContext>,
         on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, ProviderError> {
         // Decide whether to RESUME the CLI's prior session (claude `--resume`) and send only the new
@@ -1311,33 +1394,11 @@ impl CliProvider {
         };
 
         // The env `forge mcp-serve` needs to round-trip a bridge turn's activity (sink) and snapshot
-        // the model's edits into the parent turn (checkpoint context). These are set in *this*
-        // process by the parent's `run_turn`, but a host that curates its MCP servers' env (codex)
-        // strips them, so they're forwarded explicitly into the MCP config (see `build_args`).
-        let mcp_env: Vec<(String, String)> = {
-            let mut env = Vec::new();
-            if let Some(p) = &sink_path {
-                if let Some(s) = p.to_str() {
-                    env.push((SUBAGENT_SINK_ENV.to_string(), s.to_string()));
-                }
-            }
-            // Names mirror forge_core::snapshot::ENV_* and the CLI's FORGE_SUBAGENT_DEPTH (stable
-            // cross-process contract strings; forge-provider can't depend on those crates).
-            for key in [
-                "FORGE_CHECKPOINT_SESSION",
-                "FORGE_CHECKPOINT_SEQ",
-                "FORGE_CHECKPOINT_ROOT",
-                "FORGE_SUBAGENT_DEPTH",
-                // The parent's live temper, so the bridge's permission gate matches the UI mode
-                // (Plan→Auto-edit switches reach mcp-serve instead of it using the stale config).
-                "FORGE_PERMISSION_MODE",
-            ] {
-                if let Ok(val) = std::env::var(key) {
-                    env.push((key.to_string(), val));
-                }
-            }
-            env
-        };
+        // the model's edits into the parent turn (checkpoint context). The checkpoint context is
+        // passed EXPLICITLY by the parent (no process-global `set_var`) and applied to the child's
+        // own `Command` env here; a host that curates its MCP servers' env (codex) strips inherited
+        // vars, so they're forwarded explicitly into the MCP config (see `build_args`).
+        let mcp_env = bridge_mcp_env(sink_path.as_deref(), checkpoint);
 
         let args = build_args(
             self.kind,
@@ -1925,7 +1986,11 @@ impl CliProvider {
     }
 
     /// Spawn a long-lived claude `--input-format stream-json` process for the persistent transport.
-    async fn spawn_live(&self, bare: &str) -> std::io::Result<LiveSession> {
+    async fn spawn_live(
+        &self,
+        bare: &str,
+        checkpoint: Option<&CheckpointContext>,
+    ) -> std::io::Result<LiveSession> {
         let forge_exe = std::env::current_exe()
             .ok()
             .and_then(|p| p.to_str().map(str::to_string))
@@ -1939,26 +2004,13 @@ impl CliProvider {
             ));
             std::fs::File::create(&p).ok().map(|_| p)
         };
-        let mcp_env: Vec<(String, String)> = {
-            let mut env = Vec::new();
-            if let Some(p) = &sink_path {
-                if let Some(s) = p.to_str() {
-                    env.push((SUBAGENT_SINK_ENV.to_string(), s.to_string()));
-                }
-            }
-            for key in [
-                "FORGE_CHECKPOINT_SESSION",
-                "FORGE_CHECKPOINT_SEQ",
-                "FORGE_CHECKPOINT_ROOT",
-                "FORGE_SUBAGENT_DEPTH",
-                "FORGE_PERMISSION_MODE",
-            ] {
-                if let Ok(val) = std::env::var(key) {
-                    env.push((key.to_string(), val));
-                }
-            }
-            env
-        };
+        let mcp_env = bridge_mcp_env(sink_path.as_deref(), checkpoint);
+        // Pin this live process to the spawning turn's seq so a later turn forces a respawn (keeps
+        // bridge-edit `/undo` granularity correct). Prefer the explicit context; fall back to the
+        // inherited env for the legacy base path.
+        let checkpoint_seq = checkpoint
+            .map(|c| c.seq.to_string())
+            .or_else(Self::current_checkpoint_seq);
 
         // No `--resume`: a persistent process holds its own context across turns. Add the
         // streaming-input flag so it reads user turns from stdin instead of one prompt + EOF.
@@ -2001,7 +2053,7 @@ impl CliProvider {
             pgid,
             model: bare.to_string(),
             sent: 0,
-            checkpoint_seq: Self::current_checkpoint_seq(),
+            checkpoint_seq,
             sink_path,
             sub_rx,
             tailer,
@@ -2015,21 +2067,26 @@ impl CliProvider {
         &self,
         model: &str,
         messages: &[Message],
+        checkpoint: Option<&CheckpointContext>,
         on_event: &mut EventSink<'_>,
     ) -> Result<ModelResponse, PersistentTurn> {
         let bare = bare_model(model);
-        let checkpoint = Self::current_checkpoint_seq();
+        // The turn's seq drives respawn-on-new-turn: prefer the explicit context, fall back to the
+        // inherited env on the legacy base path.
+        let checkpoint_seq = checkpoint
+            .map(|c| c.seq.to_string())
+            .or_else(Self::current_checkpoint_seq);
         let mut guard = self.live.lock().await;
 
         // Reuse only a session that matches the model, has strictly grown (a shrink → its in-process
         // context is stale after a compaction/reset), and belongs to the same user turn (checkpoint).
         let reuse = matches!(&*guard, Some(s)
-            if s.model == bare && s.sent > 0 && s.sent <= messages.len() && s.checkpoint_seq == checkpoint);
+            if s.model == bare && s.sent > 0 && s.sent <= messages.len() && s.checkpoint_seq == checkpoint_seq);
         if !reuse {
             if let Some(old) = guard.take() {
                 old.teardown().await;
             }
-            match self.spawn_live(bare).await {
+            match self.spawn_live(bare, checkpoint).await {
                 Ok(s) => *guard = Some(s),
                 Err(e) => {
                     tracing::warn!("persistent bridge spawn failed, falling back to one-shot: {e}");
@@ -2707,6 +2764,38 @@ mod tests {
         // The prompt is fed via stdin, never as an argv positional (ARG_MAX fix).
         assert!(!args.iter().any(|a| a == "do a thing"));
         assert!(!args.contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn bridge_mcp_env_uses_explicit_checkpoint_context_not_process_env() {
+        // The checkpoint context handed to the `forge mcp-serve` child must come from the EXPLICIT
+        // `CheckpointContext` the parent threaded through — not from a process-global `set_var`.
+        let ctx = CheckpointContext {
+            session: "explicit-sess".to_string(),
+            seq: 42,
+            root: "/abs/checkpoints".to_string(),
+            mode: "accept-edits".to_string(),
+        };
+        let sink = std::path::PathBuf::from("/tmp/sink.jsonl");
+        let env = bridge_mcp_env(Some(sink.as_path()), Some(&ctx));
+
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("FORGE_CHECKPOINT_SESSION"), Some("explicit-sess"));
+        assert_eq!(get("FORGE_CHECKPOINT_SEQ"), Some("42"));
+        assert_eq!(get("FORGE_CHECKPOINT_ROOT"), Some("/abs/checkpoints"));
+        assert_eq!(get("FORGE_PERMISSION_MODE"), Some("accept-edits"));
+        assert_eq!(get("FORGE_SUBAGENT_SINK"), Some("/tmp/sink.jsonl"));
+
+        // The function only READS env (for the legacy/depth fallback) — it must never WRITE it, so a
+        // value present after the call cannot have been published by this code path.
+        assert!(
+            std::env::var("FORGE_CHECKPOINT_SESSION").ok().as_deref() != Some("explicit-sess"),
+            "explicit context is not leaked into the process env"
+        );
     }
 
     #[test]

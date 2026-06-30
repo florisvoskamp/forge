@@ -535,7 +535,8 @@ impl ForgeMcp {
 pub async fn run(http: bool, bind: String) -> Result<()> {
     forge_config::inject_provider_keys();
     let mut config = forge_config::load().unwrap_or_else(|_| Config::default());
-    // The parent hands us its CURRENT runtime temper via env (set per turn in `export_checkpoint_env`).
+    // The parent hands us its CURRENT runtime temper in OUR env, set explicitly on this child's
+    // `Command` at the bridge spawn site (`CompletionOptions::checkpoint` → `bridge_mcp_env`).
     // Honor it over the on-disk config mode so the permission gate matches the UI: after the user
     // switches Plan→Auto-edit (e.g. approving a plan), writes are actually allowed here — previously
     // the bridge used the stale config mode and denied them, which the model reported as "no perms".
