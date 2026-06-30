@@ -6,6 +6,46 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-06-30
+
+The "ready for the world" release. A full robustness, UX, and ecosystem pass synthesized from
+three deep audits (see `docs/ROADMAP-v2.md` / `docs/ROADMAP-v2-DELIVERED.md` for the 1:1
+item→PR mapping). Every change shipped CI-green across Linux, macOS, and Windows.
+
+### Packaging
+- **Crates published as `adforge-*`** (the `forge-*` names are taken on crates.io by unrelated
+  projects). `cargo install adforge` installs the `forge` binary. Lib names are preserved, so
+  there are no source-level changes. curl / Homebrew / AUR / Scoop installs are unchanged.
+
+### Added
+- **Robustness**: non-PTY shell no longer hangs on a backgrounded process; malformed `retry-after`
+  bodies can't panic the failover path; truncated streams are retried instead of returned as
+  complete; `web_fetch` is byte-capped (no OOM); store hardening (IMMEDIATE txns, busy-retry,
+  `UNIQUE(session_id, seq)`, `PRAGMA user_version` migrations, retention + VACUUM); file-tool
+  workspace confinement; explicit per-child checkpoint env (no process-global `set_var`).
+- **UX**: onboarding reach for `forge run`/`nl`; `/keys` + discoverability cues; inline-stream
+  markdown rendering; red error banner; `adforge`-aware help; configurable keybinds + interactive
+  configurator + mid-turn `skip_model` / `tier_up` / `tier_down` / `/reload`; customizable
+  statusline; +10 polish fixes.
+- **Ecosystem**: runtime custom OpenAI-compatible endpoints (LM Studio/vLLM/llama.cpp); Azure,
+  Bedrock, Vertex, Together, Fireworks, Perplexity providers; MCP OAuth Dynamic Client
+  Registration, sampling/roots, `tools/list_changed`, HTTP server transport, SSE client transport;
+  Claude-Code-compatible hooks (with enforced `stop`/`subagent_stop`) + `forge import` of
+  permissions/hooks/MCP; `forge run --output-format stream-json`; skills marketplace + `update` +
+  version pinning; crates.io readiness, Homebrew Linux-ARM, AUR, Scoop, shell completions, man page.
+- **Quality gates**: `cargo audit` + `cargo deny` CI (caught and fixed two real CVEs — quinn-proto
+  RUSTSEC-2026-0185 and an anyhow unsoundness), Dependabot, CODEOWNERS, release-profile PR build.
+
+### Fixed
+- Three real cross-platform production bugs surfaced by the new tri-platform CI: Windows
+  `path_to_uri` emitted malformed `file://` URIs; the lattice deleted-file prune keyed on a
+  non-canonical path so macOS/Windows users kept phantom symbols.
+
+### Changed
+- Unified `run`/`chat` resume + TUI conventions; one shared `--scope` enum across subcommands
+  (back-compat `--project` preserved); 9 major dependency upgrades (tree-sitter ×5, toml 1.1,
+  pulldown-cmark 0.13, clap_mangen 0.3, sha2 0.11).
+
 ## [1.8.4] - 2026-06-30
 
 ### Added
