@@ -71,6 +71,20 @@ graph_add_memory(type="decision|task|next|fact|blocker", content="one sentence m
 - `files` lists the files this decision/task relates to (can be empty)
 - Log immediately when the item arises — not at session end
 
+## Building the forge binary
+
+**MANDATORY: Always run `scripts/rebuild.sh` to build the `forge` release binary — NEVER run
+`cargo build --release -p forge-agent` (or `cargo install`) directly.**
+
+Why: `cargo build` replaces the binary file but does NOT affect an already-running process —
+Unix lets a process keep executing a deleted/replaced inode
+(`/proc/PID/exe -> .../forge (deleted)`). A long-lived `forge mcp agent`/`forge mcp-serve`
+process silently kept running PRE-FIX routing/code logic in memory across multiple rebuilds,
+because nothing told it to restart — this caused real, hard-to-diagnose bugs to "come back"
+after they were already fixed and merged. `scripts/rebuild.sh` builds the binary AND kills any
+stale `forge mcp` process so it respawns fresh on its next use. This is not optional housekeeping
+— skipping it silently reintroduces already-fixed bugs into the live session.
+
 ## Session End
 
 When the user signals they are done (e.g. "bye", "done", "wrap up", "end session"), proactively update `CONTEXT.md` in the project root with:
