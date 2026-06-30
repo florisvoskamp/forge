@@ -13,8 +13,9 @@ is down, and is *measurably* more reliable than the raw vendor CLIs.**
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
 [![Conformance tests](https://img.shields.io/badge/harness_conformance-324_tests-brightgreen.svg)](docs/harness/why-forge-is-a-better-harness.md)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/florisvoskamp)
 
-**[Install](#install)** &nbsp;·&nbsp; **[Quickstart](#quick-start)** &nbsp;·&nbsp; **[Free setup](#free-providers)** &nbsp;·&nbsp; **[Why Forge](#why-forge)** &nbsp;·&nbsp; **[Benchmarks](#benchmarks)** &nbsp;·&nbsp; **[vs. others](#comparison)** &nbsp;·&nbsp; **[Features](#feature-overview)** &nbsp;·&nbsp; **[Docs](#documentation)**
+**[⚡ Quick Setup Guide](./docs/quickstart.md)** &nbsp;·&nbsp; **[Install](#install)** &nbsp;·&nbsp; **[Quickstart](#quick-start)** &nbsp;·&nbsp; **[Free setup](#free-providers)** &nbsp;·&nbsp; **[Why Forge](#why-forge)** &nbsp;·&nbsp; **[Benchmarks](#benchmarks)** &nbsp;·&nbsp; **[vs. others](#comparison)** &nbsp;·&nbsp; **[Features](#feature-overview)** &nbsp;·&nbsp; **[Docs](#documentation)** &nbsp;·&nbsp; **[💖 Sponsor](https://github.com/sponsors/florisvoskamp)**
 
 </div>
 
@@ -29,6 +30,9 @@ forge run --model claude-cli::sonnet "…"       # run your Claude subscription 
 forge models --probe                           # discovered models, ranked, health-checked
 forge lattice impact "UserRepository"          # code-graph blast radius
 ```
+
+> **New here?** The **[Quick Setup Guide](./docs/quickstart.md)** walks you from install to your first
+> chat in ~5 minutes — free providers included, no credit card needed.
 
 <a id="why-forge"></a>
 
@@ -333,6 +337,8 @@ Requires a recent stable Rust toolchain. Prebuilt binaries for each OS are on th
 
 ## 🚀 Quick Start
 
+> **First time?** The **[Quick Setup Guide →](./docs/quickstart.md)** covers install, connecting a free provider, and your first session step-by-step.
+
 ```bash
 # Guided setup: API keys + subscription plans + optional local LLM
 # (runs automatically on first launch; re-run anytime)
@@ -591,6 +597,33 @@ crates/
 ├── forge-skills     # skills + commands catalog, CC-format reader
 └── forge-types      # shared domain types
 ```
+
+---
+
+## 💖 Sponsor Forge
+
+Forge is built by one person, fully open source, MIT licensed. If it saves you time, money, or
+API costs — sponsoring helps keep it maintained and growing.
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/florisvoskamp)
+
+**What your support funds:**
+- Ongoing maintenance, bugfixes, and reliability work
+- New providers, models, and integrations as the ecosystem evolves
+- SWE-bench runs and benchmark infrastructure (not free to run)
+- Time to respond to issues and review PRs
+
+### Sponsorship tiers
+
+| Tier | / month | What you get |
+|------|--------:|--------------|
+| ☕ **Coffee** | $5 | Warm thanks + knowing you helped |
+| 🌟 **Supporter** | $15 | Name in [SPONSORS.md](./SPONSORS.md) |
+| 🚀 **Backer** | $50 | Name + link in SPONSORS.md · priority issue response |
+| 💎 **Gold Sponsor** | $100 | Logo + link in README · direct line for feedback |
+| 🏆 **Platinum Sponsor** | $250 | Prominent README placement · input on roadmap |
+
+**[Become a sponsor →](https://github.com/sponsors/florisvoskamp)**
 
 ---
 
