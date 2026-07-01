@@ -102,6 +102,30 @@ fn confine(path_str: &str) -> Result<PathBuf, ToolError> {
     }
 }
 
+/// Hard ceiling on any local file this crate will load whole into memory via `read_to_string`,
+/// checked via a metadata pre-check BEFORE the read. Unlike `cap_read`/`cap_bytes` (which only
+/// truncate what's RETURNED to the model, after the full file is already buffered), this stops
+/// the allocation itself: `read_to_string` on a multi-GB file would try to allocate the whole
+/// thing as a UTF-8 String before any cap applies, which can OOM the process. Mirrors the fix
+/// web.rs applies to HTTP response bodies (see `MAX_BODY_BYTES` there) — comfortably above any
+/// real source file yet far below a process-killing allocation.
+const MAX_READABLE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Refuse to load `path` whole into memory if it's over [`MAX_READABLE_FILE_BYTES`]. Call this
+/// before every `tokio::fs::read_to_string`/`std::fs::read_to_string` in this module.
+async fn check_readable_size(path: &str) -> Result<(), ToolError> {
+    let meta = tokio::fs::metadata(path).await?;
+    if meta.len() > MAX_READABLE_FILE_BYTES {
+        return Err(ToolError::Failed(format!(
+            "{path} is {} MiB, over the {} MiB single-read limit — too large to load into memory \
+             whole",
+            meta.len() / (1024 * 1024),
+            MAX_READABLE_FILE_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
 /// Map a file extension to a syntax-highlighting language token (best-effort; unknown
 /// extensions pass through and fall back to plain highlighting downstream).
 fn lang_from_path(path: &str) -> Option<String> {
@@ -178,6 +202,7 @@ impl Tool for ReadFileTool {
         }
         let path = str_arg(args, "path")?;
         confine(path)?;
+        check_readable_size(path).await?;
         let start_line = args
             .get("start_line")
             .and_then(Value::as_u64)
@@ -221,6 +246,10 @@ async fn read_many(paths: &[Value]) -> String {
         let Some(path) = p.as_str() else { continue };
         out.push_str(&format!("===== {path} =====\n"));
         if let Err(e) = confine(path) {
+            out.push_str(&format!("[error: {e}]\n"));
+            continue;
+        }
+        if let Err(e) = check_readable_size(path).await {
             out.push_str(&format!("[error: {e}]\n"));
             continue;
         }
@@ -516,6 +545,7 @@ impl Tool for EditFileTool {
         let new = str_arg(args, "new")?;
 
         confine(path)?;
+        check_readable_size(path).await?;
         let content = tokio::fs::read_to_string(path).await?;
         let (updated, note) = apply_edit(&content, old, new)
             .map_err(|e| ToolError::Failed(format!("{e} (in {path})")))?;
@@ -528,6 +558,7 @@ impl Tool for EditFileTool {
         let old = str_arg(args, "old").ok()?;
         let new = str_arg(args, "new").ok()?;
         confine(path).ok()?;
+        check_readable_size(path).await.ok()?;
         let content = tokio::fs::read_to_string(path).await.ok()?;
         // Mirror run() (skip the diff and let run() surface the error when it can't apply).
         let (updated, _) = apply_edit(&content, old, new).ok()?;
@@ -633,6 +664,7 @@ impl Tool for MultiEditTool {
         let path = str_arg(args, "path")?;
         let edits = multi_edit_pairs(args)?;
         confine(path)?;
+        check_readable_size(path).await?;
         let original = tokio::fs::read_to_string(path).await?;
         let updated = apply_edits(&original, &edits)
             .map_err(|e| ToolError::Failed(format!("{e} (in {path}; no edits applied)")))?;
@@ -644,6 +676,7 @@ impl Tool for MultiEditTool {
         let path = str_arg(args, "path").ok()?;
         let edits = multi_edit_pairs(args).ok()?;
         confine(path).ok()?;
+        check_readable_size(path).await.ok()?;
         let original = tokio::fs::read_to_string(path).await.ok()?;
         let updated = apply_edits(&original, &edits).ok()?;
         Some(FileDiff {
@@ -915,6 +948,7 @@ impl Tool for NotebookEditTool {
             .and_then(Value::as_str)
             .unwrap_or("code");
 
+        check_readable_size(path).await?;
         let content = tokio::fs::read_to_string(path).await?;
         let updated = apply_notebook_edit(&content, cell, source, cell_type, mode)
             .map_err(|e| ToolError::Failed(format!("{e} (in {path})")))?;
@@ -945,6 +979,7 @@ impl Tool for NotebookEditTool {
             .get("cell_type")
             .and_then(Value::as_str)
             .unwrap_or("code");
+        check_readable_size(path).await.ok()?;
         let content = tokio::fs::read_to_string(path).await.ok()?;
         let updated = apply_notebook_edit(&content, cell, source, cell_type, mode).ok()?;
         Some(FileDiff {
@@ -1009,6 +1044,7 @@ impl Tool for ListDirTool {
     }
     async fn run(&self, args: &Value) -> Result<String, ToolError> {
         let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        confine(path)?;
         let meta = std::fs::metadata(path)?;
         if !meta.is_dir() {
             return Err(ToolError::Failed(format!("{path} is not a directory")));
@@ -1090,6 +1126,15 @@ impl Tool for SearchTool {
     async fn run(&self, args: &Value) -> Result<String, ToolError> {
         let query = str_arg(args, "query")?;
         let root = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        confine(root)?;
+        let root_meta = std::fs::metadata(root).map_err(|e| {
+            ToolError::Failed(format!(
+                "path '{root}' does not exist or can't be read: {e}"
+            ))
+        })?;
+        if !root_meta.is_dir() {
+            return Err(ToolError::Failed(format!("{root} is not a directory")));
+        }
         let use_regex = args.get("regex").and_then(Value::as_bool).unwrap_or(false);
         let file_pattern = args.get("file_pattern").and_then(Value::as_str);
         let context = args
@@ -1273,6 +1318,15 @@ impl Tool for GlobTool {
     async fn run(&self, args: &Value) -> Result<String, ToolError> {
         let pattern = str_arg(args, "pattern")?;
         let root = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        confine(root)?;
+        let root_meta = std::fs::metadata(root).map_err(|e| {
+            ToolError::Failed(format!(
+                "path '{root}' does not exist or can't be read: {e}"
+            ))
+        })?;
+        if !root_meta.is_dir() {
+            return Err(ToolError::Failed(format!("{root} is not a directory")));
+        }
 
         let matcher = Glob::new(pattern)
             .map_err(|e| ToolError::Failed(format!("invalid glob: {e}")))?
@@ -1886,6 +1940,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Failed(m) if m.contains("workspace")));
+    }
+
+    #[tokio::test]
+    async fn list_dir_refuses_path_outside_workspace() {
+        let err = ListDirTool
+            .run(&json!({ "path": "/etc" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(m) if m.contains("workspace")));
+    }
+
+    #[tokio::test]
+    async fn search_refuses_path_outside_workspace() {
+        let err = SearchTool
+            .run(&json!({ "query": "root", "path": "/etc" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(m) if m.contains("workspace")));
+    }
+
+    #[tokio::test]
+    async fn search_errors_on_missing_root_instead_of_no_matches() {
+        let dir = temp_dir("search-missing-root");
+        let missing = dir.join("does-not-exist");
+        let err = SearchTool
+            .run(&json!({ "query": "x", "path": missing.to_str().unwrap() }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(m) if m.contains("does not exist")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn glob_refuses_path_outside_workspace() {
+        let err = GlobTool
+            .run(&json!({ "pattern": "**/*", "path": "/etc" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(m) if m.contains("workspace")));
+    }
+
+    #[tokio::test]
+    async fn glob_errors_on_missing_root_instead_of_no_matches() {
+        let dir = temp_dir("glob-missing-root");
+        let missing = dir.join("does-not-exist");
+        let err = GlobTool
+            .run(&json!({ "pattern": "**/*", "path": missing.to_str().unwrap() }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(m) if m.contains("does not exist")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_oversized_file() {
+        let dir = temp_dir("read-oversized");
+        let path = dir.join("big.bin");
+        // Sparse file: allocate a size over the cap without actually writing that many bytes.
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_READABLE_FILE_BYTES + 1).unwrap();
+        drop(f);
+
+        let err = ReadFileTool
+            .run(&json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(m) if m.contains("too large")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 //! results). Both declare [`SideEffect::Network`] so the permission broker gates egress
 //! distinctly from a local read (SSRF / exfiltration risk). See docs/features/web-tools.md.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -182,7 +182,15 @@ pub(crate) fn is_safe_url(url: &str) -> Result<(), ToolError> {
     }
     // Bracketed IPv6 hosts arrive as "[::1]"; strip the brackets before parsing.
     let ip_candidate = lower.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = ip_candidate.parse::<IpAddr>() {
+    // `IpAddr::parse` only accepts strict dotted-quad/hex-colon notation, so a bare-integer or
+    // octal/hex-encoded host (e.g. "2130706433", which glibc's resolver treats the same as
+    // "127.0.0.1") would otherwise sail through as an "ordinary hostname". Also check the
+    // numbers-and-dots notation the system resolver actually accepts.
+    let literal_ip = ip_candidate
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| parse_ipv4_like(ip_candidate).map(IpAddr::V4));
+    if let Some(ip) = literal_ip {
         if is_private_ip(ip) {
             return Err(ToolError::BadArgs(format!(
                 "refusing to fetch private/loopback address '{host}'"
@@ -190,6 +198,68 @@ pub(crate) fn is_safe_url(url: &str) -> Result<(), ToolError> {
         }
     }
     Ok(())
+}
+
+/// Parse `host` as an IPv4 address using the "numbers-and-dots" notation accepted by glibc's
+/// `inet_aton`/`getaddrinfo` (what `reqwest`'s resolver ultimately calls): 1-4 dot-separated
+/// components, each decimal, octal (leading `0`), or hex (leading `0x`), that combine into a
+/// 32-bit address — e.g. a bare integer like `2852039166` or `0x7f.0.0.1`. `IpAddr::parse` does
+/// not accept any of these forms, only strict 4-part decimal dotted-quad.
+fn parse_ipv4_like(host: &str) -> Option<Ipv4Addr> {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut values = Vec::with_capacity(parts.len());
+    for part in &parts {
+        values.push(parse_c_uint(part)?);
+    }
+    // Every component but the last must fit in a byte; the last absorbs the remaining bits.
+    // Shift amounts are fixed literals (never a runtime-computed width) to avoid an overflow
+    // panic on the all-bits-in-one-component (bare integer) form.
+    let addr: u32 = match values.as_slice() {
+        [a] => (*a).try_into().ok()?,
+        [a, b] => {
+            if *a > 0xff || *b > 0x00ff_ffff {
+                return None;
+            }
+            ((*a as u32) << 24) | (*b as u32)
+        }
+        [a, b, c] => {
+            if *a > 0xff || *b > 0xff || *c > 0xffff {
+                return None;
+            }
+            ((*a as u32) << 24) | ((*b as u32) << 16) | (*c as u32)
+        }
+        [a, b, c, d] => {
+            if *a > 0xff || *b > 0xff || *c > 0xff || *d > 0xff {
+                return None;
+            }
+            ((*a as u32) << 24) | ((*b as u32) << 16) | ((*c as u32) << 8) | (*d as u32)
+        }
+        _ => return None,
+    };
+    Some(Ipv4Addr::from(addr))
+}
+
+/// Parse one dotted-quad component the way `strtoul` does inside `inet_aton`: decimal by
+/// default, octal with a leading `0`, hex with a leading `0x`/`0X`. Returns `None` for anything
+/// that isn't a plain unsigned integer literal (i.e. an ordinary hostname label).
+fn parse_c_uint(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let (digits, radix) = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        (hex, 16)
+    } else if s.len() > 1 && s.starts_with('0') {
+        (&s[1..], 8)
+    } else {
+        (s, 10)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(digits, radix).ok()
 }
 
 fn is_private_ip(ip: IpAddr) -> bool {
@@ -713,9 +783,26 @@ mod tests {
             "file:///etc/passwd",
             "ftp://example.com/",
             "not a url",
+            // Bare-integer / octal / hex encodings of loopback and the cloud metadata IP that
+            // the system resolver (glibc inet_aton/getaddrinfo) still treats as literal IPs.
+            "http://2130706433/",
+            "http://2852039166/",
+            "http://0x7f.0.0.1/",
+            "http://0177.0.0.1/",
+            "http://0x7f000001/",
+            "http://127.1/",
         ] {
             assert!(is_safe_url(bad).is_err(), "should reject {bad}");
         }
+    }
+
+    #[test]
+    fn safe_url_still_accepts_ordinary_hostnames_and_dotted_ips() {
+        assert!(is_safe_url("https://example.com/docs").is_ok());
+        assert!(is_safe_url("http://93.184.216.34/").is_ok());
+        // A numeric-looking label that isn't a valid IPv4-like literal (too many parts) is still
+        // an ordinary hostname.
+        assert!(is_safe_url("http://1.2.3.4.5.example.com/").is_ok());
     }
 
     #[tokio::test]

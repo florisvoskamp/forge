@@ -19,14 +19,14 @@ use std::path::{Path, PathBuf};
 /// Policy supplied by the caller.
 #[derive(Default)]
 pub struct SandboxPolicy {
-    /// Whether the sandbox is enabled at all. When `false`, `apply` is a no-op on every
-    /// platform.
+    /// Whether the sandbox is enabled at all. When `false`, the shell tool installs no
+    /// `pre_exec` sandbox hook on any platform.
     pub enabled: bool,
-    /// Extra writable paths beyond the cwd + temp dir pair that `apply` always adds.
+    /// Extra writable paths beyond the cwd + temp dir pair that [`effective_writable`] always adds.
     pub writable: Vec<PathBuf>,
 }
 
-/// Outcome of [`apply`].
+/// Outcome of applying the Landlock ruleset (see [`linux::apply_landlock`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyResult {
     /// Landlock ruleset is active; the process is confined.
@@ -130,29 +130,6 @@ pub fn is_supported() -> bool {
     }
 }
 
-/// Apply the sandbox in the **current process** according to `policy` and `writable`.
-///
-/// On Linux with Landlock available this installs the ruleset and returns `Ok(Applied)`.
-/// When `policy.enabled` is false, or the platform/kernel does not support Landlock, returns
-/// `Ok(Unsupported)` without error. A ruleset installation error is returned as `Err`.
-#[allow(dead_code)]
-pub fn apply(policy: &SandboxPolicy, writable: &[PathBuf]) -> Result<ApplyResult, String> {
-    if !policy.enabled {
-        return Ok(ApplyResult::Unsupported);
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        linux::apply_landlock(writable)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = writable;
-        Ok(ApplyResult::Unsupported)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -177,17 +154,6 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0], PathBuf::from("/some/dir"));
         assert_eq!(paths[1], std::env::temp_dir());
-    }
-
-    #[test]
-    fn disabled_policy_returns_unsupported() {
-        let policy = SandboxPolicy {
-            enabled: false,
-            writable: Vec::new(),
-        };
-        let writable = effective_writable(std::path::Path::new("."), &[]);
-        let result = apply(&policy, &writable);
-        assert_eq!(result, Ok(ApplyResult::Unsupported));
     }
 
     /// Runs only on Linux; skips gracefully if Landlock is not supported on the test kernel.
