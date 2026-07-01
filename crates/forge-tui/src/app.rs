@@ -3882,17 +3882,18 @@ pub fn render_usage_overlay(f: &mut Frame, app: &App) {
 
 /// Honest cost label for a per-model row. A flat-rate subscription bridge (Claude Code / Codex
 /// CLI) genuinely costs $0 per call, so it reads "subscription". A priced model shows its dollar
-/// cost. Anything else at $0 is a model we have NO price for (gateway/credit providers like
-/// OpenCode Zen, OpenRouter pass-through) — it may still burn real credit, so we say "untracked"
-/// rather than lie that it's a subscription.
+/// cost. At $0 with no bridge, `forge_mesh::catalog::is_free` tells apart a model we KNOW charges
+/// nothing (ollama, groq, a `:free` gateway variant, …) from one we simply have no price for
+/// (unpriced OpenRouter/OpenCode Zen models, which may still burn real gateway credit) — the
+/// former reads "free", the latter "untracked" rather than lying that it's costless.
 fn cost_cell(model: &str, cost: f64) -> String {
-    if model.starts_with("claude-cli")
-        || model.starts_with("codex-cli")
-        || model.starts_with("agy-cli")
-    {
+    let subscription = forge_mesh::catalog::is_subscription(model);
+    if subscription {
         "subscription".to_string()
     } else if cost > 0.0 {
         format!("${cost:.5}")
+    } else if forge_mesh::catalog::is_free(model, cost, subscription) {
+        "free".to_string()
     } else {
         "untracked".to_string()
     }
@@ -4916,12 +4917,23 @@ mod tests {
     }
 
     #[test]
-    fn cost_cell_distinguishes_subscription_priced_and_untracked() {
+    fn cost_cell_distinguishes_subscription_priced_free_and_untracked() {
         assert_eq!(cost_cell("claude-cli::", 0.0), "subscription");
         assert_eq!(cost_cell("codex-cli::gpt-5.5", 0.0), "subscription");
         assert_eq!(cost_cell("openai::gpt-4o-mini", 0.0123), "$0.01230");
+        // Genuinely free: known-$0 provider, positive evidence.
+        assert_eq!(cost_cell("ollama::llama3", 0.0), "free");
+        assert_eq!(cost_cell("groq::llama-3.1-8b-instant", 0.0), "free");
+        assert_eq!(
+            cost_cell("openrouter::cohere/north-mini-code:free", 0.0),
+            "free"
+        );
         // Unpriced gateway/credit model: not a bridge, $0 only because we lack a price.
         assert_eq!(cost_cell("opencode_go::glm-5.2", 0.0), "untracked");
+        assert_eq!(
+            cost_cell("openrouter::anthropic/claude-opus", 0.0),
+            "untracked"
+        );
     }
 
     #[test]

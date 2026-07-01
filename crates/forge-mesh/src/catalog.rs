@@ -41,7 +41,7 @@ pub fn is_subscription(id: &str) -> bool {
 /// (the bug the user hit), so it's paid-by-default too; mark a known-free one via a `:free` suffix
 /// or a config price of `0`. Other unpriced providers (local `ollama::`, free-tier
 /// `groq`/`cerebras`) are genuinely free.
-pub(crate) fn is_free(id: &str, cost: f64, subscription: bool) -> bool {
+pub fn is_free(id: &str, cost: f64, subscription: bool) -> bool {
     if subscription || cost > f64::EPSILON {
         return false;
     }

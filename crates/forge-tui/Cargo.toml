@@ -13,6 +13,7 @@ name = "forge_tui"
 [dependencies]
 forge-config.workspace = true
 forge-types.workspace = true
+forge-mesh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ratatui.workspace = true

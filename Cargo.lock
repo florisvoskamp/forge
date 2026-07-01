@@ -1917,6 +1917,7 @@ version = "2.2.0"
 dependencies = [
  "crossterm",
  "forge-agent-config",
+ "forge-agent-mesh",
  "forge-agent-types",
  "pulldown-cmark",
  "ratatui",
