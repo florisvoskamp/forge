@@ -13,9 +13,32 @@
 ```
 
 This runs a Complex-tier turn instructing the model to author a script and call the
-`run_workflow` tool with it. You'll see live, phase-grouped rows in the activity panel as child
-agents start and finish, exactly like `spawn_agents` — plus a `▶ <phase>` header wherever the
-script's `phase()` calls change.
+`run_workflow` tool with it. The moment the script starts executing, the dedicated full-screen
+**workflow view** opens automatically — workflows never render in the sticky subagent activity
+panel (that stays reserved for plain `spawn_agents` batches).
+
+## The workflow view
+
+A live, animated dashboard for the running script:
+
+- **Header** — the run's name (for saved scripts), a running/finished state, the turn timer, and
+  an overall progress meter with agent totals (`14/20 agents · 2 running · 1 failed · $0.03`).
+- **Phase tree** — one group per `phase()` call with its own mini-meter and done-count; a phase
+  appears the moment the script enters it, before its first agent even spawns. Failed agents show
+  a red `✗`, never a false green check.
+- **Agent rows** — one per `agent()` call, with its routed model and, while running, the live
+  trailing edge of its streamed output underneath.
+- **Narration feed** — the script's `log()` lines, newest last, pinned at the bottom.
+
+Keys: `↑↓` move the selection, `Enter` zooms into the selected agent's full transcript (`←→`
+switch agents inside the zoom, `Esc` steps back out), `Esc` **backgrounds** the view — the script
+keeps running and a one-line status band stays above the input — and `Ctrl+O` reopens it any time
+while the run exists (including after it finishes, until the next turn starts).
+
+The transcript still gets a durable scrollback record of the run (start line, `▶ phase` markers,
+one branch line per finished agent, `💬` notes, and a finish line), so the story remains readable
+after the view closes. A `log()` of a whole multi-line report lands in the view's feed; scrollback
+gets only a one-line note.
 
 ## The script API
 
@@ -70,8 +93,8 @@ concurrency budget as everything else in the script. A `parallel()` call in phas
 
 ### `await phase(title)`
 
-Labels every subsequent `agent()` call (until the next `phase()` call) with `title`, so the
-activity panel groups related rows under a `▶ title` header.
+Labels every subsequent `agent()` call (until the next `phase()` call) with `title`, opening a
+new group in the workflow view's phase tree (and a `▶ title` marker in scrollback).
 
 ```js
 await phase("research");
@@ -82,8 +105,9 @@ const fixes = await pipeline(findings, ...);
 
 ### `await log(message)`
 
-Writes a plain narrator note into the transcript — useful for surfacing an intermediate decision
-the script makes (e.g. "3 of 8 findings were false positives, skipping those").
+Writes a note into the workflow view's narration feed (and a one-line trimmed copy into the
+transcript) — useful for surfacing an intermediate decision the script makes (e.g. "3 of 8
+findings were false positives, skipping those").
 
 ### `await workflow(name, args?) -> any`
 

@@ -44,6 +44,7 @@ mod render;
 pub mod select;
 mod transcript;
 mod tui;
+mod workflow_view;
 pub use app::{
     banner_lines, handle_key, input_cursor_up, lattice_view_lines, print_banner_direct,
     render_mesh_overlay, render_usage_overlay, ActivityKind, ActivityStatus, App, InputOutcome,
@@ -65,6 +66,7 @@ pub use ratatui::text::Line as ScrollbackLine;
 pub use select::{select_multi, select_one, SelectItem};
 pub use transcript::{run_transcript_viewer, transcript_lines};
 pub use tui::TuiPresenter;
+pub use workflow_view::{WfPhase, WfRow, WfZoom, WorkflowView};
 
 // `QChoice`, `resolve_answer`, `NO_ANSWER` are defined above and re-exported at crate root.
 
@@ -264,6 +266,25 @@ pub enum PresenterEvent {
     Temper(String),
     /// The active reasoning-effort pin changed. `None` means provider default.
     Effort(Option<forge_types::EffortLevel>),
+    /// A workflow script started executing (docs/rfcs/forge-workflow.md). Brackets the run: until
+    /// [`WorkflowFinished`](PresenterEvent::WorkflowFinished) arrives, `Subagent*` events belong
+    /// to the workflow and render in the dedicated full-screen workflow view, not the sticky
+    /// subagent activity panel.
+    WorkflowStarted {
+        /// The saved script's name (`/workflow run <name>`); `None` for a model-authored script.
+        name: Option<String>,
+    },
+    /// A workflow `phase(title)` transition — opens a new group in the view's phase tree.
+    WorkflowPhase {
+        title: String,
+    },
+    /// A workflow `log(message)` narration line (raw message; presenters style it).
+    WorkflowLog(String),
+    /// The workflow script finished. `ok` is false when the script errored or any `agent()` failed.
+    WorkflowFinished {
+        ok: bool,
+        summary: String,
+    },
 }
 
 /// The outcome of a permission confirmation prompt. Returned by [`Presenter::confirm`].
@@ -504,6 +525,16 @@ impl Presenter for HeadlessPresenter {
             }
             PresenterEvent::Temper(_) => {}
             PresenterEvent::Effort(_) => {}
+            PresenterEvent::WorkflowStarted { name } => match name {
+                Some(n) => println!("  ⛓ workflow '{n}' started"),
+                None => println!("  ⛓ workflow started"),
+            },
+            PresenterEvent::WorkflowPhase { title } => println!("  ▶ phase: {title}"),
+            PresenterEvent::WorkflowLog(msg) => println!("  💬 {msg}"),
+            PresenterEvent::WorkflowFinished { ok, summary } => {
+                let mark = if ok { "✓" } else { "⚠" };
+                println!("  {mark} workflow finished: {summary}");
+            }
         }
     }
 

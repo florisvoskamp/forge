@@ -119,10 +119,22 @@ same pattern as spawn_agents — it needs provider/router/store, not a registry 
   │  primitives (see below)
   ├─ runs the (prelude + model's) script; drains its WorkflowEvents concurrently
   │  with script execution via tokio::select!, converting each into the SAME
-  │  PresenterEvent::SubagentStart/Progress/Result the activity panel already renders
+  │  PresenterEvent::SubagentStart/Progress/Result shapes the subagent path uses,
+  │  bracketed by WorkflowStarted/WorkflowFinished (plus WorkflowPhase/WorkflowLog)
   ▼
-tool result = the script's own return value; TUI shows phase-grouped live rows
+tool result = the script's own return value; the TUI opens the dedicated full-screen
+workflow view (crates/forge-tui/src/workflow_view.rs) for the run — workflow rows
+never join the sticky subagent activity panel
 ```
+
+> **Amendment (post-ship):** the original design rendered workflow agents as phase-grouped rows
+> inside the shared subagent activity panel. Live use showed a running script deserves its own
+> surface, so the `WorkflowStarted`/`WorkflowFinished` bracket events were added and the TUI now
+> routes the bracketed `Subagent*` events into a dedicated animated full-screen view (phase tree
+> with progress meters, per-agent live output edges, `log()` narration feed, Enter-zoom into any
+> agent's transcript via the shared `transcript_lines` renderer). Esc backgrounds the view (a
+> one-line status band remains above the input), Ctrl+O reopens it. See
+> `docs/features/forge-workflow.md` § "The workflow view".
 
 ### Detailed design
 

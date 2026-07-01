@@ -1276,7 +1276,12 @@ pub(crate) async fn run_chat_tui(
                         }
                     }
                     forge_tui::InputEvent::Key(key) => {
-                        if matches!(key, KeyKind::Esc) {
+                        if app.workflow.open && matches!(key, KeyKind::Esc) {
+                            // The observed session's workflow view is on top: Esc closes it
+                            // first, not the whole observer.
+                            app.workflow.open = false;
+                            dirty = true;
+                        } else if matches!(key, KeyKind::Esc) {
                             observer = None;
                             tui.clear_screen();
                             app.clear_transcript();
@@ -1334,7 +1339,16 @@ pub(crate) async fn run_chat_tui(
                     // open, same as its ↑/↓ key handling below), else the activity viewer
                     // (full-screen), else the main transcript. A few rows per notch feels natural.
                     const STEP: usize = 3;
-                    if app.mesh_overlay.open {
+                    if app.workflow.open {
+                        let key = if up { KeyKind::Up } else { KeyKind::Down };
+                        if app.workflow.zoom.is_some() {
+                            for _ in 0..STEP {
+                                workflow_zoom_key(&mut app, key);
+                            }
+                        } else {
+                            app.workflow.move_selection(if up { -1 } else { 1 });
+                        }
+                    } else if app.mesh_overlay.open {
                         let max = app.mesh_overlay.candidates.len().saturating_sub(1);
                         for _ in 0..STEP {
                             if up {
@@ -1385,6 +1399,33 @@ pub(crate) async fn run_chat_tui(
                 }
                 forge_tui::InputEvent::Key(k) => k,
             };
+
+            // The workflow view is modal while open: ↑↓ move the row selection, Enter zooms into
+            // the selected agent's transcript (Esc steps back out), Esc/q background the view —
+            // the script keeps running and the one-line status band takes over above the input.
+            if app.workflow.open {
+                if app.workflow.zoom.is_some() {
+                    workflow_zoom_key(&mut app, key);
+                } else {
+                    match key {
+                        KeyKind::Esc | KeyKind::Char('q') => app.workflow.open = false,
+                        KeyKind::Up | KeyKind::Char('k') => app.workflow.move_selection(-1),
+                        KeyKind::Down | KeyKind::Char('j') => app.workflow.move_selection(1),
+                        KeyKind::PageUp => app.workflow.move_selection(-5),
+                        KeyKind::PageDown => app.workflow.move_selection(5),
+                        KeyKind::Home => app.workflow.selected = 0,
+                        KeyKind::End => {
+                            app.workflow.selected = app.workflow.rows.len().saturating_sub(1);
+                        }
+                        KeyKind::Enter if !app.workflow.rows.is_empty() => {
+                            app.workflow.zoom = Some(Default::default());
+                        }
+                        _ => {}
+                    }
+                }
+                dirty = true;
+                continue;
+            }
 
             // The in-loop activity viewer (full-screen mode) is modal while open: it owns every key
             // (scroll / switch entry / Esc to close). Rendered through the main terminal, so there's
@@ -2322,9 +2363,12 @@ pub(crate) async fn run_chat_tui(
             }
 
             // Ctrl+O toggles focus on the sticky activity panel (main chat + subagents + critics).
-            // When focused, ↑↓ move the selection and Enter opens the full-screen transcript viewer.
+            // When a workflow exists this turn (running or just finished) it opens the dedicated
+            // workflow view instead — workflow rows live there, not in the activity panel.
             if matches!(key, KeyKind::ToggleSubagentDetail) {
-                if app.has_activity() {
+                if app.workflow.exists() {
+                    app.workflow.open = true;
+                } else if app.has_activity() {
                     app.activity_focused = !app.activity_focused;
                     if app.activity_focused {
                         app.activity_idx =
@@ -3313,6 +3357,12 @@ pub(crate) async fn run_chat_tui(
             app.mesh_overlay.anim_tick += 1;
             dirty = true;
         }
+        if app.workflow.open && app.workflow.anim_tick < app.workflow.settle_tick() {
+            // Same settle-then-stop reveal as the mesh inspector; while the run is busy the
+            // normal spinner tick keeps the row spinners animating past this point.
+            app.workflow.anim_tick += 1;
+            dirty = true;
+        }
         if app.usage_overlay.open {
             app.usage_overlay.anim_tick = app.usage_overlay.anim_tick.wrapping_add(1);
             dirty = true;
@@ -3668,6 +3718,69 @@ pub(crate) fn spawn_compact(
             sess.notify_error(&format!("compact failed: {e}"));
         }
     })
+}
+
+/// Keys inside the workflow view's Enter-zoom transcript: mirrors the activity viewer's scrolling
+/// (↑↓/PgUp/PgDn/Home/End, j/k/g/G) plus ←→/Tab to switch agents. An upward scroll first snaps
+/// the stored offset from the "tail" sentinel down to the real max (recorded by the render path),
+/// so scrolling back out of follow mode moves on the first keypress instead of unwinding a
+/// `usize::MAX / 2` sentinel one line at a time.
+pub(crate) fn workflow_zoom_key(app: &mut forge_tui::App, key: forge_tui::KeyKind) {
+    use forge_tui::KeyKind;
+    let max = app
+        .workflow
+        .zoom_geom
+        .get()
+        .map(|(wrapped_len, body_h)| wrapped_len.saturating_sub(body_h as usize));
+    let clamp = |scroll: usize| max.map_or(scroll, |m| scroll.min(m));
+    match key {
+        KeyKind::Esc | KeyKind::Char('q') => app.workflow.zoom = None,
+        KeyKind::Up | KeyKind::Char('k') => {
+            if let Some(z) = app.workflow.zoom.as_mut() {
+                z.follow = false;
+                z.scroll = clamp(z.scroll).saturating_sub(1);
+            }
+        }
+        KeyKind::Down | KeyKind::Char('j') | KeyKind::Char(' ') => {
+            if let Some(z) = app.workflow.zoom.as_mut() {
+                z.scroll = clamp(z.scroll).saturating_add(1);
+            }
+            app.workflow.zoom_refollow_at_tail();
+        }
+        KeyKind::PageUp => {
+            if let Some(z) = app.workflow.zoom.as_mut() {
+                z.follow = false;
+                z.scroll = clamp(z.scroll).saturating_sub(10);
+            }
+        }
+        KeyKind::PageDown => {
+            if let Some(z) = app.workflow.zoom.as_mut() {
+                z.scroll = clamp(z.scroll).saturating_add(10);
+            }
+            app.workflow.zoom_refollow_at_tail();
+        }
+        KeyKind::Home | KeyKind::Char('g') => {
+            if let Some(z) = app.workflow.zoom.as_mut() {
+                z.follow = false;
+                z.scroll = 0;
+            }
+        }
+        KeyKind::End | KeyKind::Char('G') => {
+            if let Some(z) = app.workflow.zoom.as_mut() {
+                z.follow = true;
+                z.scroll = usize::MAX / 2;
+            }
+        }
+        KeyKind::Left => {
+            app.workflow.move_selection(-1);
+            app.workflow.zoom = Some(Default::default());
+        }
+        KeyKind::Right | KeyKind::Tab => {
+            app.workflow.move_selection(1);
+            app.workflow.zoom = Some(Default::default());
+        }
+        _ => {}
+    }
 }
 
 /// Spawn `/workflow run <name>` as a background task (docs/rfcs/forge-workflow.md): runs a saved

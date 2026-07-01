@@ -5492,6 +5492,10 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         };
         let workflows_dir = repo_root.join(".forge").join("workflows");
 
+        // Bracket the run: Started/Finished tell the TUI a workflow owns the Subagent* events in
+        // between, so they render in the dedicated workflow view, not the subagent activity panel.
+        self.presenter
+            .emit(PresenterEvent::WorkflowStarted { name: None });
         let presenter = &mut self.presenter;
         let on_event = |ev: workflow::WorkflowEvent| match ev {
             workflow::WorkflowEvent::AgentStart {
@@ -5523,7 +5527,10 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                 summary,
                 cost_usd,
             }),
-            workflow::WorkflowEvent::Log(msg) => presenter.emit(PresenterEvent::Warning(msg)),
+            workflow::WorkflowEvent::Phase(title) => {
+                presenter.emit(PresenterEvent::WorkflowPhase { title })
+            }
+            workflow::WorkflowEvent::Log(msg) => presenter.emit(PresenterEvent::WorkflowLog(msg)),
         };
 
         let (value, all_ok) = workflow::run(
@@ -5544,6 +5551,10 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             serde_json::Value::String(s) => s.clone(),
             other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
         };
+        self.presenter.emit(PresenterEvent::WorkflowFinished {
+            ok: all_ok,
+            summary: workflow::summary(&combined),
+        });
         self.store.record_tool_call(
             msg_id,
             &call.name,
@@ -5586,6 +5597,10 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         };
         let workflows_dir = repo_root.join(".forge").join("workflows");
 
+        // Same Started/Finished bracket as the `run_workflow` tool path, carrying the saved name.
+        self.presenter.emit(PresenterEvent::WorkflowStarted {
+            name: Some(name.to_string()),
+        });
         let presenter = &mut self.presenter;
         let on_event = |ev: workflow::WorkflowEvent| match ev {
             workflow::WorkflowEvent::AgentStart {
@@ -5617,7 +5632,10 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                 summary,
                 cost_usd,
             }),
-            workflow::WorkflowEvent::Log(msg) => presenter.emit(PresenterEvent::Warning(msg)),
+            workflow::WorkflowEvent::Phase(title) => {
+                presenter.emit(PresenterEvent::WorkflowPhase { title })
+            }
+            workflow::WorkflowEvent::Log(msg) => presenter.emit(PresenterEvent::WorkflowLog(msg)),
         };
 
         let (value, all_ok) = workflow::run_saved(
@@ -5640,13 +5658,12 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
             other => serde_json::to_string(&other).unwrap_or_else(|_| other.to_string()),
         };
         // Unlike the `run_workflow` tool (whose return value the model reads and relays), a saved
-        // script run directly via `/workflow run` has no model in the loop — surface its own
-        // return value explicitly so it isn't just implied by the agent Start/Result events.
-        // `warning_line()` (forge-tui) already prepends its own `⚠` glyph — don't embed another.
-        let suffix = if all_ok { "" } else { " (with errors)" };
-        self.presenter.emit(PresenterEvent::Warning(format!(
-            "workflow '{name}' finished{suffix}: {combined}"
-        )));
+        // script run directly via `/workflow run` has no model in the loop — the Finished event's
+        // summary is the only surfacing of the script's own return value.
+        self.presenter.emit(PresenterEvent::WorkflowFinished {
+            ok: all_ok,
+            summary: format!("'{name}': {}", workflow::summary(&combined)),
+        });
         Ok(combined)
     }
 
