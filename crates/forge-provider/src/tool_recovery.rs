@@ -278,6 +278,110 @@ fn normalize_tool_name(raw: &str) -> String {
     n.to_string()
 }
 
+/// Repair a structured tool call's arguments when the provider adapter (genai) failed to parse
+/// them as JSON and fell back to the raw accumulated string — e.g. a streaming reassembly glitch
+/// (often via an OpenRouter-proxied model) that dropped or duplicated a chunk of the
+/// `tool_calls[].function.arguments` stream before genai's own end-of-stream `serde_json::from_str`
+/// ran. Passes through anything that's already a JSON object (the overwhelmingly common case)
+/// untouched.
+///
+/// ALWAYS returns a JSON object, never a bare string — this is load-bearing, not cosmetic: the
+/// repaired (or, worst case, empty) object is what gets stored on the `ToolCall` and replayed
+/// verbatim to the provider in every subsequent request in the conversation. A raw invalid JSON
+/// value sitting in `tool_calls[].function.arguments` on replay gets flatly rejected by a strict
+/// provider's own request-shape validation (observed as OpenRouter's generic `"Provider returned
+/// error"` 400 wrapper) — which Forge's mesh correctly does NOT fail over on, since a genuinely
+/// malformed request would fail identically on any model. Left unrepaired, one streaming glitch on
+/// one tool call permanently poisons the rest of that turn (and any later turn that replays the
+/// same history): every subsequent request 400s regardless of which model handles it, with no
+/// error-classification path that fixes it. Repairing at the source, before the bad value is ever
+/// stored, is the only place that actually breaks the poison loop.
+///
+/// Two repair strategies, in order:
+/// 1. Trim stray characters surrounding an otherwise-intact object (`start..=end` between the
+///    first `{` and last `}`) and retry parsing — recovers e.g. a duplicated trailing byte.
+/// 2. A best-effort scrape of `"key": value` fragments from whatever text survived — recovers
+///    partial data even when a leading chunk (including the opening `{`) was dropped entirely, as
+///    in the field report this was written for. Whatever a real required key IS still legible
+///    survives; a genuinely missing key is then reported to the model as a normal, actionable
+///    "missing required field" error on the next step instead of a generic "must be a JSON object"
+///    that gives it nothing to act on.
+///
+/// If neither recovers anything, falls back to an empty object — always object-shaped, never worse
+/// than what genai handed back.
+pub fn repair_malformed_args(raw: Value) -> Value {
+    let Value::String(s) = raw else { return raw };
+
+    if let (Some(start), Some(end)) = (s.find('{'), s.rfind('}')) {
+        if start <= end {
+            if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(&s[start..=end]) {
+                return v;
+            }
+        }
+    }
+
+    Value::Object(scrape_key_value_fragments(&s))
+}
+
+/// Best-effort extraction of `"key": value` pairs from a string that isn't valid JSON as a whole —
+/// used when a tool call's arguments were truncated or corrupted badly enough that trimming stray
+/// surrounding characters isn't enough to make the whole thing parse. Tolerant of a missing
+/// opening brace/key (the common case: a dropped leading stream chunk), of a stray leftover quote
+/// character right at the start (e.g. the orphaned closing `"` of a value whose own key got
+/// dropped with it), and of trailing junk after the last recognizable value. Scans for a `"` and
+/// only commits to it as a key if a `:` genuinely follows (skipping whitespace) — anything else is
+/// noise, and the scan resumes from just past that quote rather than losing the rest of the
+/// string. Never panics on adversarial input — every slice comes from `.find()` positions (always
+/// on a UTF-8 char boundary since `"`/`:`/`,`/`}` are all single-byte ASCII) with an early
+/// skip-and-continue on anything that doesn't match the expected shape.
+fn scrape_key_value_fragments(s: &str) -> Map<String, Value> {
+    let mut obj = Map::new();
+    let mut pos = 0usize;
+    while let Some(rel) = s[pos..].find('"') {
+        let key_start = pos + rel + 1;
+        let Some(rel_end) = s[key_start..].find('"') else {
+            break; // an unterminated quote — nothing usable left
+        };
+        let key_end = key_start + rel_end;
+        let key = &s[key_start..key_end];
+        let after_key = s[key_end + 1..].trim_start();
+
+        if key.is_empty() || !after_key.starts_with(':') {
+            // Either an empty "key" or no `:` follows — this quote wasn't a real key (e.g. a
+            // stray leftover value-closing quote). Resume scanning right after it, not past it.
+            pos = key_start;
+            continue;
+        }
+        let val_part = after_key[1..].trim_start();
+
+        let (value, consumed_to) = if let Some(vs) = val_part.strip_prefix('"') {
+            match vs.find('"') {
+                Some(vend) => (
+                    Value::String(vs[..vend].to_string()),
+                    s.len() - vs[vend + 1..].len(),
+                ),
+                None => {
+                    pos = key_start;
+                    continue;
+                }
+            }
+        } else {
+            let vend = val_part.find([',', '}']).unwrap_or(val_part.len());
+            let tok = val_part[..vend].trim();
+            if tok.is_empty() {
+                pos = key_start;
+                continue;
+            }
+            let value = serde_json::from_str::<Value>(tok)
+                .unwrap_or_else(|_| Value::String(tok.to_string()));
+            (value, s.len() - val_part[vend..].len())
+        };
+        obj.insert(key.to_string(), value);
+        pos = consumed_to;
+    }
+    obj
+}
+
 /// Cheap detector for forge-core's honest-failure guard: does this text contain an un-executed
 /// tool call? (Same markers `recover_text_tool_calls` keys on, plus the bare `default_api:` form.)
 pub fn looks_like_unexecuted_tool_call(content: &str) -> bool {
@@ -624,6 +728,78 @@ mod tests {
                 looks_like_unexecuted_tool_call(&s),
                 "non-deterministic detector: {s:?}"
             );
+        }
+    }
+
+    #[test]
+    fn repair_passes_through_an_already_valid_object_untouched() {
+        let v = serde_json::json!({"query": "mesh", "path": "crates"});
+        assert_eq!(repair_malformed_args(v.clone()), v);
+    }
+
+    #[test]
+    fn repair_passes_through_non_string_non_object_unchanged() {
+        // Only a String fallback is genai's malformed case; anything else (shouldn't happen, but
+        // must never be *worsened*) is returned as-is.
+        assert_eq!(repair_malformed_args(Value::Null), Value::Null);
+        assert_eq!(
+            repair_malformed_args(Value::Array(vec![])),
+            Value::Array(vec![])
+        );
+    }
+
+    #[test]
+    fn repair_trims_stray_characters_around_an_intact_object() {
+        // A duplicated trailing byte from a streaming reassembly glitch — the object itself is
+        // otherwise complete and valid.
+        let raw = Value::String(r#"{"query":"mesh","path":"crates"}}"#.to_string());
+        let repaired = repair_malformed_args(raw);
+        assert_eq!(repaired["query"], "mesh");
+        assert_eq!(repaired["path"], "crates");
+    }
+
+    #[test]
+    fn repair_recovers_fields_from_a_fragment_missing_its_opening_brace() {
+        // The exact field-reported shape: a dropped leading chunk took the opening `{` and the
+        // `query` key with it, leaving a fragment that starts mid-object.
+        let raw = Value::String(r#"","path":"crates","context":3}"#.to_string());
+        let repaired = repair_malformed_args(raw);
+        assert!(repaired.is_object(), "must always repair to an object");
+        assert_eq!(repaired["path"], "crates");
+        assert_eq!(repaired["context"], 3);
+        // `query` is genuinely gone — not fabricated — so a downstream required-field check still
+        // correctly reports it missing instead of the call silently "succeeding" with bad data.
+        assert!(repaired.get("query").is_none());
+    }
+
+    #[test]
+    fn repair_falls_back_to_empty_object_on_pure_garbage() {
+        let repaired = repair_malformed_args(Value::String("not json at all, no quotes".into()));
+        assert_eq!(repaired, Value::Object(Map::new()));
+    }
+
+    #[test]
+    fn repair_never_panics_on_adversarial_strings() {
+        // Fuzz-style pass over ragged/truncated/binary-ish input — mirrors
+        // `recovery_never_panics_on_adversarial_input`'s discipline for this new entry point.
+        let mut state: u64 = 0xC0FFEE;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let fragments = [
+            "\"", "{", "}", ":", ",", "\":", "\"a\"", "1", "true", "null", "🦀", "\\\"", "",
+        ];
+        for _ in 0..2000 {
+            let len = (next() % 8) as usize;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push_str(fragments[(next() % fragments.len() as u64) as usize]);
+            }
+            let repaired = repair_malformed_args(Value::String(s.clone()));
+            assert!(repaired.is_object(), "non-object result for input: {s:?}");
         }
     }
 }

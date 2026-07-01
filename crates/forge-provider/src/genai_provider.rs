@@ -1097,7 +1097,11 @@ impl Provider for GenAiProvider {
                             .map(|tc| ToolCall {
                                 id: tc.call_id,
                                 name: tc.fn_name,
-                                args: tc.fn_arguments,
+                                // genai falls back to the raw accumulated string when its own
+                                // end-of-stream parse fails (a dropped/duplicated chunk); repair
+                                // it here so a malformed call can never be stored/replayed as-is
+                                // (see `repair_malformed_args` doc comment for why that matters).
+                                args: crate::repair_malformed_args(tc.fn_arguments),
                             })
                             .collect();
                     }

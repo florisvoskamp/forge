@@ -19,7 +19,9 @@ pub use genai_provider::{
     bundled_http_client, is_discoverable, list_custom_models, list_models, GenAiProvider,
 };
 pub use mock::MockProvider;
-pub use tool_recovery::{looks_like_unexecuted_tool_call, recover_text_tool_calls};
+pub use tool_recovery::{
+    looks_like_unexecuted_tool_call, recover_text_tool_calls, repair_malformed_args,
+};
 
 /// Normalize legacy underscore-prefixed bridge ids to the canonical hyphen form so
 /// `codex_cli::gpt-5.4-mini` and `claude_cli::opus` work identically to their hyphen forms.
