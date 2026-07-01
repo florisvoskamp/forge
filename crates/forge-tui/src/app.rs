@@ -306,7 +306,12 @@ pub struct App {
     /// Subagents in the current `spawn_agents` batch (RFC subagent-orchestration). Running rows
     /// animate with a spinner in the live preview; on completion each becomes a scrollback
     /// branch line, and the whole group folds (header + branches + footer) when all finish.
+    /// Rows are retained across batches within a turn (see the `SubagentStart` handler) so a
+    /// multi-phase workflow's earlier phases stay reachable via Ctrl+O — `subagent_batch_start`
+    /// is the index where the *currently open* batch begins, so its scrollback footer sums only
+    /// this batch's rows, not every retained row from earlier phases too.
     subagents: Vec<SubRow>,
+    subagent_batch_start: usize,
     /// Per-critic rows for the live assay panel. Populated from AssayCriticRow events; cleared
     /// when the AssayReport arrives (the full report lands in scrollback instead).
     assay_critics: Vec<forge_types::AssayCriticRow>,
@@ -517,6 +522,7 @@ impl App {
                     last: r.last.clone(),
                     log: Vec::new(),
                     done: r.done,
+                    ok: r.ok,
                     cost: r.cost,
                 })
                 .collect(),
@@ -571,6 +577,9 @@ struct SubRow {
     /// child can't grow the buffer without limit.
     log: Vec<String>,
     done: bool,
+    /// Only meaningful once `done` — whether the child's own call succeeded. `true` while
+    /// running (no news isn't bad news); set from `SubagentResult.ok` on completion.
+    ok: bool,
     cost: f64,
 }
 
@@ -590,6 +599,9 @@ pub enum ActivityKind {
 pub enum ActivityStatus {
     Running,
     Done,
+    /// Finished, but the underlying subagent call itself failed — rendered distinctly (red ✗,
+    /// not a green ✓) so a failed workflow phase doesn't look like it succeeded.
+    Failed,
     Skipped,
 }
 
@@ -669,6 +681,12 @@ pub struct ViewSnapshot {
     pub transcript_follow: bool,
 }
 
+/// A pre-fix persisted snapshot has no `ok` field at all — default it to `true` (matching the
+/// old, always-green rendering) rather than fail to deserialize or flip old rows to "failed".
+fn default_ok() -> bool {
+    true
+}
+
 /// Serializable form of a subagent row (the live `SubRow` isn't serde and is private).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubagentSnapshot {
@@ -680,6 +698,8 @@ pub struct SubagentSnapshot {
     pub last: String,
     pub log: Vec<String>,
     pub done: bool,
+    #[serde(default = "default_ok")]
+    pub ok: bool,
     pub cost: f64,
 }
 
@@ -1073,6 +1093,7 @@ impl App {
                 let starting_new_batch =
                     self.subagents.is_empty() || self.subagents.iter().all(|r| r.done);
                 if starting_new_batch {
+                    self.subagent_batch_start = self.subagents.len();
                     self.flush.push(subagent_header_line());
                 }
                 self.subagents.push(SubRow {
@@ -1084,6 +1105,7 @@ impl App {
                     last: String::new(),
                     log: Vec::new(),
                     done: false,
+                    ok: true,
                     cost: 0.0,
                 });
                 // Bound total retention: drop the oldest already-finished rows first (never an
@@ -1091,14 +1113,20 @@ impl App {
                 const MAX_SUBAGENT_ROWS: usize = 500;
                 if self.subagents.len() > MAX_SUBAGENT_ROWS {
                     let mut excess = self.subagents.len() - MAX_SUBAGENT_ROWS;
+                    let mut removed_before_batch_start = 0usize;
+                    let mut idx = 0usize;
                     self.subagents.retain(|r| {
-                        if excess > 0 && r.done {
+                        let keep = !(excess > 0 && r.done);
+                        if !keep {
                             excess -= 1;
-                            false
-                        } else {
-                            true
+                            if idx < self.subagent_batch_start {
+                                removed_before_batch_start += 1;
+                            }
                         }
+                        idx += 1;
+                        keep
                     });
+                    self.subagent_batch_start -= removed_before_batch_start;
                 }
             }
             PresenterEvent::SubagentProgress { id, snippet } => {
@@ -1147,6 +1175,7 @@ impl App {
                 ));
                 if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id) {
                     row.done = true;
+                    row.ok = ok;
                     row.cost = cost_usd;
                     // Drop a trailing empty/partial line, then record the outcome at the tail of the
                     // transcript so the browser shows it.
@@ -1162,12 +1191,16 @@ impl App {
                         row.log.push(piece.to_string());
                     }
                 }
-                // When every child in the batch has reported, close the scrollback box. The rows
-                // are KEPT (not cleared) so their full transcripts remain viewable via Ctrl+O until
-                // the next batch starts; the live panel collapses on its own (no rows are running).
-                if self.subagents.iter().all(|r| r.done) {
-                    let n = self.subagents.len();
-                    let total: f64 = self.subagents.iter().map(|r| r.cost).sum();
+                // When every child in the CURRENT batch has reported, close the scrollback box.
+                // Scoped to `subagent_batch_start..` — earlier phases' rows are retained (see the
+                // `SubagentStart` handler) but must not be re-counted into this batch's total.
+                // The rows are KEPT (not cleared) so their full transcripts remain viewable via
+                // Ctrl+O until the next batch starts; the live panel collapses on its own (no rows
+                // are running).
+                let current_batch = &self.subagents[self.subagent_batch_start..];
+                if current_batch.iter().all(|r| r.done) {
+                    let n = current_batch.len();
+                    let total: f64 = current_batch.iter().map(|r| r.cost).sum();
                     self.flush.push(subagent_footer_line(n, total));
                 }
             }
@@ -1351,6 +1384,7 @@ impl App {
     pub fn on_turn_start(&mut self) {
         if !self.subagents.is_empty() && self.subagents.iter().all(|r| r.done) {
             self.subagents.clear();
+            self.subagent_batch_start = 0;
         }
         self.activity_focused = false;
         self.activity_idx = 0;
@@ -1393,10 +1427,12 @@ impl App {
                 subtitle: r.task.clone(),
                 model: r.model.clone(),
                 phase: r.phase.clone(),
-                status: if r.done {
+                status: if !r.done {
+                    ActivityStatus::Running
+                } else if r.ok {
                     ActivityStatus::Done
                 } else {
-                    ActivityStatus::Running
+                    ActivityStatus::Failed
                 },
                 cost: r.cost,
                 line_count: r.log.len(),
@@ -1911,6 +1947,7 @@ impl App {
                     last: r.last.clone(),
                     log: r.log.clone(),
                     done: r.done,
+                    ok: r.ok,
                     cost: r.cost,
                 })
                 .collect(),
@@ -1938,6 +1975,7 @@ impl App {
                 last: r.last,
                 log: r.log,
                 done: r.done,
+                ok: r.ok,
                 cost: r.cost,
             })
             .collect();
@@ -3334,6 +3372,7 @@ fn render_activity_panel(frame: &mut Frame, area: Rect, app: &App) {
         let status_span = match v.status {
             ActivityStatus::Running => Span::styled(format!("{spin} "), Style::default().fg(DIM)),
             ActivityStatus::Done => Span::styled("✓ ", Style::default().fg(OKGREEN)),
+            ActivityStatus::Failed => Span::styled("✗ ", Style::default().fg(ERRRED)),
             ActivityStatus::Skipped => Span::styled("⏭ ", Style::default().fg(DIM)),
         };
         let title_style = if selected {
@@ -6317,6 +6356,107 @@ mod tests {
         assert!(
             app.subagents.is_empty(),
             "on_turn_start still clears at the real turn boundary"
+        );
+    }
+
+    #[test]
+    fn a_second_batchs_scrollback_footer_counts_only_its_own_rows() {
+        // Regression: retaining rows across batches (the fix above) must not make the SECOND
+        // batch's "N agents · $total" scrollback footer sum every retained row from earlier
+        // phases too — found via live end-to-end testing of a real two-phase workflow script,
+        // where a 2-agent second phase's footer read "4 agents" (2 retained from phase 1 + 2 of
+        // its own), not "2 agents".
+        let mut app = App::default();
+        app.apply(PresenterEvent::SubagentStart {
+            id: "p1-a".into(),
+            agent: "researcher".into(),
+            task: "survey".into(),
+            model: Some("anthropic::opus".into()),
+            phase: Some("research".into()),
+        });
+        app.apply(PresenterEvent::SubagentResult {
+            id: "p1-a".into(),
+            agent: "researcher".into(),
+            ok: true,
+            summary: "done".into(),
+            cost_usd: 0.001,
+        });
+        let phase1_flush = flush_text(&mut app);
+        assert!(
+            phase1_flush.contains("1 agents"),
+            "phase 1's own footer: {phase1_flush}"
+        );
+
+        app.apply(PresenterEvent::SubagentStart {
+            id: "p2-a".into(),
+            agent: "implementer".into(),
+            task: "fix".into(),
+            model: Some("anthropic::sonnet".into()),
+            phase: Some("fix".into()),
+        });
+        app.apply(PresenterEvent::SubagentStart {
+            id: "p2-b".into(),
+            agent: "implementer".into(),
+            task: "fix more".into(),
+            model: Some("anthropic::sonnet".into()),
+            phase: Some("fix".into()),
+        });
+        app.apply(PresenterEvent::SubagentResult {
+            id: "p2-a".into(),
+            agent: "implementer".into(),
+            ok: true,
+            summary: "done".into(),
+            cost_usd: 0.002,
+        });
+        app.apply(PresenterEvent::SubagentResult {
+            id: "p2-b".into(),
+            agent: "implementer".into(),
+            ok: true,
+            summary: "done".into(),
+            cost_usd: 0.003,
+        });
+        let phase2_flush = flush_text(&mut app);
+        assert!(
+            phase2_flush.contains("2 agents"),
+            "phase 2 has 2 of its own agents, not phase 1's total too: {phase2_flush}"
+        );
+        assert!(
+            !phase2_flush.contains("3 agents") && !phase2_flush.contains("4 agents"),
+            "must not cumulatively count phase 1's retained row: {phase2_flush}"
+        );
+    }
+
+    #[test]
+    fn a_failed_subagent_shows_as_failed_not_a_false_success_checkmark() {
+        // Regression: `ActivitySummary::status` only ever produced `Running`/`Done` for a
+        // subagent row — a failed `agent()` call (found via live end-to-end testing of a real
+        // workflow script whose subagents all errored) still rendered a green ✓ once `done`,
+        // indistinguishable from success, even though the scrollback box right above it
+        // correctly showed a red ✗ for the exact same agent.
+        let mut app = App::default();
+        app.apply(PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "researcher".into(),
+            task: "look something up".into(),
+            model: Some("anthropic::opus".into()),
+            phase: None,
+        });
+        app.apply(PresenterEvent::SubagentResult {
+            id: "a".into(),
+            agent: "researcher".into(),
+            ok: false,
+            summary: "error: hit the step limit".into(),
+            cost_usd: 0.0,
+        });
+        let views = app.activity_summaries();
+        let row = views
+            .iter()
+            .find(|v| v.kind == ActivityKind::Subagent)
+            .expect("subagent row present");
+        assert_eq!(
+            row.status,
+            ActivityStatus::Failed,
+            "a failed agent call must not report Done"
         );
     }
 

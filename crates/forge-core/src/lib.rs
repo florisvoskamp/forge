@@ -5642,9 +5642,10 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         // Unlike the `run_workflow` tool (whose return value the model reads and relays), a saved
         // script run directly via `/workflow run` has no model in the loop — surface its own
         // return value explicitly so it isn't just implied by the agent Start/Result events.
+        // `warning_line()` (forge-tui) already prepends its own `⚠` glyph — don't embed another.
+        let suffix = if all_ok { "" } else { " (with errors)" };
         self.presenter.emit(PresenterEvent::Warning(format!(
-            "{} workflow '{name}' finished: {combined}",
-            if all_ok { "✓" } else { "⚠" }
+            "workflow '{name}' finished{suffix}: {combined}"
         )));
         Ok(combined)
     }

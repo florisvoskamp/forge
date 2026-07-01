@@ -137,6 +137,7 @@ const DIM: Color = Color::Rgb(82, 87, 108);
 const TOOLCYAN: Color = Color::Rgb(75, 212, 218);
 const WARNYEL: Color = Color::Rgb(238, 188, 82);
 const OKGREEN: Color = Color::Rgb(92, 208, 122);
+const ERRRED: Color = Color::Rgb(243, 92, 92); // error
 const VERY_DIM: Color = Color::Rgb(54, 58, 74);
 
 /// Wrap one styled line to `width` columns, preserving each span's style across the break. A blank
@@ -230,6 +231,7 @@ pub fn transcript_lines(
     let (status, status_color) = match view.status {
         ActivityStatus::Running => ("… running", DIM),
         ActivityStatus::Done => ("✔ done", OKGREEN),
+        ActivityStatus::Failed => ("✗ failed", ERRRED),
         ActivityStatus::Skipped => ("⏭ skipped", DIM),
     };
     let cost = if view.cost > 0.0 {
