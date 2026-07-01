@@ -326,20 +326,23 @@ pub struct SlashToken {
 pub fn slash_token_at(input: &str, cursor: usize) -> Option<SlashToken> {
     let mut best: Option<SlashToken> = None;
     let mut last: Option<SlashToken> = None;
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
+    let mut chars = input.char_indices().peekable();
+    while let Some(&(i, ch)) = chars.peek() {
         // Advance to the start of a word (skip whitespace).
-        if (bytes[i] as char).is_whitespace() {
-            i += 1;
+        if ch.is_whitespace() {
+            chars.next();
             continue;
         }
         let word_start = i;
         // Consume to the next whitespace (word end).
-        while i < bytes.len() && !(bytes[i] as char).is_whitespace() {
-            i += 1;
+        let mut word_end = input.len();
+        while let Some(&(j, ch)) = chars.peek() {
+            if ch.is_whitespace() {
+                word_end = j;
+                break;
+            }
+            chars.next();
         }
-        let word_end = i;
         let word = &input[word_start..word_end];
         // A slash command is a single leading `/` followed by a name; `//x` is a literal escape.
         if let Some(rest) = word.strip_prefix('/') {
@@ -377,18 +380,21 @@ pub struct AtToken {
 /// is inside the token (cursor within [start, end]). Unlike the slash palette, there is no
 /// last-token fallback — the picker closes as soon as the cursor moves off the `@` word.
 pub fn at_token_at(input: &str, cursor: usize) -> Option<AtToken> {
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if (bytes[i] as char).is_whitespace() {
-            i += 1;
+    let mut chars = input.char_indices().peekable();
+    while let Some(&(i, ch)) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
             continue;
         }
         let word_start = i;
-        while i < bytes.len() && !(bytes[i] as char).is_whitespace() {
-            i += 1;
+        let mut word_end = input.len();
+        while let Some(&(j, ch)) = chars.peek() {
+            if ch.is_whitespace() {
+                word_end = j;
+                break;
+            }
+            chars.next();
         }
-        let word_end = i;
         let word = &input[word_start..word_end];
         if let Some(rest) = word.strip_prefix('@') {
             if cursor >= word_start && cursor <= word_end {
@@ -1285,6 +1291,25 @@ mod tests {
     fn no_slash_token_returns_none() {
         assert!(slash_token_at("just plain text", 5).is_none());
         assert!(slash_token_at("", 0).is_none());
+    }
+
+    #[test]
+    fn slash_token_at_does_not_panic_on_multibyte_utf8() {
+        // Regression: scanning by raw byte value used to misdetect char boundaries inside
+        // multi-byte UTF-8 sequences (e.g. CJK), panicking on the subsequent string slice.
+        let input = "hello 你 world";
+        assert!(slash_token_at(input, input.len()).is_none());
+        assert!(slash_token_at("你", 0).is_none());
+        assert!(at_token_at(input, input.len()).is_none());
+        assert!(at_token_at("你", 0).is_none());
+
+        let with_command = "/orchestrate 你好 world";
+        let t = slash_token_at(with_command, 0).unwrap();
+        assert_eq!(t.name, "orchestrate");
+
+        let with_at = "@你好/path";
+        let t = at_token_at(with_at, with_at.len()).unwrap();
+        assert_eq!(t.query, "你好/path");
     }
 
     #[test]
