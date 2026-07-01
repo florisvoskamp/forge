@@ -1,8 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+  # No `push: branches: [main]` trigger: every merge to main goes through a PR (squash-merged via
+  # `gh pr merge --auto`), so `pull_request` already validated the exact same tree before merge —
+  # a push-triggered rerun on the post-squash commit would just repeat that same check for free.
   pull_request:
     branches: [main]
   # Exempt from GitHub's GITHUB_TOKEN anti-recursion guard (unlike push/pull_request), so

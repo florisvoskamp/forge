@@ -1,11 +1,12 @@
 name: security
 
 # Supply-chain gate: RUSTSEC advisories (cargo-audit) + licenses/bans/sources (cargo-deny).
-# Runs on every push/PR to main and weekly — a scheduled run catches advisories published
-# AFTER a PR merged, which a push-only trigger would miss against a static Cargo.lock.
+# Runs on every PR to main and weekly — a scheduled run catches advisories published AFTER a PR
+# merged, which a PR-only trigger would miss against a static Cargo.lock. No `push: branches:
+# [main]` trigger: every merge to main goes through a PR, so `pull_request` already validated the
+# exact same tree before merge — a push-triggered rerun on the post-squash commit would just
+# repeat that same check for free.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   schedule:
