@@ -223,30 +223,7 @@ pub async fn refresh_token(
     Ok(new_tokens)
 }
 
-/// Load stored OAuth tokens for a server, refresh if expired, and return the valid access token.
-/// Returns `Err` with a user-facing message when no tokens or refresh fails.
-pub fn resolve_oauth_token(server_name: &str) -> Result<String, String> {
-    let tokens = forge_config::load_oauth_tokens(server_name).ok_or_else(|| {
-        format!("no OAuth tokens for '{server_name}' — run `forge mcp login {server_name}`")
-    })?;
-
-    // Check expiry with a 60 s clock skew.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    if !tokens.is_expired(now, 60) {
-        return Ok(tokens.access_token.clone());
-    }
-
-    // Need refresh — can't do it here (sync context); caller must use resolve_oauth_token_async.
-    Err(format!(
-        "OAuth token for '{server_name}' is expired — \
-         call resolve_oauth_token_async to refresh, or run `forge mcp login {server_name}`"
-    ))
-}
-
-/// Async version: load stored tokens, refresh if expired, store updated tokens, return access token.
+/// Load stored tokens, refresh if expired, store updated tokens, return access token.
 pub async fn resolve_oauth_token_async(server_name: &str) -> Result<String, String> {
     let tokens = forge_config::load_oauth_tokens(server_name).ok_or_else(|| {
         format!("no OAuth tokens for '{server_name}' — run `forge mcp login {server_name}`")

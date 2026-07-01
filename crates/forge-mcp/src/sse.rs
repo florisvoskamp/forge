@@ -154,6 +154,17 @@ impl SseClientTransport {
     }
 }
 
+impl Drop for SseClientTransport {
+    /// Abort the background reader even if the transport is dropped without an explicit
+    /// `close()` call (e.g. a `connect_timeout` cancellation mid-`initialize`, before this
+    /// transport is ever wrapped in a `RunningService`). Without this, `run_reader`'s
+    /// `bytes_stream()` — an open HTTP connection to the (possibly untrusted) remote server —
+    /// leaks for the life of the process.
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
 impl Transport<RoleClient> for SseClientTransport {
     type Error = SseError;
 

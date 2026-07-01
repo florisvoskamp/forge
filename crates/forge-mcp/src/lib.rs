@@ -273,6 +273,12 @@ pub struct McpManager {
     /// subscribe via [`subscribe_done`] to re-announce status after the initial "connecting"
     /// placeholder is shown.
     connect_done: tokio::sync::watch::Sender<bool>,
+    /// Per-server async locks serializing [`reconnect`](Self::reconnect): without this, two
+    /// concurrent tool calls racing a dropped server could each pass the attempt-count check and
+    /// independently re-serve (re-spawn a child process / reopen an HTTP connection) for the same
+    /// logical server. Held across the whole reconnect attempt (including its `.await`s), so a
+    /// `parking_lot::Mutex` (never held across an await elsewhere in this type) won't do.
+    reconnect_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl McpManager {
@@ -286,6 +292,7 @@ impl McpManager {
             roots: Vec::new(),
             sampling: None,
             connect_done,
+            reconnect_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -403,7 +410,38 @@ impl McpManager {
 
         for (name, label, res) in results {
             match res {
-                Ok(service) => self.add_established(&name, label, service).await,
+                Ok(service) => {
+                    // `transport::serve` above only bounds the handshake; discovery
+                    // (`tools/list`/`resources/list`/`prompts/list`) is a separate round-trip that a
+                    // buggy/hostile server could hang forever without this. Bound it with the same
+                    // `connect_timeout` budget so a single stuck server can't block session startup.
+                    if let Err(_elapsed) = tokio::time::timeout(
+                        connect_timeout,
+                        self.add_established(&name, label, service),
+                    )
+                    .await
+                    {
+                        let reason = format!(
+                            "post-connect discovery timed out after {}s",
+                            connect_timeout.as_secs()
+                        );
+                        tracing::warn!("mcp: server '{name}' failed to connect: {reason}");
+                        self.conns.lock().insert(
+                            name.clone(),
+                            Connection {
+                                name,
+                                status: ServerStatus::Failed(reason),
+                                transport_label: label,
+                                peer: None,
+                                service: None,
+                                tools: vec![],
+                                resources: vec![],
+                                prompts: vec![],
+                                reconnect_attempts: 0,
+                            },
+                        );
+                    }
+                }
                 Err(reason) => {
                     tracing::warn!("mcp: server '{name}' failed to connect: {reason}");
                     self.conns.lock().insert(
@@ -517,8 +555,37 @@ impl McpManager {
         .await
         {
             Ok(Ok(service)) => {
-                self.add_established(&name, label, service).await;
-                Ok(())
+                // See `connect_active`: discovery is a separate round-trip from the handshake and
+                // needs its own bound so a server that hangs on `tools/list` can't stall forever.
+                match tokio::time::timeout(
+                    self.connect_timeout,
+                    self.add_established(&name, label, service),
+                )
+                .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(_elapsed) => {
+                        let reason = format!(
+                            "post-connect discovery timed out after {}s",
+                            self.connect_timeout.as_secs()
+                        );
+                        self.conns.lock().insert(
+                            name.clone(),
+                            Connection {
+                                name,
+                                status: ServerStatus::Failed(reason.clone()),
+                                transport_label: label,
+                                peer: None,
+                                service: None,
+                                tools: vec![],
+                                resources: vec![],
+                                prompts: vec![],
+                                reconnect_attempts: 0,
+                            },
+                        );
+                        Err(reason)
+                    }
+                }
             }
             Ok(Err(e)) => {
                 self.conns.lock().insert(
@@ -829,7 +896,13 @@ impl McpManager {
 
     fn mark(&self, server: &str, status: ServerStatus) {
         if let Some(c) = self.conns.lock().get_mut(server) {
-            // Don't overwrite a hard Failed with a transient Slow.
+            // Don't overwrite a hard Failed with a transient Slow/Connected: a concurrent call
+            // that raced ahead of a `reconnect()` giving up shouldn't silently resurrect a server
+            // whose tools were just cleared. Only `reconnect()`'s own success path (a fresh
+            // `add_established` insert) can move a server out of `Failed`.
+            if matches!(c.status, ServerStatus::Failed(_)) {
+                return;
+            }
             c.status = status;
         }
     }
@@ -876,6 +949,22 @@ impl McpManager {
     /// success re-runs discovery (picking up schema drift) and re-applies exposure; returns the
     /// fresh peer. On exhaustion marks the server `failed` and withdraws its tools.
     async fn reconnect(&self, server: &str) -> Option<rmcp::service::Peer<RoleClient>> {
+        // Serialize reconnect attempts per server: without this, two tool calls racing a dropped
+        // server could both pass the attempt-count check below and independently re-serve
+        // (double-spawn a child process / reopen an HTTP connection) for the same logical server.
+        let lock = {
+            let mut locks = self.reconnect_locks.lock();
+            locks
+                .entry(server.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+        // Someone else may have already reconnected (or failed) while we waited for the lock.
+        if let Some(peer) = self.peer_for(server) {
+            return Some(peer);
+        }
+
         let cfg = {
             let conns = self.conns.lock();
             let c = conns.get(server)?;
@@ -897,27 +986,34 @@ impl McpManager {
             .unwrap_or(0);
         tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
         let label = cfg.transport_label();
-        match tokio::time::timeout(
+        let established = match tokio::time::timeout(
             self.connect_timeout,
             transport::serve(&cfg, self.handler_deps()),
         )
         .await
         {
-            Ok(Ok(service)) => {
-                self.add_established(server, label, service).await;
-                self.peer_for(server)
-            }
-            _ => {
-                if let Some(c) = self.conns.lock().get_mut(server) {
-                    c.reconnect_attempts += 1;
-                    if c.reconnect_attempts >= self.config.max_reconnect_attempts {
-                        c.status = ServerStatus::Failed("reconnect attempts exhausted".into());
-                        c.tools.clear();
-                        c.peer = None;
-                    }
+            // Discovery (`tools/list`/etc.) is a separate round-trip from the handshake above and
+            // needs its own bound — a server that hangs there must not wedge this reconnect forever.
+            Ok(Ok(service)) => tokio::time::timeout(
+                self.connect_timeout,
+                self.add_established(server, label, service),
+            )
+            .await
+            .is_ok(),
+            _ => false,
+        };
+        if established {
+            self.peer_for(server)
+        } else {
+            if let Some(c) = self.conns.lock().get_mut(server) {
+                c.reconnect_attempts += 1;
+                if c.reconnect_attempts >= self.config.max_reconnect_attempts {
+                    c.status = ServerStatus::Failed("reconnect attempts exhausted".into());
+                    c.tools.clear();
+                    c.peer = None;
                 }
-                None
             }
+            None
         }
     }
 
@@ -1131,7 +1227,9 @@ fn content_to_block(c: &rmcp::model::ContentBlock) -> McpContentBlock {
             text: None,
             blob: None,
         },
-        _ => McpContentBlock::Text(String::new()),
+        // An rmcp content variant this match doesn't cover yet — surface a marker instead of
+        // silently rendering an empty string, so the model knows something was omitted.
+        _ => McpContentBlock::Text("[unknown content: unsupported block type]".to_string()),
     }
 }
 
@@ -1161,7 +1259,8 @@ fn resource_contents_to_block(c: &ResourceContents) -> McpContentBlock {
             text: None,
             blob: Some(blob.clone()),
         },
-        _ => McpContentBlock::Text(String::new()),
+        // Same rationale as `content_to_block`'s fallback: don't drop unhandled variants silently.
+        _ => McpContentBlock::Text("[unknown resource content: unsupported variant]".to_string()),
     }
 }
 
