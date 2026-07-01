@@ -257,6 +257,13 @@ struct ResumeState {
     /// The bare model the live session was started under. Resuming it under a DIFFERENT model (after
     /// a mesh re-route / failover) would be wrong, so a model change forces a fresh session.
     model: String,
+    /// The identifying id ([`CheckpointContext::session`]) of the conversation that recorded this
+    /// slot. This single `ResumeState` slot is shared by every caller of this `CliProvider`
+    /// instance — the main session AND any subagents spawned within it — so without this key a
+    /// resume decided for one conversation could `--resume` a DIFFERENT conversation's live
+    /// claude/codex session, cross-wiring their turns. `None` when the call carried no checkpoint
+    /// context (legacy inherited-env fallback).
+    owner: Option<String>,
 }
 
 /// A [`Provider`] that delegates the completion to an external agent CLI.
@@ -337,8 +344,10 @@ impl CliProvider {
         self.resume_enabled && matches!(self.kind, CliKind::ClaudeCode | CliKind::Codex)
     }
 
-    /// Record a live session after a successful turn so the next call can `--resume` it.
-    fn record_session(&self, id: Option<String>, sent: usize, model: &str) {
+    /// Record a live session after a successful turn so the next call can `--resume` it. `owner` is
+    /// the calling conversation's [`CheckpointContext::session`] id, so a later call from a
+    /// DIFFERENT conversation sharing this provider never reuses this slot (see [`ResumeState::owner`]).
+    fn record_session(&self, id: Option<String>, sent: usize, model: &str, owner: Option<&str>) {
         if let Ok(mut st) = self.resume.lock() {
             // Always overwrite — `None` CLEARS a stale id. Keeping the old id on a turn that produced
             // no session handle (e.g. a fresh-transcript turn where the CLI emitted no thread id) made
@@ -346,6 +355,7 @@ impl CliProvider {
             st.session_id = id;
             st.sent = sent;
             st.model = model.to_string();
+            st.owner = owner.map(str::to_string);
         }
     }
 
@@ -1337,7 +1347,10 @@ impl CliProvider {
             let can_resume = self.resumes()
                 && st.session_id.is_some()
                 && st.sent <= messages.len()
-                && st.model == bare_model(model); // a model change → fresh session
+                && st.model == bare_model(model) // a model change → fresh session
+                // A different conversation (main session vs. a subagent, or two subagents) sharing
+                // this provider instance must never resume ANOTHER conversation's live session.
+                && st.owner.as_deref() == checkpoint.map(|c| c.session.as_str());
             if can_resume {
                 let delta = render_resume_delta(&messages[st.sent..]);
                 if delta.trim().is_empty() {
@@ -1680,7 +1693,12 @@ impl CliProvider {
                 CliKind::Codex => codex_thread.clone(),
                 _ => captured_session,
             };
-            self.record_session(session, messages.len(), bare_model(model));
+            self.record_session(
+                session,
+                messages.len(),
+                bare_model(model),
+                checkpoint.map(|c| c.session.as_str()),
+            );
         }
 
         // Prose-fallback recovery (matches the direct/genai path). A bridge model sometimes writes a
@@ -1860,6 +1878,14 @@ struct LiveSession {
     sink_path: Option<std::path::PathBuf>,
     sub_rx: tokio::sync::mpsc::UnboundedReceiver<StreamEvent>,
     tailer: Option<tokio::task::JoinHandle<()>>,
+    /// Set just before writing a turn to stdin, cleared only once `drive_turn` returns `Ok` (the
+    /// turn's `result` event was fully read). If the calling future is dropped/cancelled mid-turn
+    /// (e.g. an external per-turn timeout or user interrupt), dropping the `self.live` mutex guard
+    /// only releases the lock — it does NOT drop this `LiveSession` or its `kill_on_drop` child, so
+    /// the process is left parked mid-turn with its abandoned output still arriving. Left `true`
+    /// here forces the NEXT call to tear down and respawn instead of reusing a session whose
+    /// stdout stream position is ambiguous, which would otherwise let two turns' events interleave.
+    turn_in_flight: bool,
 }
 
 impl LiveSession {
@@ -2057,6 +2083,7 @@ impl CliProvider {
             sink_path,
             sub_rx,
             tailer,
+            turn_in_flight: false,
         })
     }
 
@@ -2079,9 +2106,11 @@ impl CliProvider {
         let mut guard = self.live.lock().await;
 
         // Reuse only a session that matches the model, has strictly grown (a shrink → its in-process
-        // context is stale after a compaction/reset), and belongs to the same user turn (checkpoint).
+        // context is stale after a compaction/reset), belongs to the same user turn (checkpoint), and
+        // isn't mid-turn from a prior call that never finished (see `LiveSession::turn_in_flight`) —
+        // reusing that one would write a new turn into a stream whose read position is ambiguous.
         let reuse = matches!(&*guard, Some(s)
-            if s.model == bare && s.sent > 0 && s.sent <= messages.len() && s.checkpoint_seq == checkpoint_seq);
+            if s.model == bare && s.sent > 0 && s.sent <= messages.len() && s.checkpoint_seq == checkpoint_seq && !s.turn_in_flight);
         if !reuse {
             if let Some(old) = guard.take() {
                 old.teardown().await;
@@ -2112,6 +2141,9 @@ impl CliProvider {
         };
 
         let first_turn = sess.sent == 0;
+        // Mark mid-turn BEFORE the writes/reads that can span minutes, so a cancelled caller leaves
+        // this flag set and the next call refuses to reuse the session (see `turn_in_flight`).
+        sess.turn_in_flight = true;
         if let Err(e) = sess.write_user(&payload).await {
             if let Some(old) = guard.take() {
                 old.teardown().await;
@@ -2133,6 +2165,7 @@ impl CliProvider {
         match sess.drive_turn(self.timeout, self.kind, on_event).await {
             Ok(turn) => {
                 sess.sent = messages.len();
+                sess.turn_in_flight = false;
                 match finish_persistent_turn(&self.binary, turn) {
                     Ok(resp) => Ok(resp),
                     Err(e) => {
@@ -2219,6 +2252,12 @@ async fn tail_subagent_sink(
     loop {
         match reader.read_line(&mut buf).await {
             Ok(0) => tokio::time::sleep(Duration::from_millis(40)).await, // EOF: await more
+            Ok(_) if !buf.ends_with('\n') => {
+                // Torn read: the reader caught up to the file's current EOF mid-line (no trailing
+                // newline yet). Keep the partial bytes buffered — do NOT parse or clear — so the
+                // next read_line appends the rest of this same line instead of losing/mis-parsing it.
+                continue;
+            }
             Ok(_) => {
                 if let Some(ev) = parse_sink_line(buf.trim()) {
                     if tx.send(ev).is_err() {
@@ -2290,6 +2329,22 @@ async fn terminate(child: &mut Child, pgid: Option<i32>) {
     #[cfg(not(unix))]
     {
         let _ = pgid;
+        // A `.cmd`/`.bat` shim (how npm installs `claude`/`codex`) is launched via `cmd /S /C`
+        // (see `bridge_command`), so the direct child here is `cmd.exe`, which spawns the real CLI
+        // (often `node.exe`) as its OWN child. Windows does not kill descendants when a parent is
+        // terminated, and there is no process group on this platform (`put_in_own_process_group` is
+        // a no-op here) — so `child.start_kill()` alone would leave the real CLI process running
+        // after Forge reports the turn "killed (stalled)". `taskkill /T` kills the whole process
+        // tree rooted at this PID; it's a no-op if the child was launched directly (a real `.exe`,
+        // no descendants) or has already exited.
+        if let Some(id) = child.id() {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &id.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
         let _ = child.start_kill();
         let _ = child.wait().await;
     }
