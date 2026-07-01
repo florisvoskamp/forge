@@ -1,8 +1,11 @@
 # Feature: Lattice — built-in code intelligence & persistent semantic memory
 
-> **Status (PR2 shipped):** the `forge-index` crate now extracts **10 languages** (Rust, Python,
-> JavaScript, TypeScript+TSX, Go, Java, C, C++, Ruby) via tree-sitter **tags queries** — one
-> uniform path, adding a language is one registry row (ADR-0010). Definitions → symbol nodes;
+> **Status (grown well past the PR2 snapshot):** the `forge-index` crate now extracts **19
+> languages** (Rust, Python, JavaScript, TypeScript+TSX, Go, Java, C, C++, Ruby, C#, PHP, Elixir,
+> Lua, OCaml, Bash, Haskell, Scala, Kotlin) via tree-sitter **tags queries** — one uniform path,
+> adding a language is one registry row (ADR-0010). C# ships no built-in tags query upstream, so
+> Forge carries a hand-written `CSHARP_TAGS_QUERY` (same pattern used for Bash, Haskell, Scala)
+> to cover it anyway. Definitions → symbol nodes;
 > references → a name-keyed `lattice_ref` table; `contains` from span-nesting. Persisted into the
 > **shared** `forge-store` SQLite db, **incremental by SHA-256 content hash**. **The killer step
 > is live:** `retrieve_context()` auto-injects budget-bounded relevant code into `run_turn`
@@ -15,7 +18,7 @@
 > radius + `why`) as a styled tree in the TUI. CLI: `forge lattice update|query|impact|path|why|status`.
 > `LatticeConfig { enabled, inject, inject_token_budget, watch }`.
 >
-> **Verified:** the multi-language matrix compiles + links (10 grammars on tree-sitter core 0.24);
+> **Verified:** the multi-language matrix compiles + links (19 grammars on tree-sitter core 0.24);
 > tags extraction, cross-file `impact`, end-to-end injection, watcher auto-reindex, `why`
 > provenance, and the `/lattice` view have tests (live-verified on this repo, incl. a pty TUI
 > smoke). **Embeddings (§5.6): shipped (off by default)** — `lattice_embedding` storage, `cosine`,
@@ -24,8 +27,8 @@
 > error); wired into `run_turn` when enabled, plus `forge lattice embed` and **automatic
 > indexing + embedding in the background on session start** (no manual `forge lattice update`).
 > Unit-tested with a fake embedder + hand-crafted vectors; real semantic quality needs a live
-> backend (`ollama pull nomic-embed-text`). **Not yet built:** cross-repo identity; C# (its
-> 0.24-compatible grammar ships no tags query). The sections below are the full design.
+> backend (`ollama pull nomic-embed-text`). **Not yet built:** cross-repo identity. The sections
+> below are the full design.
 
 > A native, zero-setup code-intelligence subsystem for Forge: a pure-Rust, tree-sitter
 > AST/dependency graph plus optional semantic retrieval, stored in SQLite **alongside**

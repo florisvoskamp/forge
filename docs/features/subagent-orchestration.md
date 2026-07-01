@@ -6,8 +6,26 @@
 > (a subagent runner), `forge-tools` (a `task` tool), `forge-mesh` (per-subagent routing),
 > `forge-store` (subagent transcripts + cost rollup) and `forge-tui` (a live agent tree).
 >
-> Status: design. This is the substrate the **Assay** analysis mode is built on (§7) — Assay
-> is a curated crew preset, not a separate engine.
+> Status: design (superseded by the shipped implementation — see
+> [`docs/rfcs/subagent-orchestration.md`](../rfcs/subagent-orchestration.md), marked FULLY
+> SHIPPED, for the accurate reference). This is the substrate the **Assay** analysis mode is
+> built on (§7) — Assay is a curated crew preset, not a separate engine.
+>
+> **Post-implementation correction (symbol/file names below are design-time and do not match
+> the shipped code):** the delegation tool actually shipped as `spawn_agents`
+> (`SPAWN_AGENTS_TOOL` const, `crates/forge-core/src/subagent.rs`), intercepted directly as a
+> core "virtual tool" in `crates/forge-core/src/lib.rs` — not a `forge-tools` registry `Tool`
+> impl, so it never goes through `Tool::side_effect()`/the permission broker the way §4/§5
+> describe. There is no `SideEffect::Spawn` variant — `forge-types::SideEffect` has only
+> `ReadOnly, Write, Shell, Network, External`. The real types are `AgentRequest`,
+> `ResolvedAgent`, `AgentCtx`, `SubagentOutcome`, `Lifecycle` (all in
+> `crates/forge-core/src/subagent.rs`), not `SubagentSpec`/`SubagentResult`/`SubagentStatus`.
+> Orchestration limits live as `config.mesh.subagents.{max_concurrency, max_per_provider,
+> max_depth, ...}` (`crates/forge-config/src/lib.rs`), not a standalone `OrchestrationConfig`.
+> Presenter events are `SubagentStart`/`SubagentProgress`/`SubagentResult`
+> (`crates/forge-tui/src/lib.rs`), not `SubagentSpawned`/`SubagentDone`. The high-level behavior
+> (bounded concurrency, per-provider cap, depth cap, budget cap) matches this doc's acceptance
+> criteria conceptually — only the file paths/symbol names in §4/§5 below are stale.
 
 ## 1. Problem (JTBD)
 

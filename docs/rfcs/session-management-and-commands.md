@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | ACCEPTED (scope + key forks decided with the user) |
+| Status | SHIPPED (scope + key forks decided with the user; see "Post-build status" below) |
 | Author | Forge |
 | Created | 2026-06-15 |
 | Reviewers | florisvoskamp |

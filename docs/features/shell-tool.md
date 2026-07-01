@@ -89,7 +89,11 @@ this design — a shell tool that isn't safe is worse than no shell tool.
 - A full shell parser. Guards operate on the raw command string + a lightweight tokenizer, not a
   semantic AST. (Documented limitation, see §5.7.)
 - Remote / SSH execution.
-- Windows `cmd.exe`/PowerShell support. POSIX `sh`/`bash` on Linux/macOS only.
+
+> **Shipped since this was written:** Windows support. The tool runs `cmd /C` on Windows (`sh -c`
+> on Unix) and kills the process tree via `taskkill /F /T` (vs. process-group SIGTERM/SIGKILL on
+> Unix); see `crates/forge-tools/src/shell.rs` and its `exec_windows` test module. This was a
+> non-goal at the time of this iteration and has since been added — not a "won't have" anymore.
 
 ### Non-goals
 
@@ -228,6 +232,14 @@ Layers touched:
 - [ ] No DB schema change (background jobs live in-process for this iteration; see §5.6)
 
 ### Insertion points (specific files / symbols)
+
+> **Not what shipped:** the plan below was to split shell support across a new
+> `crates/forge-tools/src/shell/` directory (`mod.rs`/`guards.rs`/`exec.rs`/`jobs.rs`/
+> `output.rs`). The shipped code instead keeps everything — background jobs, timeouts, ANSI
+> handling — in a single `crates/forge-tools/src/shell.rs` file, and the denylist /
+> dangerous-pattern matcher this doc assigns to `guards.rs` actually lives in
+> `crates/forge-core/src/permission.rs` (not in `forge-tools` at all). This file:symbol map is
+> no longer a usable guide to the real code.
 
 ```
 forge-tools:

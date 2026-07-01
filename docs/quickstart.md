@@ -25,7 +25,7 @@ brew install forge
 
 **Cargo:**
 ```bash
-cargo install adforge
+cargo install forge-agent
 ```
 
 After install, verify it works:

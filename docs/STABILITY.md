@@ -51,9 +51,10 @@ public surface as Forge moves toward v2.0, and what a major/minor/patch bump may
 
 ## Crate API stability (pre-2.0)
 
-The `forge-*` library crates are published to crates.io to make `forge-cli` installable
-(`cargo install forge-cli`), not as a stable embedding API. Until a crate documents otherwise, its
-public Rust API may change in any minor release. Pin exact versions if you depend on them directly.
+The `forge-*` library crates are published to crates.io (as `forge-agent-*`) to make the `forge`
+binary installable (`cargo install forge-agent`), not as a stable embedding API. Until a crate
+documents otherwise, its public Rust API may change in any minor release. Pin exact versions if you
+depend on them directly.
 
 ## Deprecation process
 

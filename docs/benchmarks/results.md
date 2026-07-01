@@ -4,14 +4,15 @@ Forge's single most important job is the **harness**: be the best coding-agent h
 metrics, on BOTH API and bridge/subscription models. This file records what has been **measured and
 reproduced** so far — honestly, including where the measurement turned out to contradict the goal.
 
-## Re-confirmation on the CURRENT build (2026-06-28, v0.4.65)
+## Re-confirmation on the build current at the time (2026-06-28, v0.4.65 — since superseded by v1.0.0–v2.0.0)
 
 The headline comparison below (§ "Firming run — N=20") was measured on **v0.4.39** — ~26 releases
-old. Re-ran the same setup on the **current build** to check it still holds after all the session-5/6
-changes: 10 SWE-bench Lite instances (`sub10b`), `claude sonnet`, **same model both arms**, Forge's
-loop-gated-completeness config (`cfg-aggr`), scored by the official `swebench` Docker evaluator.
+old at that point. Re-ran the same setup on the then-current build to check it still held after all
+the session-5/6 changes: 10 SWE-bench Lite instances (`sub10b`), `claude sonnet`, **same model both
+arms**, Forge's loop-gated-completeness config (`cfg-aggr`), scored by the official `swebench`
+Docker evaluator.
 
-| (current build, N=10, same `sonnet`) | resolved | total tokens | **tokens / resolve** |
+| (build current at the time, N=10, same `sonnet`) | resolved | total tokens | **tokens / resolve** |
 |---|---|---|---|
 | claude-cli direct | 4/10 | 14.28M | 3.57M |
 | **Forge (loop-gated)** | **6/10** | 16.96M | **2.83M** |
@@ -25,8 +26,8 @@ total work (6 solves vs 4).
 **Honest caveats:** N=10 is small (the ~21% per-resolve gap is noisier than the N=20 ~11%; the
 *direction* is consistent across both). `psf__requests-2317` hung in its test container on **both**
 arms and was excluded as an error on each side (so the comparison stays fair). One raw-CLI token
-metric was incomplete (the errored instance). This is a signal that the current build did **not
-regress** the headline, not a fresh large-sample proof.
+metric was incomplete (the errored instance). This is a signal that the build current at the time
+did **not regress** the headline, not a fresh large-sample proof.
 
 > ## ⚠️ Correction (2026-06-26): the earlier "bridge token-efficiency superiority" claim was wrong
 > An initial measurement appeared to show Forge-through-the-bridge using **far fewer tokens** than the

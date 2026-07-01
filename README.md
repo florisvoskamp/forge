@@ -493,13 +493,17 @@ The statusline is a row of **widgets** you can add, remove, or reorder — live 
 ```toml
 # ~/.forge/config.toml  (or .forge/config.toml for project scope)
 [statusline]
-widgets = ["model", "mode", "tokens", "cost", "git_branch", "mcp_count", "clock"]
+left = ["model", "session_cost", "effort", "mode"]
+right = ["git_branch", "quota_claude", "mcp_status"]
+separator = "  │  "
 ```
 
-Available widgets: `model`, `mode`, `tokens`, `cost`, `git_branch`, `mcp_count`, `session`, `clock`.
-`/statusline layout` shows the current order · `/statusline toggle <widget>` adds/removes one ·
-`/statusline reset` restores the default · `/statusline edit` opens the raw config line. Changes apply
-immediately and persist to your config.
+Available widgets: `model`, `tier`, `session_cost` (alias `cost`), `effort`, `mode` (alias `temper`),
+`turn_elapsed` (alias `elapsed`), `tokens_in`, `tokens_out`, `session_tokens`, `git_branch` (alias
+`branch`), `quota_claude` (alias `claude`), `quota_codex` (alias `codex`), `mcp_status` (alias `mcp`),
+`custom`. `/statusline layout` shows the current order · `/statusline toggle <widget>` adds/removes one
+from the right segment · `/statusline reset` restores the default · `/statusline edit` opens the raw
+config line. Changes apply immediately and persist to your config.
 
 ---
 
@@ -593,6 +597,7 @@ crates/
 ├── forge-tui        # ratatui renderer + headless presenter
 ├── forge-config     # layered config + OS keyring secret resolution
 ├── forge-index      # Lattice — tree-sitter extraction, graph, embeddings
+├── forge-lsp        # language server client — live diagnostics fed back after edits
 ├── forge-mcp        # MCP client — rmcp, meta-tools, allowlist, OAuth
 ├── forge-skills     # skills + commands catalog, CC-format reader
 └── forge-types      # shared domain types

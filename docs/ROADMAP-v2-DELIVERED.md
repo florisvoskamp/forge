@@ -37,7 +37,7 @@ release-build) before merge.
 ## P1 Ecosystem — done
 | Item | PR |
 |---|---|
-| crates.io readiness (`cargo install forge-cli`) + AUR + Scoop | #363 |
+| crates.io readiness (`cargo install forge-agent`) + AUR + Scoop | #363 |
 | Homebrew Linux ARM | #363 |
 | `forge import claude/codex` imports permissions + hooks + MCP | #388 |
 | Claude-Code-compatible hooks + missing lifecycle events | #388 |
@@ -118,7 +118,7 @@ release-build) before merge.
    (compile-/test-proven). Everything else on the async path moved to `tokio::fs`/`spawn_blocking`.
 2. Diff context contrast was already correct on inspection; a regression guard was added.
 - **crates.io**: packaging is verified (`cargo publish --dry-run`); the actual publish is a
-  release-time action. `cargo install forge-cli` is the supported verb (bare `forge` needs the
+  release-time action. `cargo install forge-agent` is the supported verb (bare `forge` needs the
   crate name reserved first).
 - **`stop` / `subagent_stop` hooks** fire and report a block decision but do not yet enforce
   turn-continuation (observe-only MVP) — #388.

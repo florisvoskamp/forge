@@ -62,9 +62,10 @@ on a different tool.
   small set of built-in meta-tools (`mcp_list_resources`, `mcp_read_resource`,
   `mcp_get_prompt`).
 - As a user, when a server exposes **many tools** (tens to hundreds), Forge does not flood
-  the model's tool list: tools are discovered but **loaded on demand** via a search/expose
-  meta-tool (`mcp_search_tools` → `mcp_expose_tool`), mirroring the deferred-tool pattern of
-  the harness Forge itself runs under.
+  the model's tool list: tools are discovered but reached **on demand** through a fixed pair of
+  meta-tools — `mcp_search_tools` to find a tool, `mcp_call` to invoke it directly by qualified
+  name — mirroring the deferred-tool pattern of the harness Forge itself runs under (see §5.4 for
+  why there is no separate "expose" step).
 - As a user, a crashed stdio server is **automatically reconnected** (bounded retries with
   backoff), and HTTP **auth expiry** surfaces a clear, actionable error.
 - As a user, I control which servers/tools are permitted via an **allowlist** in config
@@ -134,8 +135,10 @@ And   the call (args, result, permission decision, server id) is persisted with 
 Given server "gitlab" exposes 200 tools and none are pre-exposed by allowlist
 When  the model calls mcp_search_tools with query "merge request review"
 Then  Forge returns a ranked list of matching tool names + descriptions (not full schemas)
-When  the model then calls mcp_expose_tool { server: "gitlab", name: "gitlab__get_mr_diff" }
-Then  that tool's full ToolSpec becomes available for the model to call on the next step.
+When  the model then calls mcp_call { name: "gitlab__get_mr_diff", arguments: {...} }
+Then  Forge invokes the qualified tool directly on the gitlab server and returns its result —
+      there is no separate "expose" step (see §5.4: a bridge path fetches its tool list once
+      per turn, so a tool "exposed" mid-turn could never become callable in that turn).
 ```
 
 ### Negative paths
@@ -231,7 +234,8 @@ Then  the broker denies it (MCP calls are side-effecting), consistent with file/
   renderer at `:82`. MCP reuses `ToolStart`/`ToolResult`.
 - **Deferred tool loading**: the harness Forge itself runs under exposes hundreds of tools by
   name only and requires a `ToolSearch`-style "fetch the schema before you can call it" step.
-  `mcp_search_tools`/`mcp_expose_tool` mirror that exactly.
+  `mcp_search_tools` (find) + `mcp_call` (invoke directly by qualified name) mirror that, minus
+  a separate "expose" step — see §5.4 for why.
 
 ### Insertion points (specific files)
 
@@ -462,7 +466,7 @@ like built-in tool calls (the namespaced name makes the source obvious).
   ○ jira        failed        stdio    command not found: jira-mcp-server
   ↻ analytics   reconnecting  http     attempt 2/3 (last error: stream closed)
 
-  tools are loaded on demand — `mcp_search_tools` to find one, then it's exposed to the model.
+  tools are loaded on demand — `mcp_search_tools` to find one, then `mcp_call` to invoke it.
   run `forge mcp --tools gitlab` to see gitlab's full tool list.
 ```
 
@@ -497,7 +501,7 @@ like built-in tool calls (the namespaced name makes the source obvious).
 | Call exceeds timeout | Tool error "timed out after Ns"; turn continues; server marked `Slow`. |
 | Slow connect blocking startup | Connect is concurrent + time-boxed; a slow server doesn't delay the session beyond the connect budget (it lands `Failed`/`Connecting`). |
 | Two servers expose the same tool name | Namespaced `server__tool`; no collision, no silent shadowing. Duplicate **server** names rejected at config load. |
-| Server exposes 200+ tools | Deferred loading: only meta-tools + allowlisted/eager tools advertised; rest via `mcp_search_tools`→`mcp_expose_tool`. |
+| Server exposes 200+ tools | Deferred loading: only meta-tools + allowlisted/eager tools advertised; rest reached via `mcp_search_tools` (find) then `mcp_call` (invoke directly). |
 | Schema drift (tool changed/removed between discovery and call) | Re-fetch `tools/list`; removed → "tool no longer exists"; changed → use new schema. |
 | Auth token expired (HTTP 401/403) | Server `Unauthorized`; actionable error; no retry loop. |
 | Token only in OS keyring, not env | Resolved via keyring at connect (ADR-0007); never written to TOML. |
@@ -562,8 +566,9 @@ posture: **treat every MCP server as untrusted by default.**
       byte-for-byte unchanged when no server is configured (regression test).
 - [ ] Config schema (`McpConfig` + `.forge/mcp.toml` layering) and `.mcp.json` importer
       implemented; secrets never written to TOML (test asserts redaction).
-- [ ] Deferred loading: `mcp_search_tools` (ReadOnly, local catalog) + `mcp_expose_tool`
-      (External) implemented; per-turn advertised tool count stays bounded for a 200-tool server.
+- [ ] Deferred loading: `mcp_search_tools` (ReadOnly, local catalog) + `mcp_call`
+      (External, invokes the qualified tool directly — no separate "expose" step) implemented;
+      per-turn advertised tool count stays bounded for a 200-tool server.
 - [ ] `forge mcp` + `/mcp` listing implemented; `PresenterEvent::McpStatus` rendered in both
       headless and TUI presenters.
 - [ ] Lifecycle: concurrent isolated connect, per-call timeout, bounded reconnect with backoff,

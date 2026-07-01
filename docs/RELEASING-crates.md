@@ -1,19 +1,19 @@
 # Releasing to crates.io
 
-Forge is a Cargo workspace published under the **`adforge`** brand (the `forge-*` package names are
-already taken on crates.io by unrelated projects). Each crate's **package** name is `adforge-X`, but
+Forge is a Cargo workspace published under the **`forge-agent`** brand (the `forge-*` package names are
+already taken on crates.io by unrelated projects). Each crate's **package** name is `forge-agent-X`, but
 its **lib** name is preserved as `forge_X`, so every `use forge_X::` import and `forge-X.workspace =
 true` dependency key still works with zero source changes. The binary crate publishes as the bare
-**`adforge`** and still builds a binary named `forge`. Installing:
+**`forge-agent`** and still builds a binary named `forge`. Installing:
 
 ```bash
-cargo install adforge      # builds + installs the `forge` binary from crates.io
+cargo install forge-agent      # builds + installs the `forge` binary from crates.io
 ```
 
 > **Naming note.** The package/lib split is intentional. Dependency KEYS in
-> `[workspace.dependencies]` stay `forge-X` (with `package = "adforge-X"`) so dependents and source
+> `[workspace.dependencies]` stay `forge-X` (with `package = "forge-agent-X"`) so dependents and source
 > imports are untouched; only the published crate names change. The binary crate keeps
-> `[[bin]] name = "forge"`, so `cargo install adforge` yields the `forge` command.
+> `[[bin]] name = "forge"`, so `cargo install forge-agent` yields the `forge` command.
 
 ## Prerequisites
 
@@ -29,19 +29,19 @@ Crates must be published leaf-first: a crate can only be published once every cr
 already on crates.io at the matching version. The valid topological order for this workspace (package
 names):
 
-1. `adforge-types`
-2. `adforge-skills`
-3. `adforge-store`
-4. `adforge-config`
-5. `adforge-index`
-6. `adforge-lsp`
-7. `adforge-mesh`
-8. `adforge-mcp`
-9. `adforge-tui`
-10. `adforge-provider`
-11. `adforge-tools`
-12. `adforge-core`
-13. `adforge` (the binary crate, published last)
+1. `forge-agent-types`
+2. `forge-agent-skills`
+3. `forge-agent-store`
+4. `forge-agent-config`
+5. `forge-agent-index`
+6. `forge-agent-lsp`
+7. `forge-agent-mesh`
+8. `forge-agent-mcp`
+9. `forge-agent-tui`
+10. `forge-agent-provider`
+11. `forge-agent-tools`
+12. `forge-agent-core`
+13. `forge-agent` (the binary crate, published last)
 
 (`xtasks` is `publish = false` and is never released.)
 
@@ -50,16 +50,16 @@ names):
 Verify packaging for each crate without publishing:
 
 ```bash
-cargo publish -p adforge-types  --dry-run
-cargo publish -p adforge-config --dry-run
-cargo publish -p adforge        --dry-run
+cargo publish -p forge-agent-types  --dry-run
+cargo publish -p forge-agent-config --dry-run
+cargo publish -p forge-agent        --dry-run
 # ...etc
 ```
 
 `--dry-run` packages the crate and type-checks the packaged copy. **Only the pure leaf
-(`adforge-types`) dry-runs cleanly in isolation** — it has no internal deps. Every other crate
-depends on at least `adforge-types`, so its dry-run fails with `no matching package named
-adforge-...` until those deps are actually published. That failure is expected pre-publish and does
+(`forge-agent-types`) dry-runs cleanly in isolation** — it has no internal deps. Every other crate
+depends on at least `forge-agent-types`, so its dry-run fails with `no matching package named
+forge-agent-...` until those deps are actually published. That failure is expected pre-publish and does
 not indicate a packaging problem; the real publish resolves each dep as it goes live in order.
 
 ## Publish
@@ -68,9 +68,9 @@ Run in the order above, waiting for each to be live (crates.io indexes within se
 next:
 
 ```bash
-for crate in adforge-types adforge-skills adforge-store adforge-config adforge-index \
-             adforge-lsp adforge-mesh adforge-mcp adforge-tui adforge-provider \
-             adforge-tools adforge-core adforge; do
+for crate in forge-agent-types forge-agent-skills forge-agent-store forge-agent-config forge-agent-index \
+             forge-agent-lsp forge-agent-mesh forge-agent-mcp forge-agent-tui forge-agent-provider \
+             forge-agent-tools forge-agent-core forge-agent; do
   cargo publish -p "$crate" --locked
   # give the index a moment so the next crate can resolve this one
   sleep 20
@@ -82,6 +82,6 @@ be re-published at the same version (bump the patch and retry the whole set if n
 
 ## After publishing
 
-- `cargo install adforge` should now work on a clean machine (installs the `forge` binary).
+- `cargo install forge-agent` should now work on a clean machine (installs the `forge` binary).
 - Tag + GitHub release (handled by `.github/workflows/release.yml`) provide the prebuilt binaries,
   Homebrew formula, AUR, and Scoop paths for users who don't build from source.

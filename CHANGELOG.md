@@ -6,6 +6,24 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Remote control**: full mobile control parity — PWA, live panels, default-deny pairing.
+
+### Changed
+- **Packaging**: crates renamed from `adforge-*` to `forge-agent-*` (binary install is now
+  `cargo install forge-agent`); commit co-author trailers now attribute to `forge@adulari.dev`.
+- **License**: switched from MIT to AGPL-3.0-only.
+
+### Fixed
+- **Mesh routing**: niche/stale 70B+ models no longer outrank Opus on the Complex tier;
+  `score_for()` no longer cross-matches an unrated new model version against an old one;
+  `minimax-m3` size misclassification and incomplete Ollama size-tag coverage fixed.
+- **MCP**: `forge mcp agent` no longer injects itself as a self-MCP server; sessions left empty by
+  that bug are now pruned from the store.
+- **Security hardening**: `search`/`glob`/`list_dir` tools confined to the workspace, IP-literal
+  SSRF blocked, and file reads capped; soft-deleted sessions no longer treated as empty; tool args
+  and memory growth capped; symlink/path-traversal escapes closed in skill install.
+
 ## [2.0.0] - 2026-06-30
 
 The "ready for the world" release. A full robustness, UX, and ecosystem pass synthesized from

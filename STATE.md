@@ -1,5 +1,9 @@
 # Forge — STATE (session 4, night of 2026-06-27, deadline 10:00 CEST)
 
+> **Stale scratch file.** This is a point-in-time session log from the v0.4.44–v0.4.61 era. The
+> repo has since shipped v1.0.0 through v2.0.0 (crate rename to `forge-agent`, AGPL-3.0 license
+> switch, and more) — none of that is reflected below. Kept as historical session notes only.
+
 ## Goal: make Forge demonstrably THE BEST harness, PROVEN, all dimensions. Ultracode, no usage cap.
 
 ## Shipped this session: 9 PRs (#283–#291), v0.4.44→v0.4.52. Releases: v0.4.48 + v0.4.50 PUBLISHED;

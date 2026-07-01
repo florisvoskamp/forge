@@ -58,11 +58,12 @@ Forge resolves **more** (the completeness re-drive catches under-scoped fixes th
 **lower cost per resolve**. Honest caveat: a second batch of 10 instances tied 5/5, so the +2 edge is
 modest — this is a real but not blowout result. Full method + caveats in `results.md` §3.
 
-**Re-confirmed on the current build (2026-06-28, v0.4.65)** — the N=20 above is from v0.4.39, ~26
-releases old, so the same setup was re-run on a fresh 10-instance batch: **Forge 6/10 vs raw CLI
-4/10**, Forge **strictly dominating** (every CLI solve is also Forge's, +2 Forge-only, 0 CLI-only) at
-**~21% lower tokens/resolve**. N=10 is small, but it confirms the headline did not regress. See
-`results.md` → "Re-confirmation on the CURRENT build".
+**Re-confirmed on the build current at the time (2026-06-28, v0.4.65 — since superseded by
+v1.0.0–v2.0.0)** — the N=20 above is from v0.4.39, ~26 releases old at that point, so the same
+setup was re-run on a fresh 10-instance batch: **Forge 6/10 vs raw CLI 4/10**, Forge **strictly
+dominating** (every CLI solve is also Forge's, +2 Forge-only, 0 CLI-only) at **~21% lower
+tokens/resolve**. N=10 is small, but it confirms the headline did not regress at that point. See
+`results.md` → "Re-confirmation on the build current at the time".
 
 ## 3. Where Forge does NOT (yet) win — stated plainly
 

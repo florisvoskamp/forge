@@ -157,7 +157,9 @@ provider::model  ─►  ProviderTarget {
                       }
 ```
 
-Mapping table (the source of truth — extend here to add a provider):
+Mapping table (the design-time set; the actual current source of truth is `PROVIDER_ENV_VARS` +
+`CUSTOM_OPENAI_PROVIDERS` in `crates/forge-config/src/lib.rs` — check those for the live list
+before relying on this table, which has fallen behind as providers were added):
 
 | prefix | genai adapter | endpoint | key (env var) |
 |---|---|---|---|
@@ -168,6 +170,17 @@ Mapping table (the source of truth — extend here to add a provider):
 | `deepseek::` | DeepSeek | default | `DEEPSEEK_API_KEY` |
 | `openrouter::` | OpenAI (compatible) | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
 | `ollama::` | Ollama | default | (none) |
+| `groq::` | Groq | default | `GROQ_API_KEY` |
+| `cohere::` | Cohere | default | `COHERE_API_KEY` |
+| `opencode_go::` | OpenCode Zen | default | `OPENCODE_GO_API_KEY` |
+| `github_copilot::` | GitHub Models | default | `GITHUB_TOKEN` |
+| `mimo::` | MiMo | default | `MIMO_API_KEY` |
+| `minimax::` | MiniMax | default | `MINIMAX_API_KEY` |
+| `bedrock::` | Bedrock (`bedrock_api`) | default | `BEDROCK_API_KEY` |
+| `vertex::` | Vertex | default (needs `VERTEX_PROJECT_ID`) | `VERTEX_API_KEY` |
+| `azure::` | Azure OpenAI (custom endpoint, no native genai adapter) | per-resource | `AZURE_OPENAI_API_KEY` |
+| `cerebras::` | OpenAI (compatible, custom endpoint) | `https://api.cerebras.ai/v1/` | `CEREBRAS_API_KEY` |
+| *(more custom OpenAI-compatible gateways: NVIDIA, SambaNova, Mistral, Together, Fireworks, Perplexity, …)* | OpenAI (compatible) | per-provider | see `CUSTOM_OPENAI_PROVIDERS` |
 | *(no prefix)* | genai name-inference (back-compat) | default | best-effort |
 
 ### Client construction — genai native namespaces (implementation note)

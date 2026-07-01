@@ -1,5 +1,10 @@
 # Forge — Feature Roadmap & Backlog
 
+> **Status: HISTORICAL.** This backlog was written while Forge was pushing toward v1.0.0. That
+> milestone (and v1.1.0 through v2.0.0) has since shipped — see
+> [`docs/ROADMAP-v2-DELIVERED.md`](ROADMAP-v2-DELIVERED.md) for the delivery record of the v2 wave.
+> Kept for historical context; do not treat the stats/backlog below as current.
+
 > The single prioritized list of what Forge is, what's actually done, and what's next.
 > Derived from three inputs, not opinion:
 > 1. **Product vision** — the Helm note *Custom AI Coding Harness & CLI* (the differentiators).
@@ -13,9 +18,9 @@
 
 ---
 
-## Road to v1.0.0 (active push)
+## Road to v1.0.0 (superseded — shipped)
 
-The current effort hardens Forge toward **v1.0.0**: the best coding-agent harness there is,
+This effort hardened Forge toward **v1.0.0**: the best coding-agent harness there is,
 proven with metrics on both API and subscription/bridge models. Themes + ranked plan live in the
 Helm note *Forge — Road to v1.0.0*; the competitor-derived adoption backlog is
 [`docs/harness/competitor-gap-analysis.md`](harness/competitor-gap-analysis.md). Shipped so far:
@@ -187,7 +192,9 @@ graphify injection, auto-title) — validates P2 hooks.
 ## Appendix B — Existing-feature audit (verdict)
 
 > Mostly real, not vaporware: 9/9 crates build clean (0 warnings), no `todo!()`/stubs, 65
-> tests green, all FRs wired end-to-end through `main.rs`. But **not** "feature-complete and
+> tests green, all FRs wired end-to-end through `main.rs` (this was the snapshot at the time;
+> the workspace has since grown to 13 library crates plus xtasks and 1,200+ test functions
+> through the v1.0.0–v2.0.0 releases). But **not** "feature-complete and
 > fully tested": FR-5's budget cap is mislabelled per-session (the core differentiator isn't
 > enforced), FR-10's fine-grained rules are unbuilt, and FR-3's real `GenAiProvider` has zero
 > automated tests. Biggest risk: the untested provider path. → Wave 1 fixes D1–D3.

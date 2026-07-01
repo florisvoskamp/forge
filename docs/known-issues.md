@@ -107,10 +107,10 @@ remaining `reqwest::Client::new()` HTTPS sites in the CLI (update-check, balance
 benchmarks, MCP, remote, local) now use it, so secondary commands no longer panic on a bare system
 either.
 
-**Known gap:** `forge-mcp/src/oauth.rs` and `forge-index/src/embed.rs` still call
-`reqwest::Client::new()` (forge-mcp has no `forge-provider` dependency; embed.rs targets localhost
-Ollama). The MCP-OAuth path should get its own bundled-roots client (add `webpki-root-certs` to
-forge-mcp) before v1.0.0.
+**Update — gap closed:** `forge-index/src/embed.rs` now has its own `bundled_ca_client()`
+(`webpki-root-certs`), and `forge-mcp/src/transport.rs` has `bundled_client_builder()`, used by both
+the streamable-HTTP transport and the OAuth flow (`forge-mcp/src/oauth.rs`). No remaining
+`reqwest::Client::new()` sites in either crate.
 
 <a id="deferred-store-connection-pool"></a>
 **Related — store connection contention (RESOLVED, #308, v0.4.67):** `forge-store` used to wrap a

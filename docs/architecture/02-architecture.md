@@ -47,6 +47,12 @@ The binary is a Cargo workspace. Dependencies flow one way; there are no cycles 
 crates (ADR-0002). `forge-core` is the orchestrator that the surfaces (TUI/headless) and
 subsystems (mesh, provider, tools, store) attach to.
 
+> Updated: the workspace has grown from the original 9 crates to 14 members. The table below
+> and `containers.puml` now include `forge-mcp` (MCP client, ADR-0009), `forge-index` ("Lattice"
+> code intelligence, ADR-0010), `forge-lsp` (live LSP diagnostics), and `forge-skills`
+> (skills/commands catalog); the remaining member, `xtasks`, is dev tooling only (not shipped,
+> `publish = false`).
+
 ## 4. Components & boundaries
 
 | Crate | Responsibility (one line) | Talks to |
@@ -55,11 +61,15 @@ subsystems (mesh, provider, tools, store) attach to.
 | `forge-cli` | Binary entry: clap parsing, command dispatch, runtime bootstrap, dependency wiring | core, config |
 | `forge-core` | Session orchestrator: the agent loop, permission broker, emits presenter events | tui, mesh, provider, tools, store |
 | `forge-mesh` | Model Mesh: `Router` trait + heuristic router; task classification, budget-aware tier→model selection, records rationale | config |
-| `forge-provider` | `Provider` trait + `GenAiProvider` (genai-backed): chat, streaming, tool calls, usage/cost extraction | genai, config |
+| `forge-provider` | `Provider` trait + `GenAiProvider` (genai-backed): chat, streaming, tool calls, usage/cost extraction. Backs many more model backends than the original Anthropic/OpenAI/Ollama set — OpenRouter, Groq, Cerebras and other custom-endpoint gateways, plus CLI bridges (claude/codex/gemini/agy) per ADR-0011 | genai, config |
 | `forge-tools` | `Tool` trait + core tools (read/write/edit/shell/search/list); declares side-effect class + JSON schema | core (for results) |
 | `forge-store` | rusqlite persistence: sessions, messages, tool calls, routing decisions, usage; migrations; blocking isolation | SQLite file |
 | `forge-tui` | ratatui+crossterm interactive renderer **and** headless line/JSON renderer behind one presenter interface | core |
 | `forge-config` | figment layered config + secret resolution (env → keyring); per-OS paths | keyring |
+| `forge-mcp` | MCP client: connects to external MCP servers (stdio/HTTP/SSE), OAuth, meta-tools (ADR-0009) | types, config |
+| `forge-index` | "Lattice": tree-sitter code-intelligence graph + optional embeddings, persisted alongside `forge-store` (ADR-0010) | types, store, config |
+| `forge-lsp` | Language-server client: live diagnostics fed back after agent edits | config |
+| `forge-skills` | Skills/commands catalog: discovery, frontmatter, templates, Claude-Code-format readers | types |
 
 **Why these seams.** Boundaries follow the *domain* of the problem, not frameworks
 (DDD bounded contexts): "talking to a model", "deciding which model", "doing things in the

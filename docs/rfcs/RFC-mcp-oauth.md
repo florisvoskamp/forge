@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | DRAFT |
+| Status | SHIPPED |
 | Author | Floris Voskamp (drafted autonomously) |
 | Created | 2026-06-16 |
 | Last updated | 2026-06-16 |

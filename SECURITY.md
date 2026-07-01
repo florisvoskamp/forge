@@ -7,8 +7,8 @@ release. We support the **latest released minor series** with security patches:
 
 | Version | Supported |
 | --- | --- |
-| Latest released `1.x` (current: `1.8.x`) | Yes — security + bug fixes |
-| Older `1.x` | No — upgrade to the latest `1.x` |
+| Latest released `2.x` (current: `2.0.x`) | Yes — security + bug fixes |
+| `1.x` | No — upgrade to the latest `2.x` |
 | `0.x` | No — pre-1.0, unsupported |
 
 Always upgrade to the latest release before reporting (`forge --version`, or re-run the installer /

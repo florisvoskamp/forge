@@ -1,8 +1,11 @@
 # Requirements — Forge
 
-> Status: **DRAFT — awaiting confirmation** (2026-06-14, Floris Voskamp).
-> The rest of the architecture is measured against this document. Once confirmed,
-> this becomes the baseline contract for v0.1.
+> Status: **HISTORICAL v0.1 baseline** (confirmed 2026-06-14, Floris Voskamp; repo is now at
+> v2.0.0). Kept as the original baseline contract for context; the "Later (planned, not in v0.1)"
+> list in §3 below is now largely shipped (MCP client/server, tree-sitter code memory, native
+> multi-agent orchestration, skills/commands system, session replay & diff, import from Claude
+> Code/Codex) — see [`docs/roadmap.md`](../roadmap.md) and
+> [`docs/ROADMAP-v2-DELIVERED.md`](../ROADMAP-v2-DELIVERED.md) for what actually shipped and when.
 
 ## 1. Purpose
 
@@ -116,8 +119,10 @@ Approximate user count at launch: 1 (author) → early OSS adopters. External, o
 - **Existing infrastructure:** None (greenfield). GitHub for repo/CI; GitHub Actions CI.
 - **Integrations:** Provider HTTP APIs (Anthropic, OpenAI), local Ollama HTTP API; OS
   keyring; local shell + filesystem.
-- **Licensing / lock-in:** MIT for the core; all dependencies must be MIT/Apache-2.0/BSD
-  compatible (no GPL/AGPL in the shipped binary). Avoid hard lock-in to any single
+- **Licensing / lock-in:** ~~MIT for the core; all dependencies must be MIT/Apache-2.0/BSD
+  compatible (no GPL/AGPL in the shipped binary).~~ **Superseded:** the project switched to
+  **AGPL-3.0-only** (commit `ec20d43`, PR #408); see the root `Cargo.toml` `license` field, the
+  `LICENSE` file, and README.md. No ADR records the decision. Avoid hard lock-in to any single
   provider's SDK or proprietary format.
 - **Language/runtime:** Rust (stable toolchain), async runtime. Single static binary
   delivery; no required external runtime (Node/JVM/Python) for core features.

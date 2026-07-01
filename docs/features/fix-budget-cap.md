@@ -1,7 +1,10 @@
 # Fix: real daily/monthly budget cap (FR-5)
 
-> Status: **DRAFT** (2026-06-15, Floris Voskamp). Remediation spec for a confirmed
-> requirements regression. Design only — no implementation in this document.
+> Status: **SHIPPED** (originally drafted 2026-06-15, Floris Voskamp). Remediation spec for a
+> confirmed requirements regression — implemented as designed: `forge-store::spend_today_usd`/
+> `spend_this_month_usd`, `forge-config`'s `daily_cap_usd`/`monthly_cap_usd`/`warn_threshold`/
+> `BudgetBehavior`, and `forge-mesh`'s `BudgetState` all exist and are wired into the pre-turn
+> gate.
 
 ## 1. Problem (JTBD)
 

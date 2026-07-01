@@ -1,5 +1,5 @@
 @startuml data-model
-title Forge — Core Data Model (SQLite, v0.1)
+title Forge — Core Data Model (SQLite, v2.0 — 20 tables in crates/forge-store/src/schema.rs)
 
 skinparam shadowing false
 skinparam defaultFontName "Sans"
@@ -15,6 +15,7 @@ entity "session" as session {
   created_at : INTEGER
   updated_at : INTEGER
   total_cost_usd : REAL
+  parent_session_id : TEXT  ' non-null for subagent child sessions
 }
 
 entity "message" as message {
@@ -25,6 +26,18 @@ entity "message" as message {
   role : TEXT  ' user | assistant | tool | system
   content : TEXT
   model : TEXT
+  tool_calls_json : TEXT
+  tool_call_id : TEXT
+  active : INTEGER  ' 0 = soft-deleted by /undo
+  created_at : INTEGER
+}
+
+entity "checkpoint" as checkpoint {
+  * id : TEXT <<PK>>
+  --
+  * session_id : TEXT <<FK>>
+  label : TEXT
+  seq : INTEGER
   created_at : INTEGER
 }
 
@@ -46,7 +59,7 @@ entity "routing_decision" as routing {
   * message_id : TEXT <<FK>>
   task_tier : TEXT     ' trivial | standard | complex
   chosen_model : TEXT
-  rationale : TEXT     ' which rule/signal fired
+  rationale : TEXT
   budget_state : TEXT
   created_at : INTEGER
 }
@@ -63,8 +76,162 @@ entity "usage" as usage {
   created_at : INTEGER
 }
 
+entity "assay_run" as assay_run {
+  * id : TEXT <<PK>>
+  --
+  scope : TEXT
+  cost_usd : REAL
+  created_at : INTEGER
+}
+
+entity "finding" as finding {
+  * id : TEXT <<PK>>
+  --
+  * run_id : TEXT <<FK>>
+  category : TEXT
+  severity : TEXT
+  confidence : TEXT
+  file : TEXT
+  line : INTEGER
+  title : TEXT
+  rationale : TEXT
+  suggested_fix : TEXT
+  effort : TEXT
+  lens : TEXT
+  verified : INTEGER
+  created_at : INTEGER
+}
+
+entity "model_health" as model_health {
+  * model : TEXT <<PK>>
+  --
+  cooldown_until : INTEGER
+  reason : TEXT
+  updated_at : INTEGER
+}
+
+entity "model_context" as model_context {
+  * model : TEXT <<PK>>
+  --
+  window : INTEGER
+  updated_at : INTEGER
+}
+
+entity "model_pricing" as model_pricing {
+  * model : TEXT <<PK>>
+  --
+  input_per_1k : REAL
+  output_per_1k : REAL
+  cache_read_per_1k : REAL
+  updated_at : INTEGER
+}
+
+entity "subscription_usage" as subscription_usage {
+  * provider : TEXT <<PK>>
+  * window_kind : TEXT <<PK>>
+  --
+  status : TEXT
+  resets_at : INTEGER
+  fraction : REAL
+  updated_at : INTEGER
+}
+
+entity "session_tasks" as session_tasks {
+  * session_id : TEXT <<PK,FK>>
+  --
+  tasks_json : TEXT
+  updated_at : INTEGER
+}
+
+entity "lattice_file" as lattice_file {
+  * id : TEXT <<PK>>
+  --
+  repo_root : TEXT
+  rel_path : TEXT
+  lang : TEXT
+  content_hash : TEXT
+  parse_status : TEXT
+  indexed_at : INTEGER
+}
+
+entity "lattice_node" as lattice_node {
+  * id : TEXT <<PK>>
+  --
+  * file_id : TEXT <<FK>>
+  kind : TEXT
+  name : TEXT
+  qualname : TEXT
+  signature : TEXT
+  span_start : INTEGER
+  span_end : INTEGER
+  line_start : INTEGER
+  pagerank : REAL
+}
+
+entity "lattice_edge" as lattice_edge {
+  * id : TEXT <<PK>>
+  --
+  * src_id : TEXT <<FK>>
+  * dst_id : TEXT <<FK>>
+  kind : TEXT
+  unresolved_name : TEXT
+}
+
+entity "lattice_ref" as lattice_ref {
+  * id : TEXT <<PK>>
+  --
+  * src_id : TEXT <<FK>>
+  name : TEXT
+  kind : TEXT
+  line : INTEGER
+}
+
+entity "lattice_embedding" as lattice_embedding {
+  * node_id : TEXT <<PK,FK>>
+  --
+  dim : INTEGER
+  vec : BLOB
+}
+
+entity "session_compaction" as session_compaction {
+  * session_id : TEXT <<PK,FK>>
+  --
+  summary : TEXT
+  created_at : INTEGER
+}
+
+entity "memory" as memory {
+  * id : TEXT <<PK>>
+  --
+  scope : TEXT
+  kind : TEXT  ' preference | decision | fact | reference
+  text : TEXT
+  source_session : TEXT
+  created_at : INTEGER
+  updated_at : INTEGER
+  salience : REAL
+  embedding : BLOB
+}
+
+entity "live_event" as live_event {
+  * id : INTEGER <<PK>>
+  --
+  * session_id : TEXT <<FK>>
+  payload_json : TEXT
+  created_at : INTEGER
+}
+
 session ||--o{ message
+session ||--o{ checkpoint
+session ||--o| session_tasks
+session ||--o| session_compaction
+session ||--o{ live_event
 message ||--o{ tool_call
 message ||--o| routing
 message ||--o| usage
+assay_run ||--o{ finding
+lattice_file ||--o{ lattice_node
+lattice_node ||--o{ lattice_edge
+lattice_node ||--o{ lattice_ref
+lattice_node ||--o| lattice_embedding
 @enduml

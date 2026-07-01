@@ -1,5 +1,5 @@
 @startuml containers
-title Forge — C4 Container / Crate View (v0.1 Cargo workspace)
+title Forge — C4 Container / Crate View (v2.0 Cargo workspace, 14 crates)
 
 skinparam shadowing false
 skinparam defaultFontName "Sans"
@@ -17,10 +17,14 @@ package "forge (single static binary)" {
   [forge-tui\nratatui+crossterm renderer\n+ headless renderer] as tui
   [forge-core\nsession orchestrator: agent loop,\npermission broker, presenter events] as core #FFE9CC
   [forge-mesh\nModel Mesh: Router trait,\nheuristic routing + budget] as mesh #FFE9CC
-  [forge-provider\nProvider trait + GenAiProvider\n(Anthropic/OpenAI/Ollama)] as prov
+  [forge-provider\nProvider trait + GenAiProvider\n(Anthropic/OpenAI/Ollama/OpenRouter/\nGroq/Cerebras/CLI bridges/…)] as prov
   [forge-tools\nTool trait + core tools:\nread/write/edit/shell/search] as tools
   [forge-store\nrusqlite (bundled): sessions,\nmessages, costs, decisions] as store
   [forge-config\nfigment layered config\n+ keyring secrets] as cfg
+  [forge-mcp\nMCP client: stdio/HTTP/SSE,\nOAuth, meta-tools] as mcp
+  [forge-index\nLattice: tree-sitter code graph\n+ optional embeddings] as index
+  [forge-lsp\nLSP client: live diagnostics] as lsp
+  [forge-skills\nSkills/commands catalog] as skills
 }
 
 cloud "Providers" {
@@ -38,12 +42,19 @@ core --> mesh : classify + route task
 core --> prov : chat/stream (chosen model)
 core --> tools : execute (after permission)
 core --> store : persist turn / costs
+core --> mcp : MCP tool calls
+core --> index : context retrieval
+core --> lsp : diagnostics after edits
+core --> skills : skill/command lookup
 mesh ..> cfg : routing rules, budget
 prov --> genai
 prov ..> cfg : provider settings
 cfg --> kr : fetch/store keys
 store --> db
 tools --> core : results
+mcp ..> cfg : server config
+index --> store : symbol/graph tables
+lsp ..> cfg : server config
 
 note right of core
   Dependency direction is one-way into core's
