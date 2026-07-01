@@ -1945,6 +1945,19 @@ pub(crate) async fn run_chat_tui(
                                     &mut busy_since,
                                 ));
                             }
+                            DispatchOutcome::RunSavedWorkflow { name, args } => {
+                                turn_gen += 1;
+                                turn_handle = Some(spawn_saved_workflow(
+                                    &session,
+                                    &done_tx,
+                                    turn_gen,
+                                    &mut app,
+                                    &mut busy,
+                                    &mut busy_since,
+                                    name,
+                                    args,
+                                ));
+                            }
                             DispatchOutcome::StartLoop { prompt } => {
                                 turn_gen += 1;
                                 loop_state = Some(LoopState {
@@ -2747,6 +2760,19 @@ pub(crate) async fn run_chat_tui(
                                         &mut busy_since,
                                     ));
                                 }
+                                DispatchOutcome::RunSavedWorkflow { name, args } => {
+                                    turn_gen += 1;
+                                    turn_handle = Some(spawn_saved_workflow(
+                                        &session,
+                                        &done_tx,
+                                        turn_gen,
+                                        &mut app,
+                                        &mut busy,
+                                        &mut busy_since,
+                                        name,
+                                        args,
+                                    ));
+                                }
                                 DispatchOutcome::StartLoop { prompt } => {
                                     turn_gen += 1;
                                     loop_state = Some(LoopState {
@@ -2987,6 +3013,19 @@ pub(crate) async fn run_chat_tui(
                                         &mut app,
                                         &mut busy,
                                         &mut busy_since,
+                                    ));
+                                }
+                                DispatchOutcome::RunSavedWorkflow { name, args } => {
+                                    turn_gen += 1;
+                                    turn_handle = Some(spawn_saved_workflow(
+                                        &session,
+                                        &done_tx,
+                                        turn_gen,
+                                        &mut app,
+                                        &mut busy,
+                                        &mut busy_since,
+                                        name,
+                                        args,
                                     ));
                                 }
                                 DispatchOutcome::StartLoop { prompt } => {
@@ -3627,6 +3666,34 @@ pub(crate) fn spawn_compact(
         let mut sess = s.lock().await;
         if let Err(e) = sess.compact(false).await {
             sess.notify_error(&format!("compact failed: {e}"));
+        }
+    })
+}
+
+/// Spawn `/workflow run <name>` as a background task (docs/rfcs/forge-workflow.md): runs a saved
+/// script directly, no authoring turn, same busy/spinner/interrupt semantics as a normal turn.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_saved_workflow(
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    done_tx: &std::sync::mpsc::Sender<u64>,
+    gen: u64,
+    app: &mut forge_tui::App,
+    busy: &mut bool,
+    busy_since: &mut std::time::Instant,
+    name: String,
+    args: serde_json::Value,
+) -> tokio::task::JoinHandle<()> {
+    app.done = false;
+    app.tick = 0;
+    *busy = true;
+    *busy_since = std::time::Instant::now();
+    let s = session.clone();
+    let dt = done_tx.clone();
+    tokio::spawn(async move {
+        let _done = DoneGuard(dt, gen);
+        let mut sess = s.lock().await;
+        if let Err(e) = sess.run_saved_workflow(&name, args).await {
+            sess.notify_error(&format!("workflow '{name}' failed: {e}"));
         }
     })
 }

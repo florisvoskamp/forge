@@ -39,6 +39,12 @@ pub(crate) enum DispatchOutcome {
     },
     /// `/compact` — summarize older messages in a background task (it makes a model call).
     RunCompact,
+    /// `/workflow run <name> [args]` — run a saved workflow script directly in a background task
+    /// (docs/rfcs/forge-workflow.md), skipping the authoring turn entirely.
+    RunSavedWorkflow {
+        name: String,
+        args: serde_json::Value,
+    },
     /// `/loop <task>` — run the task, then re-run each turn until the model signals completion.
     StartLoop { prompt: String },
     /// `/mesh` — overlay opened immediately; receiver delivers the computed `MeshOverlay` (None =
@@ -911,6 +917,68 @@ and keep going."
                         let _ = std::process::Command::new(&editor).arg(&path).status();
                     } else {
                         app.note("⚠ no config directory available on this platform");
+                    }
+                }
+            }
+        }
+        // `/workflow` — mesh-routed multi-agent workflow scripts (docs/rfcs/forge-workflow.md).
+        CommandAction::Workflow(action) => {
+            use forge_tui::WorkflowAction;
+            match action {
+                WorkflowAction::Run(goal) => {
+                    let goal = goal.trim().to_string();
+                    if goal.is_empty() {
+                        app.note(
+                            "usage: /workflow <goal> — authors and runs a mesh-routed multi-agent script",
+                        );
+                        return Ok(DispatchOutcome::Handled);
+                    }
+                    app.note(&format!("⚒ authoring a workflow script for: {goal}"));
+                    return Ok(DispatchOutcome::RunTurn {
+                        prompt: format!(
+                            "Decompose this goal into a mesh-routed multi-agent workflow script \
+and run it with the `run_workflow` tool. Use `phase(title)` to label logical stages, \
+`pipeline(items, stage1, stage2, ...)` for \"the same steps applied to many items\" \
+(independently — no barrier between items), `parallel(thunks)` for independent one-off fan-out, \
+and plain `agent(prompt, opts)` for a single subtask — every one of these returns a Promise and \
+must be awaited. Write real control flow (loops, conditionals, accumulation across rounds) for \
+genuinely dynamic multi-step work; if the goal is just one or two independent subtasks, prefer \
+`spawn_agents` instead — that's what it's for.\n\nGoal: {goal}"
+                        ),
+                        guidance: Vec::new(),
+                        tier: Some(forge_types::TaskTier::Complex),
+                    });
+                }
+                WorkflowAction::RunSaved { name, args } => {
+                    if name.is_empty() {
+                        app.note("usage: /workflow run <name> [args]");
+                        return Ok(DispatchOutcome::Handled);
+                    }
+                    let args_value = if args.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(args)
+                    };
+                    return Ok(DispatchOutcome::RunSavedWorkflow {
+                        name,
+                        args: args_value,
+                    });
+                }
+                WorkflowAction::List => {
+                    let repo_root =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let workflows_dir = repo_root.join(".forge").join("workflows");
+                    let names = forge_core::workflow::list_saved(&workflows_dir).await;
+                    if names.is_empty() {
+                        app.note(&format!(
+                            "no saved workflows in {}",
+                            workflows_dir.display()
+                        ));
+                    } else {
+                        app.note(&format!("saved workflows ({}):", workflows_dir.display()));
+                        for n in names {
+                            app.note(&format!("  {n}"));
+                        }
                     }
                 }
             }

@@ -355,12 +355,23 @@ fn workflow_host_fn(state: Arc<WorkflowState>) -> forge_workflow::HostFunction {
             let script = tokio::fs::read_to_string(&path)
                 .await
                 .map_err(|e| format!("saved workflow '{name}' not found: {e}"))?;
+            let saved_args = args.get(1).cloned().unwrap_or(serde_json::Value::Null);
+            let script = inject_args(&script, &saved_args);
 
             let nested = Arc::new(state.nested());
             let host_fns = build_host_functions(nested);
             forge_workflow::run_script(host_fns, &wrap_with_prelude(&script)).await
         }
     })
+}
+
+/// Prepends `const args = <json>;` before a SAVED script's body, so it can reference the `args`
+/// global if the author wants — used for `workflow(name, args)` and `/workflow run <name>
+/// [args]`. A top-level `run_workflow` script (authored fresh by the model each turn) has no such
+/// concept and never goes through this.
+fn inject_args(script_body: &str, args: &serde_json::Value) -> String {
+    let json = serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
+    format!("const args = {json};\n{script_body}")
 }
 
 fn build_host_functions(state: Arc<WorkflowState>) -> Vec<forge_workflow::HostFunction> {
@@ -437,6 +448,65 @@ pub async fn run(
         Ok(value) => Ok((value, all_ok)),
         Err(e) => Ok((serde_json::Value::String(format!("error: {e}")), false)),
     }
+}
+
+/// Runs a SAVED `.forge/workflows/<name>.js` script directly — the `/workflow run <name> [args]`
+/// path, which skips the authoring turn entirely (no LLM call to decide the script). Sandboxed
+/// against path traversal exactly like the `workflow()` host function.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_saved(
+    ctx: AgentCtx,
+    parent_id: String,
+    budget: BudgetState,
+    max_concurrency: usize,
+    max_per_provider: usize,
+    max_total_agents: usize,
+    workflows_dir: PathBuf,
+    name: &str,
+    args: serde_json::Value,
+    on_event: impl FnMut(WorkflowEvent) + Send,
+) -> Result<(serde_json::Value, bool), String> {
+    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
+        return Err(format!(
+            "workflow name '{name}' must be a non-empty plain filename with no path separators"
+        ));
+    }
+    let path = workflows_dir.join(format!("{name}.js"));
+    let script = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("saved workflow '{name}' not found: {e}"))?;
+    let script = inject_args(&script, &args);
+    run(
+        ctx,
+        parent_id,
+        budget,
+        max_concurrency,
+        max_per_provider,
+        max_total_agents,
+        workflows_dir,
+        &script,
+        on_event,
+    )
+    .await
+}
+
+/// Lists saved workflow scripts (`.forge/workflows/*.js`, name without the `.js` extension),
+/// sorted. Empty (not an error) if the directory doesn't exist yet.
+pub async fn list_saved(workflows_dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(workflows_dir).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("js") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                out.push(stem.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 #[cfg(test)]
@@ -768,5 +838,98 @@ mod tests {
             text.contains("depth"),
             "depth guard message surfaced: {text}"
         );
+    }
+
+    /// A unique scratch dir per test run (no `tempfile` dependency needed) — cleaned up on drop.
+    struct ScratchDir(std::path::PathBuf);
+    impl ScratchDir {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "forge-workflow-test-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            ScratchDir(dir)
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_saved_loads_a_real_file_and_injects_args() {
+        let dir = ScratchDir::new("run-saved");
+        std::fs::write(
+            dir.0.join("greet.js"),
+            r#"return "hello " + args.name + " via " + await agent("x");"#,
+        )
+        .unwrap();
+
+        let (value, ok) = run_saved(
+            ctx_with(Arc::new(EchoProvider), "openai::gpt-test"),
+            "parent".to_string(),
+            BudgetState::default(),
+            8,
+            0,
+            200,
+            dir.0.clone(),
+            "greet",
+            serde_json::json!({"name": "world"}),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(ok);
+        assert_eq!(
+            value,
+            serde_json::Value::String("hello world via child done".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn run_saved_rejects_path_traversal_in_name() {
+        let dir = ScratchDir::new("run-saved-traversal");
+        // Unlike a script's own `workflow()` calls (whose sandbox rejection surfaces as
+        // `Ok((error_text, false))`, so the model sees why), `run_saved`'s own upfront validation
+        // is a direct `Err` — there's no model in the loop to hand a text explanation to here.
+        let err = run_saved(
+            ctx_with(Arc::new(EchoProvider), "openai::gpt-test"),
+            "parent".to_string(),
+            BudgetState::default(),
+            8,
+            0,
+            200,
+            dir.0.clone(),
+            "../../etc/passwd",
+            serde_json::Value::Null,
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("path separators"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn list_saved_lists_js_files_sorted_ignoring_others() {
+        let dir = ScratchDir::new("list-saved");
+        std::fs::write(dir.0.join("b.js"), "").unwrap();
+        std::fs::write(dir.0.join("a.js"), "").unwrap();
+        std::fs::write(dir.0.join("readme.md"), "").unwrap();
+
+        let names = list_saved(&dir.0).await;
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_saved_is_empty_not_an_error_when_dir_is_missing() {
+        let missing = std::env::temp_dir().join("forge-workflow-test-does-not-exist-anywhere");
+        assert!(list_saved(&missing).await.is_empty());
     }
 }

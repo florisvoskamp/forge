@@ -190,6 +190,11 @@ pub const COMMANDS: &[Command] = &[
         desc: "customize the statusline layout — toggle widgets, show layout, reset to default",
         usage: "/statusline [layout|toggle <widget>|reset|edit]",
     },
+    Command {
+        name: "workflow",
+        desc: "author and run a mesh-routed multi-agent workflow script for a goal, run a saved one, or list saved scripts",
+        usage: "/workflow <goal> | /workflow run <name> [args] | /workflow list",
+    },
 ];
 
 /// Subcommand for `/statusline`.
@@ -203,6 +208,19 @@ pub enum StatuslineAction {
     Reset,
     /// Open `~/.config/forge/config.toml` in $EDITOR.
     Edit,
+}
+
+/// `/workflow` sub-actions (docs/rfcs/forge-workflow.md).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowAction {
+    /// `/workflow <goal>` — author a new script for this goal, mesh-routed at Complex tier, then
+    /// run it.
+    Run(String),
+    /// `/workflow run <name> [args]` — skip authoring; execute a saved
+    /// `.forge/workflows/<name>.js` directly.
+    RunSaved { name: String, args: String },
+    /// `/workflow list` — list saved scripts in `.forge/workflows/`.
+    List,
 }
 
 /// What the render loop must do when a command is accepted. forge-tui produces it; the binary
@@ -288,6 +306,8 @@ pub enum CommandAction {
     Quit,
     /// Statusline customization (`/statusline`).
     Statusline(StatuslineAction),
+    /// Mesh-routed multi-agent workflow scripts (`/workflow`, docs/rfcs/forge-workflow.md).
+    Workflow(WorkflowAction),
     /// Not a known command — the binary shows `unknown command: X`.
     Unknown(String),
 }
@@ -624,6 +644,23 @@ pub fn parse_command(line: &str) -> CommandAction {
                 }
             };
             CommandAction::Statusline(action)
+        }
+        "workflow" | "wf" => {
+            let trimmed = arg.trim();
+            let action = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") {
+                WorkflowAction::List
+            } else if let Some(rest) = trimmed
+                .strip_prefix("run ")
+                .or_else(|| trimmed.strip_prefix("run"))
+            {
+                let mut parts = rest.trim().splitn(2, char::is_whitespace);
+                let name = parts.next().unwrap_or("").trim().to_string();
+                let args = parts.next().unwrap_or("").trim().to_string();
+                WorkflowAction::RunSaved { name, args }
+            } else {
+                WorkflowAction::Run(trimmed.to_string())
+            };
+            CommandAction::Workflow(action)
         }
         other => CommandAction::Unknown(other.to_string()),
     }
@@ -1035,6 +1072,44 @@ mod tests {
             CommandAction::Remember("tabs not spaces".into())
         );
         assert_eq!(parse_command("/memories"), CommandAction::Memories);
+    }
+
+    #[test]
+    fn parses_workflow_command_and_subactions() {
+        assert_eq!(
+            parse_command("/workflow ship the release"),
+            CommandAction::Workflow(WorkflowAction::Run("ship the release".into()))
+        );
+        assert_eq!(
+            parse_command("/workflow"),
+            CommandAction::Workflow(WorkflowAction::List)
+        );
+        assert_eq!(
+            parse_command("/workflow list"),
+            CommandAction::Workflow(WorkflowAction::List)
+        );
+        assert_eq!(
+            parse_command("/workflow run audit"),
+            CommandAction::Workflow(WorkflowAction::RunSaved {
+                name: "audit".into(),
+                args: String::new(),
+            })
+        );
+        assert_eq!(
+            parse_command("/workflow run audit --deep"),
+            CommandAction::Workflow(WorkflowAction::RunSaved {
+                name: "audit".into(),
+                args: "--deep".into(),
+            })
+        );
+        // The `wf` alias behaves identically.
+        assert_eq!(
+            parse_command("/wf run audit"),
+            CommandAction::Workflow(WorkflowAction::RunSaved {
+                name: "audit".into(),
+                args: String::new(),
+            })
+        );
     }
 
     #[test]

@@ -5555,6 +5555,100 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
         Ok(combined)
     }
 
+    /// Run a saved `.forge/workflows/<name>.js` script directly — the `/workflow run <name>
+    /// [args]` path (docs/rfcs/forge-workflow.md), which skips the authoring turn entirely (no
+    /// model call decides the script). `args` is passed through as-is; the CLI passes the raw
+    /// user-typed string, wrapped as a JSON string value so a script can reference it via the
+    /// `args` global exactly like `workflow(name, args)` calls from inside another script would.
+    pub async fn run_saved_workflow(
+        &mut self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<String, CoreError> {
+        let budget = self.budget_snapshot();
+        let agents = Arc::new(forge_config::load_agents(std::path::Path::new(
+            &self.config.mesh.subagents.agents_dir,
+        )));
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let ctx = subagent::AgentCtx {
+            provider: Arc::clone(&self.provider),
+            router: Arc::clone(&self.router),
+            store: Arc::clone(&self.store),
+            config: self.config.clone(),
+            pricing: self.pricing.clone(),
+            mode: self.mode,
+            rules: self.rules.clone(),
+            depth: 0,
+            max_depth: self.config.mesh.subagents.max_depth,
+            agents,
+            worktree_root: None,
+            repo_root: repo_root.clone(),
+        };
+        let workflows_dir = repo_root.join(".forge").join("workflows");
+
+        let presenter = &mut self.presenter;
+        let on_event = |ev: workflow::WorkflowEvent| match ev {
+            workflow::WorkflowEvent::AgentStart {
+                id,
+                agent,
+                task,
+                model,
+                phase,
+            } => presenter.emit(PresenterEvent::SubagentStart {
+                id,
+                agent,
+                task,
+                model: Some(model),
+                phase,
+            }),
+            workflow::WorkflowEvent::AgentProgress { id, snippet } => {
+                presenter.emit(PresenterEvent::SubagentProgress { id, snippet })
+            }
+            workflow::WorkflowEvent::AgentDone {
+                id,
+                agent,
+                ok,
+                summary,
+                cost_usd,
+            } => presenter.emit(PresenterEvent::SubagentResult {
+                id,
+                agent,
+                ok,
+                summary,
+                cost_usd,
+            }),
+            workflow::WorkflowEvent::Log(msg) => presenter.emit(PresenterEvent::Warning(msg)),
+        };
+
+        let (value, all_ok) = workflow::run_saved(
+            ctx,
+            self.id.clone(),
+            budget,
+            self.config.mesh.subagents.max_concurrency,
+            self.config.mesh.subagents.max_per_provider,
+            self.config.mesh.workflows.max_total_agents,
+            workflows_dir,
+            name,
+            args,
+            on_event,
+        )
+        .await
+        .map_err(CoreError::Internal)?;
+
+        let combined = match value {
+            serde_json::Value::String(s) => s,
+            other => serde_json::to_string(&other).unwrap_or_else(|_| other.to_string()),
+        };
+        // Unlike the `run_workflow` tool (whose return value the model reads and relays), a saved
+        // script run directly via `/workflow run` has no model in the loop — surface its own
+        // return value explicitly so it isn't just implied by the agent Start/Result events.
+        self.presenter.emit(PresenterEvent::Warning(format!(
+            "{} workflow '{name}' finished: {combined}",
+            if all_ok { "✓" } else { "⚠" }
+        )));
+        Ok(combined)
+    }
+
     /// Handle an `ask_user` call: parse the question + options, ask the user through the
     /// presenter (interactive multi-choice / open-ended), and return their answer as the tool
     /// result (docs/features/ask-user-question.md).
