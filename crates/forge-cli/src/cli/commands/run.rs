@@ -1418,18 +1418,27 @@ pub(crate) async fn run_chat_tui(
             }
 
             // Effort slider is modal while open: ←/→ adjust level, Esc/Enter/Ctrl+R close.
+            // `try_lock` on the writes below (not a blocking `.await`): same reasoning as
+            // skip_model — a turn parked in a permission/question prompt holds the session lock
+            // for the whole prompt, and this is the main render loop. On contention the slider
+            // still moves visually; the session-side effort just isn't persisted until it's
+            // adjusted again once the lock is free.
             if app.effort_slider {
                 match key {
                     KeyKind::Left => {
                         app.effort_slider_left();
                         if let Some(level) = app.effort {
-                            session.lock().await.set_effort(Some(level));
+                            if let Ok(mut s) = session.try_lock() {
+                                s.set_effort(Some(level));
+                            }
                         }
                     }
                     KeyKind::Right => {
                         app.effort_slider_right();
                         if let Some(level) = app.effort {
-                            session.lock().await.set_effort(Some(level));
+                            if let Ok(mut s) = session.try_lock() {
+                                s.set_effort(Some(level));
+                            }
                         }
                     }
                     KeyKind::Esc | KeyKind::Enter | KeyKind::ToggleEffortSlider => {
@@ -1520,7 +1529,10 @@ pub(crate) async fn run_chat_tui(
                         Some(EffortLevel::XHigh) => None,
                     };
                     app.effort = next;
-                    session.lock().await.set_effort(next);
+                    // `try_lock`: same reasoning as skip_model/tier_up above.
+                    if let Ok(mut s) = session.try_lock() {
+                        s.set_effort(next);
+                    }
                     let label = match next {
                         None => "unset (provider default)".to_string(),
                         Some(l) => format!("{l:?}").to_lowercase(),
@@ -1571,8 +1583,11 @@ pub(crate) async fn run_chat_tui(
                     if let Ok(cfg) = forge_config::load() {
                         app.keybinds = cfg.keybinds.clone();
                         tui.keybinds = cfg.keybinds;
-                        // Clear the in-session tier override so a reload returns to normal routing.
-                        session.lock().await.pin_tier(None);
+                        // Clear the in-session tier override so a reload returns to normal
+                        // routing. `try_lock`: same reasoning as skip_model/tier_up above.
+                        if let Ok(mut s) = session.try_lock() {
+                            s.pin_tier(None);
+                        }
                         app.note("✓ config reloaded (tier override cleared)");
                     } else {
                         app.note("⚠ config reload failed");
@@ -1593,9 +1608,17 @@ pub(crate) async fn run_chat_tui(
                         .as_ref()
                         .and_then(|r| forge_types::TaskTier::from_name(&r.tier))
                         .unwrap_or(forge_types::TaskTier::Standard);
+                    // `try_lock`, NEVER a blocking `.await`: same reasoning as skip_model above —
+                    // a turn parked in a permission/question prompt holds this lock for the whole
+                    // prompt, and blocking here (the main render loop) would wedge the entire loop
+                    // before it could ever process the keystroke that answers that very prompt.
+                    let Ok(mut sess) = session.try_lock() else {
+                        app.note("⚠ try again in a moment — session is busy");
+                        dirty = true;
+                        continue;
+                    };
                     // Current effective pin (or baseline) to detect a clamp at the end.
                     let new_tier = {
-                        let mut sess = session.lock().await;
                         let before = sess.pinned_tier().unwrap_or(baseline);
                         let clamped = (up && before.is_max()) || (!up && before.is_min());
                         if clamped {
@@ -1607,6 +1630,7 @@ pub(crate) async fn run_chat_tui(
                         }
                         sess.bump_tier(up, baseline)
                     };
+                    drop(sess);
                     let arrow = if up { "↑" } else { "↓" };
                     if busy {
                         // Mid-turn: abort and re-run the same prompt at the new tier.
@@ -1654,11 +1678,29 @@ pub(crate) async fn run_chat_tui(
                     continue;
                 }
 
-                // Ctrl-K (skip_model): mid-turn, abort the current turn so the user can retry on a
-                // different model. Handled here (before the busy branch swallows it as input) so it
-                // actually fires while a turn is running; idle it's a no-op note.
+                // Ctrl-K (skip_model): mid-turn, abort + immediately retry the SAME prompt on the
+                // mesh's next fallback model — the current model is briefly benched (the same
+                // mechanism a real rate-limit uses, see `advance_fallback`) so normal routing
+                // naturally skips it and picks the next-best candidate in the proper mesh order,
+                // rather than requiring a manual `/model` pick. Idle it's a no-op note.
                 if matches!(key, KeyKind::SkipModel) {
                     if busy {
+                        let skipped = app.routing.as_ref().map(|r| r.model.clone());
+                        // `try_lock`, NEVER a blocking `.await`: this is the main render loop, and
+                        // a turn parked in a permission/question prompt holds this lock for the
+                        // whole prompt. Blocking here would wedge the entire loop before it ever
+                        // reaches the abort below that's needed to unblock that very prompt — the
+                        // same deadlock class as the remote-snapshot/usage-overlay fixes. On
+                        // contention the skip is simply not recorded; the abort+retry still happens.
+                        if let Some(m) = &skipped {
+                            if let Ok(s) = session.try_lock() {
+                                let _ = s.store.bench_for(
+                                    m,
+                                    std::time::Duration::from_secs(180),
+                                    "user skipped via Ctrl+K",
+                                );
+                            }
+                        }
                         if let Some(h) = turn_handle.take() {
                             h.abort();
                         }
@@ -1674,7 +1716,26 @@ pub(crate) async fn run_chat_tui(
                         app.prompt = None;
                         app.clear_question();
                         app.apply(forge_tui::PresenterEvent::AssistantDone);
-                        app.note("⏭ turn aborted — retry with /model to pick a different model");
+                        if let Some(p) = last_prompt.clone() {
+                            app.note(&match &skipped {
+                                Some(m) => format!("⏭ skipped {m} — retrying on next model"),
+                                None => "⏭ retrying on next model".to_string(),
+                            });
+                            turn_gen += 1;
+                            turn_handle = Some(spawn_turn_with(
+                                p,
+                                Vec::new(),
+                                None,
+                                &session,
+                                &done_tx,
+                                turn_gen,
+                                &mut app,
+                                &mut busy,
+                                &mut busy_since,
+                            ));
+                        } else {
+                            app.note("⏭ turn aborted — no prompt to retry");
+                        }
                     } else {
                         app.note("⏭ skip-model only applies mid-turn");
                     }
@@ -1986,10 +2047,13 @@ pub(crate) async fn run_chat_tui(
                                     // Provider-level row → drill in.
                                     open_models_provider(&session, &mut app, &row.id).await?;
                                 } else if row.id.contains("::") && app.models_pin_mode {
-                                    // Leaf model row in pin-mode → pin it and close.
+                                    // Leaf model row in pin-mode → pin it and close. `try_lock`:
+                                    // same reasoning as skip_model above.
                                     let model_id =
                                         forge_provider::normalize_model_id(&row.id).into_owned();
-                                    session.lock().await.pin_model(Some(model_id.clone()));
+                                    if let Ok(mut s) = session.try_lock() {
+                                        s.pin_model(Some(model_id.clone()));
+                                    }
                                     app.models_pin_mode = false;
                                     app.models_drilled = None;
                                     app.picker.close();
@@ -2044,12 +2108,18 @@ pub(crate) async fn run_chat_tui(
                                 let obs_store = std::sync::Arc::new(crate::open_store()?);
                                 let start_event_id =
                                     find_starting_event_id(&obs_store, &session_id);
-                                let (items, view) = {
-                                    let mut s = session.lock().await;
-                                    s.reset_resumed(&session_id)
-                                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                                    (s.replay_items_full(), s.view_snapshot())
+                                // `try_lock`: same reasoning as skip_model above — a turn parked
+                                // in a permission/question prompt holds this lock for the whole
+                                // prompt, and this is the main render loop.
+                                let Ok(mut s) = session.try_lock() else {
+                                    app.note("⚠ try again in a moment — session is busy");
+                                    dirty = true;
+                                    continue;
                                 };
+                                s.reset_resumed(&session_id)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let (items, view) = (s.replay_items_full(), s.view_snapshot());
+                                drop(s);
                                 tui.clear_screen();
                                 app.clear_transcript();
                                 app.note(&format!(
@@ -2318,18 +2388,24 @@ pub(crate) async fn run_chat_tui(
                 }
             } else if matches!(key, KeyKind::CycleTemper) {
                 // SHIFT+TAB: cycle the operating temper (idle only — never mid-turn).
-                let new = {
-                    let mut sess = session.lock().await;
-                    sess.cycle_temper()
+                // `try_lock`: same reasoning as skip_model above; a no-op note on contention
+                // rather than blocking the main render loop.
+                let Some(new) = session.try_lock().ok().map(|mut sess| sess.cycle_temper()) else {
+                    app.note("⚠ try again in a moment — session is busy");
+                    dirty = true;
+                    continue;
                 };
                 app.set_temper(new.label());
                 // Remember the chosen temper as the default for the next session (best-effort).
                 let _ = forge_config::write_permission_mode(new);
             } else if matches!(key, KeyKind::TemperCycle) {
                 // Alt-T: same as SHIFT+TAB temper cycling but via configurable keybind.
-                let new = {
-                    let mut sess = session.lock().await;
-                    sess.cycle_temper()
+                // `try_lock`: same reasoning as skip_model above; a no-op note on contention
+                // rather than blocking the main render loop.
+                let Some(new) = session.try_lock().ok().map(|mut sess| sess.cycle_temper()) else {
+                    app.note("⚠ try again in a moment — session is busy");
+                    dirty = true;
+                    continue;
                 };
                 app.set_temper(new.label());
                 let _ = forge_config::write_permission_mode(new);
