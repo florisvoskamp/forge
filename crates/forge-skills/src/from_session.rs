@@ -148,7 +148,30 @@ pub fn parse_model_output(raw: &str) -> (String, String) {
 /// Produces the exact frontmatter format the `Catalog` parser expects:
 /// `---\nname: <slug>\ndescription: <one line>\n---\n\n<body>\n`
 pub fn assemble_skill_md(name: &str, description: &str, body: &str) -> String {
+    let description = quote_frontmatter_scalar_if_ambiguous(description);
     format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n")
+}
+
+/// Quote a frontmatter scalar if, written verbatim, it would be misparsed as something else.
+///
+/// `frontmatter::parse()` reads a value that starts with `[` and ends with `]` as an inline YAML
+/// list rather than a scalar (see `frontmatter.rs`). An untrusted, LLM-generated description can
+/// plausibly take that shape (e.g. `"[Fix the auth bug]"`), so wrap it in quotes — which
+/// `frontmatter::parse()` strips back off — to force it to round-trip as a scalar.
+fn quote_frontmatter_scalar_if_ambiguous(value: &str) -> String {
+    if !(value.starts_with('[') && value.ends_with(']')) {
+        return value.to_string();
+    }
+    if !value.contains('"') {
+        format!("\"{value}\"")
+    } else if !value.contains('\'') {
+        format!("'{value}'")
+    } else {
+        // Contains both quote characters, which this hand-rolled (non-escaping) frontmatter
+        // format can't quote unambiguously either way. Fall back to substituting the inner
+        // double quotes so the value can still be wrapped and round-trip as a scalar.
+        format!("\"{}\"", value.replace('"', "'"))
+    }
 }
 
 /// Write a skill to `<skills_dir>/<slug>/SKILL.md`, creating dirs as needed.
@@ -344,6 +367,19 @@ mod tests {
         assert!(skill.body.contains("## Step 1"));
 
         fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn assemble_skill_md_round_trips_a_bracket_wrapped_description() {
+        // A description that happens to start with '[' and end with ']' (a plausible shape for
+        // a short LLM-generated one-liner) must not be misparsed as an inline YAML list.
+        let desc = "[Fix authentication flow bug systematically today]";
+        let md = assemble_skill_md("my-skill", desc, "## Step 1\nRun it.");
+        let (fm_text, _body) = crate::frontmatter::split(&md);
+        let fm = crate::frontmatter::parse(fm_text.unwrap_or("")).unwrap();
+        // `scalar()` only returns `Some` for `FmValue::Scalar` — if the value had been misparsed
+        // as an inline list (the bug), this would be `None` instead.
+        assert_eq!(fm.scalar("description").as_deref(), Some(desc));
     }
 
     // --- write_skill clobber guard ---
