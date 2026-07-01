@@ -414,8 +414,13 @@ viewer (main chat + subagents + critics).
 | `/statusline [layout\|toggle <widget>\|reset\|edit]` | Manage the statusline — toggle/reorder widgets, or reset to default |
 | `/` | Open command palette (fuzzy-find skills + commands) |
 
-**Keyboard shortcuts:** `SHIFT+TAB` cycle temper · `Ctrl+O` activity viewer · `Ctrl+J` newline ·
-`Esc` cancel/stop · `↑/↓` navigate · `y/n/a` allow/deny/always-allow a permission prompt.
+**Keyboard shortcuts:** `SHIFT+TAB`/`Alt+T` cycle temper · `Ctrl+K` mid-turn — abort + retry the same
+prompt on the mesh's next-ranked model (excludes ones already skipped this turn) · `Ctrl+↑`/`Ctrl+↓`
+bias the routing tier up/down, re-running immediately if mid-turn · `Ctrl+O` activity viewer ·
+`Ctrl+J` newline · `Esc` interrupt (mid-turn) / quit (idle) · `↑/↓` navigate ·
+`y/n/a` allow/deny/always-allow a permission prompt · `Alt+M` model picker · `Alt+E` cycle effort ·
+`Ctrl+N` new session · `Ctrl+S` checkpoint · `Ctrl+Z` undo last write · `Ctrl+L` compact ·
+`Ctrl+R` toggle reasoning display · `Ctrl+,` edit keybinds · `F1` full keybind reference.
 
 ### ▶️ `forge run` — single non-interactive turn
 

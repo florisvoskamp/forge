@@ -6,6 +6,43 @@ All notable changes to Forge are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-07-01
+
+### Added
+- **Mesh routing**: `Router::route`/`route_hinted` now take a `ProjectContext`, so routing
+  decisions can account for whether Forge is self-hosting the current project.
+- **Mesh inspector**: the `/mesh` overlay's candidate list now supports real cursor navigation
+  (↑/↓ moves an independent cursor with its own auto-scrolling viewport) instead of a static,
+  non-scrolling list.
+- **Ctrl+K**: skipping a model mid-turn now retries the *same* turn on the next model in mesh
+  routing order instead of aborting it, and remembers every model skipped so far in that prompt's
+  retry chain so it can't cycle back to one already skipped.
+
+### Fixed
+- **Mesh routing**: Claude context-window figures corrected — Opus and Sonnet (current CLI-bridge
+  versions) are now reported as 1M tokens instead of a stale 200k; Haiku remains 200k.
+- **Mesh inspector**: candidate `usable` flags (both the TUI overlay and the `forge mesh`/`models`
+  CLI output) now match `decide()`'s real filter (credit-mode + context-fit, not just raw
+  availability), so a model shown as usable is always actually routable.
+- **TUI**: a large block of global hotkeys no longer fires underneath an open modal (palette,
+  usage overlay, mesh inspector, `@`-picker, model picker) — they now correctly capture all input
+  while open.
+- **TUI**: `/quit` (and remote prompt-as-command quit) no longer deadlocks on a pending
+  permission/question reply channel.
+- **TUI**: two render-loop paths (remote-snapshot publish, usage-overlay periodic refresh) held a
+  blocking lock on the session mutex every frame, which could freeze the entire render loop
+  — including Esc/Ctrl-C — for a turn's full duration; both now use a non-blocking `try_lock`.
+- **TUI**: tier up/down, the effort slider/cycle, and model pinning silently stopped working mid-turn
+  because the session lock is held for a turn's entire duration (not just during a permission
+  prompt) — they now read/update a render-loop-local mirror of the relevant state instead of
+  requiring the session lock for their core compute step.
+- **TUI**: Ctrl+K's model-exclusion bench is now applied inside the same lock acquisition as the
+  retried turn itself, closing a race that could let it skip and immediately re-route to the same
+  model.
+- **TUI**: the slash-command palette no longer flashes open/closed while typing arguments after the
+  command name (a second, unfiltered token-detection call site was missing the cursor-position
+  filter the first one already had).
+
 ## [2.1.0] - 2026-07-01
 
 ### Added
@@ -1938,7 +1975,8 @@ Initial public release: Model Mesh routing, multi-provider support, cost/budget 
 inline TUI, session persistence + checkpoints, permission broker, subagents, Assay analysis,
 Lattice code intelligence, MCP client, web tools, hooks, skills/commands, and more.
 
-[Unreleased]: https://github.com/Adulari/forge/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/Adulari/forge/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/Adulari/forge/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/Adulari/forge/compare/v2.0.0...v2.1.0
 [1.8.1]: https://github.com/Adulari/forge/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/Adulari/forge/compare/v1.7.0...v1.8.0

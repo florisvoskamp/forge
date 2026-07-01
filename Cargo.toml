@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "AGPL-3.0-only"
@@ -19,18 +19,18 @@ description = "Fast, model-agnostic AI coding harness and CLI in Rust."
 # `use forge_X::` imports keep working with zero source changes; `package = "adforge-X"`
 # points each at its renamed crates.io package (the `forge-*` names are taken). Lib names
 # are preserved as `forge_X` in each crate's `[lib]` so import paths are unchanged.
-forge-types = { package = "forge-agent-types", path = "crates/forge-types", version = "2.1.0" }
-forge-config = { package = "forge-agent-config", path = "crates/forge-config", version = "2.1.0" }
-forge-core = { package = "forge-agent-core", path = "crates/forge-core", version = "2.1.0" }
-forge-index = { package = "forge-agent-index", path = "crates/forge-index", version = "2.1.0" }
-forge-lsp = { package = "forge-agent-lsp", path = "crates/forge-lsp", version = "2.1.0" }
-forge-mcp = { package = "forge-agent-mcp", path = "crates/forge-mcp", version = "2.1.0" }
-forge-mesh = { package = "forge-agent-mesh", path = "crates/forge-mesh", version = "2.1.0" }
-forge-provider = { package = "forge-agent-provider", path = "crates/forge-provider", version = "2.1.0" }
-forge-skills = { package = "forge-agent-skills", path = "crates/forge-skills", version = "2.1.0" }
-forge-store = { package = "forge-agent-store", path = "crates/forge-store", version = "2.1.0" }
-forge-tools = { package = "forge-agent-tools", path = "crates/forge-tools", version = "2.1.0" }
-forge-tui = { package = "forge-agent-tui", path = "crates/forge-tui", version = "2.1.0" }
+forge-types = { package = "forge-agent-types", path = "crates/forge-types", version = "2.2.0" }
+forge-config = { package = "forge-agent-config", path = "crates/forge-config", version = "2.2.0" }
+forge-core = { package = "forge-agent-core", path = "crates/forge-core", version = "2.2.0" }
+forge-index = { package = "forge-agent-index", path = "crates/forge-index", version = "2.2.0" }
+forge-lsp = { package = "forge-agent-lsp", path = "crates/forge-lsp", version = "2.2.0" }
+forge-mcp = { package = "forge-agent-mcp", path = "crates/forge-mcp", version = "2.2.0" }
+forge-mesh = { package = "forge-agent-mesh", path = "crates/forge-mesh", version = "2.2.0" }
+forge-provider = { package = "forge-agent-provider", path = "crates/forge-provider", version = "2.2.0" }
+forge-skills = { package = "forge-agent-skills", path = "crates/forge-skills", version = "2.2.0" }
+forge-store = { package = "forge-agent-store", path = "crates/forge-store", version = "2.2.0" }
+forge-tools = { package = "forge-agent-tools", path = "crates/forge-tools", version = "2.2.0" }
+forge-tui = { package = "forge-agent-tui", path = "crates/forge-tui", version = "2.2.0" }
 
 # External (pinned to current stable as of 2026-06; see ADRs)
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "fs", "process", "io-util", "time", "net", "signal"] }
