@@ -67,7 +67,17 @@ impl Provider for MockProvider {
             .join("\n");
         let plan_proposed = tool_results.contains("Plan presented to the user for approval");
         let tasks_set = tool_results.contains("task list updated");
-        let used_read = tool_results.contains("workspace") || tool_results.contains("read_file");
+        // Whether OUR OWN canned `read_file` call (below) already went out and came back — checked
+        // against the transcript's own tool-call record, not by pattern-matching the result TEXT.
+        // The old check (`tool_results.contains("workspace")`) only ever matched because Forge's own
+        // Cargo.toml happens to contain a literal `[workspace]` table; reading any other file (a
+        // plain `[package]` manifest, a subagent's read in a non-Forge directory, anything without
+        // that exact substring) left this permanently false, looping the mock's read_file request
+        // until the step cap — a real bug, found via live end-to-end testing of a workflow script
+        // run from a scratch project with no `[workspace]` Cargo.toml.
+        let used_read = messages.iter().any(|m| {
+            m.role == Role::Assistant && m.tool_calls.iter().any(|c| c.name == "read_file")
+        });
 
         let wants_plan = lu.contains("present_plan")
             || lu.contains("mock:plan")
@@ -193,12 +203,49 @@ mod tests {
         let p = MockProvider;
         let msgs = vec![
             Message::user("check the project"),
-            Message::assistant("Let me inspect the project manifest."),
-            Message::new(Role::Tool, "[workspace] ..."),
+            Message::assistant_tool_calls(
+                "Let me inspect the project manifest.",
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    args: json!({ "path": "Cargo.toml" }),
+                }],
+            ),
+            Message::new(Role::Tool, "[package]\nname = \"whatever\"\n"),
         ];
         let res = p.complete("mock", &msgs, &[], &mut |_| {}).await.unwrap();
         assert!(!res.wants_tools());
         assert!(!res.content.is_empty());
+    }
+
+    /// Regression: the old check pattern-matched the tool RESULT text for the literal substring
+    /// "workspace" — which only ever appeared because Forge's own Cargo.toml has a `[workspace]`
+    /// table. A `read_file` result with NO such substring (a plain package manifest, any random
+    /// file, a subagent reading from a non-Forge directory) must still be recognized as "already
+    /// read" from the transcript's own tool-call record, not from incidental file content.
+    #[tokio::test]
+    async fn recognizes_a_completed_read_even_when_the_file_content_has_no_magic_substring() {
+        let p = MockProvider;
+        let msgs = vec![
+            Message::user("say hello"),
+            Message::assistant_tool_calls(
+                "Let me inspect the project manifest.",
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    args: json!({ "path": "Cargo.toml" }),
+                }],
+            ),
+            Message::new(
+                Role::Tool,
+                "totally unrelated file content, no magic words here",
+            ),
+        ];
+        let res = p.complete("mock", &msgs, &[], &mut |_| {}).await.unwrap();
+        assert!(
+            !res.wants_tools(),
+            "must finish once a read_file call is on record, regardless of the result's own text"
+        );
     }
 
     #[tokio::test]
