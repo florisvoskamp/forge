@@ -1101,12 +1101,17 @@ pub(crate) async fn run_chat_tui(
     }
     let mut observer: Option<ObserverState> = None;
 
-    // Stable session context for remote snapshots — captured once (cheap to clone each frame
-    // instead of re-locking the session in the hot render path).
-    let remote_session_id = session.lock().await.session_id().to_string();
+    // The cwd is stable for remote snapshots (captured once, cheap to clone each frame instead of
+    // a syscall in the hot render path). The session id is NOT stable — `/new` and the "observe a
+    // live session" picker mutate it in place via `reset_fresh`/`reset_resumed` without restarting
+    // this loop — so it's re-read from the session at snapshot-build time instead of cached here.
     let remote_cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+
+    // Draw the first frame before the (possibly slow) auto-start below, so `[remote] auto =
+    // "anywhere"` — which waits on a public tunnel to come up — doesn't leave the terminal blank.
+    tui.draw(&app);
 
     // Default-on remote control: when `[remote] auto` is configured, start the server at chat
     // startup so the session is reachable from a phone/browser without typing `/remote` first.
@@ -3051,16 +3056,21 @@ pub(crate) async fn run_chat_tui(
                     .map(|rc| {
                         if let Some(t) = rc.tunnel {
                             format!("public ({t})")
-                        } else if rc.url.url.starts_with("https") {
-                            "LAN".to_string()
+                        } else if rc.url.tls_fingerprint.is_some() {
+                            if rc.tls_degraded() {
+                                "LAN (insecure — TLS failed)".to_string()
+                            } else {
+                                "LAN".to_string()
+                            }
                         } else {
                             "loopback".to_string()
                         }
                     })
                     .unwrap_or_default();
+                let remote_session_id = session.lock().await.session_id().to_string();
                 let snap = remote::Snapshot {
                     protocol: remote::PROTOCOL_VERSION,
-                    session_id: remote_session_id.clone(),
+                    session_id: remote_session_id,
                     cwd: remote_cwd.clone(),
                     exposure,
                     busy: view.busy,

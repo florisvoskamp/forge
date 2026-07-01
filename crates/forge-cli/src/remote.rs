@@ -29,6 +29,7 @@
 //! start.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -604,6 +605,20 @@ pub struct RemoteControl {
     _tunnel: Option<tokio::process::Child>,
     /// The tunnel provider's human label (`--anywhere` only), for the scrollback note.
     pub tunnel: Option<&'static str>,
+    /// Set from the spawned server task if a `Lan` bind's TLS setup fails *after* [`start`] already
+    /// returned an `https://` URL (see [`Self::tls_degraded`]) — the connect URL and cert
+    /// fingerprint were fixed at return time and can't be corrected in place, so this is checked
+    /// separately wherever the exposure is reported (e.g. the remote-page header).
+    tls_degraded: Arc<AtomicBool>,
+}
+
+impl RemoteControl {
+    /// True once a `Lan`-exposure bind's TLS config build has failed and the server fell back to
+    /// plain HTTP — meaning the token is travelling in cleartext despite the `https://` connect
+    /// URL handed out at start time. Always `false` for `Local`/`Anywhere` (no TLS is attempted).
+    pub fn tls_degraded(&self) -> bool {
+        self.tls_degraded.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for RemoteControl {
@@ -701,6 +716,11 @@ pub fn start(exposure: Exposure) -> std::io::Result<RemoteControl> {
                 // axum-server::from_tcp_rustls takes a std::net::TcpListener (non-async).
                 // We build the RustlsConfig inside the spawned async task because
                 // RustlsConfig::from_pem is async (it spawns blocking work internally).
+                // `start()` already committed to an `https://` URL above (before this task even
+                // runs), so a fallback here can't change the connect URL — `tls_degraded` is how
+                // the render loop finds out the token is actually travelling in cleartext.
+                let tls_degraded = Arc::new(AtomicBool::new(false));
+                let tls_degraded_task = tls_degraded.clone();
                 let server = tokio::spawn(async move {
                     match axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await {
                         Ok(tls_config) => {
@@ -721,6 +741,7 @@ pub fn start(exposure: Exposure) -> std::io::Result<RemoteControl> {
                                 "remote: TLS config build failed ({e}); \
                                  falling back to plain HTTP — token will travel in cleartext"
                             );
+                            tls_degraded_task.store(true, Ordering::Relaxed);
                             // Fall back: rebuild listener (the original was moved). We can't
                             // easily un-move it, so we open a new one on the same addr.
                             // In the unlikely event that fails, just log and exit the task.
@@ -752,6 +773,7 @@ pub fn start(exposure: Exposure) -> std::io::Result<RemoteControl> {
                     },
                     _server: server,
                     _tunnel: None,
+                    tls_degraded,
                     tunnel: None,
                 });
             }
@@ -788,6 +810,7 @@ pub fn start(exposure: Exposure) -> std::io::Result<RemoteControl> {
         _server: server,
         _tunnel: None,
         tunnel: None,
+        tls_degraded: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -1037,6 +1060,7 @@ const CONTROL_PAGE: &str = r##"<!doctype html>
   .agent .at { color:var(--ink); font-size:13px; margin:2px 0; }
   .agent .al { color:var(--dim); font-size:12px; white-space:pre-wrap; word-break:break-word; }
   .actions:empty { display:none; }
+  .queued { color: var(--dim); font-size: 12px; padding: 2px 2px 4px; }
   .prompt { background: var(--panel); border-radius: 8px; padding: 8px 10px; margin: 6px 0; border: 1px solid var(--acc); }
   .prompt .q { font-weight: 700; color: var(--acc); }
   .opts { display:flex; flex-direction:column; gap:6px; margin:6px 0; }
@@ -1158,17 +1182,32 @@ function renderTranscript(s) {
   t._n = sent + body.length;
 }
 
+// Rebuild `el`'s contents via `fill`, but preserve scroll position across the rebuild — a plain
+// `innerHTML = ""` resets scrollTop to 0, which would yank the view back to the top every time a
+// new snapshot arrives (e.g. a subagent's `last` line updating mid-stream) while someone is
+// scrolled up reading earlier entries. Skips the rebuild entirely when `sig` is unchanged.
+function rebuildPreservingScroll(el, sig, fill) {
+  if (el._sig === sig) return;
+  el._sig = sig;
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  const scrollTop = el.scrollTop;
+  fill();
+  el.scrollTop = nearBottom ? el.scrollHeight : scrollTop;
+}
+
 function renderTasks(s) {
   const tasks = s.tasks || [];
   $("tc").textContent = tasks.length ? tasks.filter(x => x.status === "done").length + "/" + tasks.length : "";
   const el = $("tasks");
-  if (!tasks.length) { el.innerHTML = '<div class="empty">no tasks yet</div>'; return; }
-  el.innerHTML = "";
-  tasks.forEach(t => {
-    const d = document.createElement("div"); d.className = "task " + t.status;
-    const g = t.status === "done" ? "●" : (t.status === "in_progress" ? "◐" : "○");
-    d.innerHTML = '<span class="g">' + g + '</span><span>' + esc(t.title) + '</span>';
-    el.appendChild(d);
+  rebuildPreservingScroll(el, JSON.stringify(tasks), () => {
+    if (!tasks.length) { el.innerHTML = '<div class="empty">no tasks yet</div>'; return; }
+    el.innerHTML = "";
+    tasks.forEach(t => {
+      const d = document.createElement("div"); d.className = "task " + t.status;
+      const g = t.status === "done" ? "●" : (t.status === "in_progress" ? "◐" : "○");
+      d.innerHTML = '<span class="g">' + g + '</span><span>' + esc(t.title) + '</span>';
+      el.appendChild(d);
+    });
   });
 }
 
@@ -1176,26 +1215,32 @@ function renderAgents(s) {
   const subs = s.subagents || [];
   $("ac").textContent = subs.length ? "" + subs.length : "";
   const el = $("agents");
-  if (!subs.length) { el.innerHTML = '<div class="empty">no subagents running</div>'; return; }
-  el.innerHTML = "";
-  subs.forEach(a => {
-    const d = document.createElement("div"); d.className = "agent" + (a.done ? " done" : "");
-    const head = esc(a.agent || "agent") + (a.model ? " · " + esc(a.model) : "") + (a.done ? " · done $" + (a.cost || 0).toFixed(4) : "");
-    d.innerHTML = '<div class="ah">' + (a.done ? "✓ " : "▸ ") + head + '</div>' +
-      '<div class="at">' + esc(a.task || "") + '</div>' +
-      '<div class="al">' + esc(a.last || "") + '</div>';
-    el.appendChild(d);
+  rebuildPreservingScroll(el, JSON.stringify(subs), () => {
+    if (!subs.length) { el.innerHTML = '<div class="empty">no subagents running</div>'; return; }
+    el.innerHTML = "";
+    subs.forEach(a => {
+      const d = document.createElement("div"); d.className = "agent" + (a.done ? " done" : "");
+      const head = esc(a.agent || "agent") + (a.model ? " · " + esc(a.model) : "") + (a.done ? " · done $" + (a.cost || 0).toFixed(4) : "");
+      d.innerHTML = '<div class="ah">' + (a.done ? "✓ " : "▸ ") + head + '</div>' +
+        '<div class="at">' + esc(a.task || "") + '</div>' +
+        '<div class="al">' + esc(a.last || "") + '</div>';
+      el.appendChild(d);
+    });
   });
 }
 
 function renderActions(s) {
   const a = $("actions");
+  const queued = s.queued || [];
+  let h = queued.length
+    ? '<div class="queued">' + queued.map(q => "⏳ queued: " + esc(q)).join("<br>") + '</div>'
+    : "";
   if (s.permission_prompt) {
-    a.innerHTML = '<div class="prompt"><span class="q">⚠ ' + esc(s.permission_prompt) +
+    h += '<div class="prompt"><span class="q">⚠ ' + esc(s.permission_prompt) +
       '</span></div><div class="bar"><button class="y" onclick="answer(true)">Allow</button>' +
       '<button class="n" onclick="answer(false)">Deny</button></div>';
   } else if (s.question) {
-    let h = '<div class="prompt"><span class="q">❓ ' + esc(s.question) + '</span></div>';
+    h += '<div class="prompt"><span class="q">❓ ' + esc(s.question) + '</span></div>';
     const opts = s.question_options || [];
     if (opts.length) {
       h += '<div class="opts">';
@@ -1209,10 +1254,8 @@ function renderActions(s) {
       h += '<div class="bar"><input type="text" id="ans" placeholder="answer…" enterkeyhint="done">' +
         '<button class="send" onclick="sendAnswer()">Answer</button></div>';
     }
-    a.innerHTML = h;
-  } else {
-    a.innerHTML = "";
   }
+  a.innerHTML = h;
 }
 
 function notifyTransitions(s) {

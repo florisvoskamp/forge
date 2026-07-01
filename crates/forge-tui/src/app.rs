@@ -490,16 +490,21 @@ impl App {
             streaming: self.streaming.clone(),
             transcript: self.recent_transcript.iter().cloned().collect(),
             tasks: self.tasks.clone(),
+            // `id`/`log` are left empty — the remote wire type (`remote::SnapSubagent`) never
+            // reads either, so cloning the real (unbounded-growing) log buffer here on every
+            // dirty/busy frame would be pure waste. `ViewSnapshot` (the OTHER consumer of this
+            // same `SubagentSnapshot` type, for session-resume persistence) still gets the real
+            // values via its own construction path below.
             subagents: self
                 .subagents
                 .iter()
                 .map(|r| SubagentSnapshot {
-                    id: r.id.clone(),
+                    id: String::new(),
                     agent: r.agent.clone(),
                     task: r.task.clone(),
                     model: r.model.clone(),
                     last: r.last.clone(),
-                    log: r.log.clone(),
+                    log: Vec::new(),
                     done: r.done,
                     cost: r.cost,
                 })
