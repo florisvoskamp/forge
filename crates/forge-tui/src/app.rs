@@ -1051,13 +1051,18 @@ impl App {
                 task,
                 model,
             } => {
-                // A new batch: the previous (all-finished) batch's rows are retained until now so
-                // their transcripts stay viewable (Ctrl+O); drop them as the next batch begins.
-                if !self.subagents.is_empty() && self.subagents.iter().all(|r| r.done) {
-                    self.subagents.clear();
-                }
-                // First child of a batch opens the group box in scrollback.
-                if self.subagents.is_empty() {
+                // A new batch begins once every existing row has already finished (or there are
+                // none yet) — open a fresh scrollback header for it. Rows themselves are NOT
+                // cleared here: they're retained across batches within the same turn (so e.g. a
+                // multi-phase workflow's earlier phases stay visible/viewable alongside a later
+                // one) and are only reset by `on_turn_start` at the start of a genuinely new user
+                // turn. (Previously this branch also cleared `self.subagents`, which wiped a
+                // finished batch the instant the NEXT batch's first child started — invisible for
+                // a single spawn_agents call, but silently dropped every earlier batch/phase the
+                // moment a second one began within the same turn.)
+                let starting_new_batch =
+                    self.subagents.is_empty() || self.subagents.iter().all(|r| r.done);
+                if starting_new_batch {
                     self.flush.push(subagent_header_line());
                 }
                 self.subagents.push(SubRow {
@@ -1070,6 +1075,20 @@ impl App {
                     done: false,
                     cost: 0.0,
                 });
+                // Bound total retention: drop the oldest already-finished rows first (never an
+                // in-progress one) so a turn with many batches/phases can't grow this unboundedly.
+                const MAX_SUBAGENT_ROWS: usize = 500;
+                if self.subagents.len() > MAX_SUBAGENT_ROWS {
+                    let mut excess = self.subagents.len() - MAX_SUBAGENT_ROWS;
+                    self.subagents.retain(|r| {
+                        if excess > 0 && r.done {
+                            excess -= 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
             }
             PresenterEvent::SubagentProgress { id, snippet } => {
                 if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id && !r.done) {
@@ -6175,6 +6194,65 @@ mod tests {
     }
 
     #[test]
+    fn a_second_batch_in_the_same_turn_does_not_wipe_the_first() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::SubagentStart {
+            id: "phase1-a".into(),
+            agent: "researcher".into(),
+            task: "survey the codebase".into(),
+            model: Some("anthropic::opus".into()),
+        });
+        app.apply(PresenterEvent::SubagentResult {
+            id: "phase1-a".into(),
+            agent: "researcher".into(),
+            ok: true,
+            summary: "found 3 relevant files".into(),
+            cost_usd: 0.001,
+        });
+        assert_eq!(app.subagents.len(), 1, "phase 1's row exists");
+        assert!(app.subagents[0].done);
+
+        // A second batch starts IN THE SAME TURN (no `on_turn_start` in between) — e.g. a
+        // workflow script's second phase. Before the fix, `SubagentStart` itself cleared every
+        // prior finished row here, silently deleting phase 1's row (and its Ctrl+O-viewable
+        // transcript) the instant phase 2 began.
+        app.apply(PresenterEvent::SubagentStart {
+            id: "phase2-a".into(),
+            agent: "implementer".into(),
+            task: "apply the fix".into(),
+            model: Some("anthropic::sonnet".into()),
+        });
+        assert_eq!(
+            app.subagents.len(),
+            2,
+            "phase 1's row must survive phase 2 starting"
+        );
+        assert!(
+            app.subagents.iter().any(|r| r.id == "phase1-a"),
+            "phase 1's row specifically must still be present"
+        );
+        let s = screen(&app);
+        assert!(
+            s.contains("researcher") && s.contains("implementer"),
+            "both phases' agents visible together: {s}"
+        );
+
+        // Only a genuinely new user turn clears the retained history.
+        app.apply(PresenterEvent::SubagentResult {
+            id: "phase2-a".into(),
+            agent: "implementer".into(),
+            ok: true,
+            summary: "applied".into(),
+            cost_usd: 0.002,
+        });
+        app.on_turn_start();
+        assert!(
+            app.subagents.is_empty(),
+            "on_turn_start still clears at the real turn boundary"
+        );
+    }
+
+    #[test]
     fn mesh_overlay_renders_without_panic() {
         let mesh_overlay = MeshOverlay {
             open: true,
@@ -6279,7 +6357,8 @@ mod tests {
             "result appended to transcript"
         );
 
-        // A new batch drops the previous (finished) rows.
+        // A new batch starting in the same turn RETAINS the previous (finished) batch's rows —
+        // both stay viewable, e.g. for a multi-phase workflow's earlier phases.
         app.apply(PresenterEvent::SubagentStart {
             id: "b".into(),
             agent: "general".into(),
@@ -6287,8 +6366,12 @@ mod tests {
             model: None,
         });
         let views = app.activity_views();
-        assert_eq!(views.len(), 2);
-        assert_eq!(views[1].subtitle, "next");
+        assert_eq!(views.len(), 3, "main chat + both batches' subagents");
+        assert_eq!(
+            views[1].subtitle, "find call sites",
+            "batch a's row survives"
+        );
+        assert_eq!(views[2].subtitle, "next");
     }
 
     #[test]
