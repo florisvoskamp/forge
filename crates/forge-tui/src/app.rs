@@ -16,25 +16,26 @@ use serde::{Deserialize, Serialize};
 use crate::{PresenterEvent, QChoice};
 
 // ── Palette ──────────────────────────────────────────────────────────────────
+// `pub(crate)` so sibling render modules (workflow_view) share the one palette.
 // Forge identity
-const ORANGE: Color = Color::Rgb(255, 138, 48); // forge brand — warm ember
-                                                // Electric blue primary accent (active states, model display, busy indicator)
-const ACCENT: Color = Color::Rgb(82, 162, 255); // electric blue
-                                                // Text
+pub(crate) const ORANGE: Color = Color::Rgb(255, 138, 48); // forge brand — warm ember
+                                                           // Electric blue primary accent (active states, model display, busy indicator)
+pub(crate) const ACCENT: Color = Color::Rgb(82, 162, 255); // electric blue
+                                                           // Text
 const USER: Color = Color::Rgb(122, 183, 255); // user message headers
-const DIM: Color = Color::Rgb(82, 87, 108); // muted / secondary
-const TEXT: Color = Color::Rgb(208, 213, 224); // primary body text
-                                               // Semantic
-const OKGREEN: Color = Color::Rgb(92, 208, 122); // success / ok
-const ERRRED: Color = Color::Rgb(243, 92, 92); // error
-const WARNYEL: Color = Color::Rgb(238, 188, 82); // warning
-const TOOLCYAN: Color = Color::Rgb(75, 212, 218); // tools / lattice
-                                                  // Surfaces
+pub(crate) const DIM: Color = Color::Rgb(82, 87, 108); // muted / secondary
+pub(crate) const TEXT: Color = Color::Rgb(208, 213, 224); // primary body text
+                                                          // Semantic
+pub(crate) const OKGREEN: Color = Color::Rgb(92, 208, 122); // success / ok
+pub(crate) const ERRRED: Color = Color::Rgb(243, 92, 92); // error
+pub(crate) const WARNYEL: Color = Color::Rgb(238, 188, 82); // warning
+pub(crate) const TOOLCYAN: Color = Color::Rgb(75, 212, 218); // tools / lattice
+                                                             // Surfaces
 const SELECT_BG: Color = Color::Rgb(40, 70, 132); // mouse text-selection
 const STATUSBG: Color = Color::Rgb(14, 15, 21); // deep status-bar bg
 const SEPCOL: Color = Color::Rgb(38, 42, 62); // status-bar separator tint
 
-const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(crate) const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// ANSI-Shadow block wordmark printed once into scrollback as the welcome banner.
 const FORGE_WORDMARK: &[&str] = &[
@@ -372,6 +373,10 @@ pub struct App {
     pub usage_overlay: UsageOverlay,
     /// The `/mesh` routing-inspector overlay state.
     pub mesh_overlay: MeshOverlay,
+    /// The dedicated full-screen workflow view (docs/rfcs/forge-workflow.md). Auto-opens on
+    /// `WorkflowStarted`; while a workflow is active it owns every `Subagent*` event — those rows
+    /// render here, never in the sticky subagent activity panel.
+    pub workflow: crate::workflow_view::WorkflowView,
     /// True while remote control is active (a browser can drive the session via `/remote`). Shown
     /// as a `◉ remote` segment in the statusline so it's visible at a glance that the session is
     /// remotely controllable.
@@ -525,6 +530,20 @@ impl App {
                     ok: r.ok,
                     cost: r.cost,
                 })
+                // Workflow rows live in the dedicated view, not `subagents` — the phone still
+                // wants to see them, so they ride along in the same wire shape, phase attached.
+                .chain(self.workflow.rows.iter().map(|r| SubagentSnapshot {
+                    id: String::new(),
+                    agent: r.agent.clone(),
+                    task: r.task.clone(),
+                    model: r.model.clone(),
+                    phase: r.phase_idx.map(|i| self.workflow.phases[i].title.clone()),
+                    last: r.last.clone(),
+                    log: Vec::new(),
+                    done: r.done,
+                    ok: r.ok,
+                    cost: r.cost,
+                }))
                 .collect(),
             queued: self.queued.clone(),
             permission_prompt: self.prompt.clone(),
@@ -1081,6 +1100,13 @@ impl App {
                 model,
                 phase,
             } => {
+                // A live workflow owns its agents: rows fold into the dedicated workflow view,
+                // never the sticky activity panel (its scrollback record is written by the
+                // WorkflowPhase/WorkflowFinished handlers instead of the batch header/footer).
+                if self.workflow.active {
+                    self.workflow.on_agent_start(id, agent, task, model, phase);
+                    return;
+                }
                 // A new batch begins once every existing row has already finished (or there are
                 // none yet) — open a fresh scrollback header for it. Rows themselves are NOT
                 // cleared here: they're retained across batches within the same turn (so e.g. a
@@ -1130,6 +1156,10 @@ impl App {
                 }
             }
             PresenterEvent::SubagentProgress { id, snippet } => {
+                if self.workflow.active {
+                    self.workflow.on_progress(&id, &snippet);
+                    return;
+                }
                 if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id && !r.done) {
                     // Keep only the trailing edge of the child's activity for its row.
                     row.last.push_str(snippet.replace('\n', " ").as_str());
@@ -1166,6 +1196,19 @@ impl App {
                 summary,
                 cost_usd,
             } => {
+                if self.workflow.active {
+                    // The row lives in the workflow view; a branch line still goes to scrollback
+                    // so the run leaves a readable history after the view closes.
+                    self.flush.push(subagent_branch_line(
+                        &agent,
+                        ok,
+                        cost_usd,
+                        &summary,
+                        self.last_width.get(),
+                    ));
+                    self.workflow.on_result(&id, ok, &summary, cost_usd);
+                    return;
+                }
                 self.flush.push(subagent_branch_line(
                     &agent,
                     ok,
@@ -1295,6 +1338,31 @@ impl App {
             }
             PresenterEvent::Temper(label) => self.temper = label,
             PresenterEvent::Effort(effort) => self.effort = effort,
+            PresenterEvent::WorkflowStarted { name } => {
+                self.flush.push(workflow_started_line(name.as_deref()));
+                self.workflow.begin(name);
+            }
+            PresenterEvent::WorkflowPhase { title } => {
+                self.flush.push(workflow_phase_line(&title));
+                self.workflow.on_phase(title);
+            }
+            PresenterEvent::WorkflowLog(msg) => {
+                // Scrollback gets a one-line note (a script can `log()` a whole report — the full
+                // text lives in the view's narration feed, not the transcript).
+                self.flush.push(workflow_log_line(
+                    &msg,
+                    width_cap(self.last_width.get(), 8, 72),
+                ));
+                self.workflow.on_log(msg);
+            }
+            PresenterEvent::WorkflowFinished { ok, summary } => {
+                self.flush.push(workflow_finished_line(
+                    ok,
+                    &summary,
+                    width_cap(self.last_width.get(), 8, 72),
+                ));
+                self.workflow.finish(ok, summary);
+            }
         }
     }
 
@@ -1385,6 +1453,11 @@ impl App {
         if !self.subagents.is_empty() && self.subagents.iter().all(|r| r.done) {
             self.subagents.clear();
             self.subagent_batch_start = 0;
+        }
+        // A workflow run is per-turn: a finished one's view/rows clear so the new turn starts
+        // clean. (`active` should never span turns — kept as a defensive guard.)
+        if !self.workflow.active {
+            self.workflow = Default::default();
         }
         self.activity_focused = false;
         self.activity_idx = 0;
@@ -2095,6 +2168,7 @@ impl App {
         self.subagents.clear();
         self.assay_critics.clear();
         self.assay_verifying = None;
+        self.workflow = Default::default();
         self.viewer = None;
         self.activity_focused = false;
         self.activity_idx = 0;
@@ -2690,6 +2764,46 @@ fn subagent_branch_line(
 }
 
 /// Closes the subagent group box with a total.
+/// Scrollback record of a workflow run (the live rendering is the dedicated workflow view; these
+/// lines are the durable history that remains in the transcript after it closes).
+fn workflow_started_line(name: Option<&str>) -> TextLine<'static> {
+    let label = match name {
+        Some(n) => format!("  ⛓ workflow '{n}' started"),
+        None => "  ⛓ workflow started".to_string(),
+    };
+    TextLine::from(Span::styled(label, Style::default().fg(ORANGE).bold()))
+}
+
+fn workflow_phase_line(title: &str) -> TextLine<'static> {
+    TextLine::from(Span::styled(
+        format!("  ▶ phase: {title}"),
+        Style::default().fg(WARNYEL).bold(),
+    ))
+}
+
+fn workflow_log_line(msg: &str, max: usize) -> TextLine<'static> {
+    let first = msg.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    TextLine::from(vec![
+        Span::styled("  💬 ", Style::default().fg(ACCENT)),
+        Span::styled(truncate(first, max), Style::default().fg(TEXT)),
+    ])
+}
+
+fn workflow_finished_line(ok: bool, summary: &str, max: usize) -> TextLine<'static> {
+    let (glyph, color) = if ok {
+        ("✓", OKGREEN)
+    } else {
+        ("⚠", WARNYEL)
+    };
+    TextLine::from(vec![
+        Span::styled(format!("  ⛓ {glyph} "), Style::default().fg(color).bold()),
+        Span::styled(
+            format!("workflow finished: {}", truncate(summary, max)),
+            Style::default().fg(TEXT),
+        ),
+    ])
+}
+
 fn subagent_footer_line(n: usize, total_usd: f64) -> TextLine<'static> {
     TextLine::from(Span::styled(
         format!("  ╰─ {n} agents · ${total_usd:.4}"),
@@ -2828,7 +2942,7 @@ fn model_pin_row_color(row: &crate::commands::PickerRow, tick: usize) -> Color {
 
 /// Flatten to one line, then delegate to the shared [`forge_types::truncate_ellipsis`] so the
 /// truncation-length semantics stay in lockstep with the rest of the codebase.
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     forge_types::truncate_ellipsis(&s.replace('\n', " "), max)
 }
 
@@ -2855,6 +2969,12 @@ fn width_cap(width: u16, reserve: usize, min: usize) -> usize {
 /// The inline viewport is never resized at runtime — recreating it would corrupt the scrollback.
 /// The stream area shrinks as panels grow but always keeps ≥1 row (MIN_STREAM guarantee).
 pub fn render_live(frame: &mut Frame, app: &App) {
+    // The dedicated workflow view takes over the whole frame while open (auto-opened when a
+    // workflow starts; Esc backgrounds it). Same-terminal rendering, like the activity viewer.
+    if app.workflow.open {
+        crate::workflow_view::render_workflow_view(frame, app);
+        return;
+    }
     // The in-loop activity viewer (full-screen mode) takes over the whole frame, rendered through
     // the SAME terminal as the chat — no nested alternate screen, so it can't collide with it.
     if let Some(v) = &app.viewer {
@@ -2902,10 +3022,14 @@ pub fn render_live(frame: &mut Frame, app: &App) {
         app.tasks_panel_height(),
         panel_avail,
     );
-    let stream_h = avail.saturating_sub(activity_h + task_h);
+    // One-line status band while a live workflow's view is backgrounded (Esc'd away): the run's
+    // only always-visible trace, since its rows don't join the activity panel.
+    let wf_band_h = u16::from(app.workflow.band_visible());
+    let stream_h = avail.saturating_sub(activity_h + task_h + wf_band_h);
 
     let areas = Layout::vertical([
         Constraint::Length(stream_h),
+        Constraint::Length(wf_band_h),
         Constraint::Length(activity_h),
         Constraint::Length(task_h),
         Constraint::Length(PERMISSION_H),
@@ -2955,23 +3079,29 @@ pub fn render_live(frame: &mut Frame, app: &App) {
     if app.effort_slider {
         render_effort_slider(frame, areas[0], app);
     }
+    if wf_band_h > 0 {
+        frame.render_widget(
+            Paragraph::new(crate::workflow_view::workflow_band_line(app)),
+            areas[1],
+        );
+    }
     if activity_h > 0 {
-        render_activity_panel(frame, areas[1], app);
+        render_activity_panel(frame, areas[2], app);
     }
     if task_h > 0 {
         frame.render_widget(
-            Paragraph::new(tasks_panel_lines(&app.tasks, areas[2].height)),
-            areas[2],
+            Paragraph::new(tasks_panel_lines(&app.tasks, areas[3].height)),
+            areas[3],
         );
     }
     if app.prompt.is_some() {
-        render_permission(frame, areas[3], app);
+        render_permission(frame, areas[4], app);
     }
-    render_input(frame, areas[4], app);
+    render_input(frame, areas[5], app);
     if band_h > 0 {
-        render_compact_band(frame, areas[5], app);
+        render_compact_band(frame, areas[6], app);
     }
-    render_statusline(frame, areas[6], app);
+    render_statusline(frame, areas[7], app);
     // Usage overlay renders last so it appears on top of everything.
     render_usage_overlay(frame, app);
     render_mesh_overlay(frame, app);
@@ -3273,7 +3403,7 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Short model label: strip the `provider::` prefix so the panel shows e.g. `opus` not
 /// `anthropic::claude-opus-4-8`-style fully-qualified ids.
-fn model_short(model: Option<&str>) -> String {
+pub(crate) fn model_short(model: Option<&str>) -> String {
     match model {
         Some(m) if !m.is_empty() => m.split("::").last().unwrap_or(m).to_string(),
         _ => "…".to_string(),
@@ -6878,6 +7008,171 @@ mod tests {
 
         // A plain session (no activity / viewer / tasks) writes nothing.
         assert!(App::default().view_snapshot_json().is_none());
+    }
+
+    #[test]
+    fn a_live_workflow_owns_its_agent_rows_and_never_touches_the_activity_panel() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::WorkflowStarted { name: None });
+        assert!(
+            app.workflow.open && app.workflow.active,
+            "the view auto-opens when a workflow starts"
+        );
+        app.apply(PresenterEvent::WorkflowPhase {
+            title: "research".into(),
+        });
+        app.apply(PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "general".into(),
+            task: "dig".into(),
+            model: Some("m".into()),
+            phase: Some("research".into()),
+        });
+        app.apply(PresenterEvent::SubagentProgress {
+            id: "a".into(),
+            snippet: "reading\n".into(),
+        });
+        app.apply(PresenterEvent::SubagentResult {
+            id: "a".into(),
+            agent: "general".into(),
+            ok: true,
+            summary: "found it".into(),
+            cost_usd: 0.01,
+        });
+        // The whole point of the dedicated view: nothing lands in the activity panel.
+        assert!(
+            !app.has_activity(),
+            "workflow rows must not populate the subagent activity panel"
+        );
+        assert_eq!(app.workflow.rows.len(), 1);
+        assert!(app.workflow.rows[0].done && app.workflow.rows[0].ok);
+        assert_eq!(app.workflow.phases[0].title, "research");
+        app.apply(PresenterEvent::WorkflowFinished {
+            ok: true,
+            summary: "report".into(),
+        });
+        assert!(!app.workflow.active);
+        assert!(app.workflow.exists(), "rows stay browsable after the run");
+        // A new user turn clears the finished run.
+        app.on_turn_start();
+        assert!(!app.workflow.exists());
+    }
+
+    #[test]
+    fn a_plain_spawn_agents_batch_still_uses_the_activity_panel() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "general".into(),
+            task: "x".into(),
+            model: Some("m".into()),
+            phase: None,
+        });
+        assert!(
+            app.has_activity(),
+            "no workflow → the panel works as before"
+        );
+        assert!(app.workflow.rows.is_empty());
+    }
+
+    #[test]
+    fn a_backgrounded_live_workflow_shows_the_status_band_until_it_finishes() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::WorkflowStarted {
+            name: Some("audit".into()),
+        });
+        app.apply(PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "general".into(),
+            task: "x".into(),
+            model: Some("m".into()),
+            phase: None,
+        });
+        app.workflow.open = false; // Esc → background
+        assert!(app.workflow.band_visible());
+        let out = screen_wh(&app, 100, LIVE_H);
+        assert!(out.contains("workflow"), "band names the run: {out:?}");
+        assert!(
+            out.contains("^O view"),
+            "band offers the reopen key: {out:?}"
+        );
+        app.apply(PresenterEvent::SubagentResult {
+            id: "a".into(),
+            agent: "general".into(),
+            ok: true,
+            summary: "done".into(),
+            cost_usd: 0.0,
+        });
+        app.apply(PresenterEvent::WorkflowFinished {
+            ok: true,
+            summary: "all good".into(),
+        });
+        assert!(!app.workflow.band_visible(), "no band once the run is over");
+    }
+
+    #[test]
+    fn the_workflow_view_renders_name_phases_rows_totals_and_narration() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::WorkflowStarted {
+            name: Some("audit".into()),
+        });
+        app.apply(PresenterEvent::WorkflowPhase {
+            title: "research".into(),
+        });
+        app.apply(PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "general".into(),
+            task: "scan the repo".into(),
+            model: Some("prov::mini".into()),
+            phase: Some("research".into()),
+        });
+        app.apply(PresenterEvent::SubagentProgress {
+            id: "a".into(),
+            snippet: "reading files".into(),
+        });
+        app.apply(PresenterEvent::SubagentStart {
+            id: "b".into(),
+            agent: "general".into(),
+            task: "check docs".into(),
+            model: Some("prov::mini".into()),
+            phase: Some("research".into()),
+        });
+        app.apply(PresenterEvent::SubagentResult {
+            id: "b".into(),
+            agent: "general".into(),
+            ok: true,
+            summary: "ok".into(),
+            cost_usd: 0.02,
+        });
+        app.apply(PresenterEvent::WorkflowLog("halfway there".into()));
+        app.workflow.anim_tick = 1_000; // reveal settled — everything visible
+        let out = screen_wh(&app, 100, 24);
+        assert!(out.contains("workflow 'audit'"), "header: {out:?}");
+        assert!(out.contains("research"), "phase tree: {out:?}");
+        assert!(out.contains("1/2 agents"), "totals: {out:?}");
+        assert!(out.contains("1 running"), "running count: {out:?}");
+        assert!(out.contains("halfway there"), "narration feed: {out:?}");
+        assert!(out.contains("reading files"), "live activity edge: {out:?}");
+        // The scrollback record still tells the story after the view closes.
+        let flushed = flush_text(&mut app);
+        assert!(flushed.contains("workflow 'audit' started"));
+        assert!(flushed.contains("phase: research"));
+    }
+
+    #[test]
+    fn a_workflow_log_flood_lands_in_the_feed_not_scrollback() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::WorkflowStarted { name: None });
+        // The exact failure seen live: a script `log()`s its entire multi-KB report, which used
+        // to land in scrollback verbatim as one giant warning line.
+        let report = "REPORT LINE\n".repeat(500);
+        app.apply(PresenterEvent::WorkflowLog(report));
+        let flushed = flush_text(&mut app);
+        assert_eq!(
+            flushed.matches("REPORT LINE").count(),
+            1,
+            "scrollback gets one trimmed note, the feed keeps the rest: {flushed:?}"
+        );
     }
 
     #[test]

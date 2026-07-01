@@ -48,6 +48,17 @@ pub enum LiveEvent {
         summary: String,
         cost_usd: f64,
     },
+    WorkflowStarted {
+        name: Option<String>,
+    },
+    WorkflowPhase {
+        title: String,
+    },
+    WorkflowLog(String),
+    WorkflowFinished {
+        ok: bool,
+        summary: String,
+    },
 }
 
 pub fn to_live_event(event: &PresenterEvent) -> Option<LiveEvent> {
@@ -118,6 +129,17 @@ pub fn to_live_event(event: &PresenterEvent) -> Option<LiveEvent> {
             summary: summary.clone(),
             cost_usd: *cost_usd,
         }),
+        PresenterEvent::WorkflowStarted { name } => {
+            Some(LiveEvent::WorkflowStarted { name: name.clone() })
+        }
+        PresenterEvent::WorkflowPhase { title } => Some(LiveEvent::WorkflowPhase {
+            title: title.clone(),
+        }),
+        PresenterEvent::WorkflowLog(msg) => Some(LiveEvent::WorkflowLog(msg.clone())),
+        PresenterEvent::WorkflowFinished { ok, summary } => Some(LiveEvent::WorkflowFinished {
+            ok: *ok,
+            summary: summary.clone(),
+        }),
         _ => None,
     }
 }
@@ -184,5 +206,11 @@ pub fn live_event_to_presenter(event: LiveEvent) -> Option<PresenterEvent> {
             summary,
             cost_usd,
         }),
+        LiveEvent::WorkflowStarted { name } => Some(PresenterEvent::WorkflowStarted { name }),
+        LiveEvent::WorkflowPhase { title } => Some(PresenterEvent::WorkflowPhase { title }),
+        LiveEvent::WorkflowLog(msg) => Some(PresenterEvent::WorkflowLog(msg)),
+        LiveEvent::WorkflowFinished { ok, summary } => {
+            Some(PresenterEvent::WorkflowFinished { ok, summary })
+        }
     }
 }

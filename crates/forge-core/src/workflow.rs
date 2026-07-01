@@ -107,7 +107,11 @@ pub enum WorkflowEvent {
         summary: String,
         cost_usd: f64,
     },
-    /// A `log()` call, or an internal note (e.g. a `phase()` change) — rendered as a plain note.
+    /// A `phase()` transition — the ambient label for subsequent agents changed. A dedicated
+    /// variant (not a `Log` line) so the workflow view can build its phase tree from it directly,
+    /// showing a phase the moment it starts rather than only once its first agent spawns.
+    Phase(String),
+    /// A `log()` call — the raw message; presenters add their own glyph/styling.
     Log(String),
 }
 
@@ -177,7 +181,7 @@ impl WorkflowState {
 }
 
 /// First non-empty line of a result, truncated — mirrors `subagent::summary`'s one-line style.
-fn summary(text: &str) -> String {
+pub(crate) fn summary(text: &str) -> String {
     let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     line.chars().take(120).collect()
 }
@@ -305,7 +309,7 @@ fn log_host_fn(state: Arc<WorkflowState>) -> forge_workflow::HostFunction {
         let state = Arc::clone(&state);
         async move {
             let msg = args.first().and_then(|v| v.as_str()).unwrap_or_default();
-            let _ = state.tx.send(WorkflowEvent::Log(format!("💬 {msg}")));
+            let _ = state.tx.send(WorkflowEvent::Log(msg.to_string()));
             Ok(serde_json::Value::Null)
         }
     })
@@ -325,9 +329,9 @@ fn phase_host_fn(state: Arc<WorkflowState>) -> forge_workflow::HostFunction {
             } else {
                 Some(title.clone())
             };
-            let _ = state
-                .tx
-                .send(WorkflowEvent::Log(format!("▶ phase: {title}")));
+            if !title.is_empty() {
+                let _ = state.tx.send(WorkflowEvent::Phase(title));
+            }
             Ok(serde_json::Value::Null)
         }
     })
@@ -751,6 +755,11 @@ mod tests {
         )
         .await;
         assert!(ok);
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, WorkflowEvent::Phase(t) if t == "research")),
+            "phase() emits a dedicated Phase event for the workflow view's phase tree"
+        );
         let (task, phase) = evs
             .iter()
             .find_map(|e| match e {
