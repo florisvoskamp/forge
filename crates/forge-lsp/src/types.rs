@@ -47,8 +47,8 @@ impl Diagnostic {
         format!(
             "  {}:{}:{}: [{}]{} {}",
             path,
-            self.line + 1,
-            self.character + 1,
+            self.line.saturating_add(1),
+            self.character.saturating_add(1),
             self.severity.as_str(),
             code_part,
             self.message
@@ -132,6 +132,23 @@ mod tests {
         assert_eq!(
             d.format_line("src/main.rs"),
             "  src/main.rs:10:5: [error] (E0001) unused variable"
+        );
+    }
+
+    #[test]
+    fn format_line_near_u32_max_does_not_panic_or_wrap() {
+        // A server reporting a line/character at u32::MAX (e.g. from a truncated u64) must
+        // saturate rather than overflow-panic (debug) or silently wrap to 0 (release).
+        let d = Diagnostic {
+            severity: DiagnosticSeverity::Error,
+            message: "huge position".to_string(),
+            line: u32::MAX,
+            character: u32::MAX,
+            code: None,
+        };
+        assert_eq!(
+            d.format_line("a.rs"),
+            format!("  a.rs:{}:{}: [error] huge position", u32::MAX, u32::MAX)
         );
     }
 

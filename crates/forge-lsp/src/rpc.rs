@@ -2,6 +2,12 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdout;
 
+/// Upper bound on a single LSP message body. Real messages (even large `publishDiagnostics`
+/// batches) are nowhere near this; it exists purely to reject a corrupt/misbehaving server's
+/// bogus `Content-Length` before we `vec![0u8; len]` it, which would otherwise abort the whole
+/// process on allocation failure instead of degrading to "no diagnostics".
+const MAX_CONTENT_LENGTH: usize = 16 * 1024 * 1024;
+
 pub async fn write_msg<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     msg: &Value,
@@ -33,6 +39,9 @@ pub(crate) async fn read_msg_inner<R: tokio::io::AsyncRead + Unpin>(
         }
     }
     let len = content_length?;
+    if len > MAX_CONTENT_LENGTH {
+        return None;
+    }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await.ok()?;
     serde_json::from_slice(&buf).ok()
@@ -103,6 +112,14 @@ mod tests {
         assert!(parse_bytes(b"Content-Length: not-a-number\r\n\r\n{}")
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_content_length_yields_none() {
+        // A bogus/corrupt header claiming far more than MAX_CONTENT_LENGTH must be rejected
+        // before allocating, not passed to `vec![0u8; len]`.
+        let header = format!("Content-Length: {}\r\n\r\n", MAX_CONTENT_LENGTH + 1);
+        assert!(parse_bytes(header.as_bytes()).await.is_none());
     }
 
     #[tokio::test]

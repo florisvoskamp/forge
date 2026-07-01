@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -10,13 +11,21 @@ use forge_config::LspConfig;
 use crate::server::LspServer;
 use crate::types::Diagnostic;
 
+/// A lazily-initialized language-server slot for one `(language, repo-root)` pair, behind its
+/// own lock so a hung server only blocks callers waiting on that same pair.
+type ServerSlot = Arc<Mutex<Option<LspServer>>>;
+
 /// Owns the live language-server processes and routes a file to the right one.
 ///
 /// One server is spawned lazily per `(language, repo-root)` and reused across calls (kept in
 /// `servers`), so repeated diagnostics on the same project don't pay startup each time.
+///
+/// Each entry has its own `Mutex` so a stalled/hung server for one `(language, repo-root)` only
+/// blocks callers waiting on *that* entry; the outer `servers` lock is only ever held briefly to
+/// look up or insert the entry itself, never across the slow spawn/initialize/diagnostics work.
 pub struct LspRegistry {
     config: LspConfig,
-    servers: Mutex<HashMap<(String, PathBuf), LspServer>>,
+    servers: Mutex<HashMap<(String, PathBuf), ServerSlot>>,
 }
 
 impl LspRegistry {
@@ -56,15 +65,26 @@ impl LspRegistry {
         let root_uri = path_to_uri(&root);
         let key = (lang.to_string(), root.clone());
 
-        let mut servers = self.servers.lock().await;
-        if !servers.contains_key(&key) {
+        // Only the map lookup/insert happens under the registry-wide lock; the entry's own
+        // lock (acquired below, after this guard is dropped) is what serializes the actual
+        // spawn/initialize/diagnostics work for that one (language, repo-root) pair.
+        let entry = {
+            let mut servers = self.servers.lock().await;
+            servers
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(None)))
+                .clone()
+        };
+
+        let mut slot = entry.lock().await;
+        if slot.is_none() {
             match LspServer::spawn(&cmd, &args).await {
                 Ok(mut srv) => {
-                    if let Err(e) = srv.initialize(&root_uri).await {
+                    if let Err(e) = srv.initialize(&root_uri, timeout).await {
                         warn!("lsp: initialize failed for {lang}: {e}");
                         return vec![];
                     }
-                    servers.insert(key.clone(), srv);
+                    *slot = Some(srv);
                 }
                 Err(e) => {
                     warn!("lsp: spawn failed for {lang} ({cmd}): {e}");
@@ -72,7 +92,7 @@ impl LspRegistry {
                 }
             }
         }
-        let server = servers.get_mut(&key).unwrap();
+        let server = slot.as_mut().unwrap();
 
         if let Err(e) = server.did_open(&uri, lang, &text).await {
             warn!("lsp: did_open failed: {e}");
@@ -164,7 +184,24 @@ fn path_to_uri(path: &Path) -> String {
     if !s.starts_with('/') {
         s.insert(0, '/');
     }
-    format!("file://{s}")
+    format!("file://{}", percent_encode_path(&s))
+}
+
+/// Percent-encode a URI path per RFC 3986, leaving `/` (segment separator) and `:` (needed for
+/// Windows drive letters, e.g. `/C:/...`) unescaped. Without this, a path containing a space or
+/// other reserved character never matches the (typically percent-encoded) URI a language server
+/// echoes back in `publishDiagnostics`, silently dropping diagnostics for that file forever.
+fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -351,6 +388,15 @@ mod tests {
         // leading slash before the drive letter, never file://C:\... .
         let uri = path_to_uri(Path::new(r"C:\home\user\main.rs"));
         assert_eq!(uri, "file:///C:/home/user/main.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_to_uri_percent_encodes_reserved_characters() {
+        // Spaces and other reserved/unsafe URI characters must be percent-encoded, or the
+        // language server's own (encoded) echoed URI in publishDiagnostics never matches ours.
+        let uri = path_to_uri(Path::new("/home/user/My Project/a#b%c?.rs"));
+        assert_eq!(uri, "file:///home/user/My%20Project/a%23b%25c%3F.rs");
     }
 
     #[test]

@@ -21,6 +21,7 @@ impl LspServer {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
             .spawn()?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = BufReader::new(child.stdout.take().expect("stdout piped"));
@@ -38,7 +39,7 @@ impl LspServer {
         id
     }
 
-    pub async fn initialize(&mut self, root_uri: &str) -> std::io::Result<()> {
+    pub async fn initialize(&mut self, root_uri: &str, timeout: Duration) -> std::io::Result<()> {
         let id = self.new_id();
         let req = json!({
             "jsonrpc": "2.0",
@@ -55,9 +56,33 @@ impl LspServer {
             }
         });
         write_msg(&mut self.stdin, &req).await?;
-        while let Some(msg) = read_msg(&mut self.stdout).await {
-            if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
-                break;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "lsp: initialize response timed out",
+                ));
+            }
+            match tokio::time::timeout(remaining, read_msg(&mut self.stdout)).await {
+                Ok(Some(msg)) => {
+                    if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "lsp: server closed stdout during initialize",
+                    ))
+                }
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "lsp: initialize response timed out",
+                    ))
+                }
             }
         }
         let notif = json!({
