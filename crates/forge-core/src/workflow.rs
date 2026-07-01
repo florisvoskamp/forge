@@ -92,6 +92,9 @@ pub enum WorkflowEvent {
         agent: String,
         task: String,
         model: String,
+        /// The active `phase()` label (or `opts.phase` override) at the time this agent started,
+        /// if any — a real field (not embedded in `task`) so the TUI can group by it.
+        phase: Option<String>,
     },
     AgentProgress {
         id: String,
@@ -228,16 +231,14 @@ fn agent_host_fn(state: Arc<WorkflowState>) -> forge_workflow::HostFunction {
                 .and_then(|o| o.get("phase"))
                 .and_then(|p| p.as_str())
                 .map(str::to_string)
-                .or_else(|| state.current_phase.lock().unwrap().clone());
-            let display_task = match &phase {
-                Some(p) if !p.is_empty() => format!("[{p}] {}", resolved.task),
-                _ => resolved.task.clone(),
-            };
+                .or_else(|| state.current_phase.lock().unwrap().clone())
+                .filter(|p| !p.is_empty());
             let _ = state.tx.send(WorkflowEvent::AgentStart {
                 id: child_id.clone(),
                 agent: resolved.name.clone(),
-                task: display_task,
+                task: resolved.task.clone(),
                 model: model.clone(),
+                phase: phase.clone(),
             });
 
             // Same ordering as `orchestrate()`: acquire the provider sub-cap FIRST (without
@@ -680,14 +681,17 @@ mod tests {
         )
         .await;
         assert!(ok);
-        let start = evs
+        let (task, phase) = evs
             .iter()
             .find_map(|e| match e {
-                WorkflowEvent::AgentStart { task, .. } => Some(task.clone()),
+                WorkflowEvent::AgentStart { task, phase, .. } => {
+                    Some((task.clone(), phase.clone()))
+                }
                 _ => None,
             })
             .unwrap();
-        assert_eq!(start, "[research] look into it");
+        assert_eq!(task, "look into it", "task text is unprefixed");
+        assert_eq!(phase.as_deref(), Some("research"));
     }
 
     #[tokio::test]

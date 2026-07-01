@@ -3025,6 +3025,7 @@ Output ONLY that sentence — no preamble, no quotation marks.";
                                     agent,
                                     task,
                                     model: None,
+                                    phase: None,
                                 })
                             }
                             StreamEvent::SubagentProgress { id, snippet } => {
@@ -5383,6 +5384,7 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                 agent: agent.to_string(),
                 task: task.to_string(),
                 model: Some(model.to_string()),
+                phase: None,
             }),
             subagent::Lifecycle::Progress { id, snippet } => {
                 presenter.emit(PresenterEvent::SubagentProgress {
@@ -5497,11 +5499,13 @@ hook — do NOT add Claude/Codex/Anthropic co-author lines yourself.\n\
                 agent,
                 task,
                 model,
+                phase,
             } => presenter.emit(PresenterEvent::SubagentStart {
                 id,
                 agent,
                 task,
                 model: Some(model),
+                phase,
             }),
             workflow::WorkflowEvent::AgentProgress { id, snippet } => {
                 presenter.emit(PresenterEvent::SubagentProgress { id, snippet })

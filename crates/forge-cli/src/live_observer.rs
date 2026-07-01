@@ -35,6 +35,7 @@ pub enum LiveEvent {
         agent: String,
         task: String,
         model: Option<String>,
+        phase: Option<String>,
     },
     SubagentProgress {
         id: String,
@@ -92,11 +93,13 @@ pub fn to_live_event(event: &PresenterEvent) -> Option<LiveEvent> {
             agent,
             task,
             model,
+            phase,
         } => Some(LiveEvent::SubagentStart {
             id: id.clone(),
             agent: agent.clone(),
             task: task.clone(),
             model: model.clone(),
+            phase: phase.clone(),
         }),
         PresenterEvent::SubagentProgress { id, snippet } => Some(LiveEvent::SubagentProgress {
             id: id.clone(),
@@ -157,11 +160,13 @@ pub fn live_event_to_presenter(event: LiveEvent) -> Option<PresenterEvent> {
             agent,
             task,
             model,
+            phase,
         } => Some(PresenterEvent::SubagentStart {
             id,
             agent,
             task,
             model,
+            phase,
         }),
         LiveEvent::SubagentProgress { id, snippet } => {
             Some(PresenterEvent::SubagentProgress { id, snippet })

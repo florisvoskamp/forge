@@ -176,6 +176,9 @@ pub enum PresenterEvent {
         /// The model the child routed to, when known up front (native path). `None` on the
         /// provider-stream path where the model isn't surfaced.
         model: Option<String>,
+        /// A workflow-script `phase()` label, if any (docs/rfcs/forge-workflow.md) — groups
+        /// related rows together in the activity panel. `None` for a plain `spawn_agents` batch.
+        phase: Option<String>,
     },
     /// A live activity snippet from a still-running subagent (streamed text/reasoning).
     SubagentProgress {

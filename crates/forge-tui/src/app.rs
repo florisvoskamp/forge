@@ -513,6 +513,7 @@ impl App {
                     agent: r.agent.clone(),
                     task: r.task.clone(),
                     model: r.model.clone(),
+                    phase: r.phase.clone(),
                     last: r.last.clone(),
                     log: Vec::new(),
                     done: r.done,
@@ -560,6 +561,10 @@ struct SubRow {
     task: String,
     /// The model this child routed to (shown in the activity panel). `None` until known.
     model: Option<String>,
+    /// A workflow-script `phase()` label, if any (docs/rfcs/forge-workflow.md) — rows sharing a
+    /// phase are grouped together under a header in the activity panel. `None` for a plain
+    /// `spawn_agents` batch (unchanged, ungrouped rendering).
+    phase: Option<String>,
     /// Trailing edge of the child's streamed activity (RFC subagent-orchestration Phase 3b).
     last: String,
     /// Recent progress snippets, newest last, for the expandable detail view. Bounded so a chatty
@@ -597,6 +602,9 @@ pub struct ActivitySummary {
     pub title: String,
     pub subtitle: String,
     pub model: Option<String>,
+    /// A workflow-script `phase()` label, if any (docs/rfcs/forge-workflow.md) — consecutive
+    /// entries sharing a phase are grouped under one header in the activity panel.
+    pub phase: Option<String>,
     pub status: ActivityStatus,
     pub cost: f64,
     pub line_count: usize,
@@ -668,6 +676,7 @@ pub struct SubagentSnapshot {
     pub agent: String,
     pub task: String,
     pub model: Option<String>,
+    pub phase: Option<String>,
     pub last: String,
     pub log: Vec<String>,
     pub done: bool,
@@ -1050,6 +1059,7 @@ impl App {
                 agent,
                 task,
                 model,
+                phase,
             } => {
                 // A new batch begins once every existing row has already finished (or there are
                 // none yet) — open a fresh scrollback header for it. Rows themselves are NOT
@@ -1070,6 +1080,7 @@ impl App {
                     agent,
                     task,
                     model,
+                    phase,
                     last: String::new(),
                     log: Vec::new(),
                     done: false,
@@ -1302,7 +1313,9 @@ impl App {
     }
 
     /// Rows the sticky activity panel wants in the live region (0 = hidden). Header + up to
-    /// [`ACTIVITY_PANEL_MAX`] entry rows + an overflow line.
+    /// [`ACTIVITY_PANEL_MAX`] entry rows + an overflow line + one line per workflow-script
+    /// `phase()` transition among those rows (see `needs_phase_header`) — a plain `spawn_agents`
+    /// batch has no phases, so this term is always 0 there, matching the old reservation exactly.
     pub fn activity_panel_height(&self) -> u16 {
         let n = self.activity_len();
         if n == 0 {
@@ -1310,7 +1323,16 @@ impl App {
         }
         let shown = n.min(ACTIVITY_PANEL_MAX);
         let overflow = u16::from(n > ACTIVITY_PANEL_MAX);
-        1 + shown as u16 + overflow
+        let views = self.activity_summaries();
+        let mut last_phase: Option<&str> = None;
+        let mut headers = 0u16;
+        for v in views.iter().take(shown) {
+            if needs_phase_header(last_phase, v) {
+                headers += 1;
+            }
+            last_phase = v.phase.as_deref();
+        }
+        1 + shown as u16 + overflow + headers
     }
 
     /// Keep `activity_idx` within range as the list grows/shrinks; drop focus when empty.
@@ -1355,6 +1377,7 @@ impl App {
             title: "main chat".to_string(),
             subtitle: String::new(),
             model: self.routing.as_ref().map(|r| r.model.clone()),
+            phase: None,
             status: if self.busy {
                 ActivityStatus::Running
             } else {
@@ -1369,6 +1392,7 @@ impl App {
                 title: r.agent.clone(),
                 subtitle: r.task.clone(),
                 model: r.model.clone(),
+                phase: r.phase.clone(),
                 status: if r.done {
                     ActivityStatus::Done
                 } else {
@@ -1394,6 +1418,7 @@ impl App {
                 title: c.lens.clone(),
                 subtitle,
                 model: c.model.clone(),
+                phase: None,
                 status,
                 cost: c.cost_usd,
                 line_count: c.output.lines().count(),
@@ -1882,6 +1907,7 @@ impl App {
                     agent: r.agent.clone(),
                     task: r.task.clone(),
                     model: r.model.clone(),
+                    phase: r.phase.clone(),
                     last: r.last.clone(),
                     log: r.log.clone(),
                     done: r.done,
@@ -1908,6 +1934,7 @@ impl App {
                 agent: r.agent,
                 task: r.task,
                 model: r.model,
+                phase: r.phase,
                 last: r.last,
                 log: r.log,
                 done: r.done,
@@ -3218,6 +3245,13 @@ fn model_short(model: Option<&str>) -> String {
 /// The unified sticky activity panel: lists the main chat plus every subagent and assay critic in
 /// one navigable list. When focused (Ctrl+O) the selected row is highlighted and ↑↓ move it; Enter
 /// opens that entry's full-screen transcript. Themed per kind: ● main chat, ⚒ subagent, ⚖ critic.
+/// Whether rendering `v` (given the previous shown row's phase was `prev`) needs a phase-header
+/// line first — a workflow-script `phase()` transition (docs/rfcs/forge-workflow.md). Never true
+/// for `None` phases, so a plain `spawn_agents` batch (every row's phase is `None`) never groups.
+fn needs_phase_header(prev: Option<&str>, v: &ActivitySummary) -> bool {
+    matches!(v.phase.as_deref(), Some(p) if Some(p) != prev)
+}
+
 fn render_activity_panel(frame: &mut Frame, area: Rect, app: &App) {
     if area.height == 0 {
         return;
@@ -3254,14 +3288,42 @@ fn render_activity_panel(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         0
     };
-    let overflow = views.len() > start + body_h;
-    let row_budget = if overflow {
-        body_h.saturating_sub(1)
-    } else {
-        body_h
-    };
 
-    for (i, v) in views.iter().enumerate().skip(start).take(row_budget) {
+    // Greedily take rows starting at `start` until `body_h` lines are used, accounting for the
+    // extra line a `phase()` transition costs (NOT just a plain view count — a phase header is an
+    // additional line the naive "1 view = 1 line" budget doesn't know about). Reserves 1 line for
+    // a "+N more" hint unless the view being considered is the very last one overall (then
+    // nothing will be hidden, so no reservation is needed).
+    let mut end = start.min(views.len());
+    let mut used = 0usize;
+    let mut last_phase: Option<&str> = None;
+    while end < views.len() {
+        let v = &views[end];
+        let cost = 1 + usize::from(needs_phase_header(last_phase, v));
+        let reserve = usize::from(end + 1 < views.len());
+        if used + cost + reserve > body_h {
+            break;
+        }
+        used += cost;
+        last_phase = v.phase.as_deref();
+        end += 1;
+    }
+    let overflow = end < views.len();
+
+    // Workflow-script `phase()` groups (docs/rfcs/forge-workflow.md): a header line is inserted
+    // whenever the phase changes from the previous VISIBLE row — purely additive to `lines`, never
+    // counted as its own `i`, so `activity_idx`/Ctrl+O/Enter-to-zoom indexing is untouched. `None`
+    // phases (every row in a plain `spawn_agents` batch) never trigger a header, so this is a
+    // no-op for anything that isn't a workflow script.
+    let mut last_phase: Option<&str> = None;
+    for (i, v) in views.iter().enumerate().skip(start).take(end - start) {
+        if needs_phase_header(last_phase, v) {
+            lines.push(TextLine::from(Span::styled(
+                format!("  ▶ {}", v.phase.as_deref().unwrap_or_default()),
+                Style::default().fg(WARNYEL).bold(),
+            )));
+        }
+        last_phase = v.phase.as_deref();
         let selected = focused && i == app.activity_idx;
         let marker = if selected { "▸" } else { " " };
         let (kind_glyph, kind_color) = match v.kind {
@@ -3308,7 +3370,7 @@ fn render_activity_panel(frame: &mut Frame, area: Rect, app: &App) {
         ]));
     }
     if overflow {
-        let hidden = views.len() - (start + row_budget);
+        let hidden = views.len() - end;
         lines.push(TextLine::from(Span::styled(
             format!("    … +{hidden} more"),
             Style::default().fg(DIM),
@@ -5230,12 +5292,14 @@ mod tests {
             agent: "reviewer".into(),
             task: "review the diff".into(),
             model: Some("anthropic::opus".into()),
+            phase: None,
         });
         app.apply(PresenterEvent::SubagentStart {
             id: "b".into(),
             agent: "general".into(),
             task: "find call sites".into(),
             model: Some("groq::llama".into()),
+            phase: None,
         });
 
         // Both children appear in the unified activity list while running.
@@ -6140,6 +6204,7 @@ mod tests {
             agent: "reviewer".into(),
             task: "review the diff".into(),
             model: Some("anthropic::opus".into()),
+            phase: None,
         });
         app.apply(PresenterEvent::AssistantDelta("thinking out loud".into()));
         let s = screen(&app);
@@ -6159,6 +6224,7 @@ mod tests {
             agent: "reviewer".into(),
             task: "review the diff".into(),
             model: Some("anthropic::opus".into()),
+            phase: None,
         });
         assert_eq!(app.running_subagents(), 1);
         let s = screen(&app);
@@ -6201,6 +6267,7 @@ mod tests {
             agent: "researcher".into(),
             task: "survey the codebase".into(),
             model: Some("anthropic::opus".into()),
+            phase: None,
         });
         app.apply(PresenterEvent::SubagentResult {
             id: "phase1-a".into(),
@@ -6221,6 +6288,7 @@ mod tests {
             agent: "implementer".into(),
             task: "apply the fix".into(),
             model: Some("anthropic::sonnet".into()),
+            phase: None,
         });
         assert_eq!(
             app.subagents.len(),
@@ -6249,6 +6317,63 @@ mod tests {
         assert!(
             app.subagents.is_empty(),
             "on_turn_start still clears at the real turn boundary"
+        );
+    }
+
+    #[test]
+    fn activity_panel_groups_workflow_phases_with_header_lines() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "researcher".into(),
+            task: "survey the codebase".into(),
+            model: Some("anthropic::opus".into()),
+            phase: Some("research".into()),
+        });
+        app.apply(PresenterEvent::SubagentStart {
+            id: "b".into(),
+            agent: "researcher2".into(),
+            task: "survey more".into(),
+            model: Some("anthropic::opus".into()),
+            phase: Some("research".into()),
+        });
+        app.apply(PresenterEvent::SubagentStart {
+            id: "c".into(),
+            agent: "implementer".into(),
+            task: "apply the fix".into(),
+            model: Some("anthropic::sonnet".into()),
+            phase: Some("implement".into()),
+        });
+        // The default test screen's activity panel is only a few rows tall — too short to fit 3
+        // rows + 2 phase headers alongside the input box/statusline. Use a taller one.
+        let s = screen_wh(&app, 100, 30);
+        assert!(s.contains("▶ research"), "research phase header shown: {s}");
+        assert!(
+            s.contains("▶ implement"),
+            "implement phase header shown: {s}"
+        );
+        // Exactly one header per phase — the second `research` row must NOT repeat the header.
+        assert_eq!(
+            s.matches("▶ research").count(),
+            1,
+            "header shown once per phase, not once per row: {s}"
+        );
+    }
+
+    #[test]
+    fn activity_panel_shows_no_phase_headers_for_a_plain_spawn_agents_batch() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::SubagentStart {
+            id: "a".into(),
+            agent: "reviewer".into(),
+            task: "review the diff".into(),
+            model: Some("anthropic::opus".into()),
+            phase: None,
+        });
+        let s = screen(&app);
+        assert!(
+            !s.contains('▶'),
+            "no phase header glyph for a plain batch: {s}"
         );
     }
 
@@ -6319,6 +6444,7 @@ mod tests {
             agent: "general".into(),
             task: "find call sites".into(),
             model: Some("groq::llama".into()),
+            phase: None,
         });
         // More progress than the old 200-snippet cap — the full transcript must be kept. Each
         // snippet ends in a newline so the line-assembler keeps them as distinct lines.
@@ -6364,6 +6490,7 @@ mod tests {
             agent: "general".into(),
             task: "next".into(),
             model: None,
+            phase: None,
         });
         let views = app.activity_views();
         assert_eq!(views.len(), 3, "main chat + both batches' subagents");
@@ -6551,12 +6678,14 @@ mod tests {
             agent: "general".into(),
             task: "x".into(),
             model: Some("m".into()),
+            phase: None,
         });
         app.apply(crate::PresenterEvent::SubagentStart {
             id: "b".into(),
             agent: "general".into(),
             task: "y".into(),
             model: Some("m".into()),
+            phase: None,
         });
         app.open_viewer(1);
         assert_eq!(app.viewer.as_ref().unwrap().selected, 1);
@@ -6587,6 +6716,7 @@ mod tests {
             agent: "general".into(),
             task: "scan".into(),
             model: Some("opus".into()),
+            phase: None,
         });
         app.apply(crate::PresenterEvent::SubagentProgress {
             id: "a".into(),
