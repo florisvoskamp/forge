@@ -1,0 +1,15 @@
+[package]
+name = "forge-agent-workflow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sandboxed JS workflow-script engine (agent/pipeline/parallel/phase) for Forge's mesh-routed multi-agent orchestration."
+repository.workspace = true
+
+[lib]
+name = "forge_workflow"
+
+[dependencies]
+tokio = { workspace = true }
+rquickjs = { version = "0.12", features = ["futures", "parallel"] }
