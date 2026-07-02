@@ -52,7 +52,9 @@ pub fn run_workflow_spec() -> ToolSpec {
             the script as a sequence of statements (it runs inside an async function) using real \
             control flow — loops, conditionals, accumulation across rounds — for genuinely \
             dynamic multi-step work; use `agent()` directly for a single subtask, `spawn_agents` \
-            for simple one-shot fan-out."
+            for simple one-shot fan-out. ALWAYS end the script with `return <final result>` — \
+            that value becomes this tool's result (a script that returns nothing falls back to \
+            an auto-generated digest of the agents' summaries)."
             .to_string(),
         schema: serde_json::json!({
             "type": "object",
@@ -424,14 +426,26 @@ pub async fn run(
     tokio::pin!(script_fut);
 
     let mut all_ok = true;
+    // Every agent's (name, ok, one-line summary), kept so a script that returns nothing still
+    // yields a real result (see `result_digest`).
+    let mut agent_results: Vec<(String, bool, String)> = Vec::new();
+    let mut note = |ev: &WorkflowEvent| {
+        if let WorkflowEvent::AgentDone {
+            agent, ok, summary, ..
+        } = ev
+        {
+            if !*ok {
+                all_ok = false;
+            }
+            agent_results.push((agent.clone(), *ok, summary.clone()));
+        }
+    };
     let result = loop {
         tokio::select! {
             biased;
             msg = rx.recv() => {
                 if let Some(ev) = msg {
-                    if let WorkflowEvent::AgentDone { ok: false, .. } = &ev {
-                        all_ok = false;
-                    }
+                    note(&ev);
                     on_event(ev);
                 }
             }
@@ -442,16 +456,56 @@ pub async fn run(
     };
     // Drain anything buffered between the script's last event and its future resolving.
     while let Ok(ev) = rx.try_recv() {
-        if let WorkflowEvent::AgentDone { ok: false, .. } = &ev {
-            all_ok = false;
-        }
+        note(&ev);
         on_event(ev);
     }
 
     match result {
+        // A script that ends without `return` resolves to `undefined` (JSON null) — seen live:
+        // the authored script did all its work, the tool result became the literal string
+        // "null", and the parent model relayed an empty answer. Substitute a digest of the
+        // agents' own summaries so the run ALWAYS produces something relayable.
+        Ok(value) if returned_nothing(&value) => Ok((
+            serde_json::Value::String(result_digest(&agent_results)),
+            all_ok,
+        )),
         Ok(value) => Ok((value, all_ok)),
         Err(e) => Ok((serde_json::Value::String(format!("error: {e}")), false)),
     }
+}
+
+/// `undefined`/`null`/whitespace-only — nothing a model (or the `/workflow run` finish note)
+/// could relay.
+fn returned_nothing(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// Fallback tool result for a script that returned nothing: a digest built from the agents'
+/// own one-line summaries, so the parent model still has real content to relay.
+fn result_digest(results: &[(String, bool, String)]) -> String {
+    if results.is_empty() {
+        return "The workflow script finished but returned no value and ran no agents.".to_string();
+    }
+    let failed = results.iter().filter(|(_, ok, _)| !ok).count();
+    const MAX: usize = 30;
+    let mut out = format!(
+        "The workflow script finished but returned no value (end scripts with `return <result>`). \
+         Digest of its {} agent result(s) ({} ok, {failed} failed):",
+        results.len(),
+        results.len() - failed,
+    );
+    for (i, (agent, ok, summary)) in results.iter().take(MAX).enumerate() {
+        let mark = if *ok { "✓" } else { "✗" };
+        out.push_str(&format!("\n{}. {mark} [{agent}] {summary}", i + 1));
+    }
+    if results.len() > MAX {
+        out.push_str(&format!("\n… and {} more", results.len() - MAX));
+    }
+    out
 }
 
 /// Runs a SAVED `.forge/workflows/<name>.js` script directly — the `/workflow run <name> [args]`
@@ -788,6 +842,68 @@ mod tests {
         assert!(evs
             .iter()
             .any(|e| matches!(e, WorkflowEvent::Log(m) if m.contains("hello from the script"))));
+    }
+
+    /// Regression: seen live — an authored script did all its work but had no `return`, so the
+    /// tool result was the literal string "null" and the parent model relayed an empty answer.
+    #[tokio::test]
+    async fn a_script_with_no_return_still_yields_an_agent_digest_result() {
+        let (value, ok, _evs) = run_test_workflow(
+            Arc::new(EchoProvider),
+            "openai::gpt-test",
+            r#"await agent("do the thing");"#, // no `return`
+        )
+        .await;
+        assert!(ok);
+        let text = value.as_str().expect("digest is a string");
+        assert!(
+            text.contains("returned no value"),
+            "explains itself: {text}"
+        );
+        assert!(
+            text.contains("child done"),
+            "carries the agent's own summary: {text}"
+        );
+        assert!(text.contains("1 ok, 0 failed"), "counts: {text}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_string_return_also_falls_back_to_the_digest() {
+        let (value, ok, _evs) = run_test_workflow(
+            Arc::new(EchoProvider),
+            "openai::gpt-test",
+            r#"await agent("do the thing"); return "  ";"#,
+        )
+        .await;
+        assert!(ok);
+        assert!(value.as_str().unwrap().contains("child done"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_return_value_is_untouched() {
+        let (value, ok, _evs) = run_test_workflow(
+            Arc::new(EchoProvider),
+            "openai::gpt-test",
+            r#"await agent("x"); return "my own answer";"#,
+        )
+        .await;
+        assert!(ok);
+        assert_eq!(
+            value,
+            serde_json::Value::String("my own answer".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_returnless_script_with_no_agents_says_so() {
+        let (value, ok, _evs) = run_test_workflow(
+            Arc::new(EchoProvider),
+            "openai::gpt-test",
+            r#"const x = 1;"#,
+        )
+        .await;
+        assert!(ok);
+        assert!(value.as_str().unwrap().contains("ran no agents"));
     }
 
     #[tokio::test]
