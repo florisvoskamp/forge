@@ -758,6 +758,10 @@ pub struct Session {
     /// In-session reasoning-effort pin (`/effort <level>`). When set, forwarded to the provider
     /// as a `ReasoningEffort` hint each turn. `None` = provider default (no hint sent).
     pinned_effort: Option<EffortLevel>,
+    /// Whether white-hot effort's standing orchestration guidance has been injected this session
+    /// (docs/features/whitehot-effort.md). One-shot per pin: re-armed by `set_effort` on any
+    /// change, so toggling away and back re-injects for the new stretch of the transcript.
+    whitehot_guidance_injected: bool,
     /// In-session routing-tier override (the `tier_up`/`tier_down` keybinds). When set, it biases
     /// the mesh to route the next turn at this tier instead of the classifier's pick — unless a
     /// per-turn `tier_override` (a command/skill `tier:` hint) is passed, which still wins. `None`
@@ -959,6 +963,7 @@ impl Session {
             skills: None,
             pinned_model: None,
             pinned_effort: None,
+            whitehot_guidance_injected: false,
             pinned_tier: None,
             pending_hints: vec![],
             always_compact_on_switch: false,
@@ -1016,6 +1021,10 @@ impl Session {
 
     /// Set (or clear) the in-session reasoning-effort pin. `None` returns to the provider default.
     pub fn set_effort(&mut self, e: Option<EffortLevel>) {
+        if e != self.pinned_effort {
+            // Entering (or re-entering) white-hot re-arms its one-shot guidance injection.
+            self.whitehot_guidance_injected = false;
+        }
         self.pinned_effort = e;
     }
 
@@ -3936,6 +3945,23 @@ Output ONLY that sentence — no preamble, no quotation marks.";
             self.store
                 .add_message(&self.id, gseq, Role::System, g, None)?;
             self.transcript.push(Message::system(g));
+        }
+
+        // White-hot effort (docs/features/whitehot-effort.md): xhigh reasoning PLUS a standing
+        // orchestration instruction — injected once per pin (set_effort re-arms on change) so
+        // repeated turns don't accumulate identical blocks.
+        if self.pinned_effort == Some(EffortLevel::WhiteHot) && !self.whitehot_guidance_injected {
+            let gseq = self.next_seq();
+            self.store.add_message(
+                &self.id,
+                gseq,
+                Role::System,
+                workflow::WHITEHOT_GUIDANCE,
+                None,
+            )?;
+            self.transcript
+                .push(Message::system(workflow::WHITEHOT_GUIDANCE));
+            self.whitehot_guidance_injected = true;
         }
 
         // Inject the project AGENTS.md as a standing system prompt on the first turn of a fresh

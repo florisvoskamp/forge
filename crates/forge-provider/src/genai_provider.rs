@@ -987,7 +987,9 @@ impl Provider for GenAiProvider {
                     EffortLevel::Low => ReasoningEffort::Low,
                     EffortLevel::Medium => ReasoningEffort::Medium,
                     EffortLevel::High => ReasoningEffort::High,
-                    EffortLevel::XHigh => ReasoningEffort::XHigh,
+                    // Providers top out at xhigh — WhiteHot's extra lift is orchestration
+                    // guidance in forge-core, not a provider knob.
+                    EffortLevel::XHigh | EffortLevel::WhiteHot => ReasoningEffort::XHigh,
                 };
                 options = options.with_reasoning_effort(re);
                 reasoning_engaged = true;

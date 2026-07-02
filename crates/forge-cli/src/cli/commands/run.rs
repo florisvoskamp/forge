@@ -1628,7 +1628,8 @@ pub(crate) async fn run_chat_tui(
                         Some(EffortLevel::Low) => Some(EffortLevel::Medium),
                         Some(EffortLevel::Medium) => Some(EffortLevel::High),
                         Some(EffortLevel::High) => Some(EffortLevel::XHigh),
-                        Some(EffortLevel::XHigh) => None,
+                        Some(EffortLevel::XHigh) => Some(EffortLevel::WhiteHot),
+                        Some(EffortLevel::WhiteHot) => None,
                     };
                     app.effort = next;
                     // `try_lock` when available (idle), else fire-and-forget — same reasoning as

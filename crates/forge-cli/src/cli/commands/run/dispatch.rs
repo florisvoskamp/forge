@@ -943,8 +943,11 @@ and run it with the `run_workflow` tool. Use `phase(title)` to label logical sta
 and plain `agent(prompt, opts)` for a single subtask — every one of these returns a Promise and \
 must be awaited. Write real control flow (loops, conditionals, accumulation across rounds) for \
 genuinely dynamic multi-step work; if the goal is just one or two independent subtasks, prefer \
-`spawn_agents` instead — that's what it's for. Always end the script with `return <final \
-result>` so the run yields a relayable answer.\n\nGoal: {goal}"
+`spawn_agents` instead — that's what it's for. Parse agent output defensively: agents return \
+prose, so ask discovery agents for one item per line with no commentary and no code fences, \
+split on newlines (never JSON.parse free-form prose), filter out empty or 'null' items before \
+fanning out, and never interpolate a possibly-null value into an agent prompt. Always end the \
+script with `return <final result>` so the run yields a relayable answer.\n\nGoal: {goal}"
                         ),
                         guidance: Vec::new(),
                         tier: Some(forge_types::TaskTier::Complex),
