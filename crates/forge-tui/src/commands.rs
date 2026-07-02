@@ -142,8 +142,8 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "effort",
-        desc: "pin the reasoning-effort level for this session (low/medium/high/xhigh), or clear",
-        usage: "/effort [low|medium|high|xhigh]",
+        desc: "pin the reasoning-effort level (low→xhigh, or whitehot: xhigh + auto-workflows), or clear",
+        usage: "/effort [low|medium|high|xhigh|whitehot]",
     },
     Command {
         name: "remember",
@@ -989,7 +989,10 @@ mod tests {
     #[test]
     fn arg_values_parses_fixed_enums_only() {
         // Clean `a|b|c` enum → parsed.
-        assert_eq!(arg_values("effort"), vec!["low", "medium", "high", "xhigh"]);
+        assert_eq!(
+            arg_values("effort"),
+            vec!["low", "medium", "high", "xhigh", "whitehot"]
+        );
         // Freeform args (`/model [<id>]`, `/replay <id> …`) → no fixed set.
         assert!(arg_values("model").is_empty());
         assert!(arg_values("replay").is_empty());

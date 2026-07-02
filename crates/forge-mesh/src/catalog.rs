@@ -7,6 +7,17 @@ use serde::{Deserialize, Serialize};
 
 use forge_types::{EffortLevel, TaskTier};
 
+/// Integer bench-score band for effort-biased ranking. Banding — rather than the old pairwise
+/// "prefer the higher score when the gap is ≥ 1.0" early-return — keeps the sort comparator a
+/// TOTAL order: the pairwise rule was intransitive (a within 1 of b, b within 1 of c, yet a and
+/// c more than 1 apart yields contradictory orderings) and panicked Rust's sort with
+/// "user-provided comparison function does not correctly implement a total order" the first time
+/// a white-hot turn ranked a full multi-hundred-model catalog. Unbenched models (`None`) band to
+/// `i64::MIN`, sorting below every benched model at high effort — proven quality was the ask.
+fn bench_band(score: Option<f64>) -> i64 {
+    score.map(|v| v.floor() as i64).unwrap_or(i64::MIN)
+}
+
 use crate::bench::BenchmarkScores;
 use crate::capability::{capability_score_b, is_frontier_b, CAPABLE_BENCH_THRESHOLD};
 use crate::pricing::Pricing;
@@ -625,14 +636,17 @@ impl ModelCatalog {
 
         let active_effort = effort.unwrap_or(EffortLevel::Medium);
         scored.sort_by(|a, b| match active_effort {
-            EffortLevel::High | EffortLevel::XHigh => {
-                if let (Some(sa), Some(sb)) = (a.bench_score, b.bench_score) {
-                    if (sa - sb).abs() >= 1.0 {
-                        return sb.total_cmp(&sa);
-                    }
-                }
-                b.route_score
-                    .total_cmp(&a.route_score)
+            EffortLevel::High | EffortLevel::XHigh | EffortLevel::WhiteHot => {
+                // Compare by integer bench-score BAND first, not a pairwise "gap ≥ 1.0"
+                // early-return: the pairwise rule was intransitive (a within 1 of b, b within
+                // 1 of c, but a and c more than 1 apart → contradictory orderings) and panicked
+                // Rust's sort with "comparison function does not correctly implement a total
+                // order" the first time a white-hot turn ranked a full catalog. Unbenched
+                // models (no band) sort below benched ones — at high effort you asked for
+                // proven quality.
+                bench_band(b.bench_score)
+                    .cmp(&bench_band(a.bench_score))
+                    .then_with(|| b.route_score.total_cmp(&a.route_score))
                     .then_with(|| a.cost_class.cmp(&b.cost_class))
                     .then_with(|| a.provider_rotation.cmp(&b.provider_rotation))
                     .then_with(|| a.model_weight.cmp(&b.model_weight))
@@ -640,11 +654,9 @@ impl ModelCatalog {
                     .then_with(|| a.id.cmp(b.id))
             }
             EffortLevel::Low => {
-                if let (Some(sa), Some(sb)) = (a.bench_score, b.bench_score) {
-                    if (sa - sb).abs() >= 1.0 {
-                        return sb.total_cmp(&sa);
-                    }
-                }
+                // Pure cheapest-first. The old bench early-return here had the same
+                // intransitivity as the high arm, and bench-gating never matched low effort's
+                // intent ("cheapest acceptable") anyway.
                 a.cost_class
                     .cmp(&b.cost_class)
                     .then_with(|| a.cost.total_cmp(&b.cost))
@@ -673,6 +685,7 @@ impl ModelCatalog {
 
     /// The full ranked candidate table for a tier with each model's score broken out — the data
     /// behind `/mesh` and `forge mesh explain`. Same ordering as [`ranked_seeded`](Self::ranked_seeded),
+    /// including the banded bench comparison (see [`bench_band`]).
     /// but every routable model is returned (not truncated) with its capability, cost class, the
     /// conservation penalty applied (if any), and the final score. Pure (no health/usability — the
     /// router overlays that).
@@ -734,14 +747,12 @@ impl ModelCatalog {
 
         let active_effort = effort.unwrap_or(EffortLevel::Medium);
         rows.sort_by(|a, b| match active_effort {
-            EffortLevel::High | EffortLevel::XHigh => {
-                if let (Some(sa), Some(sb)) = (a.bench_score, b.bench_score) {
-                    if (sa - sb).abs() >= 1.0 {
-                        return sb.total_cmp(&sa);
-                    }
-                }
-                b.final_score
-                    .total_cmp(&a.final_score)
+            EffortLevel::High | EffortLevel::XHigh | EffortLevel::WhiteHot => {
+                // Banded, not pairwise — same total-order fix as `ranked_seeded` (see the
+                // comment there; the pairwise gap rule panicked the sort on real catalogs).
+                bench_band(b.bench_score)
+                    .cmp(&bench_band(a.bench_score))
+                    .then_with(|| b.final_score.total_cmp(&a.final_score))
                     .then_with(|| a.cost_class.cmp(&b.cost_class))
                     .then_with(|| a.rotation.cmp(&b.rotation))
                     .then_with(|| a.weight.cmp(&b.weight))
@@ -749,11 +760,7 @@ impl ModelCatalog {
                     .then_with(|| a.model.cmp(&b.model))
             }
             EffortLevel::Low => {
-                if let (Some(sa), Some(sb)) = (a.bench_score, b.bench_score) {
-                    if (sa - sb).abs() >= 1.0 {
-                        return sb.total_cmp(&sa);
-                    }
-                }
+                // Pure cheapest-first — same rationale as `ranked_seeded`'s Low arm.
                 a.cost_class
                     .cmp(&b.cost_class)
                     .then_with(|| a.cost.total_cmp(&b.cost))
@@ -1235,6 +1242,42 @@ mod tests {
             infos[0].frontier,
             "bench 55.0 > FRONTIER_BENCH_THRESHOLD → frontier: {:?}",
             infos[0]
+        );
+    }
+
+    /// Regression: the effort-biased comparator used a pairwise "prefer higher bench when the
+    /// gap ≥ 1.0" rule that was NOT a total order (a within 1 of b, b within 1 of c, a and c
+    /// more than 1 apart → contradictory orderings). With enough models whose scores straddle
+    /// the threshold, `sort_by` panicked with "user-provided comparison function does not
+    /// correctly implement a total order" — hit live on the first white-hot routed turn.
+    /// The banded comparator must rank a saturated catalog without panicking.
+    #[test]
+    fn effort_ranking_is_a_total_order_on_threshold_straddling_scores() {
+        use crate::bench::BenchmarkScores;
+        let mut b = BenchmarkScores::new();
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..80 {
+            // Adjacent gaps of 0.6 — every neighbor "ties", every third model doesn't: the
+            // exact shape that broke the old pairwise rule.
+            b.insert(&format!("t m{i}"), 30.0 + (i as f64) * 0.6, 20.0);
+            ids.push(format!("openrouter::t/m{i}"));
+        }
+        ids.push("openrouter::t/unbenched".into());
+        let cat = ModelCatalog::new(ids).with_benchmarks(Some(b));
+        let ranked = cat.ranked_seeded(
+            TaskTier::Trivial,
+            &Pricing::default(),
+            100,
+            false,
+            7,
+            &forge_types::SubscriptionQuota::default(),
+            Some(EffortLevel::WhiteHot),
+        );
+        assert_eq!(ranked.len(), 81, "every model ranked, no panic");
+        assert_eq!(
+            ranked.last().map(String::as_str),
+            Some("openrouter::t/unbenched"),
+            "unbenched sinks below benched at white-hot effort"
         );
     }
 

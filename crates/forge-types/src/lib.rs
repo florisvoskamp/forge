@@ -369,6 +369,12 @@ pub enum EffortLevel {
     Medium,
     High,
     XHigh,
+    /// Above XHigh — the forge at its hottest, where the metal glows white. Same maximum
+    /// reasoning intensity as XHigh, PLUS a standing per-turn instruction to orchestrate
+    /// substantive work through `run_workflow` scripts automatically
+    /// (docs/features/whitehot-effort.md). Providers have no knob above xhigh — the extra
+    /// lift comes from the orchestration guidance, not a provider setting.
+    WhiteHot,
 }
 
 impl EffortLevel {
@@ -378,16 +384,18 @@ impl EffortLevel {
             EffortLevel::Medium => "medium",
             EffortLevel::High => "high",
             EffortLevel::XHigh => "xhigh",
+            EffortLevel::WhiteHot => "whitehot",
         }
     }
 
-    /// Parse case-insensitively from "low", "medium", "high", "xhigh".
+    /// Parse case-insensitively from "low", "medium", "high", "xhigh", "whitehot".
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "low" => Some(EffortLevel::Low),
             "medium" | "med" => Some(EffortLevel::Medium),
             "high" => Some(EffortLevel::High),
             "xhigh" | "x-high" | "extra-high" => Some(EffortLevel::XHigh),
+            "whitehot" | "white-hot" | "ultra" | "max" => Some(EffortLevel::WhiteHot),
             _ => None,
         }
     }

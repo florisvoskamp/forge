@@ -32,6 +32,22 @@ use crate::subagent::{self, AgentCtx};
 /// The virtual tool name the parent model calls to run a workflow script.
 pub const RUN_WORKFLOW_TOOL: &str = "run_workflow";
 
+/// Standing per-session guidance injected while `/effort whitehot` is pinned
+/// (docs/features/whitehot-effort.md): maximum reasoning intensity plus automatic workflow
+/// orchestration wherever the task has real multi-part structure.
+pub const WHITEHOT_GUIDANCE: &str = "White-hot effort is active — work at maximum thoroughness. \
+(1) For any task with three or more independent subtasks, several files/items to process, or \
+distinct research → build → verify stages, orchestrate it as a `run_workflow` script: `phase()` \
+per stage, `parallel()`/`pipeline()` for fan-out, and a final verification phase where separate \
+agents adversarially check the important results before you rely on them. \
+(2) Write workflow scripts defensively: ask discovery agents for one item per line with no \
+commentary and no code fences; split on newlines (never JSON.parse free-form prose); filter out \
+empty or 'null' items before fanning out; never interpolate a possibly-null value into an agent \
+prompt; always end the script with `return <final result>`. \
+(3) Single-step tasks are answered directly — don't orchestrate trivia. \
+(4) Verify claims against the actual code/files instead of assuming; prefer evidence from a \
+checking agent over your own recall.";
+
 /// The `ToolSpec` advertised to the parent so the model can call `run_workflow`.
 pub fn run_workflow_spec() -> ToolSpec {
     ToolSpec {
@@ -470,7 +486,22 @@ pub async fn run(
             all_ok,
         )),
         Ok(value) => Ok((value, all_ok)),
-        Err(e) => Ok((serde_json::Value::String(format!("error: {e}")), false)),
+        Err(e) => {
+            let mut msg = format!("error: {e}");
+            // Seen live: a model authored a script calling `glob(...)` — a host function that
+            // doesn't exist — and got a bare "glob is not defined". Spell out the real surface
+            // so the model's retry uses it instead of guessing another phantom function.
+            if msg.contains("is not defined") {
+                msg.push_str(
+                    "\nhint: the ONLY functions available inside a workflow script are \
+                     agent(prompt, opts?), parallel(thunks), pipeline(items, ...stages), \
+                     phase(title), log(message), and workflow(name, args?) — there is no \
+                     glob/fs/require/fetch or any other API. Do discovery, file reading, and \
+                     shell work through agent() calls.",
+                );
+            }
+            Ok((serde_json::Value::String(msg), false))
+        }
     }
 }
 
@@ -891,6 +922,28 @@ mod tests {
         assert_eq!(
             value,
             serde_json::Value::String("my own answer".to_string())
+        );
+    }
+
+    /// Regression: seen live — the model authored a script calling `glob(...)` (not a host
+    /// function) and got only "glob is not defined", so its retry guessed another phantom API.
+    #[tokio::test]
+    async fn an_undefined_function_error_lists_the_real_host_functions() {
+        let (value, ok, _evs) = run_test_workflow(
+            Arc::new(EchoProvider),
+            "openai::gpt-test",
+            r#"const files = await glob("**/*.rs"); return files;"#,
+        )
+        .await;
+        assert!(!ok);
+        let text = value.as_str().unwrap();
+        assert!(
+            text.contains("glob is not defined"),
+            "original error: {text}"
+        );
+        assert!(
+            text.contains("agent(prompt, opts?)") && text.contains("no glob/fs/require/fetch"),
+            "hint lists the real surface: {text}"
         );
     }
 

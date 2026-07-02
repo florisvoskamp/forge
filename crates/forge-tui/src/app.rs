@@ -1648,7 +1648,7 @@ impl App {
     /// Move the effort slider one step left (lower).
     pub fn effort_slider_left(&mut self) {
         use forge_types::EffortLevel::*;
-        let levels = [Low, Medium, High, XHigh];
+        let levels = [Low, Medium, High, XHigh, WhiteHot];
         let cur = self.effort.unwrap_or(Medium);
         let i = levels.iter().position(|&l| l == cur).unwrap_or(1);
         if i > 0 {
@@ -1659,7 +1659,7 @@ impl App {
     /// Move the effort slider one step right (higher).
     pub fn effort_slider_right(&mut self) {
         use forge_types::EffortLevel::*;
-        let levels = [Low, Medium, High, XHigh];
+        let levels = [Low, Medium, High, XHigh, WhiteHot];
         let cur = self.effort.unwrap_or(Medium);
         let i = levels.iter().position(|&l| l == cur).unwrap_or(1);
         if i + 1 < levels.len() {
@@ -4548,19 +4548,38 @@ fn effort_status(effort: forge_types::EffortLevel) -> (&'static str, Style) {
             "▲▲ effort xhigh",
             Style::default().fg(ERRRED).bold().bg(STATUSBG),
         ),
+        forge_types::EffortLevel::WhiteHot => (
+            "⚒ WHITE-HOT",
+            Style::default()
+                .fg(Color::Rgb(255, 252, 235))
+                .bold()
+                .bg(STATUSBG),
+        ),
     }
 }
 
 // ── Effort Slider ─────────────────────────────────────────────────────────────
 
 const EFFORT_SLIDER_H: u16 = 3;
-const EFFORT_LEVELS: [forge_types::EffortLevel; 4] = [
+const EFFORT_LEVELS: [forge_types::EffortLevel; 5] = [
     forge_types::EffortLevel::Low,
     forge_types::EffortLevel::Medium,
     forge_types::EffortLevel::High,
     forge_types::EffortLevel::XHigh,
+    forge_types::EffortLevel::WhiteHot,
 ];
-const EFFORT_LABELS: [&str; 4] = ["LOW", "MEDIUM", "HIGH", "XHIGH"];
+const EFFORT_LABELS: [&str; 5] = ["LOW", "MEDIUM", "HIGH", "XHIGH", "WHITE·HOT"];
+
+/// The WHITE·HOT ramp — the forge at the temperature where metal glows white:
+/// ember → flame → forge orange → gold → white-hot.
+const WHITEHOT_RAMP: [Color; 6] = [
+    Color::Rgb(216, 45, 28),   // deep ember
+    Color::Rgb(255, 96, 32),   // flame
+    Color::Rgb(255, 152, 40),  // forge orange
+    Color::Rgb(255, 208, 64),  // gold
+    Color::Rgb(255, 238, 150), // near-white gold
+    Color::Rgb(255, 252, 235), // white-hot
+];
 
 /// Sparkle chars that cycle at XHigh stop positions and handle.
 const SPARKLES: [char; 6] = ['✦', '✧', '⋆', '✺', '✼', '❋'];
@@ -4598,7 +4617,8 @@ fn slider_border_color(idx: usize, tick: usize) -> Color {
         0 => Color::Rgb(55, 60, 88),
         1 => TOOLCYAN,
         2 => HIGH_PULSE[(tick / 5) % HIGH_PULSE.len()],
-        _ => XHIGH_COLORS[tick % XHIGH_COLORS.len()],
+        3 => XHIGH_COLORS[tick % XHIGH_COLORS.len()],
+        _ => WHITEHOT_RAMP[(tick / 2) % WHITEHOT_RAMP.len()],
     }
 }
 
@@ -4607,7 +4627,10 @@ fn slider_fill_color(idx: usize, tick: usize, pos: usize) -> Color {
         0 => Color::Rgb(85, 92, 118),
         1 => TOOLCYAN,
         2 => HIGH_PULSE[(tick / 5) % HIGH_PULSE.len()],
-        _ => XHIGH_COLORS[(tick + pos) % XHIGH_COLORS.len()],
+        3 => XHIGH_COLORS[(tick + pos) % XHIGH_COLORS.len()],
+        // The track heats up toward the handle: ember at the left edge, white-hot at the
+        // handle, with a slow tick shimmer rippling along it.
+        _ => WHITEHOT_RAMP[(pos / 3 + tick / 4) % WHITEHOT_RAMP.len()],
     }
 }
 
@@ -4620,7 +4643,15 @@ fn slider_handle_color(idx: usize, tick: usize) -> Color {
             let pulse = (std::f32::consts::PI * t / 12.0).sin();
             Color::Rgb(255, (120.0 + 110.0 * pulse) as u8, (30.0 * pulse) as u8)
         }
-        _ => XHIGH_COLORS[(tick * 3) % XHIGH_COLORS.len()],
+        3 => XHIGH_COLORS[(tick * 3) % XHIGH_COLORS.len()],
+        // Blinding pulse between white-hot and gold — the hottest point of the forge.
+        _ => {
+            if (tick / 3) % 2 == 0 {
+                Color::Rgb(255, 252, 235)
+            } else {
+                Color::Rgb(255, 220, 90)
+            }
+        }
     }
 }
 
@@ -4631,8 +4662,11 @@ fn slider_label_style(idx: usize, tick: usize) -> Style {
         2 => Style::default()
             .fg(HIGH_PULSE[(tick / 5) % HIGH_PULSE.len()])
             .bold(),
-        _ => Style::default()
+        3 => Style::default()
             .fg(XHIGH_COLORS[(tick * 2) % XHIGH_COLORS.len()])
+            .bold(),
+        _ => Style::default()
+            .fg(WHITEHOT_RAMP[3 + (tick / 3) % 3])
             .bold(),
     }
 }
@@ -4654,7 +4688,10 @@ fn render_effort_slider(frame: &mut Frame, area: Rect, app: &App) {
         height: EFFORT_SLIDER_H,
     };
 
-    let title_text = if idx == 3 {
+    let title_text = if idx == 4 {
+        let sp = SPARKLES[(tick / 2) % SPARKLES.len()];
+        format!(" {sp} ⚒ forge · white-hot {sp} ")
+    } else if idx == 3 {
         let sp = SPARKLES[(tick / 2) % SPARKLES.len()];
         format!(" {sp} effort {sp} ")
     } else {
@@ -4684,7 +4721,7 @@ fn render_effort_slider(frame: &mut Frame, area: Rect, app: &App) {
     if track_w < 4 {
         return;
     }
-    let stops: [usize; 4] = std::array::from_fn(|i| i * track_w.saturating_sub(1) / 3);
+    let stops: [usize; 5] = std::array::from_fn(|i| i * track_w.saturating_sub(1) / 4);
 
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for pos in 0..track_w {
@@ -4693,7 +4730,7 @@ fn render_effort_slider(frame: &mut Frame, area: Rect, app: &App) {
         let (ch, style) = match at_stop {
             Some(si) if si == idx => {
                 let hcol = slider_handle_color(idx, tick);
-                let ch = if idx == 3 {
+                let ch = if idx >= 3 {
                     SPARKLES[(tick * 2) % SPARKLES.len()]
                 } else {
                     '●'
@@ -4702,7 +4739,7 @@ fn render_effort_slider(frame: &mut Frame, area: Rect, app: &App) {
             }
             Some(si) if si < idx => {
                 let fcol = slider_fill_color(idx, tick, pos);
-                let ch = if idx == 3 {
+                let ch = if idx >= 3 {
                     SPARKLES[(tick + si * 4) % SPARKLES.len()]
                 } else {
                     '●'
@@ -5790,6 +5827,24 @@ mod tests {
         app.apply(PresenterEvent::Effort(None));
         let text = screen_wh(&app, 100, LIVE_H);
         assert!(!text.contains("effort"), "cleared effort is hidden");
+    }
+
+    #[test]
+    fn whitehot_effort_has_its_own_statusline_segment_and_slider_stop() {
+        let mut app = App::default();
+        app.apply(PresenterEvent::Effort(Some(
+            forge_types::EffortLevel::WhiteHot,
+        )));
+        let text = screen_wh(&app, 100, LIVE_H);
+        assert!(text.contains("WHITE-HOT"), "statusline segment: {text}");
+
+        app.effort_slider = true;
+        let text = screen_wh(&app, 100, LIVE_H);
+        assert!(
+            text.contains("WHITE·HOT"),
+            "fifth slider stop label: {text}"
+        );
+        assert!(text.contains("white-hot"), "forge-themed title: {text}");
     }
 
     #[test]

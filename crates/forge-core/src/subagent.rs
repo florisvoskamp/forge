@@ -417,9 +417,12 @@ pub async fn run_subagent(
             } else {
                 execute_tool(ctx, &full, &msg_id, call).await?
             };
-            if result.starts_with("error:") || result.starts_with("permission denied") {
-                ok = false;
-            }
+            // Last outcome wins, not a permanent latch: a child that hits one failing tool call
+            // but RECOVERS with a later successful one is not a failed child. (Seen live in a
+            // workflow run: an agent's first read_file errored on a bad path, it recovered by
+            // reading the right file and answering well — the old latch still marked it ✗, while
+            // siblings that failed without ever touching a tool showed ✓.)
+            ok = !(result.starts_with("error:") || result.starts_with("permission denied"));
             ctx.store.add_message_full(
                 child_id,
                 next_seq(),
@@ -1014,6 +1017,92 @@ mod tests {
         assert!(
             store.current_benched().unwrap().is_benched("bad::model"),
             "the rate-limited model was benched"
+        );
+    }
+
+    /// Emits: (0) a `read_file` on a nonexistent path → "error:" tool result, (1) a `read_file`
+    /// on a real path → success, (2) a final answer — the recover-after-one-bad-call shape.
+    struct RecoveringToolProvider {
+        step: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for RecoveringToolProvider {
+        async fn complete(
+            &self,
+            _model: &str,
+            _messages: &[forge_types::Message],
+            _tools: &[ToolSpec],
+            _on_event: &mut forge_provider::EventSink<'_>,
+        ) -> Result<forge_provider::ModelResponse, forge_provider::ProviderError> {
+            let step = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let tool_calls = match step {
+                0 => vec![forge_types::ToolCall {
+                    id: "c0".into(),
+                    name: "read_file".into(),
+                    args: serde_json::json!({"path": "/definitely/not/here-xyz"}),
+                }],
+                1 => vec![forge_types::ToolCall {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    args: serde_json::json!({"path": "Cargo.toml"}),
+                }],
+                _ => vec![],
+            };
+            let content = if tool_calls.is_empty() {
+                "recovered fine".to_string()
+            } else {
+                String::new()
+            };
+            Ok(forge_provider::ModelResponse {
+                content,
+                tool_calls,
+                usage: forge_types::Usage::default(),
+                quotas: Vec::new(),
+            })
+        }
+    }
+
+    /// Regression (seen live in a workflow run): the old `ok` latch flipped false on ANY failing
+    /// tool call and never reset, so a child whose first read errored on a bad path but which
+    /// recovered with a successful read + good answer was still shown as ✗ — while siblings that
+    /// failed without ever touching a tool showed ✓. Last outcome wins now.
+    #[tokio::test]
+    async fn a_child_that_recovers_from_one_failing_tool_call_is_not_marked_failed() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let child = store
+            .create_child_session(".", "default", "parent")
+            .unwrap();
+        let provider = Arc::new(RecoveringToolProvider {
+            step: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let router = Arc::new(FixedRouter {
+            model: "good::model".into(),
+            fallbacks: vec![],
+        });
+        let ctx = ctx_with(provider, router, Arc::clone(&store));
+        let agent = ResolvedAgent {
+            name: "general".into(),
+            task: "read the manifest".into(),
+            system_prompt: "you are a subagent".into(),
+            tools: Vec::new(),
+            tier: None,
+        };
+        let mut sink = |_: StreamEvent| {};
+        let decision = route_child(&ctx, &agent, BudgetState::default()).await;
+        let out = run_subagent(
+            &ctx,
+            &child,
+            &agent,
+            decision,
+            BudgetState::default(),
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.final_text, "recovered fine");
+        assert!(
+            out.ok,
+            "one failed tool call followed by a successful one is a recovery, not a failed child"
         );
     }
 

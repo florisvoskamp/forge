@@ -355,7 +355,7 @@ impl RouteHints {
 fn effective_min_context(min_tokens: Option<u32>, effort: Option<EffortLevel>) -> Option<u32> {
     min_tokens.map(|t| match effort {
         Some(EffortLevel::High) => t.saturating_mul(3) / 2,
-        Some(EffortLevel::XHigh) => t.saturating_mul(2),
+        Some(EffortLevel::XHigh) | Some(EffortLevel::WhiteHot) => t.saturating_mul(2),
         _ => t,
     })
 }
